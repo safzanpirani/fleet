@@ -1,4 +1,4 @@
-# fleet
+<h1><img src="assets/pulse.svg" width="28" height="28" align="center" alt="●" />&nbsp;fleet</h1>
 
 One command to drive the whole fleet — run commands, restart services, check
 status across every box — **without ever thinking about ssh/PowerShell/WSL

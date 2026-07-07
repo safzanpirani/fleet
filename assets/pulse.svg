@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="44" height="44" viewBox="0 0 44 44">
+  <defs>
+    <filter id="glow" x="-100%" y="-100%" width="300%" height="300%">
+      <feGaussianBlur stdDeviation="2.2" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- expanding pulse ring -->
+  <circle cx="22" cy="22" r="6" fill="none" stroke="#22c55e" stroke-width="2">
+    <animate attributeName="r" values="6;18" dur="1.6s" repeatCount="indefinite" calcMode="spline" keySplines="0.2 0.6 0.3 1"/>
+    <animate attributeName="opacity" values="0.7;0" dur="1.6s" repeatCount="indefinite"/>
+    <animate attributeName="stroke-width" values="2.5;0" dur="1.6s" repeatCount="indefinite"/>
+  </circle>
+
+  <!-- glowing blinking core -->
+  <circle cx="22" cy="22" r="7" fill="#22c55e" filter="url(#glow)">
+    <animate attributeName="opacity" values="1;0.35;1" dur="1.6s" repeatCount="indefinite" calcMode="spline" keySplines="0.4 0 0.6 1;0.4 0 0.6 1"/>
+    <animate attributeName="r" values="7;6;7" dur="1.6s" repeatCount="indefinite"/>
+  </circle>
+</svg>
