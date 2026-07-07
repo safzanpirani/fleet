@@ -108,20 +108,20 @@ claude mcp add fleet -- bun run ~/fleet/src/mcp.ts
 }
 ```
 
-Tools: `fleet_ls`, `fleet_exec`, `fleet_cp`, `fleet_restart`, `fleet_logs`,
-`fleet_svc`, `fleet_gpu`, `fleet_status`, `fleet_run`, `fleet_screenshot`,
-`fleet_cu`, `fleet_spawn`, `fleet_jobs`, `fleet_job_log`, `fleet_job_kill`,
-`fleet_reboot`, `fleet_boot`, `fleet_switch`. The interactive `top`/`ssh` commands and live job
-`tail -f`/`wait` are intentionally **not** exposed — they need a live TTY / would
-block. Mutating tools (`exec`/`cp`/`restart`/`spawn`/`job_kill`/`reboot`/`switch`/
-`screenshot`/`cu`/`run`) vanish under the read-only kill-switch — `screenshot`
-lives on that side because capturing executes commands on the host (and on
-Windows registers a one-shot scheduled task). The read-only tools
-(`ls`/`logs`/`svc`/`gpu`/`status`/`jobs`/`job_log`/`boot`) carry `readOnlyHint`.
-`fleet_exec` takes an optional `timeout` (seconds) so a hung remote command
-returns exit 124 instead of blocking the server. Host names, groups, and recipe names are baked into the tool
-descriptions, so an agent sees valid selectors without a round-trip. Smoke-test
-it end-to-end with `bun run scripts/smoke.ts`.
+### Tools
+
+All prefixed `fleet_`, grouped by access:
+
+| Group | Tools |
+|---|---|
+| **Read-only** — carry `readOnlyHint`, always registered | `ls` · `logs` · `svc` · `gpu` · `status` · `jobs` · `job_log` · `boot` |
+| **Mutating** — dropped by the read-only kill-switch | `exec` · `cp` · `restart` · `spawn` · `job_kill` · `reboot` · `switch` · `screenshot` · `cu` · `run` |
+| **Not exposed** | `top` / `ssh` (need a live TTY) · job `tail -f` / `wait` (would block) |
+
+- `screenshot` counts as **mutating** — capturing runs commands on the host (on Windows it registers a one-shot scheduled task).
+- `exec` accepts an optional `timeout` (seconds); a hung remote command returns exit **124** instead of blocking the server.
+- Host, group, and recipe names are **baked into the tool descriptions**, so an agent sees valid selectors without a round-trip.
+- Smoke-test end-to-end: `bun run scripts/smoke.ts`.
 
 The tool set is defined once in `server.ts` (`buildServer`) and shared by the
 stdio server (`mcp.ts`) and the remote HTTP server (`http.ts`). All of them —
