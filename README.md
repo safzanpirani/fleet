@@ -183,6 +183,12 @@ The `ssh → PowerShell → wsl bash` path with nested quoting is a recurring pa
 `fleet` encapsulates it once — a base64/EncodedCommand round-trip generalised to
 every machine, so no command has to survive multiple layers of quoting.
 
+## Agent skill
+`skill/SKILL.md` is a ready-made [Agent Skill](https://modelcontextprotocol.io) that
+teaches an agent (Claude Code, etc.) how to drive fleet — commands, selectors, the
+quoting rules, and the MCP tools. Drop the `skill/` folder into your agent's skills dir
+(e.g. `~/.claude/skills/fleet/`) to use it.
+
 ## Stack
 Bun + strict TypeScript. The CLI itself has zero runtime deps; the MCP server
 adds `@modelcontextprotocol/sdk` + `zod`. `bun run typecheck` to verify.
