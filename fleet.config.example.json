@@ -1,0 +1,70 @@
+{
+  "$comment": "Copy this to fleet.config.json and edit for your own fleet. `ssh` values are SSH host aliases from your ~/.ssh/config. See README.md.",
+  "dashboard": "https://dash.example.com",
+  "hosts": {
+    "web": {
+      "ssh": "web",
+      "os": "linux",
+      "gpu": false,
+      "python": "/usr/bin/python3",
+      "health": "https://fleet.example.com/health",
+      "services": {
+        "cloudflared": { "type": "systemd", "name": "cloudflared" },
+        "fleet-mcp": { "type": "systemd", "name": "fleetmcp" }
+      }
+    },
+    "gpu-box": {
+      "ssh": "gpu-box",
+      "os": "linux",
+      "gpu": true,
+      "python": "/usr/bin/python3",
+      "services": {
+        "jellyfin": { "type": "systemd", "name": "jellyfin" }
+      }
+    },
+    "win-box": {
+      "ssh": "win-box",
+      "os": "windows",
+      "gpu": true,
+      "wsl": "Ubuntu",
+      "python": "C:\\Python3\\python.exe",
+      "services": {
+        "fleet-mcp": { "type": "winservice", "name": "FleetMCP" },
+        "some-task": { "type": "schtask", "name": "some-task" }
+      }
+    },
+    "vps": {
+      "ssh": "vps",
+      "os": "linux"
+    },
+    "laptop": {
+      "ssh": "laptop",
+      "os": "mac"
+    }
+  },
+  "machines": {
+    "dual-boot": {
+      "boots": {
+        "linux": { "host": "gpu-box", "lan": "gpu-box" },
+        "windows": { "host": "win-box", "lan": "win-box" }
+      },
+      "switch": {
+        "linux": "cmd /c C:\\path\\to\\boot-linux.cmd",
+        "windows": "sudo boot-windows"
+      }
+    }
+  },
+  "groups": {
+    "servers": ["web", "gpu-box", "vps"],
+    "home": ["gpu-box", "win-box"]
+  },
+  "recipes": {
+    "restart-fleet": [
+      "restart web fleet-mcp",
+      "restart win-box fleet-mcp"
+    ],
+    "fleet-uptime": [
+      "exec @linux \"uptime\""
+    ]
+  }
+}

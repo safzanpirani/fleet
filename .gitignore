@@ -1,0 +1,7 @@
+node_modules/
+bun.lockb
+*.log
+.DS_Store
+fleet.config.json
+fleet.config.local.json
+dist/

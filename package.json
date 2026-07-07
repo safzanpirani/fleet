@@ -1,0 +1,27 @@
+{
+  "name": "fleet",
+  "version": "0.1.0",
+  "description": "Drive your whole machine fleet over SSH without quoting pain",
+  "type": "module",
+  "bin": {
+    "fleet": "./src/cli.ts",
+    "fleet-mcp": "./src/mcp.ts",
+    "fleet-mcp-http": "./src/http.ts"
+  },
+  "scripts": {
+    "fleet": "bun run src/cli.ts",
+    "mcp": "bun run src/mcp.ts",
+    "serve": "bun run src/http.ts",
+    "test": "bun test",
+    "typecheck": "tsgo --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@typescript/native-preview": "^7.0.0-dev.20260623.1",
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^4.4.3"
+  }
+}
