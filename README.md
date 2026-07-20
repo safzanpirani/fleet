@@ -1,24 +1,43 @@
 <h1><img src="assets/pulse.svg" width="28" height="28" align="center" alt="●" />&nbsp;fleet</h1>
 
-One command to drive the whole fleet — run commands, restart services, check
-status across every box — **without ever thinking about ssh/PowerShell/WSL
-quoting**. Every exec goes over a quoting-proof primitive (`bash -ls` via stdin
-on Linux/mac, PowerShell `-EncodedCommand` on Windows), so any command with
-quotes, `$`, `&`, pipes, JSON, etc. round-trips verbatim.
+**Run commands across all your machines without fighting SSH quoting.**
 
-## Install
+Fleet is a small CLI and MCP server for managing Linux, Windows, and macOS
+machines from one place. Use it for a single command, a whole group, or every
+machine at once.
+
+```sh
+fleet exec win-box "nvidia-smi"  # one machine
+fleet exec @linux "uptime"       # a group, in parallel
+fleet status                     # the whole fleet at a glance
+```
+
+## Why Fleet?
+
+- Commands containing quotes, pipes, `$`, JSON, and shell operators arrive intact.
+- Logical routes can prefer a fast connection and fall back to another.
+- Long-running jobs survive SSH disconnects and remain easy to inspect.
+- The same operations are available to people through the CLI and agents through MCP.
+
+## Quick start
+
+Install [Bun](https://bun.sh), clone the repository, then:
+
 ```sh
 cd ~/fleet
 bun install
-cp fleet.config.example.json fleet.config.json   # then edit for your own hosts
-bun link            # puts `fleet` on your PATH
+cp fleet.config.example.json fleet.config.json
+# Edit fleet.config.json with your SSH hosts
+bun link
 fleet ls
 ```
-Or run without linking: `bun run src/cli.ts <cmd>`.
 
-`fleet.config.json` is git-ignored, so your real host map never lands in git. If
-it's absent, fleet falls back to the shipped `fleet.config.example.json` so the
-commands still run against the placeholder hosts.
+Your real `fleet.config.json` is git-ignored, so host details stay local. Without
+one, Fleet uses the safe placeholder configuration in
+`fleet.config.example.json`.
+
+Prefer not to link the command globally? Run it with
+`bun run src/cli.ts <command>`.
 
 ## Usage
 ```sh
