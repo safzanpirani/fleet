@@ -4,8 +4,8 @@ import type { FleetConfig, Host } from "../src/config.ts";
 
 const host = (name: string, os: Host["os"]): Host => ({ name, ssh: name, os });
 const cfg: FleetConfig = {
-  hosts: { oracle: host("oracle", "linux"), winbox: host("winbox", "windows") },
-  groups: { cloud: ["oracle", "winbox"] },
+  hosts: { oracle: host("oracle", "linux"), "win-box": host("win-box", "windows") },
+  groups: { cloud: ["oracle", "win-box"] },
 };
 
 describe("resolveJobRef", () => {
@@ -55,7 +55,7 @@ describe("parseRows", () => {
   });
 
   test("strips trailing CR (windows CRLF output)", () =>
-    expect(parseRows("winbox", "id3\texited\t1\t100\t1700\tcmd\r")[0]!.cmd).toBe("cmd"));
+    expect(parseRows("win-box", "id3\texited\t1\t100\t1700\tcmd\r")[0]!.cmd).toBe("cmd"));
 
   test("a command containing tabs is preserved (rejoined)", () =>
     expect(parseRows("oracle", "id4\trunning\t-\t1\t2\ta\tb\tc")[0]!.cmd).toBe("a\tb\tc"));

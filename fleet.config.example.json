@@ -27,6 +27,7 @@
       "os": "windows",
       "gpu": true,
       "wsl": "Ubuntu",
+      "winShell": "pwsh",
       "python": "C:\\Python3\\python.exe",
       "services": {
         "fleet-mcp": { "type": "winservice", "name": "FleetMCP" },
@@ -40,6 +41,11 @@
     "laptop": {
       "ssh": "laptop",
       "os": "mac"
+    }
+  },
+  "routes": {
+    "windows-auto": {
+      "prefer": ["win-box"]
     }
   },
   "machines": {

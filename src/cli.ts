@@ -10,7 +10,8 @@
  *   fleet restart <host> <svc>        restart a configured service
  *   fleet reboot <sel> [--yes]        reboot the whole machine(s)
  *   fleet gpu [--json]                every GPU: util / free VRAM / temp / loaded model
- *   fleet status [host] [--json]      live CPU/mem/disk from dash.example.com
+ *   fleet disk [sel] [--json]         every volume: free space / % used (live, not the dashboard)
+ *   fleet status [host] [--json]      live CPU/mem/disk from the configured dashboard
  *   fleet top <host>                  live terminal btop for one host
  *   fleet logs <host> <svc> [-n N]    recent logs / status for a service
  *   fleet run <recipe>                run a saved playbook from config
@@ -32,9 +33,9 @@ import {
 import type { JobRow } from "./jobs.ts";
 import {
   pullFlag, pullVal, parseLeadingFlags, lsHosts, runExec, pushFile, pullFile, parseRemoteSpec, restartService, serviceLogs, svcStatus,
-  gpuRows, fetchDashboard, hostStatus, runRecipe, captureScreenshot, rebootHosts,
+  gpuRows, diskRows, fetchDashboard, hostStatus, runRecipe, captureScreenshot, rebootHosts,
   cuInstall, cuRun, cuApps, cuWindows, cuResolvePid, cuShotWindow, preferredImageExt, overlayGrid,
-  bootState, switchMachine, waitFor, routeSelector, deployHosts, diagnose,
+  bootState, switchMachine, waitFor, routeSelector, deployHosts, diagnose, firmwareRebootHosts,
 } from "./core.ts";
 import type { ServiceAction } from "./core.ts";
 
@@ -86,18 +87,19 @@ function printResult(r: ExecResult) {
 }
 
 const SUBCOMMANDS = [
-  "ls", "exec", "spawn", "jobs", "cp", "restart", "reboot", "boot", "switch", "wait",
-  "gpu", "status", "top", "logs", "svc", "shot", "cu", "run", "deploy", "doctor", "completion", "ssh", "help",
+  "ls", "dt", "exec", "spawn", "jobs", "cp", "restart", "reboot", "bios", "boot", "switch", "wait",
+  "gpu", "disk", "status", "top", "logs", "svc", "shot", "cu", "run", "deploy", "doctor", "completion", "ssh", "help",
 ];
 /** Emit a bash/zsh completion script with this config's hosts/groups/recipes/
  *  services baked in. Source it: `eval "$(fleet completion zsh)"`. */
 function completionScript(cfg: FleetConfig, shell: string): string {
   const hosts = Object.keys(cfg.hosts);
+  const routes = Object.keys(cfg.routes ?? {});
   const machines = Object.keys(cfg.machines ?? {});
   const groups = ["@linux", "@windows", "@mac", "@gpu", ...Object.keys(cfg.groups ?? {}).map((g) => "@" + g)];
   const recipes = Object.keys(cfg.recipes ?? {});
   const services = [...new Set(Object.values(cfg.hosts).flatMap((h) => Object.keys(h.services ?? {})))];
-  const sels = ["all", ...groups, ...hosts, ...machines].join(" ");
+  const sels = ["all", ...groups, ...hosts, ...routes, ...machines].join(" ");
   const svcCmds = "restart logs svc";   // commands whose args include service names
   if (shell === "zsh") return `#compdef fleet
 _fleet() {
@@ -107,7 +109,7 @@ _fleet() {
   case $words[2] in
     run) compadd -- \${=recipes};;
     ${svcCmds.split(" ").join("|")}) compadd -- \${=sels} \${=svcs};;
-    boot|switch|wait|exec|spawn|cp|reboot|top|shot|cu|ssh|doctor|status|deploy) compadd -- \${=sels};;
+    boot|switch|wait|exec|spawn|cp|reboot|bios|top|shot|cu|ssh|doctor|status|deploy) compadd -- \${=sels};;
   esac
 }
 compdef _fleet fleet`;
@@ -120,7 +122,7 @@ compdef _fleet fleet`;
   case "\${COMP_WORDS[1]}" in
     run) COMPREPLY=( \$(compgen -W "\$recipes" -- "\$cur") );;
     ${svcCmds.split(" ").join("|")}) COMPREPLY=( \$(compgen -W "\$sels \$svcs" -- "\$cur") );;
-    boot|switch|wait|exec|spawn|cp|reboot|top|shot|cu|ssh|doctor|status|deploy) COMPREPLY=( \$(compgen -W "\$sels" -- "\$cur") );;
+    boot|switch|wait|exec|spawn|cp|reboot|bios|top|shot|cu|ssh|doctor|status|deploy) COMPREPLY=( \$(compgen -W "\$sels" -- "\$cur") );;
   esac
 }
 complete -F _fleet fleet`;
@@ -131,6 +133,7 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
     case undefined: case "help": case "-h": case "--help": {
       console.log(`${A.b("fleet")} — drive your fleet without quoting pain\n
   fleet ls                        reachability of every host
+  fleet dt                        list live Daytona sandboxes (needs DAYTONA_API_KEY)
   fleet exec [flags] <sel> <cmd…>  run a command, blocking   (flags BEFORE <sel>: --cwd dir --timeout S --wsl --raw --json)
   fleet spawn [flags] <sel> <cmd…> launch a detached job (outlives ssh)   (flags BEFORE <sel>: --cwd dir --label name --json)
   fleet jobs [<sel>]              list detached jobs across the fleet
@@ -139,10 +142,12 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
   fleet cp <local> <sel>:<remote> push a file (fan-out ok)
   fleet restart <host> <svc>      restart a configured service
   fleet reboot <sel> [--yes]      reboot the whole machine(s)
+  fleet bios <sel> [--yes]        reboot into UEFI/BIOS firmware setup
   fleet boot <machine>            which OS is live on a dual-boot box
   fleet switch <machine> --to OS  reboot into the other OS, wait for it   (--yes)
   fleet wait <host|machine> …     block until ssh/port/http/boot is ready
   fleet gpu                       util / free VRAM / temp / loaded model
+  fleet disk [sel]                free space on every volume (live, all drives)
   fleet status [host]             live stats from the dashboard   (--json)
   fleet top <host>                live terminal btop for one host
   fleet logs <host> <svc> [-n N]  recent logs for a service
@@ -154,8 +159,10 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
   fleet doctor <host>             diagnose why a host is unreachable (ssh -vv + health)
   fleet completion [bash|zsh]     shell completion (eval "$(fleet completion zsh)")
   fleet ssh <host>                interactive shell\n
-  selectors: host | @linux @windows @mac @gpu | @<custom> | all | a,b,@gpu
+  selectors: host | logical route | @linux @windows @mac @gpu | @<custom> | all | a,b,@gpu | dt:<sandbox id|name|prefix>
+  daytona:   exec/cp work on dt: sandboxes over the REST API — e.g. fleet exec dt:spore- "ls" (prefix must be unique)
   hosts: ${Object.keys(cfg.hosts).join(", ")}
+  routes: ${Object.keys(cfg.routes ?? {}).join(", ") || "none"}
   machines: ${Object.keys(cfg.machines ?? {}).join(", ") || "none"}
   recipes: ${Object.keys(cfg.recipes ?? {}).join(", ") || "none"}`);
       return 0;
@@ -171,6 +178,21 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
       if (json) { console.log(JSON.stringify(await lsHosts(cfg), null, 2)); return 0; }
       // stream each host as it resolves (fastest first) — don't block on the slowest/dead host
       await lsHosts(cfg, (h) => console.log(row(h)));
+      return 0;
+    }
+
+    case "dt": {
+      const json = pullFlag(rest, "--json");
+      const { listSandboxes } = await import("./daytona.ts");
+      const boxes = await listSandboxes();
+      if (json) { console.log(JSON.stringify(boxes, null, 2)); return 0; }
+      if (!boxes.length) { console.log(A.d("no live sandboxes")); return 0; }
+      for (const s of boxes) {
+        const dot = s.state === "started" ? A.g("●") : s.state === "stopped" ? A.d("○") : A.y("◍");
+        const labels = s.labels ? Object.entries(s.labels).map(([k, v]) => `${k}=${v}`).join(" ") : "";
+        console.log(`${dot} ${A.b((s.name ?? s.id).padEnd(28))} ${A.d(s.state.padEnd(10))} ${A.d(s.id.padEnd(38))} ${A.d(labels)}`);
+      }
+      console.log(A.d(`\n  use:  fleet exec dt:<name|id|prefix> "<cmd>"   |   fleet cp <file> dt:<name>:<path>`));
       return 0;
     }
 
@@ -261,7 +283,7 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
       if (verb === "prune") {
         rest.shift();
         const all = pullFlag(rest, "--all");
-        const out = await pruneJobs(cfg, rest[0] ?? "all", all);
+        const out = await pruneJobs(cfg, await routeSelector(cfg, rest[0] ?? "all"), all);
         for (const o of out) {
           if (o.error) console.log(`${A.r("✗")} ${A.b(o.host)} ${A.y("prune failed: " + o.error)}`);
           else console.log(`${A.d("⌫")} ${A.b(o.host)} ${A.d("pruned " + o.removed + " job(s)")}`);
@@ -270,7 +292,8 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
       }
       // bare list (optional selector)
       const listErrors: string[] = [];
-      const rows = await listJobs(cfg, rest[0] ?? "all", (h, e) => listErrors.push(`${h}: ${e}`));
+      const rows = await listJobs(cfg, await routeSelector(cfg, rest[0] ?? "all"),
+        (h, e) => listErrors.push(`${h}: ${e}`));
       for (const e of listErrors) console.error(`${A.r("✗")} ${A.y("jobs list failed on " + e)}`);
       if (json) { console.log(JSON.stringify(rows, null, 2)); return listErrors.length ? 1 : 0; }
       if (!rows.length) { console.log(A.d(listErrors.length ? "no jobs (some hosts failed)" : "no jobs")); return listErrors.length ? 1 : 0; }
@@ -329,6 +352,19 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
       return actions.some((a) => !a.result.ok) ? 1 : 0;
     }
 
+    case "bios": {
+      const yes = pullFlag(rest, "--yes") || pullFlag(rest, "-y");
+      const sel = rest[0];
+      if (!sel) die("usage: fleet bios <sel> [--yes]");
+      const routed = await routeSelector(cfg, sel!);
+      const hosts = resolveHosts(cfg, routed).map((h) => h.name);
+      if (!await confirm(`reboot ${hosts.join(", ")} into BIOS/UEFI setup (drops the connection)`, yes)) return 1;
+      const actions = await firmwareRebootHosts(cfg, routed);
+      for (const a of actions)
+        console.log(`${a.result.ok ? A.g("↻") : A.r("✗")} ${A.b(a.host)} ${A.d("· " + a.os + (a.result.ok ? " · entering firmware" : " · " + (a.result.stderr || "exit " + a.result.code)))}`);
+      return actions.some((a) => !a.result.ok) ? 1 : 0;
+    }
+
     case "logs": {
       const n = numVal(rest, "-n", 30);
       const [sel, svcName] = rest;
@@ -363,6 +399,24 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
       return 0;
     }
 
+    case "disk": {
+      const json = pullFlag(rest, "--json");
+      const sel = rest[0] ?? "all";
+      const rows = await diskRows(cfg, await routeSelector(cfg, sel));
+      if (!rows.length) die(`no volumes reported by ${sel}`);
+      if (json) { console.log(JSON.stringify(rows, null, 2)); return 0; }
+      const w = Math.max(...rows.map((r) => r.mount.length));
+      let last = "";
+      for (const r of rows) {
+        const head = r.host === last ? " ".repeat(9) : A.b(r.host.padEnd(9));
+        last = r.host;
+        const bar = heat(r.pct, (r.pct.toFixed(0) + "%").padStart(4));
+        const size = A.d(`${r.free_gb.toFixed(1)}g free of ${r.total_gb.toFixed(0)}g`);
+        console.log(`${head} ${A.c(r.mount.padEnd(w))} ${bar} used  ${size}${r.label ? "  " + A.d(r.label) : ""}`);
+      }
+      return 0;
+    }
+
     case "status": {
       const json = pullFlag(rest, "--json");
       const filter = rest[0];
@@ -387,7 +441,7 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
     case "top": {
       const sel = rest[0];
       if (!sel) die("usage: fleet top <host>");
-      const host = resolveHosts(cfg, sel)[0]!.name;
+      const host = resolveHosts(cfg, await routeSelector(cfg, sel))[0]!.name;
       return await topLoop(cfg, host);
     }
 
@@ -398,11 +452,12 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
       const out = pullVal(rest, "--out");
       const sel = rest[0];
       if (!sel) die("usage: fleet shot <host> [--out file.png] [--grid [--grid-step N]] [--no-open]");
-      const host = resolveHosts(cfg, sel)[0]!;
+      const routed = await routeSelector(cfg, sel);
+      const host = resolveHosts(cfg, routed)[0]!;
       const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
       const local = out ?? `${host.name}-${ts}.${await preferredImageExt()}`;
       process.stdout.write(A.d(`◎ capturing ${host.name} …\r`));
-      const r = await captureScreenshot(cfg, sel, local);
+      const r = await captureScreenshot(cfg, routed, local);
       if (grid && !await overlayGrid(r.localPath, gridStep)) console.error(A.y("grid overlay skipped (need python3 + Pillow)"));
       console.log(`${A.g("●")} ${A.b(r.host)} ${A.d("→")} ${r.localPath}${grid ? A.d(" (grid)") : ""}`);
       if (!noOpen && process.platform === "darwin")
@@ -417,6 +472,7 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
       const out = pullVal(rest, "--out");
       const sel = rest.shift();
       if (!sel) die("usage: fleet cu <host> install | <cua-driver args…> [--out f.png] [--grid]");
+      const target = await routeSelector(cfg, sel);
       const applyGrid = async (p?: string) => {
         if (p && grid && !await overlayGrid(p, gridStep))
           console.error(A.y("grid overlay skipped (need python3 + Pillow)"));
@@ -428,14 +484,14 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
       const verb = rest[0];
 
       if (verb === "install") {
-        console.log(A.d(`◎ installing cua-driver on ${sel} …`));
-        const r = await cuInstall(cfg, sel);
+        console.log(A.d(`◎ installing cua-driver on ${target} …`));
+        const r = await cuInstall(cfg, target);
         printResult(r);
         return r.ok ? 0 : 1;
       }
       // convenience verbs (item 3) — cut the list→list→build-JSON loop
       if (verb === "apps") {
-        const { apps, result } = await cuApps(cfg, sel, rest[1]);
+        const { apps, result } = await cuApps(cfg, target, rest[1]);
         if (!result.ok) { printResult(result); return 1; }
         for (const a of apps)
           console.log(`${A.d((a.pid + "").padStart(7))}  ${A.b(a.name)}${a.active ? A.g(" •active") : ""}`);
@@ -444,8 +500,8 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
       }
       if (verb === "windows") {
         const q = rest[1] ?? die("usage: fleet cu <host> windows <pid|app-name>");
-        const { pid } = await cuResolvePid(cfg, sel, q!);
-        const { windows, result } = await cuWindows(cfg, sel, pid);
+        const { pid } = await cuResolvePid(cfg, target, q!);
+        const { windows, result } = await cuWindows(cfg, target, pid);
         if (!result.ok) { printResult(result); return 1; }
         for (const w of windows)
           console.log(`${A.d((w.window_id + "").padStart(8))}  ${w.title || A.d("(untitled)")}`);
@@ -455,7 +511,7 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
       if (verb === "shot-window" || verb === "win") {
         const q = rest[1] ?? die("usage: fleet cu <host> shot-window <pid|app-name> [--out f.png]");
         const local = out ?? `${sel}-${q!.replace(/[^a-z0-9]+/gi, "_")}-${new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19)}.${await preferredImageExt()}`;
-        const r = await cuShotWindow(cfg, sel, q!, local);
+        const r = await cuShotWindow(cfg, target, q!, local);
         printResult(r.result);
         if (r.localImage) {
           await applyGrid(r.localImage);
@@ -465,7 +521,7 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
         return r.result.ok ? 0 : 1;
       }
 
-      const r = await cuRun(cfg, sel, rest, out);   // pull an image only when --out is given
+      const r = await cuRun(cfg, target, rest, out);   // pull an image only when --out is given
       printResult(r.result);
       if (r.localImage) {
         await applyGrid(r.localImage);
@@ -578,7 +634,7 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
       const json = pullFlag(rest, "--json");
       const sel = rest[0];
       if (!sel) die("usage: fleet doctor <host>");
-      const d = await diagnose(cfg, sel!);
+      const d = await diagnose(cfg, await routeSelector(cfg, sel!));
       if (json) { console.log(JSON.stringify(d, null, 2)); return d.sshUp ? 0 : 1; }
       const head = d.sshUp ? A.g(`● ${d.host} reachable`) : A.r(`○ ${d.host} unreachable`);
       console.log(`${head} ${A.d(`· ${d.os} · ssh ${d.ssh} · ${d.ms}ms`)}`);
@@ -594,7 +650,7 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
     case "ssh": {
       const sel = rest[0];
       if (!sel) die("usage: fleet ssh <host>");
-      return await sshInteractive(resolveHosts(cfg, sel)[0]!);
+      return await sshInteractive(resolveHosts(cfg, await routeSelector(cfg, sel))[0]!);
     }
 
     default: return die(`unknown command: ${command} (try: fleet help)`);

@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 /**
  * fleet-mcp-http — the fleet MCP server over HTTP, for remote clients (Poke,
- * etc.) reached via a Cloudflare tunnel at https://fleet.example.com.
+ * etc.) reached through a reverse proxy or tunnel at https://fleet.example.com.
  *
  * ⚠ This endpoint can run arbitrary commands across the whole fleet. The bearer
  *   token is effectively a root credential for every box — treat it that way.

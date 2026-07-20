@@ -3,7 +3,8 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 export type OS = "linux" | "windows" | "mac";
-export type ServiceType = "systemd" | "nssm" | "winservice" | "schtask";
+export type ServiceType = "systemd" | "systemd-user" | "nssm" | "winservice" | "schtask";
+export type WindowsShell = "pwsh" | "powershell";
 
 export interface Service {
   type: ServiceType;
@@ -11,10 +12,12 @@ export interface Service {
 }
 export interface Host {
   name: string;
-  ssh: string;        // ssh alias / host
+  ssh: string;        // ssh alias / host (for daytona transport: the sandbox id/name token)
   os: OS;
+  transport?: "ssh" | "daytona";  // default ssh; daytona hosts exec over the REST toolbox API
   gpu?: boolean;      // has an nvidia GPU → @gpu group
   wsl?: string;       // WSL distro for windows boxes
+  winShell?: WindowsShell; // configured shell skips per-process auto-detection
   python?: string;
   services?: Record<string, Service>;
   health?: string;    // HTTP URL probed as a liveness fallback when ssh is down (ls/doctor)
@@ -33,9 +36,13 @@ export interface Machine {
   boots: Record<string, Boot>;       // keyed by OS label: "cachyos" | "windows" | …
   switch?: Record<string, string>;   // target-OS label -> command run on the LIVE boot
 }
+export interface Route {
+  prefer: string[];                  // ordered host-entry names: preferred transport first
+}
 export interface FleetConfig {
   hosts: Record<string, Host>;
   machines?: Record<string, Machine>;    // dual-boot boxes: logical name -> its boots
+  routes?: Record<string, Route>;         // one logical host with ordered LAN/TS/etc transports
   groups?: Record<string, string[]>;     // custom named groups
   recipes?: Record<string, string[]>;    // saved playbooks (fleet subcommand strings)
   dashboard?: string;
@@ -46,7 +53,8 @@ const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 export const REPO_ROOT = ROOT;
 
 const OSES = new Set<string>(["linux", "windows", "mac"]);
-const SVC_TYPES = new Set<string>(["systemd", "nssm", "winservice", "schtask"]);
+const SVC_TYPES = new Set<string>(["systemd", "systemd-user", "nssm", "winservice", "schtask"]);
+const WIN_SHELLS = new Set<string>(["pwsh", "powershell"]);
 
 /** Structural validation — fails fast at load with a precise message instead of
  *  a confusing mid-command error (or worse, a silently-shrunk fan-out). */
@@ -57,6 +65,10 @@ export function validateConfig(cfg: FleetConfig, path: string): void {
   for (const [name, h] of Object.entries(cfg.hosts)) {
     if (!h.ssh || typeof h.ssh !== "string") fail(`hosts.${name}: missing/invalid \`ssh\``);
     if (!OSES.has(h.os)) fail(`hosts.${name}: os must be one of ${[...OSES].join("|")} (got '${h.os}')`);
+    if (h.winShell && !WIN_SHELLS.has(h.winShell))
+      fail(`hosts.${name}: winShell must be one of ${[...WIN_SHELLS].join("|")} (got '${h.winShell}')`);
+    if (h.winShell && h.os !== "windows")
+      fail(`hosts.${name}: winShell is only valid for windows hosts`);
     for (const [sn, svc] of Object.entries(h.services ?? {})) {
       if (!svc?.name || typeof svc.name !== "string") fail(`hosts.${name}.services.${sn}: missing \`name\``);
       if (!SVC_TYPES.has(svc.type)) fail(`hosts.${name}.services.${sn}: type must be one of ${[...SVC_TYPES].join("|")} (got '${svc.type}')`);
@@ -76,14 +88,24 @@ export function validateConfig(cfg: FleetConfig, path: string): void {
     for (const t of Object.keys(m.switch ?? {})) if (!m.boots[t])
       fail(`machines.${mn}.switch.${t}: no such boot (have: ${Object.keys(m.boots).join(", ")})`);
   }
+  for (const [rn, route] of Object.entries(cfg.routes ?? {})) {
+    if (cfg.hosts[rn]) fail(`routes.${rn}: name conflicts with host '${rn}'`);
+    if (cfg.machines?.[rn]) fail(`routes.${rn}: name conflicts with machine '${rn}'`);
+    if (!Array.isArray(route.prefer) || !route.prefer.length)
+      fail(`routes.${rn}.prefer must be a non-empty array of host names`);
+    for (const name of route.prefer) if (!cfg.hosts[name])
+      fail(`routes.${rn}: unknown host '${name}' (have: ${Object.keys(cfg.hosts).join(", ")})`);
+    const oses = new Set(route.prefer.map((name) => cfg.hosts[name]!.os));
+    if (oses.size !== 1) fail(`routes.${rn}: all transports must target the same OS`);
+  }
   for (const [rn, steps] of Object.entries(cfg.recipes ?? {}))
     if (!Array.isArray(steps) || steps.some((s) => typeof s !== "string"))
       fail(`recipes.${rn} must be an array of step strings`);
 }
 
 export async function loadConfig(): Promise<FleetConfig> {
-  // FLEET_CONFIG wins; else fleet.config.json; else fall back to the shipped
-  // example so a fresh clone runs (copy the example to fleet.config.json to edit).
+  // FLEET_CONFIG wins; otherwise use a private local config when present and
+  // fall back to the shipped, sanitized example for a fresh public clone.
   let path = process.env.FLEET_CONFIG ?? join(ROOT, "fleet.config.json");
   if (!process.env.FLEET_CONFIG && !(await Bun.file(path).exists()))
     path = join(ROOT, "fleet.config.example.json");
@@ -107,10 +129,18 @@ function groupHosts(cfg: FleetConfig, g: string): Host[] {
   throw new Error(`unknown group @${g} (built-in: @linux @windows @mac @gpu; custom: ${Object.keys(cfg.groups ?? {}).join(", ") || "none"})`);
 }
 
-/** Expand a selector: comma list of hostnames | @groups | all. Dedupes, keeps order. */
+/** Expand a selector: comma list of hostnames | @groups | all | dt:<sandbox>.
+ *  Dedupes, keeps order. `dt:` tokens synthesize an ephemeral Daytona host —
+ *  no config entry, no API call here; the token resolves lazily at exec time. */
 export function resolveHosts(cfg: FleetConfig, sel: string): Host[] {
   const set = new Map<string, Host>();
   for (const t of sel.split(",").map((s) => s.trim()).filter(Boolean)) {
+    if (t.startsWith("dt:")) {
+      const token = t.slice(3);
+      if (!token) throw new Error("dt: selector needs a sandbox id/name (try `fleet dt` to list)");
+      set.set(t, { name: t, ssh: token, os: "linux", transport: "daytona" });
+      continue;
+    }
     if (t === "all" || t === "*") {
       Object.values(cfg.hosts).forEach((h) => set.set(h.name, h));
     } else if (t.startsWith("@")) {

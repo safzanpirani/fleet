@@ -39,8 +39,10 @@ fleet exec win-box "nvidia-smi"
 | `fleet shot <host> [--out f] [--grid] [--no-open]` | Screenshot the remote desktop → local image (webp default; `--grid` overlays a coord ruler). Alias: `fleet screenshot`. |
 | `fleet cu <host> <args…> [--out f.png]` | Computer-use via [cua-driver](https://github.com/trycua/cua): `install`, or pass a tool + JSON (`click`, `type_text`, `get_window_state`…). |
 | `fleet restart <host> <service>` | Restart a **configured** service (see config). |
+| `fleet bios <sel> [--yes]` | Reboot Windows UEFI/systemd Linux hosts into firmware setup. |
 | `fleet logs <host> <service> [-n N]` | Recent logs / status for a service. |
 | `fleet gpu [--json]` | Every GPU: util · free VRAM · temp · loaded model. |
+| `fleet disk [sel] [--json]` | Live free space on every mounted volume. |
 | `fleet status [host] [--json]` | Live stats pulled from the dashboard API. |
 | `fleet top <host>` | Live terminal btop for one host (interactive; runs until Ctrl-C). |
 | `fleet run <recipe>` | Run a saved playbook from config (stops on first failure). |
@@ -48,8 +50,9 @@ fleet exec win-box "nvidia-smi"
 
 ## Selectors
 
-Anywhere `<sel>` appears: a hostname, a group, `all`, or a comma-mix (`vps,@gpu`).
-Groups: `@linux` `@windows` `@mac` `@gpu`, plus custom ones from config (e.g. `@servers`).
+Anywhere `<sel>` appears: a hostname, logical route, group, `all`, Daytona
+`dt:<id|name|prefix>`, or a comma-mix (`vps,@gpu`). Groups: `@linux` `@windows`
+`@mac` `@gpu`, plus custom ones from config (e.g. `@servers`).
 
 ## Critical rules
 
@@ -63,9 +66,10 @@ Groups: `@linux` `@windows` `@mac` `@gpu`, plus custom ones from config (e.g. `@
 - `fleet top` is a foreground live loop — only run it interactively, never to capture
   one-shot output (use `fleet status <host>` for that).
 - A non-zero exit on any host makes `exec`/`cp` exit non-zero (good for scripting).
-- **Windows shell:** fleet auto-prefers **PowerShell 7 (`pwsh`)** when installed (faster
-  start, no CLIXML noise, preserves JSON quotes) and falls back to Windows PowerShell 5.1.
-  Force with `FLEET_WIN_SHELL=powershell|pwsh`. Detected once per host, cached.
+- **Windows shell:** fleet uses a host's configured `winShell` (`pwsh` or `powershell`)
+  without an extra discovery round-trip. When omitted, it auto-prefers **PowerShell 7
+  (`pwsh`)** and falls back to Windows PowerShell 5.1. Override every host with
+  `FLEET_WIN_SHELL=powershell|pwsh`.
 - **Screenshots default to WebP** (lossless, crisp text, smaller) when `cwebp` is on the
   local machine; otherwise PNG. Pass `--out foo.png` to force PNG. Applies to `shot` and
   `cu` image pulls.
@@ -161,14 +165,16 @@ Run standalone with `bun run mcp` (honours `FLEET_CONFIG`); smoke-test end-to-en
 | `fleet_restart` | `host`, `service` | `fleet restart` |
 | `fleet_logs` | `host`, `service`, `lines?` | `fleet logs` |
 | `fleet_gpu` | — | `fleet gpu` |
+| `fleet_disk` | `selector?` | `fleet disk [selector]` |
 | `fleet_status` | `host?` | `fleet status` |
+| `fleet_bios` | `selector` | `fleet bios <selector> --yes` |
 | `fleet_run` | `recipe` | `fleet run` |
 
 - `top` and `ssh` are **not** exposed — they need a live TTY. `spawn`/`jobs` are **not yet**
   exposed either (CLI-only for now).
 - Same rules as the CLI: pass `command` verbatim (don't escape), syntax is the target's
   native shell, and `restart`/`logs` services must be config-defined.
-- `fleet_restart` is annotated `destructive`; `ls`/`logs`/`gpu`/`status`/`screenshot` are
+- `fleet_restart` and `fleet_bios` are annotated `destructive`; `ls`/`logs`/`gpu`/`disk`/`status`/`screenshot` are
   `readOnly` (always registered, even with the kill-switch on).
   Host, group, and recipe names are baked into the tool descriptions, so an agent sees
   valid selectors without a round-trip.
@@ -185,11 +191,11 @@ The host it runs on is the SSH origin for the whole fleet. Build/run details are
 
 ## Config & extending
 
-Hosts, groups, recipes live in `fleet.config.json` (override path with `FLEET_CONFIG`;
-copy `fleet.config.example.json` to start). A host has `ssh`, `os`, optional `gpu`, `wsl`,
-and a `services` map; each service `type` (`systemd` / `winservice` / `schtask`) decides
-how restart/logs run. To add a saved playbook, add a `recipes` entry whose steps are
-`fleet` subcommand strings.
+Hosts, logical routes, groups, and recipes live in `fleet.config.json` (override path
+with `FLEET_CONFIG`; copy `fleet.config.example.json` to start). A host has `ssh`, `os`,
+optional `gpu`, `wsl`, `winShell`, and a `services` map; each service `type`
+(`systemd` / `systemd-user` / `winservice` / `schtask`) decides how restart/logs run.
+A route has an ordered `prefer` list of same-OS host entries.
 
 ## When NOT to use
 

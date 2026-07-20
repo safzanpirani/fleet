@@ -24,8 +24,10 @@ commands still run against the placeholder hosts.
 ```sh
 fleet ls                            # reachability + services (◍ = ssh-down but health-URL ok)
 fleet exec win-box "nvidia-smi"      # run on one host
+fleet exec windows-auto "hostname"  # resolve a logical route before dispatch
 fleet exec all "uptime"             # run on every host, in parallel
 fleet exec --wsl web "uname -a"  # run inside WSL on a windows box
+fleet dt                            # list Daytona sandboxes (DAYTONA_API_KEY)
 fleet exec --cwd /srv/app oracle "./build.sh"   # run in a dir; fails fast if missing
 fleet exec --timeout 60 vps "slow-thing"        # wall-clock cap; a hung command exits 124
 fleet spawn --cwd /srv/app oracle "./train.sh"  # detached job that outlives ssh -> job id
@@ -36,9 +38,11 @@ fleet jobs kill oracle:mqtn19-9px   # signal the whole job process-group
 fleet jobs prune                    # GC finished job spools
 fleet cp -r ./dist oracle:~/dist    # copy a dir (recursive); pull with  cp oracle:~/f.log ./
 fleet restart @linux cloudflared   # restart a configured service (fans out across the selector)
+fleet bios windows-auto --yes      # reboot directly into UEFI/BIOS firmware setup
 fleet svc cloudflared              # up/down of one service on every host that has it
 fleet deploy gpu-box              # ship fleet source -> host, bun install, restart fleet-mcp
 fleet status                        # live CPU/mem/disk/gpu from dash.example.com
+fleet disk                          # live free space on every mounted volume
 fleet status vps                    # one host
 fleet logs web cloudflared -n 50
 fleet shot web                 # screenshot the remote desktop -> local PNG
@@ -49,6 +53,42 @@ fleet doctor web               # diagnose why a host is unreachable (ssh -vv + h
 fleet completion zsh                # shell completion:  eval "$(fleet completion zsh)"
 fleet ssh web                  # drop into an interactive shell
 ```
+
+`fleet bios` supports Windows UEFI and systemd Linux hosts. macOS entries in a
+fan-out are reported as unsupported without blocking the other hosts. Firmware
+that ignores the OS boot-to-firmware request may perform a normal reboot instead.
+
+## Logical routes
+
+A logical route chooses one concrete host entry from an ordered `prefer` list
+before dispatching a command:
+
+```json
+{
+  "routes": {
+    "windows-auto": { "prefer": ["win-box"] }
+  }
+}
+```
+
+Fleet probes transports in order and never retries an already-dispatched command
+on another transport, so a connection loss cannot execute a mutation twice.
+
+## Daytona sandboxes (`dt:`)
+
+Ephemeral Daytona sandboxes can use the normal exec/copy interface over Daytona's
+REST toolbox API. Set `DAYTONA_API_KEY`, then address a sandbox by ID, name, or a
+unique prefix:
+
+```sh
+fleet dt
+fleet exec dt:spore-run42 "uname -a"
+fleet exec --cwd /home/daytona/repo dt:spore- "git status"
+fleet cp ./artifact.tgz dt:spore-:/home/daytona/artifact.tgz
+```
+
+Daytona targets are Linux-only. A command deadline maps to exit 124, and
+recursive copy is not currently supported.
 
 ## Detached jobs
 `exec` is **foreground**: it blocks, streams nothing, and returns the remote exit
@@ -114,8 +154,8 @@ All prefixed `fleet_`, grouped by access:
 
 | Group | Tools |
 |---|---|
-| **Read-only** — carry `readOnlyHint`, always registered | `ls` · `logs` · `svc` · `gpu` · `status` · `jobs` · `job_log` · `boot` |
-| **Mutating** — dropped by the read-only kill-switch | `exec` · `cp` · `restart` · `spawn` · `job_kill` · `reboot` · `switch` · `screenshot` · `cu` · `run` |
+| **Read-only** — carry `readOnlyHint`, always registered | `ls` · `logs` · `svc` · `gpu` · `disk` · `status` · `jobs` · `job_log` · `boot` |
+| **Mutating** — dropped by the read-only kill-switch | `exec` · `cp` · `restart` · `spawn` · `job_kill` · `reboot` · `bios` · `switch` · `screenshot` · `cu` · `run` |
 | **Not exposed** | `top` / `ssh` (need a live TTY) · job `tail -f` / `wait` (would block) |
 
 - `screenshot` counts as **mutating** — capturing runs commands on the host (on Windows it registers a one-shot scheduled task).
@@ -151,12 +191,16 @@ FLEET_MCP_TOKEN=<long-random> bun run src/http.ts     # or: bun run serve
   (and `FLEET_MCP_READONLY=1 bun run scripts/smoke-http.ts` for the kill-switch).
 
 ## Config — `fleet.config.json`
-Each host: `ssh` alias, `os` (`linux|windows|mac`), optional `wsl` distro, and a
-`services` map. Service `type` controls how `restart`/`logs` work:
+Each host has an `ssh` alias, `os` (`linux|windows|mac`), optional `wsl` distro,
+optional `winShell` (`pwsh|powershell`), and a `services` map. Configuring
+`winShell` skips a shell-discovery round trip on every short-lived CLI process.
+Top-level `routes` map logical names to ordered, same-OS host lists. Service
+`type` controls how `restart`/`logs` work:
 
 | type | restart | logs |
 |---|---|---|
 | `systemd` | `sudo systemctl restart` | `journalctl -u` |
+| `systemd-user` | `systemctl --user restart` | `journalctl --user -u` |
 | `winservice` / `nssm` | `Restart-Service` | `Get-Service … \| Format-List` |
 | `schtask` | `schtasks /End` + `/Run` | `schtasks /Query /V` |
 
@@ -175,7 +219,7 @@ git-ignored `fleet.config.local.json` if you don't want hosts in git.
 | `FLEET_CONFIG` | alternate config path |
 | `FLEET_EXEC_TIMEOUT` | default wall-clock cap (seconds) for every exec; per-call `--timeout` / MCP `timeout` wins. Unset/0 = no cap |
 | `FLEET_PROBE_TIMEOUT_MS` | reachability-probe cap (default 4000) |
-| `FLEET_WIN_SHELL` | force `pwsh` or `powershell` on Windows hosts (skips the auto-probe) |
+| `FLEET_WIN_SHELL` | force `pwsh` or `powershell` on every Windows host (overrides per-host `winShell`) |
 | `FLEET_NO_SSH_MUX` | `1` disables SSH connection multiplexing. By default fleet reuses one master connection per host (`ControlMaster=auto`, `ControlPersist=60s`, sockets under `~/.fleet/ssh/`) so fan-outs and poll loops don't re-handshake; a wedged socket is fixed by this flag or `rm ~/.fleet/ssh/cm-*` |
 
 ## Why

@@ -62,6 +62,7 @@ export function splitArgs(s: string): string[] {
 export function restartCmd(svc: Service): { cmd: string; shell: Shell } {
   switch (svc.type) {
     case "systemd": return { cmd: `sudo systemctl restart '${bashEsc(svc.name)}'`, shell: "bash" };
+    case "systemd-user": return { cmd: `systemctl --user restart '${bashEsc(svc.name)}'`, shell: "bash" };
     case "nssm": case "winservice":
       return { cmd: `Restart-Service -Name '${psEsc(svc.name)}'`, shell: "powershell" };
     case "schtask": return {
@@ -75,6 +76,7 @@ const lineCount = (n: number, fallback = 30) =>
 export function logsCmd(svc: Service, n: number): { cmd: string; shell: Shell } {
   switch (svc.type) {
     case "systemd": return { cmd: `journalctl -u '${bashEsc(svc.name)}' -n ${lineCount(n)} --no-pager`, shell: "bash" };
+    case "systemd-user": return { cmd: `journalctl --user -u '${bashEsc(svc.name)}' -n ${lineCount(n)} --no-pager`, shell: "bash" };
     case "schtask": return { cmd: `schtasks /Query /TN '${psEsc(svc.name)}' /V /FO LIST`, shell: "powershell" };
     default: return { cmd: `Get-Service -Name '${psEsc(svc.name)}' | Format-List Name,Status,StartType`, shell: "powershell" };
   }
@@ -83,6 +85,7 @@ export function logsCmd(svc: Service, n: number): { cmd: string; shell: Shell } 
 export function statusCmd(svc: Service): { cmd: string; shell: Shell } {
   switch (svc.type) {
     case "systemd": return { cmd: `systemctl is-active '${bashEsc(svc.name)}' 2>/dev/null || true`, shell: "bash" };
+    case "systemd-user": return { cmd: `systemctl --user is-active '${bashEsc(svc.name)}' 2>/dev/null || true`, shell: "bash" };
     case "schtask": return {
       cmd: `$x=schtasks /query /tn '${psEsc(svc.name)}' /fo list 2>$null | Select-String '^Status:'; if($x){($x -split ':',2)[1].Trim()}else{'missing'}`,
       shell: "powershell" };
@@ -94,7 +97,7 @@ export function statusCmd(svc: Service): { cmd: string; shell: Shell } {
 /** Interpret a statusCmd's output into up/down + a human detail token. */
 function interpretStatus(type: ServiceType, out: string): { up: boolean; detail: string } {
   const detail = out.trim().split("\n").pop()?.trim() || "unknown";
-  if (type === "systemd") return { up: detail === "active", detail };
+  if (type === "systemd" || type === "systemd-user") return { up: detail === "active", detail };
   if (type === "schtask") return { up: /^(running|ready)$/i.test(detail), detail };
   return { up: /running/i.test(detail), detail };   // winservice / nssm
 }
@@ -172,11 +175,17 @@ export async function pullFile(
  *  prefix is a real selector (so a unix local path or `C:\…` isn't mistaken for
  *  one). Returns null when the token is a plain local path. */
 export function parseRemoteSpec(cfg: FleetConfig, token: string): { sel: string; path: string } | null {
+  // dt:<sandbox>:<path> — the selector itself contains a colon
+  if (token.startsWith("dt:")) {
+    const j = token.indexOf(":", 3);
+    if (j <= 3) return null;
+    return { sel: token.slice(0, j), path: token.slice(j + 1) };
+  }
   const i = token.indexOf(":");
   if (i <= 0) return null;
   const sel = token.slice(0, i);
   const known = sel === "all" || sel === "*" || sel.startsWith("@") || sel.includes(",")
-    || !!cfg.hosts[sel] || !!cfg.machines?.[sel];
+    || !!cfg.hosts[sel] || !!cfg.routes?.[sel] || !!cfg.machines?.[sel];
   return known ? { sel, path: token.slice(i + 1) } : null;
 }
 
@@ -349,15 +358,29 @@ export async function resolveLiveHost(cfg: FleetConfig, name: string): Promise<s
 
 async function resolveLiveHostOrSelf(cfg: FleetConfig, name: string): Promise<string> {
   if (cfg.hosts[name]) return name;
+  if (cfg.routes?.[name]) return routeSelector(cfg, name);
   try { return await resolveLiveHost(cfg, name); } catch { return name; }
 }
 
-/** Resolve a *single bare machine name* to its live boot's host; pass hosts,
- *  groups, comma-lists, and unknown names through unchanged. Lets any command
- *  that takes a selector accept a dual-boot machine name and auto-route to the
- *  currently-live OS — the same convenience `exec` already had, now shared. */
-export async function routeSelector(cfg: FleetConfig, sel: string): Promise<string> {
-  if (sel.includes(",") || sel.startsWith("@") || cfg.hosts[sel] || !cfg.machines?.[sel]) return sel;
+/** Resolve a single bare logical route or dual-boot machine name to a concrete
+ *  host entry. A route probes transports in configured priority order and
+ *  chooses one BEFORE dispatch; callers never retry a command on another route. */
+export async function routeSelector(
+  cfg: FleetConfig,
+  sel: string,
+  deps: { probe?: (host: Host) => Promise<boolean> } = {},
+): Promise<string> {
+  if (sel.includes(",") || sel.startsWith("@") || cfg.hosts[sel]) return sel;
+  const route = cfg.routes?.[sel];
+  if (route) {
+    const probeHost = deps.probe ?? probe;
+    for (const name of route.prefer) {
+      const host = cfg.hosts[name];
+      if (host && await probeHost(host)) return name;
+    }
+    throw new Error(`route ${sel} is not reachable (tried: ${route.prefer.join(", ")})`);
+  }
+  if (!cfg.machines?.[sel]) return sel;
   return resolveLiveHost(cfg, sel);
 }
 
@@ -879,6 +902,19 @@ export function rebootCmd(host: Host): { cmd: string; shell: Shell } {
     shell: "bash",
   };
 }
+
+/** Reboot into the machine's UEFI/BIOS setup on the next boot. */
+export function firmwareRebootCmd(host: Host): { cmd: string; shell: Shell } {
+  if (host.os === "windows")
+    return { cmd: `shutdown /r /fw /t 3 /c "fleet bios"`, shell: "powershell" };
+  if (host.os === "linux")
+    return {
+      cmd: `nohup bash -c 'sleep 2; sudo systemctl reboot --firmware-setup' >/dev/null 2>&1 & echo firmware-reboot-scheduled`,
+      shell: "bash",
+    };
+  throw new Error("fleet bios: macOS has no firmware setup to reboot into");
+}
+
 export interface RebootAction { host: string; os: string; cmd: string; result: ExecResult; }
 /** Reboot every host the selector resolves to. */
 export async function rebootHosts(cfg: FleetConfig, sel: string): Promise<RebootAction[]> {
@@ -887,6 +923,119 @@ export async function rebootHosts(cfg: FleetConfig, sel: string): Promise<Reboot
     const { cmd, shell } = rebootCmd(h);
     return { host: h.name, os: h.os, cmd, result: await exec(h, cmd, shell) };
   }));
+}
+
+/** Reboot every selected UEFI host into firmware setup. Unsupported macOS
+ *  entries become per-host failures so they do not block a mixed fan-out. */
+export async function firmwareRebootHosts(
+  cfg: FleetConfig,
+  sel: string,
+  deps: { exec?: typeof exec } = {},
+): Promise<RebootAction[]> {
+  const run = deps.exec ?? exec;
+  return Promise.all(resolveHosts(cfg, sel).map(async (h) => {
+    if (h.os === "mac") {
+      return {
+        host: h.name,
+        os: h.os,
+        cmd: "",
+        result: {
+          host: h.name,
+          ok: false,
+          code: 1,
+          stdout: "",
+          stderr: "fleet bios: macOS has no firmware setup to reboot into",
+        },
+      };
+    }
+    const { cmd, shell } = firmwareRebootCmd(h);
+    return { host: h.name, os: h.os, cmd, result: await run(h, cmd, shell) };
+  }));
+}
+
+// ── disk (live, every volume) ─────────────────────────────────────────────────
+/** Free space per volume, queried live over ssh.
+ *
+ *  The dashboard collector only ever reports the *boot* volume (`C:\` / `/`), so
+ *  `status` is blind to extra drives (D:, E:, spinning rust, external NVMe).
+ *  This asks the host itself and returns every real, fixed volume.
+ *
+ *  Windows: `Get-Volume` — note `wmic` is REMOVED on current Windows, don't use it.
+ *  Unix: `df -kP`, POSIX mode so the columns never wrap. */
+export function diskCmd(host: Host): { cmd: string; shell: Shell } {
+  if (host.os === "windows")
+    return {
+      shell: "powershell",
+      // -Compress keeps it on one line; @(…) forces an array even for a single volume.
+      cmd: `@(Get-Volume | Where-Object { $_.DriveLetter -and $_.Size -gt 0 -and $_.DriveType -eq 'Fixed' } | ForEach-Object { [pscustomobject]@{ mount = "$($_.DriveLetter):"; label = [string]$_.FileSystemLabel; total = [double]$_.Size; free = [double]$_.SizeRemaining } }) | ConvertTo-Json -Compress`,
+    };
+  // Only real block devices — skips tmpfs/devfs/overlay noise without an OS-specific -x list.
+  return { cmd: `df -kP | awk 'NR>1 && $1 ~ /^\\/dev\\//'`, shell: "bash" };
+}
+
+export interface DiskRow {
+  host: string; os: string; mount: string; label: string;
+  total_gb: number; free_gb: number; pct: number;   // pct = percent USED
+}
+
+const GB = 1024 ** 3;
+const round1 = (n: number) => Math.round(n * 10) / 10;
+
+/** Parse a diskCmd's stdout. Shape differs per-OS, so the parser pairs with the command. */
+export function parseDisk(host: Host, out: string): DiskRow[] {
+  const base = { host: host.name, os: host.os };
+  const rows: DiskRow[] = [];
+  if (host.os === "windows") {
+    const text = out.trim();
+    if (!text) return rows;
+    let parsed: any;
+    try { parsed = JSON.parse(text); } catch { return rows; }
+    for (const v of [parsed].flat()) {
+      const total = Number(v?.total), free = Number(v?.free);
+      if (!Number.isFinite(total) || !Number.isFinite(free) || total <= 0) continue;
+      rows.push({ ...base, mount: String(v.mount ?? ""), label: String(v.label ?? "").trim(),
+        total_gb: round1(total / GB), free_gb: round1(free / GB),
+        pct: round1((total - free) / total * 100) });
+    }
+    return rows;
+  }
+  // One row per pool of shared free space, not per mountpoint — otherwise a single
+  // filesystem is listed N times with N identical numbers:
+  //   btrfs  — /, /home, /var/log … are all the same device (/dev/sda5)
+  //   APFS   — volumes in one container get distinct devices (/dev/disk3s1, s5, s6 …)
+  //            but share the container's capacity, so key on the container (/dev/disk3).
+  // Linux partitions (sda5 vs sda6) are genuinely independent, so only APFS folds
+  // the partition suffix away. Shortest mountpoint represents the group.
+  const key = (dev: string) =>
+    host.os === "mac" ? dev.replace(/^(\/dev\/disk\d+).*$/, "$1") : dev;
+  const groups = new Map<string, DiskRow>();
+  for (const line of out.trim().split("\n")) {
+    // Filesystem 1024-blocks Used Available Capacity Mounted-on
+    const f = line.trim().split(/\s+/);
+    if (f.length < 6) continue;
+    const totalK = Number(f[1]), freeK = Number(f[3]);
+    if (!Number.isFinite(totalK) || !Number.isFinite(freeK) || totalK <= 0) continue;
+    const dev = f[0]!, mount = f.slice(5).join(" ");
+    const k = key(dev);
+    const prev = groups.get(k);
+    if (prev && prev.mount.length <= mount.length) continue;
+    groups.set(k, { ...base, mount, label: dev,
+      total_gb: round1(totalK / 1024 / 1024), free_gb: round1(freeK / 1024 / 1024),
+      pct: round1((totalK - freeK) / totalK * 100) });
+  }
+  return [...groups.values()];
+}
+
+/** Every volume on every host the selector resolves to. Unreachable hosts are skipped
+ *  rather than failing the batch — one dead box shouldn't hide the other seven. */
+export async function diskRows(cfg: FleetConfig, sel: string): Promise<DiskRow[]> {
+  const hosts = resolveHosts(cfg, sel);
+  const per = await Promise.all(hosts.map(async (h) => {
+    const { cmd, shell } = diskCmd(h);
+    const r = await exec(h, cmd, shell);
+    return r.ok ? parseDisk(h, r.stdout) : [];
+  }));
+  return per.flat();
 }
 
 // ── dashboard (gpu / status) ──────────────────────────────────────────────────

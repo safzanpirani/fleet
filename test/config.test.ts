@@ -9,8 +9,8 @@ const cfg: FleetConfig = {
   hosts: {
     vps: host("vps", "linux"),
     oracle: host("oracle", "linux"),
-    winbox: host("winbox", "windows", true),
-    main: host("main", "windows"),
+    "win-box": host("win-box", "windows", true),
+    "win-lan": host("win-lan", "windows"),
     mac: host("mac", "mac"),
     gpubox: host("gpubox", "linux", true),
   },
@@ -27,6 +27,18 @@ describe("resolveHosts", () => {
   test("unknown host throws with the list", () =>
     expect(() => resolveHosts(cfg, "nope")).toThrow(/unknown host: nope/));
 
+  test("dt: selector synthesizes an ephemeral daytona host", () => {
+    const hs = resolveHosts(cfg, "dt:spore-run42");
+    expect(hs).toHaveLength(1);
+    expect(hs[0]).toMatchObject({ name: "dt:spore-run42", ssh: "spore-run42", os: "linux", transport: "daytona" });
+  });
+
+  test("dt: with an empty token throws", () =>
+    expect(() => resolveHosts(cfg, "dt:")).toThrow(/dt: selector needs/));
+
+  test("dt: mixes with config hosts in one selector", () =>
+    expect(names("vps,dt:abc")).toEqual(["vps", "dt:abc"]));
+
   test("all / * expand to every host", () => {
     expect(names("all").sort()).toEqual(Object.keys(cfg.hosts).sort());
     expect(names("*").sort()).toEqual(Object.keys(cfg.hosts).sort());
@@ -34,12 +46,12 @@ describe("resolveHosts", () => {
 
   test("@linux / @windows / @mac filter by os", () => {
     expect(names("@linux").sort()).toEqual(["gpubox", "oracle", "vps"]);
-    expect(names("@windows").sort()).toEqual(["main", "winbox"]);
+    expect(names("@windows").sort()).toEqual(["win-box", "win-lan"]);
     expect(names("@mac")).toEqual(["mac"]);
   });
 
   test("@gpu filters by the gpu flag", () =>
-    expect(names("@gpu").sort()).toEqual(["gpubox", "winbox"]));
+    expect(names("@gpu").sort()).toEqual(["gpubox", "win-box"]));
 
   test("custom group expands", () => expect(names("@cloud")).toEqual(["vps", "oracle"]));
 
@@ -47,9 +59,9 @@ describe("resolveHosts", () => {
     expect(() => resolveHosts(cfg, "@whatever")).toThrow(/unknown group @whatever/));
 
   test("comma-mix dedupes and preserves first-seen order", () =>
-    // oracle, then @cloud adds vps (oracle dup), then @gpu adds winbox+gpubox
-    // in host-declaration order — winbox is declared before gpubox.
-    expect(names("oracle,@cloud,vps,@gpu")).toEqual(["oracle", "vps", "winbox", "gpubox"]));
+    // oracle, then @cloud adds vps (oracle dup), then @gpu adds win-box+gpubox
+    // in host-declaration order — win-box is declared before gpubox.
+    expect(names("oracle,@cloud,vps,@gpu")).toEqual(["oracle", "vps", "win-box", "gpubox"]));
 
   test("whitespace around comma tokens is tolerated", () =>
     expect(names(" vps , oracle ")).toEqual(["vps", "oracle"]));
@@ -75,6 +87,12 @@ describe("validateConfig", () => {
     expect(() => validateConfig(cfg, "t")).toThrow(/hosts\.vps.*plan9/);
   });
 
+  test("invalid configured Windows shell fails at load", () => {
+    const cfg = base();
+    cfg.hosts.win = { ...host("win", "windows"), winShell: "cmd" as any };
+    expect(() => validateConfig(cfg, "t")).toThrow(/hosts\.win.*winShell.*cmd/);
+  });
+
   test("bad service type fails", () => {
     const cfg = base();
     cfg.hosts.vps!.services = { web: { type: "initd" as any, name: "web" } };
@@ -91,6 +109,32 @@ describe("validateConfig", () => {
     const cfg = base();
     cfg.machines = { box: { boots: { linux: { host: "nope" } } } };
     expect(() => validateConfig(cfg, "t")).toThrow(/machines\.box.*nope/);
+  });
+
+  test("route referencing an unknown transport fails at load", () => {
+    const cfg = base();
+    cfg.routes = { remote: { prefer: ["vps", "ghost"] } };
+    expect(() => validateConfig(cfg, "t")).toThrow(/routes\.remote.*ghost/);
+  });
+
+  test("route name cannot be shadowed by a concrete host", () => {
+    const cfg = base();
+    cfg.routes = { vps: { prefer: ["vps"] } };
+    expect(() => validateConfig(cfg, "t")).toThrow(/routes\.vps.*conflicts.*host/);
+  });
+
+  test("route name cannot shadow a dual-boot machine", () => {
+    const cfg = base();
+    cfg.machines = { box: { boots: { linux: { host: "vps" } } } };
+    cfg.routes = { box: { prefer: ["vps"] } };
+    expect(() => validateConfig(cfg, "t")).toThrow(/routes\.box.*conflicts.*machine/);
+  });
+
+  test("route transports must target the same OS", () => {
+    const cfg = base();
+    cfg.hosts.win = host("win", "windows");
+    cfg.routes = { mixed: { prefer: ["vps", "win"] } };
+    expect(() => validateConfig(cfg, "t")).toThrow(/routes\.mixed.*same OS/);
   });
 
   test("switch target without a matching boot fails", () => {

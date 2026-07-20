@@ -3,7 +3,7 @@
  * frontends: `mcp.ts` (stdio) and `http.ts` (remote). One place defines the
  * tools; the transports differ. All tools delegate to the `core.ts` actions.
  *
- * Read tools (ls/status/gpu/logs) are always registered. The mutating tools
+ * Read tools (ls/status/gpu/disk/logs) are always registered. The mutating tools
  * (exec/cp/restart/run) are registered only when `readOnly` is false — the
  * kill-switch (`FLEET_MCP_READONLY=1`) makes them vanish from `tools/list`.
  */
@@ -13,8 +13,8 @@ import type { FleetConfig } from "./config.ts";
 import type { ExecResult } from "./ssh.ts";
 import {
   lsHosts, runExec, pushFile, restartService, serviceLogs,
-  gpuRows, hostStatus, runRecipe, captureScreenshot, cuRun,
-  rebootHosts, bootState, switchMachine, routeSelector, svcStatus,
+  gpuRows, diskRows, hostStatus, runRecipe, captureScreenshot, cuRun,
+  rebootHosts, firmwareRebootHosts, bootState, switchMachine, routeSelector, svcStatus,
 } from "./core.ts";
 import { spawnJob, listJobs, jobLog, jobTail, killJob } from "./jobs.ts";
 import { tmpdir } from "node:os";
@@ -48,9 +48,11 @@ const text = (t: string, isError = false) =>
 
 function selectorHelp(cfg: FleetConfig): string {
   const hosts = Object.keys(cfg.hosts).join(", ");
+  const routes = Object.keys(cfg.routes ?? {}).join(", ");
   const groups = Object.keys(cfg.groups ?? {}).map((g) => "@" + g).join(" ");
-  return `Selector: a host name, an @group, "all", or a comma-mix (e.g. "vps,@gpu"). `
-    + `Hosts: ${hosts}. Groups: @linux @windows @mac @gpu${groups ? " " + groups : ""}.`;
+  return `Selector: a host name, logical route, an @group, "all", or a comma-mix (e.g. "vps,@gpu"). `
+    + `Hosts: ${hosts}. Routes: ${routes || "none"}. `
+    + `Groups: @linux @windows @mac @gpu${groups ? " " + groups : ""}.`;
 }
 
 export interface BuildOpts { readOnly?: boolean }
@@ -118,7 +120,8 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     annotations: { readOnlyHint: true, openWorldHint: true },
   }, async ({ selector }) => {
     const errors: string[] = [];
-    const rows = await listJobs(cfg, selector ?? "all", (h, e) => errors.push(`✗ ${h}: list failed — ${e}`));
+    const rows = await listJobs(cfg, await routeSelector(cfg, selector ?? "all"),
+      (h, e) => errors.push(`✗ ${h}: list failed — ${e}`));
     if (!rows.length && !errors.length) return text("no jobs");
     const out = rows.map((r) =>
       `${r.status === "running" ? "●" : r.status === "exited" ? "○" : "✗"} `
@@ -176,6 +179,28 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     return text(out);
   });
 
+  server.registerTool("fleet_disk", {
+    title: "Free space on every volume",
+    description: "Free space per volume, queried live over ssh. Unlike `fleet_status` — which only "
+      + "reports the boot volume (C:\\ or /) from the dashboard — this sees EVERY drive, so use it "
+      + "for questions about secondary drives (D:, E:, external disks). Defaults to the whole fleet.",
+    inputSchema: {
+      selector: z.string().optional().describe(selectorHelp(cfg) + " Defaults to \"all\"."),
+    },
+    annotations: { readOnlyHint: true, openWorldHint: true },
+  }, async ({ selector }) => {
+    const sel = selector ?? "all";
+    const rows = await diskRows(cfg, await routeSelector(cfg, sel));
+    if (!rows.length) return text(`no volumes reported by ${sel}`);
+    const w = Math.max(...rows.map((r) => r.mount.length));
+    const out = rows.map((r) =>
+      `${r.host.padEnd(9)} ${r.mount.padEnd(w)} ${(r.pct.toFixed(0) + "%").padStart(4)} used  `
+      + `${r.free_gb.toFixed(1)}g free of ${r.total_gb.toFixed(0)}g`
+      + `${r.label ? "  " + r.label : ""}`,
+    ).join("\n");
+    return text(out);
+  });
+
   server.registerTool("fleet_status", {
     title: "Live host stats",
     description: "Live CPU / memory / disk / GPU stats pulled from the dashboard, plus uptime "
@@ -218,7 +243,7 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
   }, async ({ host }) => {
     const local = join(tmpdir(), `fleet_shot_${Date.now()}.png`);
     try {
-      const r = await captureScreenshot(cfg, host, local);
+      const r = await captureScreenshot(cfg, await routeSelector(cfg, host), local);
       const data = await consumeImage(r.localPath);
       return { content: [
         { type: "text" as const, text: `screenshot of ${r.host}` },
@@ -237,7 +262,7 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       + "bash for @linux/@mac, PowerShell for @windows (set wsl:true to run bash inside WSL on a "
       + "Windows box). " + sel,
     inputSchema: {
-      selector: z.string().describe("Host selector, e.g. \"winbox\", \"@linux\", \"all\", \"vps,@gpu\"."),
+      selector: z.string().describe("Host selector, e.g. \"win-box\", \"@linux\", \"all\", \"vps,@gpu\"."),
       command: z.string().describe("Command to run, verbatim. Quotes/pipes/$ round-trip as-is."),
       wsl: z.boolean().optional().describe("Run the command inside WSL bash on a Windows host."),
       timeout: z.number().int().positive().optional()
@@ -245,7 +270,8 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     },
     annotations: { openWorldHint: true },
   }, async ({ selector, command, wsl, timeout }) => {
-    const results = await runExec(cfg, selector, command, { wsl, timeoutMs: timeout ? timeout * 1000 : undefined });
+    const results = await runExec(cfg, await routeSelector(cfg, selector), command,
+      { wsl, timeoutMs: timeout ? timeout * 1000 : undefined });
     return text(renderExec(results), results.some((r) => !r.ok));
   });
 
@@ -260,7 +286,7 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     },
     annotations: { openWorldHint: true },
   }, async ({ local, selector, remote }) => {
-    const results = await pushFile(cfg, local, selector, remote);
+    const results = await pushFile(cfg, local, await routeSelector(cfg, selector), remote);
     const out = results.map((r) =>
       `${r.ok ? "✓" : "✗"} ${r.host} · ${local} → ${remote}${r.stderr ? "\n" + indent(r.stderr) : ""}`,
     ).join("\n");
@@ -333,6 +359,22 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     return text(out, actions.some((a) => !a.result.ok));
   });
 
+  server.registerTool("fleet_bios", {
+    title: "Reboot machine(s) into firmware setup",
+    description: "Reboot Windows UEFI or systemd Linux hosts directly into BIOS/UEFI firmware "
+      + "setup. macOS hosts are reported as unsupported. This drops the connection. " + sel,
+    inputSchema: {
+      selector: z.string().describe("Host selector to reboot into firmware setup."),
+    },
+    annotations: { destructiveHint: true, openWorldHint: true },
+  }, async ({ selector }) => {
+    const actions = await firmwareRebootHosts(cfg, await routeSelector(cfg, selector));
+    const out = actions.map((a) =>
+      `${a.result.ok ? "↻" : "✗"} ${a.host} · ${a.os}${a.result.ok ? " · entering firmware" : " · " + a.result.stderr}`,
+    ).join("\n");
+    return text(out, actions.some((a) => !a.result.ok));
+  });
+
   server.registerTool("fleet_switch", {
     title: "Reboot a dual-boot machine into another OS",
     description: "Switch a dual-boot machine into a target OS (reboots into the other boot and "
@@ -367,11 +409,11 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
   }, async ({ host, args, image }) => {
     if (args[0] === "install") {
       const { cuInstall } = await import("./core.ts");
-      const r = await cuInstall(cfg, host);
+      const r = await cuInstall(cfg, await routeSelector(cfg, host));
       return text(renderExec([r]), !r.ok);
     }
     const local = image ? join(tmpdir(), `cua_${Date.now()}.png`) : undefined;
-    const r = await cuRun(cfg, host, args, local);
+    const r = await cuRun(cfg, await routeSelector(cfg, host), args, local);
     const content: any[] = [{ type: "text" as const, text: renderExec([r.result]) }];
     if (r.localImage) {
       const data = await consumeImage(r.localImage);

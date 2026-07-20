@@ -1,9 +1,12 @@
 import { test, expect, describe } from "bun:test";
 import { buildArgs } from "../src/ssh.ts";
 import type { Host } from "../src/config.ts";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { delimiter, join } from "node:path";
 
 const linux: Host = { name: "vps", ssh: "vps", os: "linux" };
-const win: Host = { name: "winbox", ssh: "winbox", os: "windows" };
+const win: Host = { name: "win-box", ssh: "win-box", os: "windows" };
 
 const decodeUtf16le = (b64: string) => Buffer.from(b64, "base64").toString("utf16le");
 const decodeUtf8 = (b64: string) => Buffer.from(b64, "base64").toString("utf8");
@@ -76,6 +79,44 @@ describe("buildArgs — windows (PowerShell EncodedCommand)", () => {
 
   test("uses the chosen winBin", () =>
     expect(buildArgs(win, "x", "powershell", "pwsh").args).toContain("pwsh"));
+
+  test("a configured pwsh host executes without Windows PowerShell discovery", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "fleet-ssh-test-"));
+    try {
+      const fakeSsh = join(dir, "ssh");
+      writeFileSync(fakeSsh, `#!/bin/sh
+case "$*" in
+  *powershell*) exit 127 ;;
+  *pwsh*) printf ok; exit 0 ;;
+  *) exit 2 ;;
+esac
+`);
+      chmodSync(fakeSsh, 0o755);
+      const snippet = `
+        import { exec } from "${import.meta.dir}/../src/ssh.ts";
+        const result = await exec(
+          { name: "win", ssh: "win", os: "windows", winShell: "pwsh" },
+          "Write-Output ok",
+        );
+        console.log(JSON.stringify(result));
+        process.exit(result.ok ? 0 : 1);
+      `;
+      const proc = Bun.spawn(["bun", "-e", snippet], {
+        env: { ...process.env, PATH: dir + delimiter + (process.env.PATH ?? "") },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stdout, stderr, code] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+        proc.exited,
+      ]);
+      expect(code, stderr).toBe(0);
+      expect(JSON.parse(stdout).stdout).toBe("ok");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 
   test("--cwd wraps with Set-Location -LiteralPath, quotes doubled", () => {
     const enc = decodeUtf16le(valAfter(buildArgs(win, "dir", "powershell", "powershell", `C:\\o'brien`).args, "-EncodedCommand"));

@@ -12,6 +12,7 @@
  * `fleet`: you never think about quoting again.
  */
 import type { Host } from "./config.ts";
+import { dtExec, dtProbe, dtPush, dtPull } from "./daytona.ts";
 import { homedir } from "node:os";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
@@ -76,6 +77,7 @@ const winBinCache = new Map<string, Promise<WinBin>>();
 async function resolveWinBin(host: Host): Promise<WinBin> {
   const forced = process.env.FLEET_WIN_SHELL as WinBin | undefined;
   if (forced === "pwsh" || forced === "powershell") return forced;
+  if (host.winShell) return host.winShell;
   const cached = winBinCache.get(host.ssh);
   if (cached) return cached;
   const probe = (async (): Promise<WinBin> => {
@@ -136,6 +138,12 @@ export async function exec(
   shell: Shell = "auto",
   opts: { cwd?: string; timeoutMs?: number } = {},
 ): Promise<ExecResult> {
+  if (host.transport === "daytona") {
+    if (shell !== "auto" && shell !== "bash")
+      return { host: host.name, ok: false, code: 1, stdout: "",
+        stderr: `${host.name} is a daytona sandbox — only bash is available` };
+    return dtExec(host, command, { cwd: opts.cwd, timeoutMs: opts.timeoutMs ?? EXEC_TIMEOUT_MS });
+  }
   const resolved: Shell = shell === "auto"
     ? (host.os === "windows" ? "powershell" : "bash")
     : shell;
@@ -174,6 +182,7 @@ export async function exec(
  *  Override the cap with FLEET_PROBE_TIMEOUT_MS. */
 const PROBE_CAP_MS = Number(process.env.FLEET_PROBE_TIMEOUT_MS ?? 4000);
 export async function probe(host: Host, capMs = PROBE_CAP_MS): Promise<boolean> {
+  if (host.transport === "daytona") return dtProbe(host);
   const connectTimeout = Math.max(1, Math.ceil(capMs / 1000));
   const proc = Bun.spawn(["ssh", ...controlOpts(), "-o", "BatchMode=yes", "-o", `ConnectTimeout=${connectTimeout}`,
     host.ssh, "echo ok"], { stdin: "ignore", stdout: "pipe", stderr: "ignore" });
@@ -249,11 +258,21 @@ async function runScp(host: Host, argv: string[]): Promise<ExecResult> {
  *  (forward slashes work on Windows OpenSSH; `C:\…` absolute paths work too).
  *  `recursive` (scp -r) copies a directory tree. */
 export function scp(host: Host, local: string, remote: string, recursive = false): Promise<ExecResult> {
+  if (host.transport === "daytona") {
+    if (recursive) return Promise.resolve({ host: host.name, ok: false, code: 1, stdout: "",
+      stderr: "cp -r to a dt: sandbox is not supported yet — tar locally and push the archive" });
+    return dtPush(host, local, remote);
+  }
   return runScp(host, [...(recursive ? ["-r"] : []), local, `${host.ssh}:${remote}`]);
 }
 
 /** scp host:remote → local (pull). Mirror of `scp`, for retrieving a file/dir
  *  the remote produced (e.g. a screenshot). Remote path passed through verbatim. */
 export function scpPull(host: Host, remote: string, local: string, recursive = false): Promise<ExecResult> {
+  if (host.transport === "daytona") {
+    if (recursive) return Promise.resolve({ host: host.name, ok: false, code: 1, stdout: "",
+      stderr: "cp -r from a dt: sandbox is not supported yet — tar in the sandbox and pull the archive" });
+    return dtPull(host, remote, local);
+  }
   return runScp(host, [...(recursive ? ["-r"] : []), `${host.ssh}:${remote}`, local]);
 }
