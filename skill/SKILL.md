@@ -48,6 +48,18 @@ fleet exec win-box "nvidia-smi"
 | `fleet run <recipe>` | Run a saved playbook from config (stops on first failure). |
 | `fleet ssh <host>` | Interactive shell. |
 
+## Prefer the LAN entry over the Tailscale one
+
+A machine can appear in `fleet.config.json` twice: once on the local network and once over
+Tailscale. Reach for the LAN entry — tailnet traffic can leave the network and come back,
+so copying anything large over the remote entry burns bandwidth for no gain.
+
+Name them so the transport is obvious: the plain name for the LAN box and a `-ts` suffix
+for its Tailscale twin (`server-pc` / `server-pc-ts`). `fleet ls` shows the ssh alias for
+every host, and a `routes` entry (`{"prefer": ["server-pc", "server-pc-ts"]}`) falls back
+to Tailscale automatically only when the LAN box does not answer. Dual-boot `machines`
+probe LAN first too.
+
 ## Selectors
 
 Anywhere `<sel>` appears: a hostname, logical route, group, `all`, Daytona

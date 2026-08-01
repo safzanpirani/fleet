@@ -324,13 +324,15 @@ function getMachine(cfg: FleetConfig, name: string): Machine {
 export async function bootState(cfg: FleetConfig, machine: string): Promise<BootState> {
   const m = getMachine(cfg, machine);
   const probed = await Promise.all(Object.entries(m.boots).map(async ([os, b]) => {
-    const transports = ([["ts", b.host], ["lan", b.lan]] as const).filter(([, n]) => !!n);
+    // LAN first: when a box answers on both, the local path is the one we want —
+    // Tailscale can hairpin out of the network and back for no benefit.
+    const transports = ([["lan", b.lan], ["ts", b.host]] as const).filter(([, n]) => !!n);
     const hits = await Promise.all(transports.map(async ([t, name]) => {
       const h = cfg.hosts[name!];
       if (!h) throw new Error(`machine ${machine} boot ${os} references unknown host '${name}'`);
       return { t, ok: await probe(h) };
     }));
-    const hit = hits.find((r) => r.ok) ?? null;     // prefer TS (listed first)
+    const hit = hits.find((r) => r.ok) ?? null;     // prefer LAN (listed first)
     const via = hit?.t ?? null;
     return {
       os, host: b.host, reachable: !!hit, via,
