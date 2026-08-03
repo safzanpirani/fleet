@@ -6,6 +6,8 @@ Fleet is a small CLI and MCP server for managing Linux, Windows, and macOS
 machines from one place. Use it for a single command, a whole group, or every
 machine at once.
 
+![fleet in action](demo/fleet-demo.gif)
+
 ```sh
 fleet exec win-box "nvidia-smi"  # one machine
 fleet exec @linux "uptime"       # a group, in parallel
