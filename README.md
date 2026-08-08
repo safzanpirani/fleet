@@ -152,11 +152,22 @@ job needs a user logged on at the console to host the interactive session.
 
 ## Agent setup
 
-Fleet is built to be driven by a coding agent as much as by a human. A complete
-setup is three things: the **CLI** on PATH, the **MCP server** registered with
-your client, and the **skill** that teaches the agent when and how to use them.
-Steps 1–3 take about five minutes; step 4 is optional and only needed if the
-agent runs somewhere other than this machine.
+Fleet is built to be driven by a coding agent as much as by a human. For most
+setups that's two things: the **CLI** on PATH, and the **skill** that teaches the
+agent when to reach for it. Steps 3 and 4 are optional.
+
+**Prefer the CLI to the MCP server.** Any agent that can run shell commands can
+already run `fleet` — one install serves every agent on the box, and each new
+one works the day you install it with no extra wiring. Registering the MCP server
+means a per-client config entry in Claude Code *and* Codex *and* Cursor *and* the
+desktop app, each with its own file, syntax, and restart, all pointing at the
+same binary the shell already has. That's N configs to keep in sync for
+capability you get once from `bun link`. The CLI is also the fuller surface:
+`top`, `ssh`, and `jobs tail -f` need a TTY and are deliberately absent from MCP.
+
+Reach for MCP when the agent **can't** shell out — a sandboxed or remote client,
+a hosted assistant — or when you specifically want tool-level gating, since
+`FLEET_MCP_READONLY=1` can drop every mutating tool in a way a shell can't.
 
 ### 1. Install the CLI and describe your machines
 
@@ -180,49 +191,13 @@ fleet doctor <host>                # explains an unreachable host (ssh -vv + hea
 fleet exec all 'echo ok'           # proves fan-out and auth on every box at once
 ```
 
-### 2. Register the MCP server
+### 2. Install the skill
 
-The same config, selectors, and quoting-proof exec are exposed over
-[MCP](https://modelcontextprotocol.io) on stdio, so the agent calls tools instead
-of guessing at shell syntax.
-
-```sh
-bun run src/mcp.ts            # or: bun run mcp   (FLEET_CONFIG honoured)
-```
-
-**Claude Code**
-```sh
-claude mcp add fleet -- bun run ~/fleet/src/mcp.ts
-```
-**Any client that reads an MCP config** (`.mcp.json`, `claude_desktop_config.json`,
-Cursor, Windsurf, Zed, …):
-```json
-{
-  "mcpServers": {
-    "fleet": { "command": "bun", "args": ["run", "/path/to/fleet/src/mcp.ts"] }
-  }
-}
-```
-
-**Codex CLI** (`~/.codex/config.toml`):
-```toml
-[mcp_servers.fleet]
-command = "bun"
-args = ["run", "/path/to/fleet/src/mcp.ts"]
-```
-
-Use an **absolute path** — the server resolves `fleet.config.json` from the repo
-root, and MCP clients rarely launch from a predictable cwd. To point one client
-at a different fleet, add `"env": { "FLEET_CONFIG": "/path/to/other.json" }`.
-
-Restart the client, then ask it to list tools; you should see 20 named `fleet_*`.
-
-### 3. Install the skill
-
-Tools tell an agent *what it can call*; the skill tells it *when to reach for
-fleet at all, and which of the two surfaces to use*. Without it, agents fall back
-to hand-rolled `ssh host "…"` and rediscover the quoting problem fleet exists to
-delete.
+An agent with the CLI on PATH still has to know it's there. The skill is what
+tells it *when to reach for fleet at all* — without one, agents fall back to
+hand-rolled `ssh host "…"` and rediscover the quoting problem fleet exists to
+delete. This is the step that does the most work, and it applies whether or not
+you register the MCP server.
 
 `skill/SKILL.md` is a ready-made [Agent Skill](https://code.claude.com/docs/en/skills)
 covering the commands, selector syntax (`host`, `a,b`, `@group`, `all`), the
@@ -255,6 +230,44 @@ Then edit the installed copy's frontmatter `description` to name **your** hosts
 and groups. That line is what the agent matches against, so "run something on
 gpu-box / all my servers" is far more likely to trigger it than the generic
 wording shipped here.
+
+### 3. Register the MCP server — only if you need it
+
+Skip this if steps 1 and 2 already gave your agent what it needs. If a client
+can't run shell commands, or you want the read-only kill-switch, the same config,
+selectors, and quoting-proof exec are exposed over
+[MCP](https://modelcontextprotocol.io) on stdio — register it per client:
+
+```sh
+bun run src/mcp.ts            # or: bun run mcp   (FLEET_CONFIG honoured)
+```
+
+**Claude Code**
+```sh
+claude mcp add fleet -- bun run ~/fleet/src/mcp.ts
+```
+**Any client that reads an MCP config** (`.mcp.json`, `claude_desktop_config.json`,
+Cursor, Windsurf, Zed, …):
+```json
+{
+  "mcpServers": {
+    "fleet": { "command": "bun", "args": ["run", "/path/to/fleet/src/mcp.ts"] }
+  }
+}
+```
+
+**Codex CLI** (`~/.codex/config.toml`):
+```toml
+[mcp_servers.fleet]
+command = "bun"
+args = ["run", "/path/to/fleet/src/mcp.ts"]
+```
+
+Use an **absolute path** — the server resolves `fleet.config.json` from the repo
+root, and MCP clients rarely launch from a predictable cwd. To point one client
+at a different fleet, add `"env": { "FLEET_CONFIG": "/path/to/other.json" }`.
+
+Restart the client, then ask it to list tools; you should see 20 named `fleet_*`.
 
 ### 4. If the agent doesn't run on this machine
 
