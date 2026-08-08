@@ -21,6 +21,9 @@ fleet status                     # the whole fleet at a glance
 - Long-running jobs survive SSH disconnects and remain easy to inspect.
 - The same operations are available to people through the CLI and agents through MCP.
 
+Driving fleet from Claude Code, Codex, or another agent? Start with
+**[Agent setup](#agent-setup)**.
+
 ## Quick start
 
 Install [Bun](https://bun.sh), clone the repository, then:
@@ -147,20 +150,52 @@ the GPU/OpenCL — the task definition is unregistered once the runner records i
 pid (the running instance survives), and `taskkill /T` reaps the tree. A Windows
 job needs a user logged on at the console to host the interactive session.
 
-## MCP server
-The same fleet — same config, same quoting-proof exec, same selectors/recipes —
-is also exposed as a [Model Context Protocol](https://modelcontextprotocol.io)
-server over stdio, so an agent can drive it as tools instead of a shell.
+## Agent setup
+
+Fleet is built to be driven by a coding agent as much as by a human. A complete
+setup is three things: the **CLI** on PATH, the **MCP server** registered with
+your client, and the **skill** that teaches the agent when and how to use them.
+Steps 1–3 take about five minutes; step 4 is optional and only needed if the
+agent runs somewhere other than this machine.
+
+### 1. Install the CLI and describe your machines
+
+```sh
+git clone https://github.com/safzanpirani/fleet ~/fleet
+cd ~/fleet && bun install && bun link
+cp fleet.config.example.json fleet.config.json
+$EDITOR fleet.config.json          # your ssh aliases, OSes, services, groups
+fleet ls                           # every host should answer
+```
+
+Each host key is an **ssh alias**, so whatever `ssh <alias>` already does — keys,
+jump hosts, Tailscale names — fleet inherits. Get `fleet ls` green before wiring
+up any agent: everything below is a thin layer over the same config, and a host
+that fails here fails there too.
+
+Strongly recommended before an agent touches it:
+
+```sh
+fleet doctor <host>                # explains an unreachable host (ssh -vv + health)
+fleet exec all 'echo ok'           # proves fan-out and auth on every box at once
+```
+
+### 2. Register the MCP server
+
+The same config, selectors, and quoting-proof exec are exposed over
+[MCP](https://modelcontextprotocol.io) on stdio, so the agent calls tools instead
+of guessing at shell syntax.
 
 ```sh
 bun run src/mcp.ts            # or: bun run mcp   (FLEET_CONFIG honoured)
 ```
 
-Register it with Claude Code:
+**Claude Code**
 ```sh
 claude mcp add fleet -- bun run ~/fleet/src/mcp.ts
 ```
-…or in an MCP client config (`.mcp.json` / `claude_desktop_config.json`):
+**Any client that reads an MCP config** (`.mcp.json`, `claude_desktop_config.json`,
+Cursor, Windsurf, Zed, …):
 ```json
 {
   "mcpServers": {
@@ -169,7 +204,79 @@ claude mcp add fleet -- bun run ~/fleet/src/mcp.ts
 }
 ```
 
-### Tools
+**Codex CLI** (`~/.codex/config.toml`):
+```toml
+[mcp_servers.fleet]
+command = "bun"
+args = ["run", "/path/to/fleet/src/mcp.ts"]
+```
+
+Use an **absolute path** — the server resolves `fleet.config.json` from the repo
+root, and MCP clients rarely launch from a predictable cwd. To point one client
+at a different fleet, add `"env": { "FLEET_CONFIG": "/path/to/other.json" }`.
+
+Restart the client, then ask it to list tools; you should see 20 named `fleet_*`.
+
+### 3. Install the skill
+
+Tools tell an agent *what it can call*; the skill tells it *when to reach for
+fleet at all, and which of the two surfaces to use*. Without it, agents fall back
+to hand-rolled `ssh host "…"` and rediscover the quoting problem fleet exists to
+delete.
+
+`skill/SKILL.md` is a ready-made [Agent Skill](https://code.claude.com/docs/en/skills)
+covering the commands, selector syntax (`host`, `a,b`, `@group`, `all`), the
+quoting rules, the detached-jobs workflow, and the MCP tool names. Install it by
+copying the folder into your agent's skills directory:
+
+```sh
+cp -R ~/fleet/skill ~/.claude/skills/fleet        # Claude Code (user-level)
+cp -R ~/fleet/skill .claude/skills/fleet          # …or scoped to one project
+```
+
+Edit the copy's frontmatter `description` to name **your** hosts and groups. That
+line is what the agent matches against, so "run something on gpu-box / all my
+servers" is far more likely to trigger it than the generic wording shipped here.
+
+### 4. If the agent doesn't run on this machine
+
+A cloud agent, a phone client, or a teammate's session can't spawn a local stdio
+process. For those, run the [HTTP endpoint](#remote-mcp-endpoint-http) instead
+and register `https://fleet.example.com/mcp` with the token as the API key. The
+token is a root credential for every machine in the config — treat it that way,
+and start read-only:
+
+```sh
+FLEET_MCP_READONLY=1 FLEET_MCP_TOKEN=<long-random> bun run serve
+```
+
+### Give the agent room to work
+
+Two habits make the difference between an agent that uses fleet well and one that
+fights it:
+
+- **Let it fan out.** `fleet exec @linux 'uptime'` is one call that runs in
+  parallel; a loop over hosts is N calls and N round-trips. The selector is the
+  parallelism.
+- **Never let it sleep-poll.** For anything long-running, `fleet spawn` returns a
+  job id immediately, and `fleet jobs wait <id> --until '<regex>'` blocks until
+  the output matches — no blind `sleep 60`, no lost work when the SSH session
+  drops. See [Detached jobs](#detached-jobs).
+
+### Verify the whole path
+
+```sh
+fleet ls                                  # CLI → hosts
+bun run scripts/smoke.ts                  # MCP stdio → tools → hosts
+bun run scripts/smoke-http.ts             # HTTP transport + auth
+FLEET_MCP_READONLY=1 bun run scripts/smoke-http.ts   # kill-switch drops mutating tools
+```
+
+Then ask the agent something it can only answer by actually calling out — *"how
+much disk is free on every machine?"* — and confirm it comes back with your real
+hosts rather than a plausible guess.
+
+### MCP tools
 
 All prefixed `fleet_`, grouped by access:
 
@@ -247,12 +354,6 @@ git-ignored `fleet.config.local.json` if you don't want hosts in git.
 The `ssh → PowerShell → wsl bash` path with nested quoting is a recurring pain.
 `fleet` encapsulates it once — a base64/EncodedCommand round-trip generalised to
 every machine, so no command has to survive multiple layers of quoting.
-
-## Agent skill
-`skill/SKILL.md` is a ready-made [Agent Skill](https://modelcontextprotocol.io) that
-teaches an agent (Claude Code, etc.) how to drive fleet — commands, selectors, the
-quoting rules, and the MCP tools. Drop the `skill/` folder into your agent's skills dir
-(e.g. `~/.claude/skills/fleet/`) to use it.
 
 ## Stack
 Bun + strict TypeScript. The CLI itself has zero runtime deps; the MCP server
