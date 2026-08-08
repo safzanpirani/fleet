@@ -673,21 +673,36 @@ function cuaBin(os: Host["os"]): { prelude: string; invoke: string } {
   };
 }
 
-/** Install cua-driver on the first selected host (official one-line installer). */
-export async function cuInstall(cfg: FleetConfig, sel: string): Promise<ExecResult> {
-  const host = resolveHosts(cfg, sel)[0]!;
-  if (host.os === "windows") {
-    return exec(host,
-      `irm https://raw.githubusercontent.com/trycua/cua/main/libs/cua-driver/scripts/install.ps1 | iex; `
+/** The official one-line cua-driver installer for one host, plus an autostart kick. */
+function cuInstallCmd(os: Host["os"]): { cmd: string; shell: Shell } {
+  if (os === "windows") return {
+    shell: "powershell",
+    cmd: `irm https://raw.githubusercontent.com/trycua/cua/main/libs/cua-driver/scripts/install.ps1 | iex; `
       + `& "$env:LOCALAPPDATA\\Programs\\Cua\\cua-driver\\bin\\cua-driver.exe" autostart kick`,
-      "powershell");
-  }
-  return exec(host,
-    `/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/trycua/cua/main/libs/cua-driver/scripts/install.sh)"; `
-    + `"$(command -v cua-driver || echo "$HOME/.local/bin/cua-driver")" autostart kick`,
-    "bash");
+  };
+  return {
+    shell: "bash",
+    cmd: `/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/trycua/cua/main/libs/cua-driver/scripts/install.sh)"; `
+      + `"$(command -v cua-driver || echo "$HOME/.local/bin/cua-driver")" autostart kick`,
+  };
 }
 
+/** Install cua-driver across every host a selector resolves to, in parallel.
+ *  Fans out like `restart`/`reboot`: `fleet cu @windows install` provisions the
+ *  whole group from one call instead of silently doing only the first host. */
+export async function cuInstall(
+  cfg: FleetConfig,
+  sel: string,
+  deps: { exec?: typeof exec } = {},
+): Promise<CuInstallAction[]> {
+  const run = deps.exec ?? exec;
+  return Promise.all(resolveHosts(cfg, sel).map(async (h) => {
+    const { cmd, shell } = cuInstallCmd(h.os);
+    return { host: h.name, os: h.os, result: await run(h, cmd, shell) };
+  }));
+}
+
+export interface CuInstallAction { host: string; os: Host["os"]; result: ExecResult; }
 export interface CuResult { host: string; result: ExecResult; localImage?: string; }
 
 const IMG_SENTINEL = "__FLEET_IMG__";

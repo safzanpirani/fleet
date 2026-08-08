@@ -71,7 +71,8 @@ fleet status vps                    # one host
 fleet logs web cloudflared -n 50
 fleet shot web                 # screenshot the remote desktop -> local PNG
 fleet shot web --grid          # overlay a labeled pixel-coordinate grid (--grid-step N)
-fleet cu web get_screen_size   # computer-use via cua-driver (install | click/type/...)
+fleet cu @windows install      # install cua-driver across a selector (computer use)
+fleet cu web get_screen_size   # drive a desktop: click/type/read window state
 fleet cu web ... --grid        # same grid overlay on the cua capture, for click targeting
 fleet doctor web               # diagnose why a host is unreachable (ssh -vv + health)
 fleet completion zsh                # shell completion:  eval "$(fleet completion zsh)"
@@ -149,6 +150,61 @@ logon principal, so the job lands in the logged-in console session and can see
 the GPU/OpenCL — the task definition is unregistered once the runner records its
 pid (the running instance survives), and `taskkill /T` reaps the tree. A Windows
 job needs a user logged on at the console to host the interactive session.
+
+## Computer use (`fleet cu`)
+
+`fleet shot` gets you a picture of a remote desktop. `fleet cu` lets something
+*act* on it — click, type, read window state — by driving
+[cua-driver](https://github.com/trycua/cua) on the host: a self-contained binary
+that runs a background `serve` daemon inside the interactive session and exposes
+computer-use tools. Same requirement as `fleet shot`: a **logged-in interactive
+desktop**. Nothing can drive a lock screen.
+
+### Install it everywhere in one command
+
+```sh
+fleet cu <host> install         # one box
+fleet cu @windows install       # a whole group, in parallel
+fleet cu all install            # the entire fleet
+```
+
+Installing takes a selector like any other fleet command, so provisioning ten
+machines is one call rather than ten. Each host runs its own OS's official
+installer (`install.ps1` on Windows, `install.sh` elsewhere) followed by an
+`autostart kick`, which registers the daemon to come back after a reboot —
+without it, the first reboot silently ends your computer-use setup. You get a
+result line per host plus an `n/N host(s) installed` tally, and a non-zero exit
+if any host failed, so a mixed fan-out tells you exactly which box needs another
+look. Windows prompts once for UAC elevation (the task runs at RunLevel=Highest).
+
+### Driving a desktop
+
+The convenience verbs collapse cua-driver's pid → window_id → capture loop:
+
+```sh
+fleet cu web apps                       # pid + name table (optional name filter)
+fleet cu web windows firefox            # window_id + title (name resolves to a pid)
+fleet cu web shot-window firefox --out w.png   # resolve + capture in one round-trip
+```
+
+Anything else passes straight through to cua-driver:
+
+```sh
+fleet cu web list-tools                 # authoritative tool list for the installed version
+fleet cu web get_screen_size
+fleet cu web click '{"pid":3848,"window_id":66756,"x":100,"y":200}'
+fleet cu web type_text '{"text":"hello"}'
+```
+
+- **Coordinates are window-local pixels**, not screen-global. Add `--grid`
+  (`--grid-step N`) to any capture to overlay a labeled coordinate ruler and read
+  the numbers off before clicking.
+- **JSON args are piped over stdin**, not passed as argv — Windows PowerShell 5.1
+  strips the quotes around JSON field names on native-command args, and piping
+  preserves them.
+- An image comes back only when you pass `--out` (or use `shot-window`).
+- Exposed to agents as the `fleet_cu` MCP tool; `args: ["install"]` fans out over
+  a selector there too.
 
 ## Agent setup
 
@@ -280,6 +336,21 @@ and start read-only:
 ```sh
 FLEET_MCP_READONLY=1 FLEET_MCP_TOKEN=<long-random> bun run serve
 ```
+
+### 5. Optional: let the agent use a desktop
+
+Everything above gives an agent a shell on your machines. If you also want it
+clicking and typing in GUI apps, install [cua-driver](https://github.com/trycua/cua)
+— one command, and a selector installs it everywhere at once:
+
+```sh
+fleet cu @windows install       # …or a single host, or `all`
+```
+
+Each host gets its own OS's installer plus an autostart kick, so the daemon
+returns after a reboot; you get a line per host and an `n/N host(s) installed`
+tally. See [Computer use](#computer-use-fleet-cu) for what the agent can then do
+with it, and skip this entirely if your agents only need a shell.
 
 ### Give the agent room to work
 

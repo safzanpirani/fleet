@@ -154,6 +154,7 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
   fleet svc <svc> [sel]           status of a service across every host that has it
   fleet shot <host> [--out f]     screenshot the remote desktop → local PNG
   fleet cu <host> <args…>         computer-use via cua-driver (install | click/type/…)
+  fleet cu <sel> install          install cua-driver across a host, group, or all
   fleet deploy <sel>              ship fleet source → host(s), bun install, restart   (--no-restart)
   fleet run <recipe>              run a saved playbook
   fleet doctor <host>             diagnose why a host is unreachable (ssh -vv + health)
@@ -471,7 +472,7 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
       const gridStep = numVal(rest, "--grid-step", 100);
       const out = pullVal(rest, "--out");
       const sel = rest.shift();
-      if (!sel) die("usage: fleet cu <host> install | <cua-driver args…> [--out f.png] [--grid]");
+      if (!sel) die("usage: fleet cu <host> <cua-driver args…> [--out f.png] [--grid]  |  fleet cu <sel> install");
       const target = await routeSelector(cfg, sel);
       const applyGrid = async (p?: string) => {
         if (p && grid && !await overlayGrid(p, gridStep))
@@ -485,9 +486,12 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
 
       if (verb === "install") {
         console.log(A.d(`◎ installing cua-driver on ${target} …`));
-        const r = await cuInstall(cfg, target);
-        printResult(r);
-        return r.ok ? 0 : 1;
+        const actions = await cuInstall(cfg, target);
+        actions.forEach((a) => printResult(a.result));
+        const failed = actions.filter((a) => !a.result.ok);
+        if (actions.length > 1)
+          console.log(A.d(`${actions.length - failed.length}/${actions.length} host(s) installed`));
+        return failed.length ? 1 : 0;
       }
       // convenience verbs (item 3) — cut the list→list→build-JSON loop
       if (verb === "apps") {

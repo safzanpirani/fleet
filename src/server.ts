@@ -401,7 +401,8 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       + "[\"install\"] to install it. Set image:true for screen/window-capture calls to get the "
       + "PNG back. Needs a logged-in interactive desktop on the target. " + sel,
     inputSchema: {
-      host: z.string().describe("Host name (or selector — first matched host is used)."),
+      host: z.string().describe("Host name (or selector — first matched host is used, except "
+        + "for args:[\"install\"], which installs on every host the selector resolves to)."),
       args: z.array(z.string()).describe("cua-driver CLI args, verbatim (tool name + JSON arg)."),
       image: z.boolean().optional().describe("True if the call captures a screenshot/window image."),
     },
@@ -409,8 +410,8 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
   }, async ({ host, args, image }) => {
     if (args[0] === "install") {
       const { cuInstall } = await import("./core.ts");
-      const r = await cuInstall(cfg, await routeSelector(cfg, host));
-      return text(renderExec([r]), !r.ok);
+      const actions = await cuInstall(cfg, await routeSelector(cfg, host));
+      return text(renderExec(actions.map((a) => a.result)), actions.some((a) => !a.result.ok));
     }
     const local = image ? join(tmpdir(), `cua_${Date.now()}.png`) : undefined;
     const r = await cuRun(cfg, await routeSelector(cfg, host), args, local);
