@@ -226,17 +226,35 @@ delete.
 
 `skill/SKILL.md` is a ready-made [Agent Skill](https://code.claude.com/docs/en/skills)
 covering the commands, selector syntax (`host`, `a,b`, `@group`, `all`), the
-quoting rules, the detached-jobs workflow, and the MCP tool names. Install it by
-copying the folder into your agent's skills directory:
+quoting rules, the detached-jobs workflow, and the MCP tool names.
+
+Install it straight from this repo with [`skills`](https://github.com/vercel-labs/skills):
 
 ```sh
-cp -R ~/fleet/skill ~/.claude/skills/fleet        # Claude Code (user-level)
-cp -R ~/fleet/skill .claude/skills/fleet          # …or scoped to one project
+npx skills add safzanpirani/fleet -g        # user-level, every agent
+npx skills add safzanpirani/fleet           # …or scoped to the current project
 ```
 
-Edit the copy's frontmatter `description` to name **your** hosts and groups. That
-line is what the agent matches against, so "run something on gpu-box / all my
-servers" is far more likely to trigger it than the generic wording shipped here.
+It installs as `fleet`; `--list` shows what's in the repo, `-a claude-code`
+targets one agent, and `npx skills update fleet` pulls later changes. Prefer to
+do it by hand? Copy the folder in:
+
+```sh
+cp -R ~/fleet/skill ~/.claude/skills/fleet
+```
+
+**Install it wherever the `fleet` CLI is reachable.** The skill is only useful to
+an agent that can actually run `fleet` — so put it in every context you drive the
+fleet from: your global agent config, any project whose agent does remote ops,
+and, if you run agents *on* your boxes (a coding agent on the GPU machine, a
+cloud session), the skill and a working `fleet` install belong on those too.
+Installed where the CLI is missing, it just teaches the agent commands it can't
+call.
+
+Then edit the installed copy's frontmatter `description` to name **your** hosts
+and groups. That line is what the agent matches against, so "run something on
+gpu-box / all my servers" is far more likely to trigger it than the generic
+wording shipped here.
 
 ### 4. If the agent doesn't run on this machine
 
