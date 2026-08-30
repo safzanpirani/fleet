@@ -14,15 +14,12 @@
  *     exit     — exit code (written only on completion → its presence = "done")
  *     run      — the generated runner script (cd → run → record exit)
  *
- * Linux/mac launch via `setsid` (no privilege, survives SSH disconnect because
- * setsid detaches it from the controlling terminal/session). Windows is the
- * genuinely fiddly case — a job must be launched with an *interactive* token so
- * it can see the GPU/OpenCL (session-0 non-interactive tasks cannot). We get one
- * by registering a Scheduled Task with an Interactive logon principal, starting
- * it on demand, then unregistering the definition once the runner has recorded
- * its pid (the running instance survives the unregister). Requires a user to be
- * logged on at the console — with nobody logged in there is no interactive
- * session to host the job.
+ * Linux launches via `setsid`; macOS uses `nohup` because `setsid` is not a
+ * system utility there. Windows jobs need an *interactive* token so they can see
+ * the GPU/OpenCL (session-0 non-interactive tasks cannot). We get one by
+ * registering a Scheduled Task with an Interactive logon principal, starting it
+ * on demand, then unregistering the definition once the runner records its pid.
+ * Requires a user to be logged on at the console.
  */
 import { resolveHosts } from "./config.ts";
 import type { FleetConfig, Host } from "./config.ts";
@@ -51,6 +48,30 @@ function lineCount(n: number, fallback = 40): number {
   return Number.isFinite(n) && n >= 1 ? Math.floor(n) : fallback;
 }
 
+// A pid is not proof of ownership: operating systems reuse them. Every
+// destructive or "running" check also verifies that the process command line
+// names this exact job's generated runner.
+const UNIX_OWNED_FN = `
+is_owned() {
+  owned_pid="$1"
+  owned_runner="$2"
+  [ -n "$owned_pid" ] || return 1
+  if [ "$(uname -s)" = "Darwin" ]; then
+    ps -p "$owned_pid" -o command= 2>/dev/null | grep -F -- "$owned_runner" >/dev/null
+  else
+    [ -r "/proc/$owned_pid/cmdline" ] &&
+      tr '\\0' '\\n' < "/proc/$owned_pid/cmdline" 2>/dev/null | grep -Fqx -- "$owned_runner"
+  fi
+}
+`;
+
+const WIN_OWNED_FN = `
+function Test-FleetJobProcess([int]$ProcessId, [string]$Runner) {
+  $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$ProcessId" -EA SilentlyContinue
+  return ($null -ne $proc -and $proc.CommandLine -and $proc.CommandLine.Contains($Runner))
+}
+`;
+
 export interface JobRow {
   host: string;
   id: string;
@@ -74,7 +95,7 @@ export interface SpawnResult {
  *  kill/wait) act on exactly one job. */
 export function resolveJobRef(cfg: FleetConfig, a: string, b?: string): { host: Host; id: string } {
   let hostSel = a, id = b;
-  if (!id && a.includes(":")) { const i = a.indexOf(":"); hostSel = a.slice(0, i); id = a.slice(i + 1); }
+  if (!id && a.includes(":")) { const i = a.lastIndexOf(":"); hostSel = a.slice(0, i); id = a.slice(i + 1); }
   if (!id) throw new Error("usage: <host> <id>  (or  <host:id>)");
   assertId(id);
   const hosts = resolveHosts(cfg, hostSel);
@@ -83,16 +104,21 @@ export function resolveJobRef(cfg: FleetConfig, a: string, b?: string): { host: 
 }
 
 // ── spawn ─────────────────────────────────────────────────────────────────────
-function linuxSpawnScript(id: string, cmd: string, cwd?: string): string {
+export function unixSpawnScript(host: Host, id: string, cmd: string, cwd?: string): string {
   // The runner is materialised on the host via a QUOTED heredoc (zero expansion,
   // so a cwd containing quotes/$ can't break it) and derives its own spool dir
   // from its path — the detached process needs no controller state.
   const cwdSrc = cwd ? `cwd="$(printf '%s' '${b64(cwd)}' | base64 -d)"` : `cwd=""`;
+  const launch = host.os === "mac"
+    ? `nohup "$dir/run" < /dev/null > /dev/null 2>&1 &`
+    : `setsid "$dir/run" < /dev/null > /dev/null 2>&1 &`;
   return [
     `set -e`,
     `id='${id}'`,
-    `dir="$HOME/.fleet/jobs/$id"`,
-    `mkdir -p "$dir"`,
+    `base="$HOME/.fleet/jobs"`,
+    `dir="$base/$id"`,
+    `mkdir -p "$base"`,
+    `mkdir "$dir"`,
     `printf '%s' '${b64(cmd)}' | base64 -d > "$dir/cmd"`,
     cwdSrc,
     `cwd="\${cwd:-$HOME}"`,
@@ -101,15 +127,18 @@ function linuxSpawnScript(id: string, cmd: string, cwd?: string): string {
     `cat > "$dir/run" <<'RUNEOF'`,
     `#!/bin/bash`,
     `dir="$(cd "$(dirname "$0")" && pwd)"`,
+    `echo $$ > "$dir/pid"`,
     `cwd="$(cat "$dir/cwd")"`,
     `cd -- "$cwd" || { echo "fleet: cwd not found: $cwd" 1>&2; echo 127 > "$dir/exit"; exit 127; }`,
     `bash "$dir/cmd" > "$dir/out" 2>&1`,
     `echo $? > "$dir/exit"`,
     `RUNEOF`,
     `chmod +x "$dir/run"`,
-    `setsid "$dir/run" < /dev/null > /dev/null 2>&1 &`,
-    `echo $! > "$dir/pid"`,
-    `printf 'OK %s %s\\n' "$id" "$(cat "$dir/pid")"`,
+    launch,
+    `i=0; while [ "$i" -lt 100 ] && [ ! -s "$dir/pid" ]; do sleep 0.05; i=$((i+1)); done`,
+    `pid="$(cat "$dir/pid" 2>/dev/null)"`,
+    `[ -n "$pid" ] || { echo "ERR runner did not record a pid" 1>&2; exit 1; }`,
+    `printf 'OK %s %s\\n' "$id" "$pid"`,
   ].join("\n");
 }
 
@@ -135,8 +164,11 @@ function windowsSpawnScript(id: string, cmd: string, cwd?: string): string {
   return [
     `$ErrorActionPreference='Stop'`,
     `$id='${id}'`,
-    `$dir="$env:USERPROFILE\\.fleet\\jobs\\$id"`,
-    `New-Item -ItemType Directory -Force -Path $dir | Out-Null`,
+    `$base="$env:USERPROFILE\\.fleet\\jobs"`,
+    `$dir="$base\\$id"`,
+    `New-Item -ItemType Directory -Force -Path $base | Out-Null`,
+    `if (Test-Path $dir) { throw "fleet: job id collision: $id" }`,
+    `New-Item -ItemType Directory -Path $dir | Out-Null`,
     `[IO.File]::WriteAllText("$dir\\cmd.ps1", [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${b64(cmd)}')))`,
     `$cwd = '${cwd ? b64(cwd) : ""}'`,
     `$cwd = if ($cwd) { [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($cwd)) } else { $env:USERPROFILE }`,
@@ -167,7 +199,7 @@ export async function spawnJob(
     const id = newId(opts.label);
     const script = h.os === "windows"
       ? windowsSpawnScript(id, cmd, opts.cwd)
-      : linuxSpawnScript(id, cmd, opts.cwd);
+      : unixSpawnScript(h, id, cmd, opts.cwd);
     const r = await exec(h, script, shellFor(h));
     const m = r.stdout.match(/OK\s+(\S+)\s+(\d+)/);
     if (!r.ok || !m) return { host: h.name, ok: false, id: null, pid: null, error: r.stderr || r.stdout || "spawn failed" };
@@ -177,6 +209,7 @@ export async function spawnJob(
 
 // ── list ──────────────────────────────────────────────────────────────────────
 const LINUX_LIST = `
+${UNIX_OWNED_FN}
 base="$HOME/.fleet/jobs"
 [ -d "$base" ] || exit 0
 for d in "$base"/*/; do
@@ -185,7 +218,7 @@ for d in "$base"/*/; do
   pid="$(cat "$d/pid" 2>/dev/null)"
   started="$(cat "$d/started" 2>/dev/null)"
   if [ -f "$d/exit" ]; then st="exited"; code="$(cat "$d/exit" 2>/dev/null)"
-  elif [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then st="running"; code="-"
+  elif is_owned "$pid" "$d/run"; then st="running"; code="-"
   else st="dead"; code="-"; fi
   cmd="$(tr '\\n\\t' '  ' < "$d/cmd" 2>/dev/null | cut -c1-160)"
   printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' "$id" "$st" "\${code:--}" "\${pid:--}" "\${started:--}" "$cmd"
@@ -193,6 +226,7 @@ done
 `;
 
 const WIN_LIST = `
+${WIN_OWNED_FN}
 $base="$env:USERPROFILE\\.fleet\\jobs"
 if (!(Test-Path $base)) { return }
 foreach ($d in (Get-ChildItem -Directory $base -EA SilentlyContinue)) {
@@ -200,7 +234,7 @@ foreach ($d in (Get-ChildItem -Directory $base -EA SilentlyContinue)) {
   $jpid=(Get-Content "$p\\pid" -EA SilentlyContinue | Select-Object -First 1)
   $started=(Get-Content "$p\\started" -EA SilentlyContinue | Select-Object -First 1)
   if (Test-Path "$p\\exit") { $st="exited"; $code=(Get-Content "$p\\exit" -EA SilentlyContinue | Select-Object -First 1) }
-  elseif ($jpid -and (Get-Process -Id $jpid -EA SilentlyContinue)) { $st="running"; $code="-" }
+  elseif ($jpid -and (Test-FleetJobProcess ([int]$jpid) "$p\\run.ps1")) { $st="running"; $code="-" }
   else { $st="dead"; $code="-" }
   $cmd=(Get-Content "$p\\cmd.ps1" -Raw -EA SilentlyContinue)
   if ($null -eq $cmd) { $cmd="" }
@@ -252,10 +286,15 @@ export async function listJobs(
 export async function jobLog(cfg: FleetConfig, a: string, b?: string): Promise<{ host: string; output: string }> {
   const { host, id } = resolveJobRef(cfg, a, b);
   const script = host.os === "windows"
-    ? `$o="$env:USERPROFILE\\.fleet\\jobs\\${id}\\out"; if (Test-Path $o) { Get-Content $o -Raw } else { Write-Error "fleet: no such job: ${id}" }`
-    : `cat "$HOME/.fleet/jobs/${id}/out" 2>/dev/null || echo "fleet: no such job: ${id}" 1>&2`;
+    ? `$d="$env:USERPROFILE\\.fleet\\jobs\\${id}"
+if (!(Test-Path -LiteralPath $d -PathType Container)) { Write-Error "fleet: no such job: ${id}"; exit 1 }
+$o=Join-Path $d 'out'
+if (Test-Path -LiteralPath $o -PathType Leaf) { Get-Content -LiteralPath $o -Raw }`
+    : `d="$HOME/.fleet/jobs/${id}"
+[ -d "$d" ] || { echo "fleet: no such job: ${id}" 1>&2; exit 1; }
+if [ -f "$d/out" ]; then cat "$d/out"; fi`;
   const r = await exec(host, script, shellFor(host));
-  if (!r.ok && r.stderr) throw new Error(r.stderr);
+  if (!r.ok) throw new Error(r.stderr || r.stdout || `failed to read job ${id} output (exit ${r.code})`);
   return { host: host.name, output: r.stdout };
 }
 
@@ -263,9 +302,15 @@ export async function jobTail(cfg: FleetConfig, a: string, b: string | undefined
   const { host, id } = resolveJobRef(cfg, a, b);
   const lines = lineCount(n);
   const script = host.os === "windows"
-    ? `$o="$env:USERPROFILE\\.fleet\\jobs\\${id}\\out"; if (Test-Path $o) { Get-Content $o -Tail ${lines} }`
-    : `tail -n ${lines} "$HOME/.fleet/jobs/${id}/out" 2>/dev/null`;
+    ? `$d="$env:USERPROFILE\\.fleet\\jobs\\${id}"
+if (!(Test-Path -LiteralPath $d -PathType Container)) { Write-Error "fleet: no such job: ${id}"; exit 1 }
+$o=Join-Path $d 'out'
+if (Test-Path -LiteralPath $o -PathType Leaf) { Get-Content -LiteralPath $o -Tail ${lines} }`
+    : `d="$HOME/.fleet/jobs/${id}"
+[ -d "$d" ] || { echo "fleet: no such job: ${id}" 1>&2; exit 1; }
+if [ -f "$d/out" ]; then tail -n ${lines} "$d/out"; fi`;
   const r = await exec(host, script, shellFor(host));
+  if (!r.ok) throw new Error(r.stderr || r.stdout || `failed to tail job ${id} output (exit ${r.code})`);
   return { host: host.name, output: r.stdout };
 }
 
@@ -280,38 +325,56 @@ export function jobFollow(cfg: FleetConfig, a: string, b: string | undefined, n:
 }
 
 // ── kill ──────────────────────────────────────────────────────────────────────
-export async function killJob(cfg: FleetConfig, a: string, b?: string): Promise<ExecResult> {
-  const { host, id } = resolveJobRef(cfg, a, b);
-  // setsid (linux) makes the pid the process-group leader, so `kill -- -pid` reaps
-  // the whole tree; on Windows `taskkill /T` does the same by walking children.
-  // The runner dies with the tree and never records an exit code, so write a
-  // 143 (SIGTERM) / 137 (SIGKILL) sentinel — otherwise the job reads "dead"
-  // forever and the default prune skips it. The sentinel is written ONLY after
-  // the process is confirmed gone: writing it while the tree is still alive
-  // would mislabel a live job "exited" and let prune delete its spool under it.
-  const script = host.os === "windows"
-    ? `$d="$env:USERPROFILE\\.fleet\\jobs\\${id}"\n` +
+export function killScript(host: Host, id: string): string {
+  assertId(id);
+  if (host.os === "windows") {
+    return WIN_OWNED_FN +
+      `$d="$env:USERPROFILE\\.fleet\\jobs\\${id}"\n` +
+      `if (Test-Path "$d\\exit") { Write-Error "fleet: job ${id} already exited"; exit 1 }\n` +
       `$jpid=(Get-Content "$d\\pid" -EA SilentlyContinue | Select-Object -First 1)\n` +
       `if (-not $jpid) { Write-Error "fleet: no such job: ${id}"; exit 1 }\n` +
+      `if (-not (Test-FleetJobProcess ([int]$jpid) "$d\\run.ps1")) { Write-Error "fleet: refusing to kill pid $($jpid): it is not job ${id}"; exit 1 }\n` +
       `taskkill /PID $jpid /T /F 2>&1 | Out-Null\n` +
-      `for ($i=0; $i -lt 40; $i++) { if (-not (Get-Process -Id $jpid -EA SilentlyContinue)) { break }; Start-Sleep -Milliseconds 250 }\n` +
-      `if (Get-Process -Id $jpid -EA SilentlyContinue) { Write-Error "fleet: pid $jpid survived taskkill /F — not marking exited"; exit 1 }\n` +
+      `for ($i=0; $i -lt 40; $i++) { if (-not (Test-FleetJobProcess ([int]$jpid) "$d\\run.ps1")) { break }; Start-Sleep -Milliseconds 250 }\n` +
+      `if (Test-FleetJobProcess ([int]$jpid) "$d\\run.ps1") { Write-Error "fleet: pid $jpid survived taskkill /F — not marking exited"; exit 1 }\n` +
       `if (!(Test-Path "$d\\exit")) { '137' | Set-Content -Encoding ascii "$d\\exit" }\n` +
-      `"killed $jpid"`
-    : `d="$HOME/.fleet/jobs/${id}"\n` +
-      `pid="$(cat "$d/pid" 2>/dev/null)"\n` +
-      `[ -n "$pid" ] || { echo "fleet: no such job: ${id}" 1>&2; exit 1; }\n` +
-      `kill -TERM -"$pid" 2>/dev/null; kill -TERM "$pid" 2>/dev/null\n` +
-      `code=143\n` +
-      `for i in $(seq 1 20); do kill -0 "$pid" 2>/dev/null || break; sleep 0.25; done\n` +
-      `if kill -0 "$pid" 2>/dev/null; then\n` +
-      `  kill -KILL -"$pid" 2>/dev/null; kill -KILL "$pid" 2>/dev/null; code=137\n` +
-      `  for i in $(seq 1 8); do kill -0 "$pid" 2>/dev/null || break; sleep 0.25; done\n` +
-      `fi\n` +
-      `if kill -0 "$pid" 2>/dev/null; then echo "fleet: pid $pid survived SIGKILL — not marking exited" 1>&2; exit 1; fi\n` +
-      `[ -f "$d/exit" ] || echo "$code" > "$d/exit"\n` +
-      `echo "killed $pid"`;
-  return exec(host, script, shellFor(host));
+      `"killed $jpid"`;
+  }
+
+  const signal = host.os === "mac"
+    ? `kill_tree() {\n` +
+      `  tree_signal="$1"; tree_pid="$2"\n` +
+      `  for child in $(pgrep -P "$tree_pid" 2>/dev/null); do kill_tree "$tree_signal" "$child"; done\n` +
+      `  kill "-$tree_signal" "$tree_pid" 2>/dev/null || true\n` +
+      `}\n` +
+      `kill_tree TERM "$pid"`
+    : `kill -TERM -"$pid" 2>/dev/null || true\nkill -TERM "$pid" 2>/dev/null || true`;
+  const force = host.os === "mac"
+    ? `kill_tree KILL "$pid"`
+    : `kill -KILL -"$pid" 2>/dev/null || true\n  kill -KILL "$pid" 2>/dev/null || true`;
+
+  return UNIX_OWNED_FN +
+    `d="$HOME/.fleet/jobs/${id}"\n` +
+    `[ ! -f "$d/exit" ] || { echo "fleet: job ${id} already exited" 1>&2; exit 1; }\n` +
+    `pid="$(cat "$d/pid" 2>/dev/null)"\n` +
+    `[ -n "$pid" ] || { echo "fleet: no such job: ${id}" 1>&2; exit 1; }\n` +
+    `is_owned "$pid" "$d/run" || { echo "fleet: refusing to kill pid $pid: it is not job ${id}" 1>&2; exit 1; }\n` +
+    `${signal}\n` +
+    `code=143\n` +
+    `i=0; while [ "$i" -lt 20 ] && is_owned "$pid" "$d/run"; do sleep 0.25; i=$((i+1)); done\n` +
+    `if is_owned "$pid" "$d/run"; then\n` +
+    `  ${force}\n` +
+    `  code=137\n` +
+    `  i=0; while [ "$i" -lt 8 ] && is_owned "$pid" "$d/run"; do sleep 0.25; i=$((i+1)); done\n` +
+    `fi\n` +
+    `if is_owned "$pid" "$d/run"; then echo "fleet: pid $pid survived SIGKILL — not marking exited" 1>&2; exit 1; fi\n` +
+    `[ -f "$d/exit" ] || echo "$code" > "$d/exit"\n` +
+    `echo "killed $pid"`;
+}
+
+export async function killJob(cfg: FleetConfig, a: string, b?: string): Promise<ExecResult> {
+  const { host, id } = resolveJobRef(cfg, a, b);
+  return exec(host, killScript(host, id), shellFor(host));
 }
 
 // ── wait --until ──────────────────────────────────────────────────────────────
@@ -328,10 +391,10 @@ export interface JobWaitResult {
   elapsedMs: number;
 }
 
-function waitPoll(host: Host, id: string, until?: string): string {
+export function waitPoll(host: Host, id: string, until?: string): string {
   if (host.os === "windows") {
     const untilSrc = until
-      ? `$rx=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${b64(until)}')); if (Select-String -Path "$dir\\out" -Pattern $rx -EA SilentlyContinue) { 'MATCH' }`
+      ? `$rx=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${b64(until)}')); try { if (Test-Path "$dir\\out") { if (Select-String -Path "$dir\\out" -Pattern $rx -EA Stop) { 'MATCH' } } } catch { Write-Error "fleet: invalid --until regex: $($_.Exception.Message)"; exit 2 }`
       : "";
     return [
       `$dir="$env:USERPROFILE\\.fleet\\jobs\\${id}"`,
@@ -341,7 +404,7 @@ function waitPoll(host: Host, id: string, until?: string): string {
     ].join("\n");
   }
   const untilSrc = until
-    ? `rx="$(printf '%s' '${b64(until)}' | base64 -d)"; grep -qE "$rx" "$dir/out" 2>/dev/null && echo MATCH`
+    ? `rx="$(printf '%s' '${b64(until)}' | base64 -d)"; if [ -f "$dir/out" ]; then grep -qE "$rx" "$dir/out"; grep_code=$?; [ "$grep_code" -eq 0 ] && echo MATCH; [ "$grep_code" -le 1 ] || { echo "fleet: invalid --until regex" 1>&2; exit 2; }; fi`
     : "";
   return `dir="$HOME/.fleet/jobs/${id}"\n` +
     `[ -d "$dir" ] || { echo MISSING; exit 0; }\n` +
@@ -359,8 +422,17 @@ export async function waitJob(cfg: FleetConfig, a: string, b: string | undefined
   const poll = waitPoll(host, id, opts.until);
   const start = Date.now();
   for (;;) {
-    const r = await exec(host, poll, shellFor(host));
+    const beforePoll = Date.now() - start;
+    if (timeoutMs && beforePoll >= timeoutMs)
+      return { host: host.name, id, outcome: "timeout", code: null, elapsedMs: beforePoll };
+    const remaining = timeoutMs ? Math.max(1, timeoutMs - beforePoll) : undefined;
+    const r = await exec(host, poll, shellFor(host), { timeoutMs: remaining });
     const elapsed = Date.now() - start;
+    if (!r.ok) {
+      if (r.code === 124 && timeoutMs)
+        return { host: host.name, id, outcome: "timeout", code: null, elapsedMs: elapsed };
+      throw new Error(r.stderr || `failed to inspect job ${id} (exit ${r.code})`);
+    }
     if (/^MISSING$/m.test(r.stdout)) throw new Error(`no such job: ${id}`);
     const exit = r.stdout.match(/EXIT:(-?\d+)/);
     if (opts.until && /^MATCH$/m.test(r.stdout))
@@ -370,7 +442,8 @@ export async function waitJob(cfg: FleetConfig, a: string, b: string | undefined
     if (timeoutMs && elapsed >= timeoutMs)
       return { host: host.name, id, outcome: "timeout", code: null, elapsedMs: elapsed };
     opts.onTick?.(opts.until ? "waiting for match/exit" : "running", elapsed);
-    await Bun.sleep(intervalMs);
+    const sleepMs = timeoutMs ? Math.min(intervalMs, Math.max(0, timeoutMs - elapsed)) : intervalMs;
+    if (sleepMs > 0) await Bun.sleep(sleepMs);
   }
 }
 
@@ -378,6 +451,7 @@ export async function waitJob(cfg: FleetConfig, a: string, b: string | undefined
 function pruneScript(host: Host, all: boolean): string {
   if (host.os === "windows") {
     return `
+${WIN_OWNED_FN}
 $base="$env:USERPROFILE\\.fleet\\jobs"
 if (!(Test-Path $base)) { '0'; exit 0 }
 $n=0
@@ -385,13 +459,14 @@ foreach ($d in (Get-ChildItem -Directory $base -EA SilentlyContinue)) {
   $p=$d.FullName
   $jpid=(Get-Content "$p\\pid" -EA SilentlyContinue | Select-Object -First 1)
   if (Test-Path "$p\\exit") { }
-  elseif ($jpid -and (Get-Process -Id $jpid -EA SilentlyContinue)) { continue }
+  elseif ($jpid -and (Test-FleetJobProcess ([int]$jpid) "$p\\run.ps1")) { continue }
   elseif ('${all ? "1" : "0"}' -ne '1') { continue }
   Remove-Item -Recurse -Force $p -EA SilentlyContinue; $n++
 }
 "$n"`;
   }
   return `
+${UNIX_OWNED_FN}
 base="$HOME/.fleet/jobs"
 [ -d "$base" ] || { echo 0; exit 0; }
 n=0
@@ -399,7 +474,7 @@ for d in "$base"/*/; do
   [ -d "$d" ] || continue
   pid="$(cat "$d/pid" 2>/dev/null)"
   if [ -f "$d/exit" ]; then :
-  elif [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then continue   # running — never prune
+  elif is_owned "$pid" "$d/run"; then continue                       # running — never prune
   elif [ "${all ? "1" : "0"}" != "1" ]; then continue               # dead, but not --all
   fi
   rm -rf "$d" && n=$((n+1))

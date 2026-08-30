@@ -7,7 +7,7 @@ description: Run commands, launch detached background jobs, restart services, pu
 
 `fleet` is a global CLI (installed from the repo, on PATH via `bun link`) that drives a
 whole machine fleet over SSH. Every exec is **quoting-proof**: `bash -ls` over
-stdin on Linux, PowerShell `-EncodedCommand` on Windows — so **never escape anything**,
+stdin on Linux and PowerShell `-Command -` over stdin on Windows — so **never escape anything**,
 just pass the command. Prefer `fleet exec` over raw `ssh` for these boxes. The same
 actions are also exposed as an **MCP server** (see below) for MCP clients/agents.
 

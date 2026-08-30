@@ -4,7 +4,7 @@ import type { FleetConfig, Host } from "../src/config.ts";
 
 const host = (name: string, os: Host["os"]): Host => ({ name, ssh: name, os });
 const cfg: FleetConfig = {
-  hosts: { oracle: host("oracle", "linux"), "win-box": host("win-box", "windows") },
+  hosts: { oracle: host("oracle", "linux"), maints: host("maints", "windows") },
   routes: { "oracle-auto": { prefer: ["oracle"] } },
   groups: { cloud: ["oracle"] },
   machines: { cachy: { boots: { linux: { host: "oracle" } } } },
@@ -18,7 +18,7 @@ describe("parseRemoteSpec (cp direction detection)", () => {
     expect(parseRemoteSpec(cfg, "@cloud:~/x")?.sel).toBe("@cloud");
     expect(parseRemoteSpec(cfg, "@linux:~/x")?.sel).toBe("@linux");
     expect(parseRemoteSpec(cfg, "all:/x")?.sel).toBe("all");
-    expect(parseRemoteSpec(cfg, "oracle,win-box:/x")?.sel).toBe("oracle,win-box");
+    expect(parseRemoteSpec(cfg, "oracle,maints:/x")?.sel).toBe("oracle,maints");
   });
 
   test("a dual-boot machine name is a valid prefix", () =>
@@ -34,8 +34,8 @@ describe("parseRemoteSpec (cp direction detection)", () => {
     expect(parseRemoteSpec(cfg, "C:\\Users\\me\\file.txt")).toBeNull());
 
   test("a Windows REMOTE path keeps its drive colon in the path half", () =>
-    expect(parseRemoteSpec(cfg, "win-box:C:\\Users\\Admin\\out.png"))
-      .toEqual({ sel: "win-box", path: "C:\\Users\\Admin\\out.png" }));
+    expect(parseRemoteSpec(cfg, "maints:C:\\Users\\Admin\\out.png"))
+      .toEqual({ sel: "maints", path: "C:\\Users\\Admin\\out.png" }));
 
   test("an unknown prefix is treated as a local path, not a host", () =>
     expect(parseRemoteSpec(cfg, "notahost:/x")).toBeNull());

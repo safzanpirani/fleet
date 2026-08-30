@@ -3,20 +3,27 @@
  * frontends: `mcp.ts` (stdio) and `http.ts` (remote). One place defines the
  * tools; the transports differ. All tools delegate to the `core.ts` actions.
  *
- * Read tools (ls/status/gpu/disk/logs) are always registered. The mutating tools
- * (exec/cp/restart/run) are registered only when `readOnly` is false — the
- * kill-switch (`FLEET_MCP_READONLY=1`) makes them vanish from `tools/list`.
+ * Read/probe tools are always registered. Tools that execute commands, copy
+ * files, capture the desktop, or otherwise mutate external state are registered
+ * only when `readOnly` is false — the kill-switch (`FLEET_MCP_READONLY=1`)
+ * makes them vanish from `tools/list`.
  */
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { FleetConfig } from "./config.ts";
 import type { ExecResult } from "./ssh.ts";
 import {
-  lsHosts, runExec, pushFile, restartService, serviceLogs,
-  gpuRows, diskRows, hostStatus, runRecipe, captureScreenshot, cuRun,
-  rebootHosts, firmwareRebootHosts, bootState, switchMachine, routeSelector, svcStatus,
+  lsHosts, runExec, runScript, readScriptSource, editRemoteFile, pushFile, pullFile, restartService, serviceLogs,
+  gpuRows, diskRows, hostStatus, runRecipe, captureScreenshot, overlayGrid, cuRun,
+  cuInstall, cuTools, cuDescribe, cuRecordStart, cuRecordStop, cuRecordStatus,
+  cuApps, cuResolvePid, cuWindows, cuShotWindow, browseHost, deployHosts, diagnose,
+  rebootHosts, firmwareRebootHosts, bootState, switchMachine, waitFor, routeSelector, svcStatus,
 } from "./core.ts";
-import { spawnJob, listJobs, jobLog, jobTail, killJob } from "./jobs.ts";
+import {
+  spawnJob, listJobs, jobLog, jobTail, killJob, waitJob, pruneJobs,
+} from "./jobs.ts";
+import { listSandboxes } from "./daytona.ts";
+import { toolsStatus } from "./tools.ts";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { unlink } from "node:fs/promises";
@@ -36,8 +43,9 @@ function indent(s: string, pad = "  "): string {
 function renderExec(results: ExecResult[]): string {
   return results.map((r) => {
     const head = `${r.ok ? "✓" : "✗"} ${r.host} · exit ${r.code}`;
+    const stdout = r.stdout.trimEnd();
     const body = [
-      r.stdout && indent(r.stdout),
+      stdout && indent(stdout),
       r.stderr && indent("stderr: " + r.stderr),
     ].filter(Boolean).join("\n");
     return body ? `${head}\n${body}` : head;
@@ -55,10 +63,22 @@ function selectorHelp(cfg: FleetConfig): string {
     + `Groups: @linux @windows @mac @gpu${groups ? " " + groups : ""}.`;
 }
 
+/**
+ * Ceiling on how long a wait tool may hold its response open, in seconds.
+ *
+ * Much lower than the CLI's cap on purpose. An MCP wait occupies a response
+ * stream for its whole duration, and MCP 2026-07-28 drops stream resumability
+ * (no `Last-Event-ID`, no redelivery) — a dropped connection loses the in-flight
+ * request outright, so an hour-long hold through the tunnel is an hour-long bet.
+ * Past this ceiling the agent should poll `fleet_jobs` / `fleet_job_log` instead,
+ * which is the shape the protocol is moving toward anyway.
+ */
+export const MCP_WAIT_CAP_S = 120;
+
 export interface BuildOpts { readOnly?: boolean }
 
 export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
-  const server = new McpServer({ name: "fleet", version: "0.4.0" });
+  const server = new McpServer({ name: "fleet", version: "0.5.0" });
   const sel = selectorHelp(cfg);
   const recipeNames = Object.keys(cfg.recipes ?? {});
 
@@ -105,7 +125,7 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     },
     annotations: { readOnlyHint: true, openWorldHint: true },
   }, async ({ service, selector }) => {
-    const rows = await svcStatus(cfg, selector ?? "all", service);
+    const rows = await svcStatus(cfg, await routeSelector(cfg, selector ?? "all"), service);
     const out = rows.map((r) => `${r.up ? "●" : "○"} ${r.host.padEnd(10)} ${r.service.padEnd(16)} ${r.detail} (${r.type})`).join("\n");
     return text(out, rows.some((r) => !r.up));
   });
@@ -225,6 +245,160 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     return text(lines.join("\n") || `no data${host ? " for " + host : ""}`);
   });
 
+  server.registerTool("fleet_dt", {
+    title: "List Daytona sandboxes",
+    description: "Discover live Daytona sandboxes that can be addressed by the other tools as "
+      + "`dt:<id|name|unique-prefix>`. Requires DAYTONA_API_KEY in the server environment.",
+    inputSchema: {
+      timeout: z.number().int().min(1).max(300).optional()
+        .describe("API deadline in seconds (default: DAYTONA_API_TIMEOUT_MS, capped here at 300s)."),
+    },
+    annotations: { readOnlyHint: true, openWorldHint: true },
+  }, async ({ timeout }) => {
+    const boxes = await listSandboxes(timeout ? timeout * 1000 : undefined);
+    if (!boxes.length) return text("no Daytona sandboxes");
+    return text(boxes.map((box) =>
+      `${box.state === "started" ? "●" : "○"} ${(box.name ?? "(unnamed)").padEnd(24)} `
+      + `${box.state.padEnd(10)} ${box.id}`,
+    ).join("\n"));
+  });
+
+  server.registerTool("fleet_doctor", {
+    title: "Diagnose host reachability",
+    description: "Diagnose why one host is unreachable using an SSH handshake plus its configured "
+      + "health URL, and return actionable failure hints. " + sel,
+    inputSchema: {
+      host: z.string().describe("Host, logical route, or dual-boot machine to diagnose."),
+    },
+    annotations: { readOnlyHint: true, openWorldHint: true },
+  }, async ({ host }) => {
+    const d = await diagnose(cfg, host);
+    const lines = [
+      `${d.sshUp ? "●" : "○"} ${d.host} ${d.sshUp ? "reachable" : "unreachable"} · ${d.os} · ssh ${d.ssh} · ${d.ms}ms`,
+      d.health && `  ${d.httpUp ? "●" : "○"} health ${d.httpUp ? "ok" : "down"} · ${d.health}`,
+      d.services.length ? `  services: ${d.services.join(", ")}` : "",
+      d.reason && `  reason: ${d.reason}`,
+      ...d.hints.map((hint) => `  → ${hint}`),
+    ].filter(Boolean);
+    return text(lines.join("\n"), !d.sshUp);
+  });
+
+  server.registerTool("fleet_wait", {
+    title: "Wait for a bounded host condition",
+    description: "Poll until SSH, a TCP port, an HTTP status, or a dual-boot target becomes ready. "
+      + `MCP waits are deliberately bounded; timeout is required and capped at ${MCP_WAIT_CAP_S}s. `
+      + "For anything longer, call this repeatedly rather than asking for one long hold.",
+    inputSchema: {
+      target: z.string().describe("Host/machine for SSH, port, and boot waits; an informational label for HTTP waits."),
+      port: z.number().int().min(1).max(65535).optional().describe("Wait for this TCP port."),
+      http: z.string().url().optional().describe("Wait for this HTTP(S) URL."),
+      status: z.number().int().min(100).max(599).optional().describe("Expected HTTP status (default 200; requires http)."),
+      boot: z.string().optional().describe("Wait for a dual-boot machine to reach this OS label."),
+      timeout: z.number().int().min(1).max(MCP_WAIT_CAP_S)
+        .describe(`Required deadline in seconds (max ${MCP_WAIT_CAP_S}).`),
+      interval: z.number().int().min(1).max(60).optional().describe("Polling interval in seconds (default 3)."),
+    },
+    annotations: { readOnlyHint: true, openWorldHint: true },
+  }, async ({ target, port, http, status, boot, timeout, interval }) => {
+    const selected = [port != null, http != null, boot != null].filter(Boolean).length;
+    if (selected > 1) return text("choose only one of port, http, or boot (omit all three for SSH)", true);
+    if (status != null && !http) return text("status requires http", true);
+    const r = await waitFor(cfg, target, {
+      port, http, status, boot, ssh: selected === 0,
+      timeoutMs: timeout * 1000,
+      intervalMs: (interval ?? 3) * 1000,
+    });
+    return text(
+      `${r.ok ? "● ready" : "○ timeout"} ${target} · ${r.lastDetail} · `
+      + `${r.attempts} attempt(s) · ${Math.round(r.elapsedMs / 1000)}s`
+      + (r.ok ? "" : " · not ready yet — call again to keep waiting"),
+      !r.ok,
+    );
+  });
+
+  server.registerTool("fleet_job_wait", {
+    title: "Wait for a detached job",
+    description: "Wait until a detached job exits or its output matches a regex. MCP waits are "
+      + `deliberately bounded; timeout is required and capped at ${MCP_WAIT_CAP_S}s. A job that `
+      + "outlives that is still running — call this again, or poll fleet_jobs / fleet_job_log.",
+    inputSchema: {
+      ref: z.string().describe("Job reference: \"host:id\"."),
+      until: z.string().optional().describe("Resolve early when the job output matches this regex."),
+      timeout: z.number().int().min(1).max(MCP_WAIT_CAP_S)
+        .describe(`Required deadline in seconds (max ${MCP_WAIT_CAP_S}).`),
+      interval: z.number().int().min(1).max(60).optional().describe("Polling interval in seconds (default 3)."),
+    },
+    annotations: { readOnlyHint: true, openWorldHint: true },
+  }, async ({ ref, until, timeout, interval }) => {
+    const r = await waitJob(cfg, ref, undefined, {
+      until,
+      timeoutMs: timeout * 1000,
+      intervalMs: (interval ?? 3) * 1000,
+    });
+    const ok = r.outcome === "matched" || (r.outcome === "exited" && r.code === 0);
+    const state = r.outcome === "matched" ? "matched"
+      : r.outcome === "timeout" ? "timeout" : `exit ${r.code}`;
+    return text(
+      `${ok ? "●" : "○"} ${r.host}:${r.id} · ${state} · ${Math.round(r.elapsedMs / 1000)}s`
+      + (r.outcome === "timeout" ? " · still running — call again or poll fleet_job_log" : ""),
+      !ok,
+    );
+  });
+
+  server.registerTool("fleet_tools_status", {
+    title: "Which boxes have a stale CLI tool",
+    description: "Report, per registered CLI tool, which hosts are running the current build "
+      + "and which have drifted. The verdict comes from a content hash of exactly what gets "
+      + "shipped (source + paired SKILL.md), so it cannot be fooled by a forgotten version "
+      + "bump. Use this before trusting that a tool or its skill is up to date on a remote box.",
+    inputSchema: {
+      tool: z.string().optional().describe("Single registered tool name (default: all of them)."),
+      selector: z.string().optional().describe("Host selector (default: each tool's configured hosts)."),
+    },
+    annotations: { readOnlyHint: true, openWorldHint: true },
+  }, async ({ tool, selector }) => {
+    const known = Object.keys(cfg.tools ?? {});
+    if (!known.length) return text("no `tools` block in this fleet config — nothing is tracked", true);
+    if (tool && !known.includes(tool)) return text(`unknown tool '${tool}' (have: ${known.join(", ")})`, true);
+    const rows = await toolsStatus(cfg, tool ? [tool] : known,
+      selector ? await routeSelector(cfg, selector) : undefined);
+    const mark = { current: "\u2713", stale: "\u2717", missing: "\u00b7", unreachable: "?" } as const;
+    const out = rows.map((r) =>
+      `${mark[r.state]} ${r.tool.padEnd(12)} ${r.host.padEnd(14)} ${r.state}`
+      + (r.state === "stale" ? ` (has ${r.remote!.version}/${r.remote!.hash}, current is ${r.local.version}/${r.local.hash})` : "")
+      + (r.state === "current" ? ` (${r.local.version}/${r.local.hash})` : "")
+      + (r.error ? ` \u2014 ${r.error.split("\n")[0]}` : ""),
+    ).join("\n");
+    return text(out || "no rows");
+  });
+
+  server.registerTool("fleet_cu_tools", {
+    title: "List cua-driver tools",
+    description: "Run cua-driver list-tools on a host and optionally filter its self-documented "
+      + "tool list by a case-insensitive substring. " + sel,
+    inputSchema: {
+      host: z.string().describe("Host name or selector (first matched host is used)."),
+      filter: z.string().optional().describe("Case-insensitive substring matched against each output line."),
+    },
+    annotations: { readOnlyHint: true, openWorldHint: true },
+  }, async ({ host, filter }) => {
+    const r = await cuTools(cfg, await routeSelector(cfg, host), filter);
+    return text(renderExec([r.result]), !r.result.ok);
+  });
+
+  server.registerTool("fleet_cu_describe", {
+    title: "Describe one cua-driver tool",
+    description: "Return cua-driver's installed description and input schema for one tool. " + sel,
+    inputSchema: {
+      host: z.string().describe("Host name or selector (first matched host is used)."),
+      tool: z.string().min(1).describe("Exact cua-driver tool name."),
+    },
+    annotations: { readOnlyHint: true, openWorldHint: true },
+  }, async ({ host, tool }) => {
+    const r = await cuDescribe(cfg, await routeSelector(cfg, host), tool);
+    return text(renderExec([r.result]), !r.result.ok);
+  });
+
   // ── mutating tools (skipped when readOnly — the kill-switch) ─────────────────
   if (opts.readOnly) return server;
 
@@ -238,15 +412,19 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       + "reachable display. " + sel,
     inputSchema: {
       host: z.string().describe("Host name (or selector — first matched host is used)."),
+      grid: z.boolean().optional().describe("Overlay a labeled coordinate grid on the returned image."),
+      gridStep: z.number().int().positive().max(1000).optional().describe("Grid spacing in pixels (default 100)."),
     },
     annotations: { openWorldHint: true },
-  }, async ({ host }) => {
+  }, async ({ host, grid, gridStep }) => {
     const local = join(tmpdir(), `fleet_shot_${Date.now()}.png`);
     try {
       const r = await captureScreenshot(cfg, await routeSelector(cfg, host), local);
+      const gridApplied = grid ? await overlayGrid(r.localPath, gridStep ?? 100) : false;
       const data = await consumeImage(r.localPath);
       return { content: [
-        { type: "text" as const, text: `screenshot of ${r.host}` },
+        { type: "text" as const, text: `screenshot of ${r.host}`
+          + (grid ? gridApplied ? " · coordinate grid applied" : " · grid skipped (python3 + Pillow required)" : "") },
         { type: "image" as const, data, mimeType: "image/png" },
       ] };
     } catch (e) {
@@ -262,35 +440,132 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       + "bash for @linux/@mac, PowerShell for @windows (set wsl:true to run bash inside WSL on a "
       + "Windows box). " + sel,
     inputSchema: {
-      selector: z.string().describe("Host selector, e.g. \"win-box\", \"@linux\", \"all\", \"vps,@gpu\"."),
+      selector: z.string().describe("Host selector, e.g. \"maints\", \"@linux\", \"all\", \"vps,@gpu\"."),
       command: z.string().describe("Command to run, verbatim. Quotes/pipes/$ round-trip as-is."),
       wsl: z.boolean().optional().describe("Run the command inside WSL bash on a Windows host."),
+      cwd: z.string().optional().describe("Working directory on the target (fails fast if missing)."),
       timeout: z.number().int().positive().optional()
         .describe("Wall-clock cap in seconds — a hung command returns exit 124 instead of blocking forever."),
     },
     annotations: { openWorldHint: true },
-  }, async ({ selector, command, wsl, timeout }) => {
+  }, async ({ selector, command, wsl, cwd, timeout }) => {
     const results = await runExec(cfg, await routeSelector(cfg, selector), command,
-      { wsl, timeoutMs: timeout ? timeout * 1000 : undefined });
+      { wsl, cwd, timeoutMs: timeout ? timeout * 1000 : undefined });
     return text(renderExec(results), results.some((r) => !r.ok));
   });
 
-  server.registerTool("fleet_cp", {
-    title: "Copy a file to host(s)",
-    description: "scp a local file to one or more hosts (fan-out across a group). Remote path is "
-      + "passed verbatim (forward slashes and C:\\… both work on Windows OpenSSH). " + sel,
+  server.registerTool("fleet_edit", {
+    title: "Edit a remote file in place",
+    description: "Surgical find-and-replace inside a file on host(s), returning a diff of what "
+      + "landed. Prefer this over `fleet_exec` with sed/PowerShell -replace, and over "
+      + "pull → edit → push: it refuses when `old` is not found, refuses an ambiguous match "
+      + "unless `all` is set, and aborts if the file changed between read and write, so it "
+      + "cannot silently clobber a concurrent change. Omit `new` to delete the matched text. "
+      + "Set `dryRun` to see the diff without writing. " + sel,
     inputSchema: {
-      local: z.string().describe("Path to the local file to push."),
-      selector: z.string().describe("Destination host selector."),
-      remote: z.string().describe("Remote destination path."),
+      selector: z.string().describe("Host selector."),
+      path: z.string().describe("Absolute path of the remote file."),
+      old: z.string().min(1).describe("Exact text to find. Must be unique unless `all` is true."),
+      new: z.string().optional().describe("Replacement text. Omit to delete the matched text."),
+      all: z.boolean().optional().describe("Replace every occurrence instead of failing on multiple."),
+      dryRun: z.boolean().optional().describe("Show the diff without writing anything."),
+      wsl: z.boolean().optional().describe("Edit inside WSL on a Windows host."),
     },
     annotations: { openWorldHint: true },
-  }, async ({ local, selector, remote }) => {
-    const results = await pushFile(cfg, local, await routeSelector(cfg, selector), remote);
+  }, async ({ selector, path, old, new: neu, all, dryRun, wsl }) => {
+    const results = await editRemoteFile(
+      cfg, await routeSelector(cfg, selector), path, old, neu ?? "", { all, dryRun, wsl });
+    const out = results.map((r) => {
+      if (!r.ok) return `✗ ${r.host} ${r.path} · ${r.error ?? "edit failed"}`;
+      const what = `${r.replacements} replacement${r.replacements === 1 ? "" : "s"}`
+        + (dryRun ? " (dry run — nothing written)" : "");
+      return `✓ ${r.host} ${r.path} · ${what}${r.diff ? "\n" + indent(r.diff) : ""}`;
+    }).join("\n\n");
+    return text(out, results.some((r) => !r.ok));
+  });
+
+  server.registerTool("fleet_script", {
+    title: "Run a local script on host(s)",
+    description: "Run a script that exists locally (or that you pass inline) on remote host(s) "
+      + "without copying it: no scp, no remote temp file, nothing left behind. Prefer this over "
+      + "fleet_cp + fleet_exec for anything longer than a one-liner, and over cramming a "
+      + "multi-line program into fleet_exec. Give EITHER `path` (a local file) OR `source` "
+      + "(the script text). The interpreter follows the extension — .py→python3, .sh→native "
+      + "shell, .ps1→PowerShell, .js→node, .ts→bun — or set `interp` explicitly, which is "
+      + "required when passing `source` without an `ext`. " + sel,
+    inputSchema: {
+      selector: z.string().describe("Host selector."),
+      path: z.string().optional().describe("Path to a LOCAL script file to run remotely."),
+      source: z.string().optional().describe("Script text, as an alternative to `path`."),
+      ext: z.string().optional().describe("Extension for `source` (e.g. '.py') to pick the interpreter."),
+      interp: z.string().optional().describe("Interpreter command, overriding the extension guess."),
+      cwd: z.string().optional().describe("Directory to run in (fails fast if missing)."),
+      wsl: z.boolean().optional().describe("Run inside WSL on a Windows host."),
+      timeoutSeconds: z.number().int().positive().optional().describe("Kill the script after N seconds."),
+    },
+    annotations: { openWorldHint: true },
+  }, async ({ selector, path, source, ext, interp, cwd, wsl, timeoutSeconds }) => {
+    if (!path && source === undefined) return text("give either `path` or `source`", true);
+    if (path && source !== undefined) return text("give `path` or `source`, not both", true);
+    try {
+      const script = path
+        ? await readScriptSource(path)
+        : { source: source!, ext: ext ?? "", label: "<inline>" };
+      if (!script.ext && !interp) {
+        return text("inline `source` needs `ext` (e.g. '.py') or `interp` so an interpreter can be chosen", true);
+      }
+      const results = await runScript(cfg, await routeSelector(cfg, selector), script, {
+        wsl, cwd, interp, timeoutMs: timeoutSeconds ? timeoutSeconds * 1000 : undefined,
+      });
+      return text(renderExec(results), results.some((r) => !r.ok));
+    } catch (e) {
+      return text(e instanceof Error ? e.message : String(e), true);
+    }
+  });
+
+  server.registerTool("fleet_cp", {
+    title: "Copy file(s) to host(s)",
+    description: "scp one or more local files to one or more hosts (fan-out across a group). Remote "
+      + "path is passed verbatim (forward slashes and C:\\… both work on Windows OpenSSH). Pass an "
+      + "array of paths to copy several files in one call — `remote` must then be an existing "
+      + "directory. " + sel,
+    inputSchema: {
+      local: z.union([z.string(), z.array(z.string()).min(1)])
+        .describe("Path to the local file to push, or an array of paths (remote must be a directory)."),
+      selector: z.string().describe("Destination host selector."),
+      remote: z.string().describe("Remote destination path."),
+      recursive: z.boolean().optional().describe("Recursively copy a directory."),
+    },
+    annotations: { openWorldHint: true },
+  }, async ({ local, selector, remote, recursive }) => {
+    const results = await pushFile(cfg, local, await routeSelector(cfg, selector), remote, recursive);
+    const from = Array.isArray(local) ? local.join(" ") : local;
     const out = results.map((r) =>
-      `${r.ok ? "✓" : "✗"} ${r.host} · ${local} → ${remote}${r.stderr ? "\n" + indent(r.stderr) : ""}`,
+      `${r.ok ? "✓" : "✗"} ${r.host} · ${from} → ${remote}${r.stderr ? "\n" + indent(r.stderr) : ""}`,
     ).join("\n");
     return text(out, results.some((r) => !r.ok));
+  });
+
+  server.registerTool("fleet_pull", {
+    title: "Copy file(s) from a host",
+    description: "Pull one or more remote files or directories to the MCP server's local filesystem. "
+      + "Exactly one source host must match. Pass an array of remote paths to pull several in one "
+      + "call — `local` must then be an existing directory. Daytona downloads are supported. " + sel,
+    inputSchema: {
+      selector: z.string().describe("Single source host selector."),
+      remote: z.union([z.string(), z.array(z.string()).min(1)])
+        .describe("Remote source path, or an array of paths (local must be a directory)."),
+      local: z.string().describe("Destination path on the MCP server/controller."),
+      recursive: z.boolean().optional().describe("Recursively copy a directory."),
+    },
+    annotations: { openWorldHint: true },
+  }, async ({ selector, remote, local, recursive }) => {
+    const r = await pullFile(cfg, await routeSelector(cfg, selector), remote, local, recursive);
+    const from = Array.isArray(remote) ? remote.join(" ") : remote;
+    return text(
+      `${r.ok ? "✓" : "✗"} ${r.host} · ${from} → ${local}${r.stderr ? "\n" + indent(r.stderr) : ""}`,
+      !r.ok,
+    );
   });
 
   server.registerTool("fleet_restart", {
@@ -314,7 +589,7 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     description: "Start a long-running command as a DETACHED job that outlives the SSH session "
       + "(builds, training runs, anything slow) — returns a host:id to track with fleet_jobs / "
       + "fleet_job_log. Use this instead of fleet_exec for anything that takes more than a few "
-      + "seconds. Works on Linux/mac (setsid) and Windows (interactive Scheduled Task → sees the "
+      + "seconds. Works on Linux (setsid), macOS (nohup), and Windows (interactive Scheduled Task → sees the "
       + "GPU). Command syntax is the target's native shell. " + sel,
     inputSchema: {
       selector: z.string().describe("Host selector (a dual-boot machine name auto-routes to its live OS)."),
@@ -341,6 +616,27 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
   }, async ({ ref }) => {
     const r = await killJob(cfg, ref);
     return text(renderExec([r]), !r.ok);
+  });
+
+  server.registerTool("fleet_jobs_prune", {
+    title: "Prune detached job spools",
+    description: "Delete completed job spools. With includeDead:true, also delete dead/stale "
+      + "spools. Running jobs are always preserved. " + sel,
+    inputSchema: {
+      selector: z.string().optional().describe("Host selector (default: all)."),
+      includeDead: z.boolean().optional().describe("Also remove dead/stale spools (default false)."),
+    },
+    annotations: { destructiveHint: true, openWorldHint: true },
+  }, async ({ selector, includeDead }) => {
+    const rows = await pruneJobs(
+      cfg,
+      await routeSelector(cfg, selector ?? "all"),
+      includeDead ?? false,
+    );
+    const out = rows.map((r) => r.error
+      ? `✗ ${r.host} · prune failed: ${r.error}`
+      : `⌫ ${r.host} · pruned ${r.removed} job(s)`).join("\n");
+    return text(out, rows.some((r) => !!r.error));
   });
 
   server.registerTool("fleet_reboot", {
@@ -383,14 +679,69 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       machine: z.string().describe("Dual-boot machine name."),
       to: z.string().describe("Target OS/boot label to switch into."),
       wait: z.boolean().optional().describe("Wait until the target boot is reachable (default true)."),
+      timeout: z.number().int().min(1).max(3600).optional()
+        .describe("Arrival deadline in seconds (default 180, max 3600)."),
     },
     annotations: { destructiveHint: true, openWorldHint: true },
-  }, async ({ machine, to, wait }) => {
-    const r = await switchMachine(cfg, machine, to, { wait: wait ?? true });
+  }, async ({ machine, to, wait, timeout }) => {
+    const r = await switchMachine(cfg, machine, to, {
+      wait: wait ?? true,
+      timeoutMs: (timeout ?? 180) * 1000,
+    });
     if (wait === false) return text(`↻ ${machine}: switch to ${to} issued (from ${r.from ?? "?"}); not waiting`);
     return text(r.arrived
       ? `● ${machine} now in ${to} (${Math.round(r.waitedMs / 1000)}s)`
       : `✗ ${machine} did not reach ${to} in time`, !r.arrived);
+  });
+
+  server.registerTool("fleet_browse", {
+    title: "Attach to a host's configured browser",
+    description: "Verify the host's configured Chrome DevTools Protocol endpoint, optionally open "
+      + "one URL in a new tab, and return the endpoint plus current target list. This only resolves "
+      + "and attaches to CDP. Use cua-driver browser_* tools for page interaction. " + sel,
+    inputSchema: {
+      host: z.string().describe("Host with a cdp field in fleet.config.json."),
+      url: z.string().optional().describe("URL to open through PUT /json/new before listing targets."),
+    },
+    annotations: { openWorldHint: true },
+  }, async ({ host, url }) => {
+    try {
+      const r = await browseHost(cfg, await routeSelector(cfg, host), url);
+      return text(JSON.stringify({ endpoint: r.endpoint, targets: r.targets }, null, 2));
+    } catch (error) {
+      return text(error instanceof Error ? error.message : String(error), true);
+    }
+  });
+
+  server.registerTool("fleet_cu_record", {
+    title: "Control cua-driver trajectory recording",
+    description: "Start, stop, or inspect cua-driver trajectory recording. Start uses out as the "
+      + "remote recording directory. Stop uses out as a local controller directory "
+      + "and pulls the finalized artifacts through Fleet's file-pull path. " + sel,
+    inputSchema: {
+      host: z.string().describe("Host name or selector (first matched host is used)."),
+      action: z.enum(["start", "stop", "status"]),
+      out: z.string().optional().describe("Remote directory for start; local controller directory for stop."),
+    },
+    annotations: { openWorldHint: true },
+  }, async ({ host, action, out }) => {
+    try {
+      const target = await routeSelector(cfg, host);
+      if (action === "start") {
+        const r = await cuRecordStart(cfg, target, out);
+        return text(renderExec([r.result]), !r.result.ok);
+      }
+      if (action === "status") {
+        if (out) return text("out is only valid with start or stop", true);
+        const r = await cuRecordStatus(cfg, target);
+        return text(renderExec([r.result]), !r.result.ok);
+      }
+      const r = await cuRecordStop(cfg, target, out);
+      const paths = r.localPaths.length ? `\n${r.localPaths.join("\n")}` : "";
+      return text(`${renderExec([r.result])}${paths}`, !r.result.ok);
+    } catch (error) {
+      return text(error instanceof Error ? error.message : String(error), true);
+    }
   });
 
   server.registerTool("fleet_cu", {
@@ -405,11 +756,12 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
         + "for args:[\"install\"], which installs on every host the selector resolves to)."),
       args: z.array(z.string()).describe("cua-driver CLI args, verbatim (tool name + JSON arg)."),
       image: z.boolean().optional().describe("True if the call captures a screenshot/window image."),
+      grid: z.boolean().optional().describe("Overlay a labeled coordinate grid on the returned image."),
+      gridStep: z.number().int().positive().max(1000).optional().describe("Grid spacing in pixels (default 100)."),
     },
     annotations: { openWorldHint: true },
-  }, async ({ host, args, image }) => {
+  }, async ({ host, args, image, grid, gridStep }) => {
     if (args[0] === "install") {
-      const { cuInstall } = await import("./core.ts");
       const actions = await cuInstall(cfg, await routeSelector(cfg, host));
       return text(renderExec(actions.map((a) => a.result)), actions.some((a) => !a.result.ok));
     }
@@ -417,10 +769,100 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     const r = await cuRun(cfg, await routeSelector(cfg, host), args, local);
     const content: any[] = [{ type: "text" as const, text: renderExec([r.result]) }];
     if (r.localImage) {
+      const gridApplied = grid ? await overlayGrid(r.localImage, gridStep ?? 100) : false;
+      if (grid) content[0].text += gridApplied
+        ? "\ncoordinate grid applied"
+        : "\ngrid skipped (python3 + Pillow required)";
       const data = await consumeImage(r.localImage);
       content.push({ type: "image" as const, data, mimeType: "image/png" });
     }
     return { content, isError: !r.result.ok };
+  });
+
+  server.registerTool("fleet_cu_apps", {
+    title: "List desktop applications",
+    description: "List applications visible to cua-driver on the target's active desktop, "
+      + "optionally filtered by name. " + sel,
+    inputSchema: {
+      host: z.string().describe("Host name or selector (first matched host is used)."),
+      filter: z.string().optional().describe("Case-insensitive app-name substring."),
+    },
+    annotations: { openWorldHint: true },
+  }, async ({ host, filter }) => {
+    const { apps, result } = await cuApps(cfg, await routeSelector(cfg, host), filter);
+    if (!result.ok) return text(renderExec([result]), true);
+    return text([
+      ...apps.map((app) => `${String(app.pid).padStart(7)}  ${app.name}${app.active ? " · active" : ""}`),
+      `${apps.length} app(s)`,
+    ].join("\n"));
+  });
+
+  server.registerTool("fleet_cu_windows", {
+    title: "List an application's windows",
+    description: "Resolve an application by PID or name and list its desktop windows. " + sel,
+    inputSchema: {
+      host: z.string().describe("Host name or selector (first matched host is used)."),
+      app: z.string().describe("Numeric PID or case-insensitive app-name substring."),
+    },
+    annotations: { openWorldHint: true },
+  }, async ({ host, app }) => {
+    const target = await routeSelector(cfg, host);
+    const resolved = await cuResolvePid(cfg, target, app);
+    const { windows, result } = await cuWindows(cfg, target, resolved.pid);
+    if (!result.ok) return text(renderExec([result]), true);
+    return text([
+      ...windows.map((window) => `${String(window.window_id).padStart(8)}  ${window.title || "(untitled)"}`),
+      `${windows.length} window(s) for ${resolved.name} (pid ${resolved.pid})`,
+    ].join("\n"));
+  });
+
+  server.registerTool("fleet_cu_screenshot_window", {
+    title: "Screenshot an application window",
+    description: "Resolve an application by PID or name, capture its first window, and return "
+      + "the image. This composes app discovery, window discovery, and capture efficiently. " + sel,
+    inputSchema: {
+      host: z.string().describe("Host name or selector (first matched host is used)."),
+      app: z.string().describe("Numeric PID or case-insensitive app-name substring."),
+      grid: z.boolean().optional().describe("Overlay a labeled coordinate grid on the returned image."),
+      gridStep: z.number().int().positive().max(1000).optional().describe("Grid spacing in pixels (default 100)."),
+    },
+    annotations: { openWorldHint: true },
+  }, async ({ host, app, grid, gridStep }) => {
+    const target = await routeSelector(cfg, host);
+    const local = join(tmpdir(), `cua_window_${Date.now()}.png`);
+    const r = await cuShotWindow(cfg, target, app, local);
+    if (!r.result.ok || !r.localImage) return text(renderExec([r.result]), true);
+    const gridApplied = grid ? await overlayGrid(r.localImage, gridStep ?? 100) : false;
+    const data = await consumeImage(r.localImage);
+    return { content: [
+      { type: "text" as const, text: `${r.app.name} · window ${r.window.window_id}`
+        + (grid ? gridApplied ? " · coordinate grid applied" : " · grid skipped (python3 + Pillow required)" : "") },
+      { type: "image" as const, data, mimeType: "image/png" },
+    ] };
+  });
+
+  server.registerTool("fleet_deploy", {
+    title: "Deploy Fleet to host(s)",
+    description: "Build a Fleet source tarball, copy it to matching hosts, install dependencies, "
+      + "and optionally restart a configured service. " + sel,
+    inputSchema: {
+      selector: z.string().describe("Destination host selector."),
+      restart: z.union([z.boolean(), z.string()]).optional()
+        .describe("true: configured/default Fleet service; false: no restart; string: named configured service."),
+    },
+    annotations: { destructiveHint: true, openWorldHint: true },
+  }, async ({ selector, restart }) => {
+    const rows = await deployHosts(cfg, await routeSelector(cfg, selector), {
+      restart: restart ?? true,
+    });
+    const out = rows.map((r) => {
+      const head = `${r.ok ? "✓" : "✗"} ${r.host} · ${r.dir}`;
+      const body = renderExec([r.result]);
+      const restarted = (r.restarted ?? []).map((a) =>
+        `${a.result.ok ? "↻" : "✗"} ${a.host} · restarted ${a.service} (${a.type})`).join("\n");
+      return [head, body, restarted].filter(Boolean).join("\n");
+    }).join("\n\n");
+    return text(out, rows.some((r) => !r.ok));
   });
 
   server.registerTool("fleet_run", {

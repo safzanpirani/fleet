@@ -11,6 +11,9 @@ import { exec, probe, scp, scpPull, sshDiagnose, bashEsc, psEsc } from "./ssh.ts
 import type { ExecResult, Shell } from "./ssh.ts";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createConnection } from "node:net";
+import { mkdir, readdir } from "node:fs/promises";
+import { createHash } from "node:crypto";
 
 // ── tiny arg helpers (shared by cli flag parsing + recipe step parsing) ──────
 export function pullFlag(rest: string[], flag: string): boolean {
@@ -154,9 +157,79 @@ export async function runExec(
   return Promise.all(hosts.map((h) => exec(h, cmd, shell, { cwd: opts.cwd, timeoutMs: opts.timeoutMs })));
 }
 
+// ── exec --script ─────────────────────────────────────────────────────────────
+// Run a LOCAL script file (or stdin) on remote hosts without ever creating a
+// remote file. The old shape of this was: write the script locally, `fleet cp`
+// it to /tmp on the box, `fleet exec` the interpreter on it, forget to clean up.
+// Here the source is base64'd into the same stdin/EncodedCommand blob `exec`
+// already uses, so quoting stays a non-issue and nothing is left behind.
+
+/** Interpreter to feed a script to, picked from its file extension. `null`
+ *  means "this IS the shell's own language" — pass the source through as the
+ *  command itself rather than piping it to anything. */
+export function interpreterFor(ext: string, os: string): string | null {
+  switch (ext.toLowerCase()) {
+    case ".sh": case ".bash": case "": return os === "windows" ? "bash" : null;
+    case ".ps1": return os === "windows" ? null : "pwsh";
+    case ".py": return os === "windows" ? "python" : "python3";
+    case ".js": case ".cjs": case ".mjs": return "node";
+    case ".ts": return "bun";
+    case ".rb": return "ruby";
+    case ".pl": return "perl";
+    default: return null;
+  }
+}
+
+/** Wrap script source into a single command string for `exec`. When an
+ *  interpreter is needed the source is base64'd and decoded remotely, so the
+ *  script's own quotes/newlines/heredocs never meet a shell parser. */
+export function buildScriptCommand(source: string, interp: string | null, os: string, shell: Shell): string {
+  if (!interp) return source;                       // native to the target shell
+  const b64 = Buffer.from(source, "utf8").toString("base64");
+  // PowerShell target: decode in-process, pipe the text to the interpreter's stdin
+  if (os === "windows" && shell !== "wsl" && shell !== "bash")
+    return `[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${b64}')) | & ${interp} -`;
+  // bash target (linux/mac/wsl): decode with base64(1), pipe to stdin
+  return `printf %s '${b64}' | base64 -d | ${interp} -`;
+}
+
+export interface ScriptSource { source: string; ext: string; label: string }
+
+/** Read a script from a local path, or from stdin when `path` is "-". */
+export async function readScriptSource(path: string): Promise<ScriptSource> {
+  if (path === "-") {
+    const source = await new Response(Bun.stdin.stream()).text();
+    if (!source.trim()) throw new Error("fleet: --script - got empty stdin");
+    return { source, ext: "", label: "<stdin>" };
+  }
+  const file = Bun.file(path);
+  if (!(await file.exists())) throw new Error(`fleet: script not found: ${path}`);
+  const source = await file.text();
+  const dot = path.lastIndexOf(".");
+  const slash = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
+  return { source, ext: dot > slash ? path.slice(dot) : "", label: path };
+}
+
+/** Run a local script on every selected host. `interp` overrides the
+ *  extension-derived interpreter; "-" as `path` reads stdin. */
+export async function runScript(
+  cfg: FleetConfig, sel: string, script: ScriptSource,
+  opts: { wsl?: boolean; cwd?: string; timeoutMs?: number; interp?: string } = {},
+): Promise<ExecResult[]> {
+  const hosts = resolveHosts(cfg, sel);
+  const shell: Shell = opts.wsl ? "wsl" : "auto";
+  return Promise.all(hosts.map((h) => {
+    // a WSL target is a linux box wearing a Windows host entry — pick its interpreter as such
+    const os = opts.wsl ? "linux" : h.os;
+    const interp = opts.interp ?? interpreterFor(script.ext, os);
+    const cmd = buildScriptCommand(script.source, interp, os, shell);
+    return exec(h, cmd, shell, { cwd: opts.cwd, timeoutMs: opts.timeoutMs });
+  }));
+}
+
 // ── cp ────────────────────────────────────────────────────────────────────────
 export async function pushFile(
-  cfg: FleetConfig, local: string, sel: string, remote: string, recursive = false,
+  cfg: FleetConfig, local: string | string[], sel: string, remote: string, recursive = false,
 ): Promise<ExecResult[]> {
   const hosts = resolveHosts(cfg, sel);
   return Promise.all(hosts.map((h) => scp(h, local, remote, recursive)));
@@ -164,11 +237,134 @@ export async function pushFile(
 
 /** Pull host:remote → local. Single-host only (one local destination). */
 export async function pullFile(
-  cfg: FleetConfig, sel: string, remote: string, local: string, recursive = false,
+  cfg: FleetConfig, sel: string, remote: string | string[], local: string, recursive = false,
 ): Promise<ExecResult> {
   const hosts = resolveHosts(cfg, sel);
   if (hosts.length !== 1) throw new Error(`pull needs exactly one source host (got ${hosts.length} from '${sel}')`);
   return scpPull(hosts[0]!, remote, local, recursive);
+}
+
+// ── edit ──────────────────────────────────────────────────────────────────────
+// Surgical in-place edit of a remote file. The alternative people reach for is
+// `exec … sed -i`, which differs between GNU and BSD sed, silently succeeds when
+// the pattern doesn't match, and mangles anything with a slash in it. Or it's
+// pull → edit locally → cp back, which re-ships the whole file and clobbers any
+// concurrent remote change. This does neither: read bytes, replace exactly,
+// write back only if the file is still byte-identical to what we read.
+
+/** Read a remote file and return its bytes as UTF-8 text. */
+export async function readRemoteFile(host: Host, path: string, shell: Shell = "auto"): Promise<{ text: string; b64: string }> {
+  const win = host.os === "windows" && shell !== "wsl" && shell !== "bash";
+  const cmd = win
+    ? `[Convert]::ToBase64String([IO.File]::ReadAllBytes('${psEsc(path)}'))`
+    : `base64 < '${bashEsc(path)}' | tr -d '\\n'`;
+  const r = await exec(host, cmd, shell);
+  if (!r.ok) throw new Error(`${host.name}: cannot read ${path}: ${r.stderr.trim() || "exit " + r.code}`);
+  const b64 = r.stdout.replace(/\s/g, "");
+  const bytes = Buffer.from(b64, "base64");
+  let text: string;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+  } catch {
+    throw new Error(`${host.name}: cannot edit ${path}: file is not valid UTF-8`);
+  }
+  return { text, b64 };
+}
+
+/** Write text to a remote file, but only if it still matches `expectB64` — so a
+ *  change made on the host between our read and our write aborts instead of
+ *  being silently overwritten. */
+export async function writeRemoteFile(
+  host: Host, path: string, text: string, expectB64: string | null, shell: Shell = "auto",
+  deps: { exec?: typeof exec } = {},
+): Promise<ExecResult> {
+  const win = host.os === "windows" && shell !== "wsl" && shell !== "bash";
+  const next = Buffer.from(text, "utf8").toString("base64");
+  const expectHash = expectB64 === null ? null
+    : createHash("sha256").update(Buffer.from(expectB64, "base64")).digest("hex");
+  const cmd = win
+    ? [
+        `$p = '${psEsc(path)}'`,
+        ...(expectHash === null ? [] : [
+          `$cur = (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToLowerInvariant()`,
+          `if ($cur -ne '${expectHash}') { Write-Error 'fleet: ${psEsc(path)} changed on the host since it was read — aborting'; exit 3 }`,
+        ]),
+        `[IO.File]::WriteAllBytes($p, [Convert]::FromBase64String('${next}'))`,
+      ].join("\n")
+    : [
+        `set -e`,
+        `p='${bashEsc(path)}'`,
+        `[ ! -L "$p" ] || { echo 'fleet: refusing to replace symlink '"$p" 1>&2; exit 4; }`,
+        ...(expectB64 === null ? [] : [
+          `cur=$(base64 < "$p" | tr -d '\\n')`,
+          `[ "$cur" = '${expectB64}' ] || { echo 'fleet: '"$p"' changed on the host since it was read — aborting' 1>&2; exit 3; }`,
+        ]),
+        // Copy metadata to a sibling temp before replacing the contents. The
+        // final rename stays atomic without dropping executable bits/ownership.
+        `tmp="$p.fleet-tmp.$$"`,
+        `trap 'rm -f -- "$tmp"' EXIT HUP INT TERM`,
+        `cp -p -- "$p" "$tmp"`,
+        `printf %s '${next}' | base64 -d > "$tmp"`,
+        `mv -- "$tmp" "$p"`,
+        `trap - EXIT HUP INT TERM`,
+      ].join("\n");
+  return (deps.exec ?? exec)(host, cmd, shell);
+}
+
+export interface EditResult {
+  host: string; ok: boolean; path: string;
+  replacements: number;
+  diff: string;
+  error?: string;
+}
+
+/** Unified-ish diff of just the changed regions, with `ctx` lines of context. */
+export function diffLines(before: string, after: string, ctx = 2): string {
+  const a = before.split("\n"), b = after.split("\n");
+  // changed span = first and last line index where the two differ
+  let lo = 0;
+  while (lo < a.length && lo < b.length && a[lo] === b[lo]) lo++;
+  let ea = a.length - 1, eb = b.length - 1;
+  while (ea >= lo && eb >= lo && a[ea] === b[eb]) { ea--; eb--; }
+  if (lo > ea && lo > eb) return "";
+  const out: string[] = [];
+  for (let i = Math.max(0, lo - ctx); i < lo; i++) out.push(`  ${i + 1} ${a[i]}`);
+  for (let i = lo; i <= ea; i++) out.push(`- ${i + 1} ${a[i]}`);
+  for (let i = lo; i <= eb; i++) out.push(`+ ${i + 1} ${b[i]}`);
+  for (let i = ea + 1; i <= Math.min(a.length - 1, ea + ctx); i++) out.push(`  ${i + 1} ${a[i]}`);
+  return out.join("\n");
+}
+
+/** Replace `oldStr` with `newStr` in a remote file on every selected host.
+ *  Fails loudly on zero matches, and on multiple matches unless `all` is set —
+ *  a silent no-op is the exact failure mode this command exists to prevent. */
+export async function editRemoteFile(
+  cfg: FleetConfig, sel: string, path: string, oldStr: string, newStr: string,
+  opts: { wsl?: boolean; all?: boolean; dryRun?: boolean } = {},
+): Promise<EditResult[]> {
+  if (!oldStr) throw new Error("fleet edit: --old cannot be empty");
+  const hosts = resolveHosts(cfg, sel);
+  const shell: Shell = opts.wsl ? "wsl" : "auto";
+  return Promise.all(hosts.map(async (h): Promise<EditResult> => {
+    const base = { host: h.name, path, replacements: 0, diff: "" };
+    try {
+      const { text, b64 } = await readRemoteFile(h, path, shell);
+      const n = text.split(oldStr).length - 1;
+      if (n === 0) return { ...base, ok: false, error: `--old not found in ${path}` };
+      if (n > 1 && !opts.all)
+        return { ...base, ok: false, error: `--old matches ${n} times in ${path} — pass --all to replace every one, or extend --old until it is unique` };
+      const next = opts.all ? text.split(oldStr).join(newStr) : text.replace(oldStr, newStr);
+      // Remote edits commonly target env/config files. Unchanged neighbors can
+      // contain credentials, so show only the lines that will change.
+      const diff = diffLines(text, next, 0);
+      if (opts.dryRun) return { ...base, ok: true, replacements: n, diff };
+      const w = await writeRemoteFile(h, path, next, b64, shell);
+      if (!w.ok) return { ...base, ok: false, error: w.stderr.trim() || `write failed (exit ${w.code})` };
+      return { ...base, ok: true, replacements: n, diff };
+    } catch (e) {
+      return { ...base, ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  }));
 }
 
 /** Split a `sel:path` token into its selector and remote path, but only if the
@@ -193,33 +389,74 @@ export function parseRemoteSpec(cfg: FleetConfig, token: string): { sel: string;
 export interface DeployResult {
   host: string; ok: boolean; dir: string; result: ExecResult; restarted?: ServiceAction[];
 }
+export interface DeploySourceOptions {
+  explicit?: string;
+  embeddedRoot?: string;
+  cwd?: string;
+}
+async function isFleetSourceRoot(root: string): Promise<boolean> {
+  if (root.includes("$bunfs")) return false;
+  return await Bun.file(join(root, "package.json")).exists()
+    && await Bun.file(join(root, "src", "cli.ts")).exists();
+}
+/** Resolve a real source checkout for deploy. Compiled binaries execute from
+ *  Bun's virtual /$bunfs tree, which cannot be passed to the system tar binary. */
+export async function resolveDeploySourceRoot(opts: DeploySourceOptions = {}): Promise<string> {
+  const explicit = opts.explicit ?? process.env.FLEET_SOURCE_ROOT;
+  if (explicit) {
+    if (await isFleetSourceRoot(explicit)) return explicit;
+    throw new Error(`FLEET_SOURCE_ROOT is not a fleet source checkout: ${explicit}`);
+  }
+  const candidates = [...new Set([opts.embeddedRoot ?? REPO_ROOT, opts.cwd ?? process.cwd()])];
+  for (const candidate of candidates)
+    if (await isFleetSourceRoot(candidate)) return candidate;
+  throw new Error(
+    "fleet deploy needs a source checkout; set FLEET_SOURCE_ROOT when running a compiled binary",
+  );
+}
 /** The remote install dir (literal shell expression, expanded on the host). */
 function deployDir(h: Host): string {
   return h.deploy?.dir ?? (h.os === "windows" ? "$env:USERPROFILE\\fleet" : "$HOME/fleet");
 }
-function deployScript(h: Host): { cmd: string; shell: Shell } {
+export function deployScript(h: Host): { cmd: string; shell: Shell } {
   const dir = deployDir(h);
   if (h.os === "windows") return { shell: "powershell", cmd: [
     `$ErrorActionPreference='Stop'`,
     h.deploy?.bun ? `$bun='${h.deploy.bun}'`
       : `$bun=(Get-Command bun -EA SilentlyContinue).Source; if(-not $bun){$bun="$env:USERPROFILE\\.bun\\bin\\bun.exe"}`,
     `$dir="${dir}"`,
+    `try {`,
     `New-Item -ItemType Directory -Force -Path $dir | Out-Null`,
     `tar -xzf "$env:USERPROFILE\\fleet-deploy.tgz" -C $dir`,
+    `if($LASTEXITCODE -ne 0){throw "tar extraction failed with exit $LASTEXITCODE"}`,
     `Set-Location $dir`,
     `& $bun install 2>&1 | Out-Null`,
-    `Remove-Item "$env:USERPROFILE\\fleet-deploy.tgz" -Force -EA SilentlyContinue`,
+    `if($LASTEXITCODE -ne 0){throw "bun install failed with exit $LASTEXITCODE"}`,
+    `$shim="$env:USERPROFILE\\.local\\bin"`,
+    `New-Item -ItemType Directory -Force -Path $shim | Out-Null`,
+    `$shimText = '@echo off' + [Environment]::NewLine + '"' + $bun + '" "' + $dir + '\\src\\cli.ts" %*'`,
+    `Set-Content -Path "$shim\\fleet.cmd" -Value $shimText -Encoding ascii`,
+    `$resolved=(Get-Command fleet -EA SilentlyContinue).Source`,
+    `if(-not $resolved -or [IO.Path]::GetFullPath($resolved) -ne [IO.Path]::GetFullPath("$shim\\fleet.cmd")){throw "deployed Fleet is shadowed by '$resolved'; put $shim first on PATH"}`,
     `"deployed to $dir (bun: $bun)"`,
+    `} finally {`,
+    `Remove-Item "$env:USERPROFILE\\fleet-deploy.tgz" -Force -EA SilentlyContinue`,
+    `}`,
   ].join("\n") };
   return { shell: "bash", cmd: [
     `set -e`,
+    `trap 'rm -f "$HOME/fleet-deploy.tgz"' EXIT`,
     h.deploy?.bun ? `bun='${h.deploy.bun}'` : `bun="$(command -v bun || echo "$HOME/.bun/bin/bun")"`,
     `dir="${dir}"`,
     `mkdir -p "$dir"`,
     `tar -xzf "$HOME/fleet-deploy.tgz" -C "$dir"`,
     `cd "$dir"`,
     `"$bun" install >/dev/null 2>&1`,
-    `rm -f "$HOME/fleet-deploy.tgz"`,
+    `mkdir -p "$HOME/.local/bin"`,
+    `cat > "$HOME/.local/bin/fleet" <<LAUNCHER\n#!/bin/sh\nexec "$bun" "$dir/src/cli.ts" "\\$@"\nLAUNCHER`,
+    `chmod 755 "$HOME/.local/bin/fleet"`,
+    `resolved="$(command -v fleet || true)"`,
+    `if [ "$resolved" != "$HOME/.local/bin/fleet" ]; then echo "deployed Fleet is shadowed by '$resolved'; put $HOME/.local/bin first on PATH" >&2; exit 1; fi`,
     `echo "deployed to $dir (bun: $bun)"`,
   ].join("\n") };
 }
@@ -237,7 +474,7 @@ async function deployOne(cfg: FleetConfig, h: Host, tarLocal: string, restart: b
   const result = await exec(h, cmd, shell);
   if (!result.ok) return { host: h.name, ok: false, dir: deployDir(h), result };
   const svc = deployRestartName(h, restart);
-  const restarted = svc && h.services?.[svc] ? await restartService(cfg, h.name, svc) : undefined;
+  const restarted = svc ? await restartService(cfg, h.name, svc) : undefined;
   return { host: h.name, ok: restarted ? restarted.every((a) => a.result.ok) : true, dir: deployDir(h), result, restarted };
 }
 /** Build a tarball of the fleet source on the controller, ship it to each host
@@ -247,13 +484,22 @@ export async function deployHosts(
   cfg: FleetConfig, sel: string, opts: { restart?: boolean | string } = {},
 ): Promise<DeployResult[]> {
   const hosts = resolveHosts(cfg, sel);
+  for (const host of hosts) {
+    const service = deployRestartName(host, opts.restart ?? true);
+    if (service && !host.services?.[service])
+      throw new Error(`cannot deploy ${host.name}: restart service '${service}' is not configured (available: ${Object.keys(host.services ?? {}).join(", ") || "none"})`);
+  }
+  const sourceRoot = await resolveDeploySourceRoot();
   const tar = join(tmpdir(), `fleet-deploy-${Date.now()}.tgz`);
-  const build = Bun.spawn(
-    ["tar", "czf", tar, "-C", REPO_ROOT, "--exclude", "node_modules", "--exclude", ".git", "--exclude", "dist", "."],
-    { env: { ...process.env, COPYFILE_DISABLE: "1" }, stdout: "ignore", stderr: "pipe" });
-  if (await build.exited !== 0)
-    throw new Error("tarball build failed: " + (await new Response(build.stderr).text()).trim());
   try {
+    const build = Bun.spawn(
+      ["tar", "czf", tar, "-C", sourceRoot, "--exclude", "node_modules", "--exclude", ".git", "--exclude", "dist", "."],
+      { env: { ...process.env, COPYFILE_DISABLE: "1" }, stdout: "ignore", stderr: "pipe" });
+    const [buildCode, buildError] = await Promise.all([
+      build.exited,
+      new Response(build.stderr).text(),
+    ]);
+    if (buildCode !== 0) throw new Error("tarball build failed: " + buildError.trim());
     return await Promise.all(hosts.map((h) => deployOne(cfg, h, tar, opts.restart ?? true)));
   } finally {
     await Bun.spawn(["rm", "-f", tar]).exited;
@@ -321,16 +567,21 @@ function getMachine(cfg: FleetConfig, name: string): Machine {
 
 /** Probe every boot of a machine — all boots and both transports CONCURRENTLY.
  *  Boots are mutually exclusive, so at most one is live; first by config order wins. */
-export async function bootState(cfg: FleetConfig, machine: string): Promise<BootState> {
+export async function bootState(
+  cfg: FleetConfig,
+  machine: string,
+  deps: { probe?: (host: Host) => Promise<boolean> } = {},
+): Promise<BootState> {
   const m = getMachine(cfg, machine);
+  const probeHost = deps.probe ?? probe;
   const probed = await Promise.all(Object.entries(m.boots).map(async ([os, b]) => {
     // LAN first: when a box answers on both, the local path is the one we want —
-    // Tailscale can hairpin out of the network and back for no benefit.
+    // Tailscale can hairpin out of the house and back for no benefit.
     const transports = ([["lan", b.lan], ["ts", b.host]] as const).filter(([, n]) => !!n);
     const hits = await Promise.all(transports.map(async ([t, name]) => {
       const h = cfg.hosts[name!];
       if (!h) throw new Error(`machine ${machine} boot ${os} references unknown host '${name}'`);
-      return { t, ok: await probe(h) };
+      return { t, ok: await probeHost(h) };
     }));
     const hit = hits.find((r) => r.ok) ?? null;     // prefer LAN (listed first)
     const via = hit?.t ?? null;
@@ -351,39 +602,77 @@ export async function bootState(cfg: FleetConfig, machine: string): Promise<Boot
 
 /** Resolve a machine name to its currently-live boot's host entry. Plain host
  *  names pass through unchanged. Used to auto-route exec at a logical name. */
-export async function resolveLiveHost(cfg: FleetConfig, name: string): Promise<string> {
+export async function resolveLiveHost(
+  cfg: FleetConfig,
+  name: string,
+  deps: { probe?: (host: Host) => Promise<boolean> } = {},
+): Promise<string> {
   if (cfg.hosts[name]) return name;
-  const st = await bootState(cfg, name);
+  const st = await bootState(cfg, name, deps);
   if (!st.liveHost) throw new Error(`machine ${name} is not reachable in any boot (it may be powered off)`);
   return st.liveHost;
 }
 
-async function resolveLiveHostOrSelf(cfg: FleetConfig, name: string): Promise<string> {
+async function resolveLiveHostOrSelf(
+  cfg: FleetConfig,
+  name: string,
+  probeHost?: (host: Host) => Promise<boolean>,
+): Promise<string> {
   if (cfg.hosts[name]) return name;
-  if (cfg.routes?.[name]) return routeSelector(cfg, name);
-  try { return await resolveLiveHost(cfg, name); } catch { return name; }
+  if (cfg.routes?.[name]) return routeSelector(cfg, name, { probe: probeHost });
+  try { return await resolveLiveHost(cfg, name, { probe: probeHost }); } catch { return name; }
 }
 
-/** Resolve a single bare logical route or dual-boot machine name to a concrete
- *  host entry. A route probes transports in configured priority order and
- *  chooses one BEFORE dispatch; callers never retry a command on another route. */
+/** Resolve logical routes or dual-boot machine names anywhere in a selector.
+ *  Independent comma tokens resolve concurrently; each route still probes its
+ *  transports sequentially and chooses one BEFORE dispatch. Commands are never
+ *  retried on another route after dispatch. */
 export async function routeSelector(
   cfg: FleetConfig,
   sel: string,
   deps: { probe?: (host: Host) => Promise<boolean> } = {},
 ): Promise<string> {
-  if (sel.includes(",") || sel.startsWith("@") || cfg.hosts[sel]) return sel;
-  const route = cfg.routes?.[sel];
-  if (route) {
-    const probeHost = deps.probe ?? probe;
-    for (const name of route.prefer) {
-      const host = cfg.hosts[name];
-      if (host && await probeHost(host)) return name;
-    }
-    throw new Error(`route ${sel} is not reachable (tried: ${route.prefer.join(", ")})`);
-  }
-  if (!cfg.machines?.[sel]) return sel;
-  return resolveLiveHost(cfg, sel);
+  const probeHost = deps.probe ?? probe;
+  const cache = new Map<string, Promise<string>>();
+  const resolveToken = (token: string): Promise<string> => {
+    const cached = cache.get(token);
+    if (cached) return cached;
+    const pending = (async () => {
+      if (token.startsWith("@") || token === "all" || token === "*" || token.startsWith("dt:") || cfg.hosts[token])
+        return token;
+      const route = cfg.routes?.[token];
+      if (route) {
+        for (const name of route.prefer) {
+          const host = cfg.hosts[name];
+          if (host && await probeHost(host)) return name;
+        }
+        throw new Error(`route ${token} is not reachable (tried: ${route.prefer.join(", ")})`);
+      }
+      if (!cfg.machines?.[token]) return token;
+      return resolveLiveHost(cfg, token, { probe: probeHost });
+    })();
+    cache.set(token, pending);
+    return pending;
+  };
+  const tokens = sel.split(",").map((token) => token.trim()).filter(Boolean);
+  return (await Promise.all(tokens.map(resolveToken))).join(",");
+}
+
+async function probePort(hostname: string, port: number, timeoutMs: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = createConnection({ host: hostname, port });
+    let settled = false;
+    const done = (ok: boolean) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve(ok);
+    };
+    socket.setTimeout(timeoutMs);
+    socket.once("connect", () => done(true));
+    socket.once("timeout", () => done(false));
+    socket.once("error", () => done(false));
+  });
 }
 
 export interface SwitchResult {
@@ -423,32 +712,39 @@ export interface WaitCond {
   timeoutMs?: number; intervalMs?: number; onTick?: (detail: string, ms: number) => void;
 }
 
-async function probeOnce(cfg: FleetConfig, target: string, c: WaitCond): Promise<{ ok: boolean; detail: string }> {
+async function probeOnce(
+  cfg: FleetConfig,
+  target: string,
+  c: WaitCond,
+  remainingMs: number,
+): Promise<{ ok: boolean; detail: string }> {
+  const deadlineAt = Date.now() + remainingMs;
+  const timeLeft = () => Math.max(1, deadlineAt - Date.now());
+  const boundedProbe = (host: Host) => probe(host, timeLeft());
   if (c.boot) {
-    const st = await bootState(cfg, target);
+    const st = await bootState(cfg, target, { probe: boundedProbe });
     return { ok: st.live === c.boot, detail: `live=${st.live ?? "off"}` };
   }
   if (c.http) {
     try {
-      const res = await fetch(c.http, { redirect: "manual", signal: AbortSignal.timeout(8000) });
+      const res = await fetch(c.http, {
+        redirect: "manual",
+        signal: AbortSignal.timeout(Math.min(8000, timeLeft())),
+      });
       return { ok: res.status === (c.status ?? 200), detail: `http ${res.status}` };
     } catch { return { ok: false, detail: "http err" }; }
   }
   if (c.port != null) {
-    const name = await resolveLiveHostOrSelf(cfg, target);
+    const name = await resolveLiveHostOrSelf(cfg, target, boundedProbe);
     const addr = cfg.hosts[name]?.ssh ?? target;
-    try {
-      const sock = await Bun.connect({ hostname: addr, port: c.port,
-        socket: { open: (s) => { s.end(); }, data() {}, close() {}, error() {} } });
-      void sock;
-      return { ok: true, detail: `:${c.port} open` };
-    } catch { return { ok: false, detail: `:${c.port} closed` }; }
+    const open = await probePort(addr, c.port, timeLeft());
+    return { ok: open, detail: `:${c.port} ${open ? "open" : "closed"}` };
   }
-  const name = await resolveLiveHostOrSelf(cfg, target);
+  const name = await resolveLiveHostOrSelf(cfg, target, boundedProbe);
   const h = cfg.hosts[name];
   if (!h) return { ok: false, detail: "no host" };
-  const r = await exec(h, "echo ok");
-  return { ok: r.ok && r.stdout.includes("ok"), detail: r.ok ? "ssh up" : "ssh down" };
+  const up = await boundedProbe(h);
+  return { ok: up, detail: up ? "ssh up" : "ssh down" };
 }
 
 export async function waitFor(cfg: FleetConfig, target: string, c: WaitCond): Promise<WaitResult> {
@@ -456,7 +752,8 @@ export async function waitFor(cfg: FleetConfig, target: string, c: WaitCond): Pr
   const start = Date.now(); let attempts = 0, lastDetail = "";
   while (Date.now() - start < timeoutMs) {
     attempts++;
-    const { ok, detail } = await probeOnce(cfg, target, c);
+    const remaining = Math.max(1, timeoutMs - (Date.now() - start));
+    const { ok, detail } = await probeOnce(cfg, target, c, remaining);
     lastDetail = detail;
     const elapsed = Date.now() - start;
     c.onTick?.(detail, elapsed);
@@ -710,15 +1007,29 @@ const IMG_SENTINEL = "__FLEET_IMG__";
 /** Build the piped/quoted `<bin> <args>` invocation for one cua-driver call.
  *  A JSON positional arg is piped via stdin (Windows PowerShell 5.1 strips the
  *  quotes around field names on native-command args; piping preserves them). */
-function cuInvocation(args: string[], os: Host["os"], invoke: string, extra = ""): string {
-  const jsonArg = args.find((a) => /^\s*[[{]/.test(a));
+function cuInvocation(args: string[], os: Host["os"], invoke: string, outVar = ""): string {
+  let jsonArg = args.find((a) => /^\s*[[{]/.test(a));
   const flags = args.filter((a) => a !== jsonArg).map((a) => shellQuote(a, os)).join(" ");
+  if (outVar) {
+    // cua-driver ≥0.22 takes the capture path as the `screenshot_out_file` JSON
+    // input (the old --screenshot-out-file flag is gone). Splice the shell
+    // variable into the JSON at run time so $TMPDIR-style paths expand.
+    const base = (jsonArg ?? "{}").trim();
+    const prefix = base.replace(/\}\s*$/, "");
+    const comma = prefix.trimEnd().endsWith("{") ? "" : ",";
+    if (os === "windows") {
+      const pre = `'${(prefix + comma).replace(/'/g, "''")}"screenshot_out_file":"'`;
+      return `((${pre} + ($${outVar} -replace '\\\\','\\\\') + '"}')) | ${invoke} ${flags}`;
+    }
+    const pre = `'${(prefix + comma).replace(/'/g, "'\\''")}"screenshot_out_file":"'`;
+    return `printf '%s' ${pre}"$${outVar}"'"}' | ${invoke} ${flags}`;
+  }
   const pipe = jsonArg
     ? (os === "windows"
       ? `'${jsonArg.replace(/'/g, "''")}' | `
       : `printf '%s' '${jsonArg.replace(/'/g, "'\\''")}' | `)
     : "";
-  return `${pipe}${invoke} ${flags}${extra}`;
+  return `${pipe}${invoke} ${flags}`;
 }
 
 /** Run `cua-driver <args>` on a host. If `imageOut` is set, the call is given
@@ -727,14 +1038,16 @@ function cuInvocation(args: string[], os: Host["os"], invoke: string, extra = ""
  *  surfaced via the returned ExecResult — never masked by a pull/scp error. */
 export async function cuRun(
   cfg: FleetConfig, sel: string, args: string[], imageOut?: string,
+  deps: { exec?: typeof exec } = {},
 ): Promise<CuResult> {
   const host = resolveHosts(cfg, sel)[0]!;
   const win = host.os === "windows";
   const { prelude, invoke } = cuaBin(host.os);
   const shell: Shell = win ? "powershell" : "bash";
+  const runExec = deps.exec ?? exec;
 
   if (!imageOut) {
-    const result = await exec(host, `${prelude}\n${cuInvocation(args, host.os, invoke)}`, shell);
+    const result = await runExec(host, `${prelude}\n${cuInvocation(args, host.os, invoke)}`, shell);
     return { host: host.name, result };
   }
 
@@ -743,13 +1056,18 @@ export async function cuRun(
   const cmd = win
     ? [prelude,
        `$out = Join-Path $env:TEMP ('cua_' + [guid]::NewGuid().ToString('N') + '.png')`,
-       `${cuInvocation(args, host.os, invoke, ` --screenshot-out-file $out`)} 2>&1 | Write-Output`,
-       `if (Test-Path $out) { Write-Output ('${IMG_SENTINEL}' + $out) }`].join("\n")
+       `$driverOutput = @(${cuInvocation(args, host.os, invoke, "out")} 2>&1); $driverSucceeded = $?; $driverCode = $LASTEXITCODE`,
+       `$driverOutput | Write-Output`,
+       `if (Test-Path $out) { Write-Output ('${IMG_SENTINEL}' + $out) }`,
+       `if (-not $driverSucceeded) { if ($null -ne $driverCode -and $driverCode -ne 0) { exit $driverCode }; exit 1 }`,
+       `if ($null -ne $driverCode -and $driverCode -ne 0) { exit $driverCode }`].join("\n")
     : [prelude,
-       `t="$(mktemp -t cua_shot)"; out="$t.png"; rm -f "$t" "$out"`,
-       `${cuInvocation(args, host.os, invoke, ` --screenshot-out-file "$out"`)} 2>&1`,
-       `if [ -f "$out" ]; then echo "${IMG_SENTINEL}$out"; fi`].join("\n");
-  const raw = await exec(host, cmd, shell);
+       `out="${"${TMPDIR:-/tmp}"}/cua_shot_$$_$RANDOM.png"; rm -f "$out"`,
+       `${cuInvocation(args, host.os, invoke, "out")} 2>&1`,
+       `driver_code=$?`,
+       `if [ -f "$out" ]; then echo "${IMG_SENTINEL}$out"; fi`,
+       `exit "$driver_code"`].join("\n");
+  const raw = await runExec(host, cmd, shell);
 
   // split the sentinel out of the displayed output
   const lines = raw.stdout.split("\n");
@@ -767,6 +1085,180 @@ export async function cuRun(
   if (!pull.ok) return { host: host.name,
     result: { ...result, ok: false, stderr: `${result.stderr}\nimage pull failed: ${pull.stderr}`.trim() } };
   return { host: host.name, result, localImage: path };
+}
+
+/** Self-documenting cua-driver tool list, with an optional case-insensitive
+ * substring filter over its line-oriented output. */
+export async function cuTools(
+  cfg: FleetConfig, sel: string, filter?: string,
+  deps: { run?: typeof cuRun } = {},
+): Promise<CuResult> {
+  const run = deps.run ?? cuRun;
+  const response = await run(cfg, sel, ["list-tools"]);
+  if (!filter || !response.result.ok) return response;
+  const needle = filter.toLowerCase();
+  return {
+    ...response,
+    result: {
+      ...response.result,
+      stdout: response.result.stdout.split("\n")
+        .filter((line) => line.toLowerCase().includes(needle))
+        .join("\n"),
+    },
+  };
+}
+
+/** Describe one cua-driver tool using the same binary-resolution and quoting
+ * path as raw `fleet cu` calls. */
+export async function cuDescribe(
+  cfg: FleetConfig, sel: string, tool: string,
+  deps: { run?: typeof cuRun } = {},
+): Promise<CuResult> {
+  return (deps.run ?? cuRun)(cfg, sel, ["describe", tool]);
+}
+
+export interface CdpTarget {
+  id?: string;
+  title?: string;
+  type?: string;
+  url?: string;
+  webSocketDebuggerUrl?: string;
+  [key: string]: unknown;
+}
+export interface BrowseResult {
+  host: string;
+  endpoint: string;
+  version: Record<string, unknown>;
+  targets: CdpTarget[];
+}
+
+/** Resolve and verify a host's configured CDP endpoint. If `url` is present,
+ * ask Chromium to open it before returning the current target list. */
+export async function browseHost(
+  cfg: FleetConfig,
+  sel: string,
+  url?: string,
+  deps: { fetch?: (input: string, init?: RequestInit) => Promise<Response>; timeoutMs?: number } = {},
+): Promise<BrowseResult> {
+  const host = resolveHosts(cfg, sel)[0]!;
+  if (!host.cdp) throw new Error(
+    `host ${host.name} has no CDP endpoint; add \"cdp\": \"http://host:port\" to hosts.${host.name} in fleet.config.json`,
+  );
+  const endpoint = host.cdp.replace(/\/+$/, "");
+  const request = deps.fetch ?? fetch;
+  const readJson = async (path: string, init?: RequestInit): Promise<unknown> => {
+    let response: Response;
+    const signal = init?.signal ?? AbortSignal.timeout(deps.timeoutMs ?? 10_000);
+    try { response = await request(`${endpoint}${path}`, { ...init, signal }); }
+    catch (error) {
+      throw new Error(`CDP endpoint ${endpoint} did not answer ${path}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (!response.ok) throw new Error(`CDP endpoint ${endpoint} returned HTTP ${response.status} for ${path}`);
+    try { return await response.json(); }
+    catch { throw new Error(`CDP endpoint ${endpoint} returned invalid JSON for ${path}`); }
+  };
+
+  const version = await readJson("/json/version") as Record<string, unknown>;
+  if (url) await readJson(`/json/new?${encodeURIComponent(url)}`, { method: "PUT" });
+  const targets = await readJson("/json/list");
+  if (!Array.isArray(targets)) throw new Error(`CDP endpoint ${endpoint} returned a non-array target list`);
+  return { host: host.name, endpoint, version, targets: targets as CdpTarget[] };
+}
+
+export interface CuRecordingState {
+  enabled: boolean;
+  output_dir: string | null;
+  next_turn?: number;
+  last_error?: string | null;
+  last_video_path?: string | null;
+  recording?: boolean;
+  video_active?: boolean;
+  [key: string]: unknown;
+}
+export interface CuRecordingStatus extends CuResult { state?: CuRecordingState; }
+export interface CuRecordingStart extends CuRecordingStatus { remoteDir: string; }
+export interface CuRecordingStop extends CuRecordingStatus {
+  stateBefore?: CuRecordingState;
+  pull?: ExecResult;
+  localPaths: string[];
+}
+
+function parseRecordingState(result: ExecResult): CuRecordingState | undefined {
+  if (!result.ok) return undefined;
+  const value = extractJson(result.stdout);
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    throw new Error("cua-driver returned an invalid recording state");
+  return value as CuRecordingState;
+}
+
+function defaultRecordingDir(now = new Date()): string {
+  const stamp = now.toISOString().replace(/[:.]/g, "-");
+  return `~/.fleet/recordings/${stamp}`;
+}
+
+export async function cuRecordStatus(
+  cfg: FleetConfig, sel: string,
+  deps: { run?: typeof cuRun } = {},
+): Promise<CuRecordingStatus> {
+  const response = await (deps.run ?? cuRun)(cfg, sel, ["get_recording_state"]);
+  return { ...response, state: parseRecordingState(response.result) };
+}
+
+/** Start a persistent trajectory recording. The one-shot `start_recording`
+ * tool belongs to its CLI transport and auto-stops when that process exits.
+ * cua-driver's `recording start` sub-API creates the same recorder without a
+ * transport owner, so a later Fleet invocation can inspect and stop it. */
+export async function cuRecordStart(
+  cfg: FleetConfig, sel: string, remoteDir = defaultRecordingDir(),
+  deps: { run?: typeof cuRun } = {},
+): Promise<CuRecordingStart> {
+  const run = deps.run ?? cuRun;
+  const started = await run(cfg, sel, ["recording", "start", remoteDir]);
+  if (!started.result.ok) return { ...started, remoteDir };
+  const response = await run(cfg, sel, ["get_recording_state"]);
+  return { ...response, remoteDir, state: parseRecordingState(response.result) };
+}
+
+async function localFiles(root: string): Promise<string[]> {
+  const files: string[] = [];
+  const walk = async (dir: string): Promise<void> => {
+    for (const entry of await readdir(dir, { withFileTypes: true })) {
+      const path = join(dir, entry.name);
+      if (entry.isDirectory()) await walk(path);
+      else files.push(path);
+    }
+  };
+  await walk(root);
+  return files.sort();
+}
+
+/** Stop the active recorder. When `localOut` is present, capture the remote
+ * output directory before stop resets state, then pull the directory contents
+ * with Fleet's normal scp path. */
+export async function cuRecordStop(
+  cfg: FleetConfig,
+  sel: string,
+  localOut?: string,
+  deps: {
+    run?: typeof cuRun;
+    pull?: typeof pullFile;
+    makeDir?: (path: string) => Promise<unknown>;
+    listLocalFiles?: typeof localFiles;
+  } = {},
+): Promise<CuRecordingStop> {
+  const run = deps.run ?? cuRun;
+  const beforeResponse = await run(cfg, sel, ["get_recording_state"]);
+  const stateBefore = parseRecordingState(beforeResponse.result);
+  const response = await run(cfg, sel, ["stop_recording", "{}"]);
+  const state = parseRecordingState(response.result);
+  if (!response.result.ok || !localOut) return { ...response, state, stateBefore, localPaths: [] };
+  if (!stateBefore?.output_dir) throw new Error("cua-driver has no recording output directory to pull");
+
+  await (deps.makeDir ?? (async (path) => { await mkdir(path, { recursive: true }); }))(localOut);
+  const pull = await (deps.pull ?? pullFile)(cfg, sel, `${stateBefore.output_dir}/.`, localOut, true);
+  if (!pull.ok) throw new Error(`could not pull recording from ${response.host}: ${pull.stderr || `scp exit ${pull.code}`}`);
+  const localPaths = await (deps.listLocalFiles ?? localFiles)(localOut);
+  return { ...response, state, stateBefore, pull, localPaths: localPaths.length ? localPaths : [localOut] };
 }
 
 // ── computer-use conveniences (item 3: cut the list→list→build-JSON loop) ─────
@@ -851,8 +1343,8 @@ export async function cuShotWindow(
     `if (-not $w) { Write-Error "pid $tpid ($tname) has no capturable windows"; exit 3 }`,
     // capture to temp; keep stdout clean, surface cua errors only on failure
     `$out = Join-Path $env:TEMP ('cua_' + [guid]::NewGuid().ToString('N') + '.png')`,
-    `$payload = '{"pid":' + $tpid + ',"window_id":' + $w.window_id + ',"capture_mode":"vision"}'`,
-    `$err = ($payload | ${invoke} get_window_state --screenshot-out-file $out 2>&1)`,
+    `$payload = '{"pid":' + $tpid + ',"window_id":' + $w.window_id + ',"capture_mode":"vision","screenshot_out_file":"' + ($out -replace '\\\\','\\\\') + '"}'`,
+    `$err = ($payload | ${invoke} get_window_state 2>&1)`,
     `if (Test-Path $out) { Write-Output ('${IMG_SENTINEL}' + $out + '|' + $tpid + '|' + $w.window_id + '|' + $tname + '|' + $w.title) }`,
     `else { Write-Output $err; exit 4 }`,
   ].join("\n");
@@ -1103,44 +1595,109 @@ export interface RecipeHooks {
   onStepDone?: (sr: StepResult) => void;
 }
 
-/** Execute one recipe step. Recipes support the mutating subcommands only. */
-async function runStep(cfg: FleetConfig, step: string): Promise<StepResult> {
+export type ParsedRecipeStep =
+  | { kind: "exec"; selector: string; command: string; wsl: boolean; cwd?: string; timeoutMs?: number }
+  | { kind: "restart"; selector: string; service: string }
+  | { kind: "cp"; local: string; selector: string; remote: string; recursive: boolean }
+  | { kind: "logs"; selector: string; service: string; lines: number };
+
+function recipeNumber(value: string | true | undefined, flag: string, fallback: number, min: number): number {
+  if (value === undefined) return fallback;
+  const parsed = Number(value);
+  if (value === true || !Number.isFinite(parsed) || parsed < min)
+    throw new Error(`${flag} needs a number ≥ ${min} (got '${value}')`);
+  return Math.floor(parsed);
+}
+
+/** Parse Fleet-owned flags only before the selector. The rest of an exec step is
+ *  command payload and flag-looking tokens remain payload, including
+ *  --wsl/--json/--raw/--cwd. */
+export function parseRecipeStep(cfg: FleetConfig, step: string): ParsedRecipeStep {
   const toks = splitArgs(step);
   const sub = toks[0];
-  const rest = toks.slice(1);
-  let results: ExecResult[];
+  const args = toks.slice(1);
   switch (sub) {
     case "exec": {
-      const wsl = pullFlag(rest, "--wsl");
-      pullFlag(rest, "--json"); pullFlag(rest, "--raw");   // irrelevant inside a recipe
-      const sel = rest.shift();
-      const cmd = rest.join(" ");
-      if (!sel || !cmd) throw new Error(`recipe step needs 'exec <sel> <cmd>': ${step}`);
-      results = await runExec(cfg, sel, cmd, { wsl });
-      break;
+      const { flags, rest } = parseLeadingFlags(
+        args, ["--wsl", "--json", "--raw"], ["--cwd", "--timeout"],
+      );
+      const [selector, ...commandTokens] = rest;
+      const command = commandTokens.join(" ");
+      if (!selector || !command) throw new Error(`recipe step needs 'exec [flags] <sel> <cmd>': ${step}`);
+      const cwdValue = flags["--cwd"];
+      if (cwdValue === true || cwdValue === "")
+        throw new Error(`recipe exec --cwd needs a directory: ${step}`);
+      const timeoutS = recipeNumber(flags["--timeout"], "--timeout", 0, 0);
+      return {
+        kind: "exec",
+        selector,
+        command,
+        wsl: flags["--wsl"] === true,
+        ...(typeof cwdValue === "string" ? { cwd: cwdValue } : {}),
+        ...(timeoutS > 0 ? { timeoutMs: timeoutS * 1000 } : {}),
+      };
     }
     case "restart": {
-      const [sel, svc] = rest;
-      if (!sel || !svc) throw new Error(`recipe step needs 'restart <host> <svc>': ${step}`);
-      results = (await restartService(cfg, sel, svc)).map((a) => a.result);
-      break;
+      const [selector, service, ...extra] = args;
+      if (!selector || !service || extra.length)
+        throw new Error(`recipe step needs 'restart <host> <svc>': ${step}`);
+      return { kind: "restart", selector, service };
     }
     case "cp": {
-      const [local, target] = rest;
-      if (!local || !target || !target.includes(":")) throw new Error(`recipe step needs 'cp <local> <sel>:<remote>': ${step}`);
-      const ci = target.indexOf(":");
-      results = await pushFile(cfg, local, target.slice(0, ci), target.slice(ci + 1));
-      break;
+      const { flags, rest } = parseLeadingFlags(args, ["-r", "--recursive"], []);
+      const [local, target, ...extra] = rest;
+      const remote = target ? parseRemoteSpec(cfg, target) : null;
+      if (!local || !remote || extra.length)
+        throw new Error(`recipe step needs 'cp [-r] <local> <sel>:<remote>': ${step}`);
+      return {
+        kind: "cp",
+        local,
+        selector: remote.sel,
+        remote: remote.path,
+        recursive: flags["-r"] === true || flags["--recursive"] === true,
+      };
     }
     case "logs": {
-      const n = parseInt(pullVal(rest, "-n") ?? "30", 10);
-      const [sel, svc] = rest;
-      if (!sel || !svc) throw new Error(`recipe step needs 'logs <host> <svc>': ${step}`);
-      results = (await serviceLogs(cfg, sel, svc, n)).map((a) => a.result);
-      break;
+      const { flags, rest } = parseLeadingFlags(args, [], ["-n"]);
+      const [selector, service, ...extra] = rest;
+      if (!selector || !service || extra.length)
+        throw new Error(`recipe step needs 'logs [-n N] <host> <svc>': ${step}`);
+      return { kind: "logs", selector, service, lines: recipeNumber(flags["-n"], "-n", 30, 1) };
     }
     default:
       throw new Error(`recipe step uses unsupported subcommand '${sub ?? ""}': ${step} (recipes support exec/restart/cp/logs)`);
+  }
+}
+
+/** Execute one recipe step. Recipes support the mutating subcommands only. */
+async function runStep(cfg: FleetConfig, step: string): Promise<StepResult> {
+  const parsed = parseRecipeStep(cfg, step);
+  let results: ExecResult[];
+  switch (parsed.kind) {
+    case "exec": {
+      const selector = await routeSelector(cfg, parsed.selector);
+      results = await runExec(cfg, selector, parsed.command, {
+        wsl: parsed.wsl,
+        cwd: parsed.cwd,
+        timeoutMs: parsed.timeoutMs,
+      });
+      break;
+    }
+    case "restart": {
+      const selector = await routeSelector(cfg, parsed.selector);
+      results = (await restartService(cfg, selector, parsed.service)).map((a) => a.result);
+      break;
+    }
+    case "cp": {
+      const selector = await routeSelector(cfg, parsed.selector);
+      results = await pushFile(cfg, parsed.local, selector, parsed.remote, parsed.recursive);
+      break;
+    }
+    case "logs": {
+      const selector = await routeSelector(cfg, parsed.selector);
+      results = (await serviceLogs(cfg, selector, parsed.service, parsed.lines)).map((a) => a.result);
+      break;
+    }
   }
   return { step, results, ok: results.every((r) => r.ok) };
 }

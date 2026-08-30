@@ -9,8 +9,8 @@ const cfg: FleetConfig = {
   hosts: {
     vps: host("vps", "linux"),
     oracle: host("oracle", "linux"),
-    "win-box": host("win-box", "windows", true),
-    "win-lan": host("win-lan", "windows"),
+    maints: host("maints", "windows", true),
+    main: host("main", "windows"),
     mac: host("mac", "mac"),
     gpubox: host("gpubox", "linux", true),
   },
@@ -46,12 +46,12 @@ describe("resolveHosts", () => {
 
   test("@linux / @windows / @mac filter by os", () => {
     expect(names("@linux").sort()).toEqual(["gpubox", "oracle", "vps"]);
-    expect(names("@windows").sort()).toEqual(["win-box", "win-lan"]);
+    expect(names("@windows").sort()).toEqual(["main", "maints"]);
     expect(names("@mac")).toEqual(["mac"]);
   });
 
   test("@gpu filters by the gpu flag", () =>
-    expect(names("@gpu").sort()).toEqual(["gpubox", "win-box"]));
+    expect(names("@gpu").sort()).toEqual(["gpubox", "maints"]));
 
   test("custom group expands", () => expect(names("@cloud")).toEqual(["vps", "oracle"]));
 
@@ -59,9 +59,9 @@ describe("resolveHosts", () => {
     expect(() => resolveHosts(cfg, "@whatever")).toThrow(/unknown group @whatever/));
 
   test("comma-mix dedupes and preserves first-seen order", () =>
-    // oracle, then @cloud adds vps (oracle dup), then @gpu adds win-box+gpubox
-    // in host-declaration order — win-box is declared before gpubox.
-    expect(names("oracle,@cloud,vps,@gpu")).toEqual(["oracle", "vps", "win-box", "gpubox"]));
+    // oracle, then @cloud adds vps (oracle dup), then @gpu adds maints+gpubox
+    // in host-declaration order — maints is declared before gpubox.
+    expect(names("oracle,@cloud,vps,@gpu")).toEqual(["oracle", "vps", "maints", "gpubox"]));
 
   test("whitespace around comma tokens is tolerated", () =>
     expect(names(" vps , oracle ")).toEqual(["vps", "oracle"]));
@@ -78,6 +78,12 @@ describe("validateConfig", () => {
   test("a minimal valid config passes", () =>
     expect(() => validateConfig(base(), "t")).not.toThrow());
 
+  test("a JSON Schema comment passes", () => {
+    const cfg = base();
+    cfg.$comment = "copy this example before use";
+    expect(() => validateConfig(cfg, "t")).not.toThrow();
+  });
+
   test("empty hosts fails", () =>
     expect(() => validateConfig({ hosts: {} } as FleetConfig, "t")).toThrow(/hosts/));
 
@@ -85,6 +91,11 @@ describe("validateConfig", () => {
     const cfg = base();
     (cfg.hosts.vps as any).os = "plan9";
     expect(() => validateConfig(cfg, "t")).toThrow(/hosts\.vps.*plan9/);
+  });
+
+  test("ssh aliases cannot be parsed as local ssh options", () => {
+    const bad = { hosts: { unsafe: { name: "unsafe", ssh: "-oProxyCommand=touch /tmp/x", os: "linux" } } } as FleetConfig;
+    expect(() => validateConfig(bad, "test.json")).toThrow(/hosts\.unsafe\.ssh must not begin/);
   });
 
   test("invalid configured Windows shell fails at load", () => {
@@ -97,6 +108,39 @@ describe("validateConfig", () => {
     const cfg = base();
     cfg.hosts.vps!.services = { web: { type: "initd" as any, name: "web" } };
     expect(() => validateConfig(cfg, "t")).toThrow(/services\.web/);
+  });
+
+  test("cdp accepts absolute HTTP endpoints and rejects other values", () => {
+    const ok = base();
+    ok.hosts.vps!.cdp = "http://100.91.226.87:9223";
+    expect(() => validateConfig(ok, "t")).not.toThrow();
+
+    const bad = base();
+    bad.hosts.vps!.cdp = "localhost:9223";
+    expect(() => validateConfig(bad, "t")).toThrow(/hosts\.vps\.cdp.*http/);
+  });
+
+  test("dashboard and health require absolute HTTP endpoints", () => {
+    const badDashboard = base();
+    badDashboard.dashboard = "dashboard.local";
+    expect(() => validateConfig(badDashboard, "t")).toThrow(/dashboard must be an absolute http/);
+
+    const badHealth = base();
+    badHealth.hosts.vps!.health = "file:///tmp/alive";
+    expect(() => validateConfig(badHealth, "t")).toThrow(/hosts\.vps\.health must be an absolute http/);
+  });
+
+  test("service types must match the host OS", () => {
+    const windowsSystemd = base();
+    windowsSystemd.hosts.win = {
+      ...host("win", "windows"),
+      services: { bad: { type: "systemd", name: "bad" } },
+    };
+    expect(() => validateConfig(windowsSystemd, "t")).toThrow(/systemd requires a linux host/);
+
+    const linuxWinService = base();
+    linuxWinService.hosts.vps!.services = { bad: { type: "winservice", name: "bad" } };
+    expect(() => validateConfig(linuxWinService, "t")).toThrow(/winservice requires a windows host/);
   });
 
   test("group with unknown member fails at load", () => {
@@ -147,5 +191,46 @@ describe("validateConfig", () => {
     const cfg = base();
     cfg.recipes = { r: [{ bad: true }] as any };
     expect(() => validateConfig(cfg, "t")).toThrow(/recipes\.r/);
+  });
+
+  test("unknown top-level, host, and nested fields fail instead of becoming no-ops", () => {
+    expect(() => validateConfig({ ...base(), typo: true } as any, "t")).toThrow(/unknown field.*typo/);
+    const badHost = base();
+    (badHost.hosts.vps as any).loadout = true;
+    expect(() => validateConfig(badHost, "t")).toThrow(/hosts\.vps.*loadout/);
+    const badService = base();
+    badService.hosts.vps!.services = { web: { type: "systemd", name: "web", typo: 1 } as any };
+    expect(() => validateConfig(badService, "t")).toThrow(/services\.web.*typo/);
+  });
+
+  test("tools registry: root is required, fields are typed, typos are loud", () => {
+    const ok = base();
+    ok.tools = { tg: { root: "~/Development/tg", hosts: "oracle", exclude: ["fixtures"] } };
+    expect(() => validateConfig(ok, "t")).not.toThrow();
+
+    const noRoot = base();
+    noRoot.tools = { tg: { hosts: "oracle" } as any };
+    expect(() => validateConfig(noRoot, "t")).toThrow(/tools\.tg.*root/);
+
+    const typo = base();
+    typo.tools = { tg: { root: "~/x", host: "oracle" } as any };
+    expect(() => validateConfig(typo, "t")).toThrow(/tools\.tg.*'host'/);
+
+    const badExclude = base();
+    badExclude.tools = { tg: { root: "~/x", exclude: "fixtures" } as any };
+    expect(() => validateConfig(badExclude, "t")).toThrow(/tools\.tg\.exclude must be an array/);
+  });
+
+  test("null optional containers fail with their exact path", () => {
+    const bad = base();
+    bad.groups = null as any;
+    expect(() => validateConfig(bad, "t")).toThrow(/groups must be an object/);
+  });
+
+  test("deploy service must exist on that host", () => {
+    const bad = {
+      hosts: { app: { name: "app", ssh: "app", os: "linux", services: {}, deploy: { service: "typo" } } },
+    } as FleetConfig;
+    expect(() => validateConfig(bad, "test.json")).toThrow(/deploy\.service: unknown service 'typo'/);
   });
 });

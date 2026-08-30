@@ -454,7 +454,7 @@ git-ignored `fleet.config.local.json` if you don't want hosts in git.
 
 ## Why
 The `ssh → PowerShell → wsl bash` path with nested quoting is a recurring pain.
-`fleet` encapsulates it once — a base64/EncodedCommand round-trip generalised to
+`fleet` encapsulates it once through stdin-based shell transport, generalised to
 every machine, so no command has to survive multiple layers of quoting.
 
 ## Stack

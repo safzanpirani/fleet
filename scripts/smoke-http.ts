@@ -5,7 +5,7 @@
  * Streamable-HTTP MCP session (tools/list + fleet_status).
  *
  *   bun run scripts/smoke-http.ts            # full control
- *   FLEET_MCP_READONLY=1 bun run scripts/smoke-http.ts   # expect 4 read tools only
+ *   FLEET_MCP_READONLY=1 bun run scripts/smoke-http.ts   # expect read/probe tools only
  */
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -40,8 +40,8 @@ try {
   if (!ready) throw new Error("server did not become ready on /health");
 
   // 1. health
-  const health = await (await fetch(`${BASE}/health`)).json();
-  check("GET /health ok", health.ok === true && health.hosts > 0, JSON.stringify(health));
+  const health = await (await fetch(`${BASE}/health`)).json() as { ok?: unknown; hosts?: number };
+  check("GET /health ok", health.ok === true && typeof health.hosts === "number" && health.hosts > 0, JSON.stringify(health));
 
   // 2. 401 without a token
   const noAuth = await fetch(`${BASE}/mcp`, {
@@ -68,8 +68,19 @@ try {
   console.log("  tools:", names.join(", "));
   check("tools/list non-empty", tools.length > 0);
   const hasMutating = names.includes("fleet_exec");
-  if (READONLY) check("read-only: no fleet_exec", !hasMutating, names.length + " tools");
-  else check("full: fleet_exec present", hasMutating, names.length + " tools");
+  if (READONLY) {
+    check("read-only: no fleet_exec", !hasMutating, names.length + " tools");
+    check("read-only: bounded waits remain", names.includes("fleet_wait") && names.includes("fleet_job_wait"));
+    check("read-only: diagnostics remain", names.includes("fleet_dt") && names.includes("fleet_doctor"));
+    check("read-only: destructive parity tools hidden",
+      !names.includes("fleet_deploy") && !names.includes("fleet_jobs_prune") && !names.includes("fleet_pull"));
+  } else {
+    check("full: fleet_exec present", hasMutating, names.length + " tools");
+    check("full: parity tools present",
+      ["fleet_dt", "fleet_doctor", "fleet_wait", "fleet_job_wait", "fleet_pull",
+        "fleet_jobs_prune", "fleet_deploy", "fleet_cu_screenshot_window"]
+        .every((name) => names.includes(name)));
+  }
 
   const res = await client.callTool({ name: "fleet_status", arguments: {} });
   const t = (res.content as any[]).map((c) => c.text ?? "").join("\n");

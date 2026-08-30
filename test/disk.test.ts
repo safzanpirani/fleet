@@ -78,7 +78,7 @@ describe("parseDisk — unix", () => {
   });
 
   test("btrfs subvolumes on one device collapse to a single row", () => {
-    // A Linux host can report /, /home, /var/log … all as one block device.
+    // server-pc really does report /, /home, /var/log … all as /dev/sda5.
     const out = [
       "/dev/sda5 108505600 79267840 27676672 75% /",
       "/dev/sda5 108505600 79267840 27676672 75% /home",

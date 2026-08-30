@@ -13,11 +13,13 @@
     "mcp": "bun run src/mcp.ts",
     "serve": "bun run src/http.ts",
     "test": "bun test",
-    "typecheck": "tsgo --noEmit"
+    "typecheck": "tsc --noEmit",
+    "check": "bun run typecheck && bun test",
+    "build:linux": "bun build --compile --target=bun-linux-x64 src/cli.ts --outfile dist/fleet-linux-x64",
+    "build:local": "bun build --compile src/cli.ts --outfile dist/fleet-local"
   },
   "devDependencies": {
     "@types/bun": "latest",
-    "@typescript/native-preview": "^7.0.0-dev.20260623.1",
     "typescript": "^5"
   },
   "dependencies": {
