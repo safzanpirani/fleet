@@ -12,6 +12,7 @@ import {
   resolveTool,
   serializeToolSyncResults,
   shippedFiles,
+  skillDestinations,
   stampSkill,
   syncTools,
   toolDir,
@@ -596,6 +597,16 @@ describe("toolDir", () => {
   });
   test("explicit dir wins on every OS", () => {
     expect(toolDir({ name: "tg", dir: "/opt/tg" }, host("oracle", "linux"))).toBe("/opt/tg");
+  });
+});
+
+describe("skillDestinations", () => {
+  test("installs paired skills for every supported agent on POSIX", async () => {
+    expect(await skillDestinations(host("oracle", "linux"), "fleet")).toEqual([
+      ".claude/skills/fleet/SKILL.md",
+      ".agents/skills/fleet/SKILL.md",
+      ".openclaw/skills/fleet/SKILL.md",
+    ]);
   });
 });
 

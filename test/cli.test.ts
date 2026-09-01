@@ -81,6 +81,33 @@ describe("machine-readable CLI output", () => {
     }
   });
 
+  test("spawn rejects Fleet flags after the selector", async () => {
+    const { root, config } = fixture();
+    try {
+      const result = await runCli(["spawn", "local", "--cwd", "/tmp", "echo ok"], config);
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain("must come BEFORE the host selector");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("tools status rejects an unknown tool when a selector follows it", async () => {
+    const { root, config } = fixture();
+    try {
+      writeFileSync(config, JSON.stringify({
+        hosts: { local: { ssh: "local", os: "linux" } },
+        tools: { demo: { root } },
+      }));
+      const result = await runCli(["tools", "status", "deja", "local"], config);
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain("unknown tool 'deja'");
+      expect(result.stderr).toContain("demo");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("wait --json keeps progress off stdout", async () => {
     const { root, config } = fixture();
     const server = Bun.serve({ port: 0, fetch: () => new Response("ok") });

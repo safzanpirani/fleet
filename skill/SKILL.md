@@ -27,8 +27,9 @@ fleet exec win-box "nvidia-smi"
 
 | Command | Use |
 |---|---|
-| `fleet exec <sel> "<cmd>" [--cwd dir] [--wsl] [--raw] [--json]` | Run a command on host(s), **blocking** (returns exit code). `--cwd` runs in a dir and fails fast (exit 127) if it's missing; `--wsl` runs inside WSL on Windows boxes; `--raw` prints only remote stdout. |
-| `fleet spawn <sel> "<cmd>" [--cwd dir] [--json]` | Launch a **detached** job that outlives the SSH session → returns a `host:id`. Fire-and-track (vs `exec`, which blocks). **Linux/mac only** for now; Windows errors with a clear stub message. |
+| `fleet exec [--cwd dir] [--wsl] [--raw] [--json] <sel> "<cmd>"` | Run a command on host(s), **blocking** (returns exit code). `--cwd` expands a leading `~` and fails fast (exit 127) if the directory is missing. `--wsl` runs inside WSL on Windows boxes. `--raw` prints only remote stdout. |
+| `fleet exec --script <file\|-> [--interp cmd] <sel>` | Run a local script file or stdin on host(s). Fleet infers file extensions and supported stdin shebangs. Untyped stdin requires `--interp`. |
+| `fleet spawn [--cwd dir] [--json] <sel> "<cmd>"` | Launch a detached job that outlives the SSH session and returns a `host:id`. |
 | `fleet jobs [<sel>]` | List detached jobs across the fleet (running ● / exited ○ / dead ✗). |
 | `fleet jobs log <host:id>` | Full captured output of a job. |
 | `fleet jobs tail <host:id> [-n N] [-f]` | Last N lines; `-f` streams live (foreground until Ctrl-C). |
@@ -36,6 +37,7 @@ fleet exec win-box "nvidia-smi"
 | `fleet jobs kill <host:id>` | TERM the whole job process-group. |
 | `fleet jobs prune [<sel>] [--all]` | Remove finished job spools (`--all` also drops dead ones; never touches running). |
 | `fleet cp <local> <sel>:<remote>` | Copy a file to host(s); fan-out across a group. |
+| `fleet edit <sel>:<path> --old S --new S` | Edit a remote file in place, reject ambiguous matches, and print the diff. |
 | `fleet shot <host> [--out f] [--grid] [--no-open]` | Screenshot the remote desktop → local image (webp default; `--grid` overlays a coord ruler). Alias: `fleet screenshot`. |
 | `fleet cu <host> <args…> [--out f.png]` | Computer-use via [cua-driver](https://github.com/trycua/cua): `install`, or pass a tool + JSON (`click`, `type_text`, `get_window_state`…). |
 | `fleet restart <host> <service>` | Restart a **configured** service (see config). |
@@ -46,6 +48,7 @@ fleet exec win-box "nvidia-smi"
 | `fleet status [host] [--json]` | Live stats pulled from the dashboard API. |
 | `fleet top <host>` | Live terminal btop for one host (interactive; runs until Ctrl-C). |
 | `fleet run <recipe>` | Run a saved playbook from config (stops on first failure). |
+| `fleet tools status [tool] [sel]` | Report stale CLI and skill installations. Use `tools sync` to ship source, a launcher, and paired skills. |
 | `fleet ssh <host>` | Interactive shell. |
 
 ## Prefer the LAN entry over the Tailscale one
@@ -69,6 +72,7 @@ Anywhere `<sel>` appears: a hostname, logical route, group, `all`, Daytona
 ## Critical rules
 
 - **Don't escape commands.** `fleet exec vps 'echo "a & b | c"'` round-trips verbatim.
+- **Put Fleet flags before the selector.** Fleet rejects misplaced `spawn` flags instead of sending them to the remote shell.
 - **Command syntax is the target's native shell**: bash for Linux hosts, **PowerShell**
   for Windows hosts. So `fleet exec all "uptime"` works on Linux but fails on Windows
   (no native `uptime`). For cross-OS, pick portable commands or scope by group
@@ -78,6 +82,9 @@ Anywhere `<sel>` appears: a hostname, logical route, group, `all`, Daytona
 - `fleet top` is a foreground live loop — only run it interactively, never to capture
   one-shot output (use `fleet status <host>` for that).
 - A non-zero exit on any host makes `exec`/`cp` exit non-zero (good for scripting).
+- **Use `--script` for stdin programs and quote-heavy PowerShell.** Fleet accepts a supported shebang or an explicit `--interp`. It rejects untyped stdin.
+- **Use real newlines with `fleet edit`.** The CLI preserves argument bytes and does not translate the characters `\\n`. A leading `~` in Unix edit paths expands safely.
+- **Sync paired skills to every agent root.** `fleet tools sync` installs `SKILL.md` under `~/.claude/skills`, `~/.agents/skills`, and `~/.openclaw/skills`.
 - **Windows shell:** fleet uses a host's configured `winShell` (`pwsh` or `powershell`)
   without an extra discovery round-trip. When omitted, it auto-prefers **PowerShell 7
   (`pwsh`)** and falls back to Windows PowerShell 5.1. Override every host with
@@ -102,15 +109,13 @@ harness-backgrounded SSH session open for it.
 - **State lives on the host, not the controller**: a per-host spool `~/.fleet/jobs/<id>/`
   (`cmd`, `cwd`, `pid`, `out`, `exit`). Every `jobs` verb is a thin read over the same
   quoting-proof `exec`. Jobs are addressed as **`host:id`** (e.g. `gpu-box:mqtn19dk-96px`).
-- **Linux/mac** launch via `setsid` (no privilege, survives disconnect).
-- **Windows `spawn` is NOT yet implemented** — it needs Task Scheduler / a transient
-  service with an *interactive* token so the job can see the GPU/OpenCL (session-0
-  non-interactive tasks can't). It errors with that exact message until wired; don't
-  promise Windows background jobs yet.
+- **Linux** uses `setsid`, **macOS** uses `nohup`, and **Windows** uses an interactive Scheduled Task.
+- Linux runners carry an ownership marker. The marker keeps a live job visible when its child process changes the runner command line.
+- `jobs wait` retries brief SSH failures and spool-visibility delays. Three consecutive failures stop the waiter with the underlying error.
 - `wait --until '<regex>'` returns as soon as output matches (e.g. detect an autotune /
   "Recovered.*1/1" marker) — beats `sleep`-and-hope. Plain `wait` blocks until exit and
   propagates the job's code, so `fleet jobs wait gpu-box:<id> && deploy` works.
-- Typical flow: `fleet spawn gpu-box "./train.sh" --cwd /srv/app` → `fleet jobs` to find it
+- Typical flow: `fleet spawn --cwd /srv/app gpu-box "./train.sh"` → `fleet jobs` to find it
   → `fleet jobs tail gpu-box:<id> -f` or `fleet jobs wait gpu-box:<id> --until '<rx>'` →
   `fleet jobs prune` when done. **Not exposed over MCP yet** (CLI-only).
 

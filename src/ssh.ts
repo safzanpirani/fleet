@@ -70,9 +70,22 @@ function b64utf16le(s: string): string {
 // running in the wrong place — the footgun this exists to kill.
 export const bashEsc = (s: string) => s.replace(/'/g, `'\\''`);     // close-quote, escaped-quote, reopen
 export const psEsc = (s: string) => s.replace(/'/g, "''");          // doubled single-quote
+export function bashPathAssignment(variable: string, value: string): string {
+  if (!/^[a-z_][a-z0-9_]*$/i.test(variable)) throw new Error(`invalid shell variable: ${variable}`);
+  const q = bashEsc(value);
+  return [
+    `${variable}='${q}'`,
+    `case "$${variable}" in`,
+    `  '~') ${variable}="$HOME" ;;`,
+    "  '~/'*) " + variable + '="$HOME/${' + variable + '#\\~/}" ;;',
+    `esac`,
+  ].join("\n");
+}
 function withCwdBash(cmd: string, cwd: string): string {
-  const q = bashEsc(cwd);
-  return `cd -- '${q}' || { echo 'fleet: cwd not found: ${q}' 1>&2; exit 127; }\n${cmd}`;
+  return `${bashPathAssignment("fleet_cwd", cwd)}
+cd -- "$fleet_cwd" || { echo "fleet: cwd not found: $fleet_cwd" 1>&2; exit 127; }
+unset fleet_cwd
+${cmd}`;
 }
 function withCwdPwsh(cmd: string, cwd: string): string {
   return `Set-Location -LiteralPath '${psEsc(cwd)}' -ErrorAction Stop\n${cmd}`;

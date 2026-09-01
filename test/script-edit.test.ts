@@ -1,5 +1,6 @@
 import { test, expect, describe } from "bun:test";
-import { interpreterFor, buildScriptCommand, diffLines, readScriptSource } from "../src/core.ts";
+import { interpreterFor, buildScriptCommand, diffLines, extensionFromShebang, readScriptSource, runScript } from "../src/core.ts";
+import type { FleetConfig } from "../src/config.ts";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -88,6 +89,20 @@ describe("readScriptSource", () => {
 
   test("a missing file fails fast", async () => {
     await expect(readScriptSource("/nope/does-not-exist.sh")).rejects.toThrow(/script not found/);
+  });
+});
+
+describe("stdin script language", () => {
+  test("infers common env and direct shebangs", () => {
+    expect(extensionFromShebang("#!/usr/bin/env python3\nprint(1)\n")).toBe(".py");
+    expect(extensionFromShebang("#!/usr/bin/env -S bun run\nconsole.log(1)\n")).toBe(".ts");
+    expect(extensionFromShebang("#!/bin/bash\necho ok\n")).toBe(".sh");
+  });
+
+  test("requires an interpreter for untyped stdin before contacting a host", async () => {
+    const cfg = { hosts: { local: { name: "local", ssh: "local", os: "linux" } } } as FleetConfig;
+    await expect(runScript(cfg, "local", { source: "print(1)\n", ext: "", label: "<stdin>" }))
+      .rejects.toThrow("needs --interp");
   });
 });
 

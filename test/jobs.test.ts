@@ -1,5 +1,5 @@
 import { test, expect, describe, spyOn } from "bun:test";
-import { jobLog, jobTail, killScript, resolveJobRef, parseRows, newId, unixSpawnScript, waitPoll } from "../src/jobs.ts";
+import { jobLog, jobTail, killScript, resolveJobRef, parseRows, newId, unixSpawnScript, waitJob, waitPoll } from "../src/jobs.ts";
 import * as ssh from "../src/ssh.ts";
 import type { FleetConfig, Host } from "../src/config.ts";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -190,6 +190,36 @@ describe("job log and tail", () => {
 });
 
 describe("detached job lifecycle", () => {
+  test("Linux launch stamps an ownership marker for runner command-line changes", () => {
+    const script = unixSpawnScript(host("oracle", "linux"), "owned-job", "true");
+    expect(script).toContain('FLEET_JOB_ID="$id" setsid');
+  });
+
+  test("wait retries transient inspection failures", async () => {
+    const execSpy = spyOn(ssh, "exec")
+      .mockResolvedValueOnce({ host: "oracle", ok: false, code: 255, stdout: "", stderr: "connection reset" })
+      .mockResolvedValueOnce({ host: "oracle", ok: true, code: 0, stdout: "EXIT:0\n", stderr: "" });
+    try {
+      const result = await waitJob(cfg, "oracle:retry-job", undefined, { intervalMs: 1 });
+      expect(result).toMatchObject({ outcome: "exited", code: 0 });
+      expect(execSpy).toHaveBeenCalledTimes(2);
+    } finally {
+      execSpy.mockRestore();
+    }
+  });
+
+  test("wait tolerates brief spool visibility delay", async () => {
+    const execSpy = spyOn(ssh, "exec")
+      .mockResolvedValueOnce({ host: "oracle", ok: true, code: 0, stdout: "MISSING\n", stderr: "" })
+      .mockResolvedValueOnce({ host: "oracle", ok: true, code: 0, stdout: "EXIT:7\n", stderr: "" });
+    try {
+      const result = await waitJob(cfg, "oracle:late-spool", undefined, { intervalMs: 1 });
+      expect(result).toMatchObject({ outcome: "exited", code: 7 });
+    } finally {
+      execSpy.mockRestore();
+    }
+  });
+
   test("macOS launch uses nohup, records the runner pid, and really completes", async () => {
     const home = mkdtempSync(join(tmpdir(), "fleet-job-home-"));
     const mac = host("mac", "mac");

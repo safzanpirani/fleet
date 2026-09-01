@@ -7,7 +7,7 @@
  */
 import { resolveHosts, REPO_ROOT } from "./config.ts";
 import type { FleetConfig, Host, Service, ServiceType, Machine } from "./config.ts";
-import { exec, probe, scp, scpPull, sshDiagnose, bashEsc, psEsc } from "./ssh.ts";
+import { exec, probe, scp, scpPull, sshDiagnose, bashEsc, bashPathAssignment, psEsc } from "./ssh.ts";
 import type { ExecResult, Shell } from "./ssh.ts";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -195,12 +195,29 @@ export function buildScriptCommand(source: string, interp: string | null, os: st
 
 export interface ScriptSource { source: string; ext: string; label: string }
 
+/** Infer a script type from a conventional shebang. This keeps stdin scripts
+ * safe without guessing their language from their contents. */
+export function extensionFromShebang(source: string): string {
+  const first = source.split(/\r?\n/, 1)[0] ?? "";
+  const match = first.match(/^#!\s*(?:\/usr\/bin\/env(?:\s+-S)?\s+)?(?:\S*\/)?([^\s]+)(?:\s|$)/);
+  const bin = match?.[1]?.toLowerCase();
+  if (!bin) return "";
+  if (["sh", "bash", "zsh"].includes(bin)) return ".sh";
+  if (["python", "python3"].includes(bin)) return ".py";
+  if (["pwsh", "powershell"].includes(bin)) return ".ps1";
+  if (bin === "node") return ".js";
+  if (bin === "bun") return ".ts";
+  if (bin === "ruby") return ".rb";
+  if (bin === "perl") return ".pl";
+  return "";
+}
+
 /** Read a script from a local path, or from stdin when `path` is "-". */
 export async function readScriptSource(path: string): Promise<ScriptSource> {
   if (path === "-") {
     const source = await new Response(Bun.stdin.stream()).text();
     if (!source.trim()) throw new Error("fleet: --script - got empty stdin");
-    return { source, ext: "", label: "<stdin>" };
+    return { source, ext: extensionFromShebang(source), label: "<stdin>" };
   }
   const file = Bun.file(path);
   if (!(await file.exists())) throw new Error(`fleet: script not found: ${path}`);
@@ -216,6 +233,8 @@ export async function runScript(
   cfg: FleetConfig, sel: string, script: ScriptSource,
   opts: { wsl?: boolean; cwd?: string; timeoutMs?: number; interp?: string } = {},
 ): Promise<ExecResult[]> {
+  if (script.label === "<stdin>" && !script.ext && !opts.interp)
+    throw new Error("fleet: --script - needs --interp <command> unless stdin starts with a supported shebang");
   const hosts = resolveHosts(cfg, sel);
   const shell: Shell = opts.wsl ? "wsl" : "auto";
   return Promise.all(hosts.map((h) => {
@@ -257,7 +276,8 @@ export async function readRemoteFile(host: Host, path: string, shell: Shell = "a
   const win = host.os === "windows" && shell !== "wsl" && shell !== "bash";
   const cmd = win
     ? `[Convert]::ToBase64String([IO.File]::ReadAllBytes('${psEsc(path)}'))`
-    : `base64 < '${bashEsc(path)}' | tr -d '\\n'`;
+    : `${bashPathAssignment("p", path)}
+base64 < "$p" | tr -d '\\n'`;
   const r = await exec(host, cmd, shell);
   if (!r.ok) throw new Error(`${host.name}: cannot read ${path}: ${r.stderr.trim() || "exit " + r.code}`);
   const b64 = r.stdout.replace(/\s/g, "");
@@ -293,7 +313,7 @@ export async function writeRemoteFile(
       ].join("\n")
     : [
         `set -e`,
-        `p='${bashEsc(path)}'`,
+        bashPathAssignment("p", path),
         `[ ! -L "$p" ] || { echo 'fleet: refusing to replace symlink '"$p" 1>&2; exit 4; }`,
         ...(expectB64 === null ? [] : [
           `cur=$(base64 < "$p" | tr -d '\\n')`,

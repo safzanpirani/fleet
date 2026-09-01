@@ -4,7 +4,7 @@
  *
  * The problem this exists for: a house-style CLI (`fleet`, `tg`, `qb`, `see`…)
  * lives in ~10 places at once — a source tree per box, a launcher on each PATH,
- * a `SKILL.md` under each ~/.claude/skills — and nothing announces when one of
+ * a `SKILL.md` under each agent's skill root — and nothing announces when one of
  * them falls behind. Drift is discovered the hard way, mid-task, on the box
  * where it matters. So: fingerprint the tool on the controller, stamp a manifest
  * on every host at sync time, and let `fleet tools status` diff the two.
@@ -413,8 +413,18 @@ function psSingle(s: string): string {
   return `'${s.replace(/'/g, "''")}'`;
 }
 
+export async function skillDestinations(h: Host, name: string): Promise<string[]> {
+  if (h.os === "windows") {
+    const user = await winUser(h);
+    return [".claude", ".agents", ".openclaw"]
+      .map((root) => `C:/Users/${user}/${root}/skills/${name}/SKILL.md`);
+  }
+  return [".claude", ".agents", ".openclaw"]
+    .map((root) => `${root}/skills/${name}/SKILL.md`);
+}
+
 /** Ship one tool to one host: tarball → extract → `bun install` → launcher →
- *  SKILL.md → manifest. The manifest is written last and only on success, so a
+ *  SKILL.md in every supported agent root → manifest. The manifest is written last and only on success, so a
  *  half-finished sync reports stale rather than falsely claiming to be current. */
 async function syncOne(
   cfg: FleetConfig, spec: ReturnType<typeof resolveTool>, fp: ToolFingerprint,
@@ -427,16 +437,21 @@ async function syncOne(
 
   let skillPushed = false;
   if (opts.skill !== false && fp.skillPath) {
-    const dest = h.os === "windows"
-      ? `C:/Users/${await winUser(h)}/.claude/skills/${spec.name}/SKILL.md`
-      : `.claude/skills/${spec.name}/SKILL.md`;
-    // scp will not create the intermediate skill dir; make it first.
+    const destinations = await skillDestinations(h, spec.name);
+    // scp will not create intermediate skill directories. Create every agent
+    // root first so Claude, Codex, and OpenClaw receive the same instructions.
     const mk = h.os === "windows"
-      ? await exec(h, `New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\\.claude\\skills\\${spec.name}" | Out-Null`, "powershell")
-      : await exec(h, `mkdir -p "$HOME/.claude/skills/${spec.name}"`, "bash");
+      ? await exec(h, [".claude", ".agents", ".openclaw"]
+        .map((root) => `New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\\${root}\\skills\\${spec.name}" | Out-Null`)
+        .join("\n"), "powershell")
+      : await exec(h, [".claude", ".agents", ".openclaw"]
+        .map((root) => `mkdir -p "$HOME/${root}/skills/${spec.name}"`)
+        .join("\n"), "bash");
     if (!mk.ok) return { ...base, ok: false, result: mk, error: `skill dir: ${mk.stderr}` };
-    const sk = await scp(h, fp.skillPath, dest);
-    if (!sk.ok) return { ...base, ok: false, result: sk, error: `skill push: ${sk.stderr}` };
+    for (const dest of destinations) {
+      const sk = await scp(h, fp.skillPath, dest);
+      if (!sk.ok) return { ...base, ok: false, result: sk, error: `skill push to ${dest}: ${sk.stderr}` };
+    }
     skillPushed = true;
   }
 

@@ -283,6 +283,9 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
       const sel = pos.shift();
       const cmd = pos.join(" ");
       if (!sel || !cmd) die("usage: fleet spawn [--cwd dir] [--label name] [--json] <sel> <cmd…>");
+      const misplaced = ["--cwd", "--label", "--json"].includes(pos[0] ?? "") ? pos[0] : undefined;
+      if (misplaced)
+        die("'" + misplaced + "' must come BEFORE the host selector: fleet spawn " + misplaced + " <value> " + sel + " <cmd…>");
       const results = await spawnJob(cfg, await routeSelector(cfg, sel!), cmd, { cwd, label });
       if (json) { console.log(JSON.stringify(results, null, 2)); return results.some((r) => !r.ok) ? 1 : 0; }
       for (const r of results) {
@@ -813,6 +816,8 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
         // `fleet tools status [tool] [sel]` — both optional. A leading arg that
         // names a registered tool selects that tool; anything else is a selector.
         const args = rest.filter((a) => !a.startsWith("-"));
+        if (args.length > 1 && !known.includes(args[0]!))
+          die("unknown tool '" + args[0] + "' in 'fleet tools status <tool> <sel>' (tools: " + known.join(", ") + ")");
         const tools = args[0] && known.includes(args[0]) ? [args.shift()!] : known;
         // No selector → each tool checks its own configured hosts (see toolsStatus).
         const rows = await toolsStatus(cfg, tools, args[0] ? await routeSelector(cfg, args[0]) : undefined);

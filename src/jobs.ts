@@ -55,12 +55,15 @@ const UNIX_OWNED_FN = `
 is_owned() {
   owned_pid="$1"
   owned_runner="$2"
+  owned_id="$(basename "$(dirname "$owned_runner")")"
   [ -n "$owned_pid" ] || return 1
   if [ "$(uname -s)" = "Darwin" ]; then
     ps -p "$owned_pid" -o command= 2>/dev/null | grep -F -- "$owned_runner" >/dev/null
   else
-    [ -r "/proc/$owned_pid/cmdline" ] &&
-      tr '\\0' '\\n' < "/proc/$owned_pid/cmdline" 2>/dev/null | grep -Fqx -- "$owned_runner"
+    { [ -r "/proc/$owned_pid/cmdline" ] &&
+      tr '\\0' '\\n' < "/proc/$owned_pid/cmdline" 2>/dev/null | grep -Fqx -- "$owned_runner"; } ||
+    { [ -r "/proc/$owned_pid/environ" ] &&
+      tr '\\0' '\\n' < "/proc/$owned_pid/environ" 2>/dev/null | grep -Fqx -- "FLEET_JOB_ID=$owned_id"; }
   fi
 }
 `;
@@ -111,7 +114,7 @@ export function unixSpawnScript(host: Host, id: string, cmd: string, cwd?: strin
   const cwdSrc = cwd ? `cwd="$(printf '%s' '${b64(cwd)}' | base64 -d)"` : `cwd=""`;
   const launch = host.os === "mac"
     ? `nohup "$dir/run" < /dev/null > /dev/null 2>&1 &`
-    : `setsid "$dir/run" < /dev/null > /dev/null 2>&1 &`;
+    : "FLEET_JOB_ID=\"$id\" setsid \"$dir/run\" < /dev/null > /dev/null 2>&1 &";
   return [
     `set -e`,
     `id='${id}'`,
@@ -421,6 +424,8 @@ export async function waitJob(cfg: FleetConfig, a: string, b: string | undefined
   const intervalMs = opts.intervalMs ?? 3000;
   const poll = waitPoll(host, id, opts.until);
   const start = Date.now();
+  let inspectionFailures = 0;
+  let missingPolls = 0;
   for (;;) {
     const beforePoll = Date.now() - start;
     if (timeoutMs && beforePoll >= timeoutMs)
@@ -431,17 +436,28 @@ export async function waitJob(cfg: FleetConfig, a: string, b: string | undefined
     if (!r.ok) {
       if (r.code === 124 && timeoutMs)
         return { host: host.name, id, outcome: "timeout", code: null, elapsedMs: elapsed };
-      throw new Error(r.stderr || `failed to inspect job ${id} (exit ${r.code})`);
+      inspectionFailures++;
+      if (inspectionFailures >= 3)
+        throw new Error(r.stderr || `failed to inspect job ${id} after ${inspectionFailures} attempts (exit ${r.code})`);
+      opts.onTick?.(`inspection failed; retrying (${inspectionFailures}/3)`, elapsed);
+    } else {
+      inspectionFailures = 0;
+      if (/^MISSING$/m.test(r.stdout)) {
+        missingPolls++;
+        if (missingPolls >= 3) throw new Error(`no such job: ${id}`);
+        opts.onTick?.(`job spool not visible; retrying (${missingPolls}/3)`, elapsed);
+      } else {
+        missingPolls = 0;
+        const exit = r.stdout.match(/EXIT:(-?\d+)/);
+        if (opts.until && /^MATCH$/m.test(r.stdout))
+          return { host: host.name, id, outcome: "matched", code: exit ? Number(exit[1]) : null, elapsedMs: elapsed };
+        if (exit)
+          return { host: host.name, id, outcome: "exited", code: Number(exit[1]), elapsedMs: elapsed };
+        opts.onTick?.(opts.until ? "waiting for match/exit" : "running", elapsed);
+      }
     }
-    if (/^MISSING$/m.test(r.stdout)) throw new Error(`no such job: ${id}`);
-    const exit = r.stdout.match(/EXIT:(-?\d+)/);
-    if (opts.until && /^MATCH$/m.test(r.stdout))
-      return { host: host.name, id, outcome: "matched", code: exit ? Number(exit[1]) : null, elapsedMs: elapsed };
-    if (exit)
-      return { host: host.name, id, outcome: "exited", code: Number(exit[1]), elapsedMs: elapsed };
     if (timeoutMs && elapsed >= timeoutMs)
       return { host: host.name, id, outcome: "timeout", code: null, elapsedMs: elapsed };
-    opts.onTick?.(opts.until ? "waiting for match/exit" : "running", elapsed);
     const sleepMs = timeoutMs ? Math.min(intervalMs, Math.max(0, timeoutMs - elapsed)) : intervalMs;
     if (sleepMs > 0) await Bun.sleep(sleepMs);
   }

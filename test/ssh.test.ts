@@ -1,5 +1,5 @@
 import { test, expect, describe } from "bun:test";
-import { buildArgs, scpRemotePath } from "../src/ssh.ts";
+import { bashPathAssignment, buildArgs, scpRemotePath } from "../src/ssh.ts";
 import type { Host } from "../src/config.ts";
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -54,15 +54,48 @@ describe("buildArgs — linux (bash over stdin)", () => {
   test("--cwd prepends a fail-fast cd, still only via stdin", () => {
     const { args, stdin } = buildArgs(linux, "ls", "bash", "powershell", "/srv/app");
     const script = new TextDecoder().decode(stdin!);
-    expect(script).toContain("cd -- '/srv/app'");
+    expect(script).toContain("fleet_cwd='/srv/app'");
+    expect(script).toContain('cd -- "$fleet_cwd"');
     expect(script).toContain("exit 127");                     // missing dir fails fast
     expect(script.endsWith("ls\n")).toBe(true);
     expect(args.join(" ")).not.toContain("/srv/app");
   });
 
+  test("--cwd expands a leading home shorthand after safe assignment", () => {
+    const built = buildArgs(linux, "pwd", "auto", "powershell", "~/app");
+    const script = new TextDecoder().decode(built.stdin!);
+    expect(script).toContain(`fleet_cwd='~/app'`);
+    expect(script).toContain('fleet_cwd="$HOME/${fleet_cwd#\\~/}"');
+    expect(script).toContain('cd -- "$fleet_cwd"');
+  });
+
   test("single quotes in cwd are escaped", () => {
     const { stdin } = buildArgs(linux, "ls", "bash", "powershell", "/srv/o'brien");
-    expect(new TextDecoder().decode(stdin!)).toContain(`cd -- '/srv/o'\\''brien'`);
+    expect(new TextDecoder().decode(stdin!)).toContain(`fleet_cwd='/srv/o'\\''brien'`);
+  });
+});
+
+describe("bashPathAssignment", () => {
+  test("expands only a leading tilde and preserves quoted path bytes", () => {
+    const script = bashPathAssignment("p", "~/a b/'c");
+    expect(script).toContain(`p='~/a b/'\\''c'`);
+    expect(script).toContain('p="$HOME/${p#\\~/}"');
+  });
+
+  test("the generated shell expands home shorthand", async () => {
+    const proc = Bun.spawn(["bash"], {
+      env: { ...process.env, HOME: "/tmp/fleet-home" },
+      stdin: new TextEncoder().encode(bashPathAssignment("p", "~/app") + '\nprintf "%s\\n" "$p"\n'),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, code] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    expect(code, stderr).toBe(0);
+    expect(stdout).toBe("/tmp/fleet-home/app\n");
   });
 });
 
