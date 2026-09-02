@@ -68,6 +68,18 @@ function numVal(rest: string[], flag: string, def: number, min = 1): number {
   if (!Number.isFinite(n) || n < min) die(`${flag} needs a number ≥ ${min} (got '${v}')`);
   return Math.floor(n);
 }
+/** A fleet flag written after the command — as its last token, or as the
+ *  second-to-last token when the flag takes a value — was almost certainly meant
+ *  for fleet, not the remote shell. Return it so the caller can refuse. */
+export function trailingFleetFlag(pos: string[], bools: string[], valued: string[]): string | undefined {
+  if (pos.length < 2) return undefined;
+  const last = pos[pos.length - 1]!;
+  if (bools.includes(last) || valued.includes(last)) return last;
+  const beforeLast = pos.length >= 3 ? pos[pos.length - 2]! : "";
+  if (valued.includes(beforeLast) && !last.startsWith("--")) return beforeLast;
+  return undefined;
+}
+
 /** Same strictness as numVal, but over a parseLeadingFlags result. */
 function numFlag(flags: Record<string, string | true>, flag: string, def: number, min = 1): number {
   const v = flags[flag];
@@ -266,6 +278,9 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
         die(`there is no --shell flag; use --wsl, and put it BEFORE the host: fleet exec --wsl ${sel} <cmd…>`);
       if (strayFlag && ["--json", "--wsl", "--raw", "--cwd", "--timeout", "--script", "--interp"].includes(strayFlag))
         die(`'${strayFlag}' must come BEFORE the host selector: fleet exec ${strayFlag} ${sel} <cmd…>`);
+      const trailing = trailingFleetFlag(pos, ["--json", "--wsl", "--raw"], ["--cwd", "--timeout", "--script", "--interp"]);
+      if (trailing)
+        die(`'${trailing}' must come BEFORE the host selector: fleet exec ${trailing} ${sel} <cmd…>  (quote the whole command if it really ends in ${trailing})`);
       // a bare machine name (dual-boot box) auto-routes to whichever boot is live
       const target = await routeSelector(cfg, sel!);
       const results = await runExec(cfg, target, cmd, { wsl, cwd, timeoutMs: timeout * 1000 || undefined });
@@ -283,9 +298,12 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
       const sel = pos.shift();
       const cmd = pos.join(" ");
       if (!sel || !cmd) die("usage: fleet spawn [--cwd dir] [--label name] [--json] <sel> <cmd…>");
-      const misplaced = ["--cwd", "--label", "--json"].includes(pos[0] ?? "") ? pos[0] : undefined;
+      const misplaced = ["--cwd", "--label", "--json", "--name"].includes(pos[0] ?? "") ? pos[0]
+        : trailingFleetFlag(pos, ["--json"], ["--cwd", "--label", "--name"]);
+      if (misplaced === "--name")
+        die("there is no --name flag; use --label, and put it BEFORE the host: fleet spawn --label <name> " + sel + " <cmd…>");
       if (misplaced)
-        die("'" + misplaced + "' must come BEFORE the host selector: fleet spawn " + misplaced + " <value> " + sel + " <cmd…>");
+        die("'" + misplaced + "' must come BEFORE the host selector: fleet spawn " + misplaced + " <value> " + sel + " <cmd…>  (quote the whole command if it really ends in " + misplaced + ")");
       const results = await spawnJob(cfg, await routeSelector(cfg, sel!), cmd, { cwd, label });
       if (json) { console.log(JSON.stringify(results, null, 2)); return results.some((r) => !r.ok) ? 1 : 0; }
       for (const r of results) {

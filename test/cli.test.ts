@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { completionScript } from "../src/cli.ts";
+import { completionScript, trailingFleetFlag } from "../src/cli.ts";
 import type { FleetConfig } from "../src/config.ts";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -213,4 +213,20 @@ test("completion data cannot execute config-key command substitutions", async ()
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+describe("trailingFleetFlag", () => {
+  const bools = ["--json", "--wsl", "--raw"];
+  const valued = ["--cwd", "--timeout"];
+  test("catches a fleet flag written after the command", () => {
+    expect(trailingFleetFlag(["echo x", "--json"], bools, valued)).toBe("--json");
+    expect(trailingFleetFlag(["echo", "hi", "--timeout", "5"], bools, valued)).toBe("--timeout");
+    expect(trailingFleetFlag(["echo", "hi", "--cwd"], bools, valued)).toBe("--cwd");
+  });
+  test("leaves a quoted command and remote flags alone", () => {
+    expect(trailingFleetFlag(["gh pr list --json number"], bools, valued)).toBeUndefined();
+    expect(trailingFleetFlag(["gh", "pr", "list", "--json", "number"], bools, valued)).toBeUndefined();
+    expect(trailingFleetFlag(["--json"], bools, valued)).toBeUndefined();
+    expect(trailingFleetFlag(["curl", "--retry", "3"], bools, valued)).toBeUndefined();
+  });
 });

@@ -251,7 +251,20 @@ export async function pushFile(
   cfg: FleetConfig, local: string | string[], sel: string, remote: string, recursive = false,
 ): Promise<ExecResult[]> {
   const hosts = resolveHosts(cfg, sel);
-  return Promise.all(hosts.map((h) => scp(h, local, remote, recursive)));
+  // scp needs the destination directory to exist. A trailing slash states the
+  // intent unambiguously, so create it instead of failing with "No such file".
+  const wantsDir = /[\\/]$/.test(remote) && remote.length > 1;
+  return Promise.all(hosts.map(async (h) => {
+    if (wantsDir && h.transport !== "daytona") {
+      const mk = h.os === "windows"
+        ? `New-Item -ItemType Directory -Force -LiteralPath '${psEsc(remote)}' | Out-Null`
+        : `${bashPathAssignment("d", remote)}
+mkdir -p -- "$d"`;
+      const r = await exec(h, mk, "auto");
+      if (!r.ok) return { ...r, stderr: `could not create destination directory ${remote}: ${r.stderr.trim() || "exit " + r.code}` };
+    }
+    return scp(h, local, remote, recursive);
+  }));
 }
 
 /** Pull host:remote → local. Single-host only (one local destination). */
@@ -277,6 +290,10 @@ export async function readRemoteFile(host: Host, path: string, shell: Shell = "a
   const cmd = win
     ? `[Convert]::ToBase64String([IO.File]::ReadAllBytes('${psEsc(path)}'))`
     : `${bashPathAssignment("p", path)}
+[ -e "$p" ] || { echo "no such file" 1>&2; exit 2; }
+[ -f "$p" ] || { echo "not a regular file" 1>&2; exit 2; }
+[ -r "$p" ] || { echo "permission denied (owned by $(ls -ld -- "$p" 2>/dev/null | awk '{print $3}'); use exec --script with sudo)" 1>&2; exit 2; }
+set -o pipefail
 base64 < "$p" | tr -d '\\n'`;
   const r = await exec(host, cmd, shell);
   if (!r.ok) throw new Error(`${host.name}: cannot read ${path}: ${r.stderr.trim() || "exit " + r.code}`);

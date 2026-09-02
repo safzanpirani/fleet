@@ -125,6 +125,7 @@ export function unixSpawnScript(host: Host, id: string, cmd: string, cwd?: strin
     `printf '%s' '${b64(cmd)}' | base64 -d > "$dir/cmd"`,
     cwdSrc,
     `cwd="\${cwd:-$HOME}"`,
+    `case "$cwd" in "~") cwd="$HOME";; "~/"*) cwd="$HOME/\${cwd#\\~/}";; esac`,
     `printf '%s' "$cwd" > "$dir/cwd"`,
     `date +%s > "$dir/started"`,
     `cat > "$dir/run" <<'RUNEOF'`,
@@ -132,7 +133,7 @@ export function unixSpawnScript(host: Host, id: string, cmd: string, cwd?: strin
     `dir="$(cd "$(dirname "$0")" && pwd)"`,
     `echo $$ > "$dir/pid"`,
     `cwd="$(cat "$dir/cwd")"`,
-    `cd -- "$cwd" || { echo "fleet: cwd not found: $cwd" 1>&2; echo 127 > "$dir/exit"; exit 127; }`,
+    `cd -- "$cwd" || { echo "fleet: cwd not found: $cwd" | tee "$dir/out" 1>&2; echo 127 > "$dir/exit"; exit 127; }`,
     `bash "$dir/cmd" > "$dir/out" 2>&1`,
     `echo $? > "$dir/exit"`,
     `RUNEOF`,
@@ -175,6 +176,7 @@ function windowsSpawnScript(id: string, cmd: string, cwd?: string): string {
     `[IO.File]::WriteAllText("$dir\\cmd.ps1", [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${b64(cmd)}')))`,
     `$cwd = '${cwd ? b64(cwd) : ""}'`,
     `$cwd = if ($cwd) { [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($cwd)) } else { $env:USERPROFILE }`,
+    `if ($cwd -eq '~') { $cwd = $env:USERPROFILE } elseif ($cwd.StartsWith('~/') -or $cwd.StartsWith('~\\')) { $cwd = Join-Path $env:USERPROFILE $cwd.Substring(2) }`,
     `[IO.File]::WriteAllText("$dir\\cwd", $cwd)`,
     `[IO.File]::WriteAllText("$dir\\started", [string][long]([DateTimeOffset]::UtcNow.ToUnixTimeSeconds()))`,
     `[IO.File]::WriteAllText("$dir\\run.ps1", [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${b64(WIN_RUNNER)}')))`,
@@ -409,10 +411,14 @@ export function waitPoll(host: Host, id: string, until?: string): string {
   const untilSrc = until
     ? `rx="$(printf '%s' '${b64(until)}' | base64 -d)"; if [ -f "$dir/out" ]; then grep -qE "$rx" "$dir/out"; grep_code=$?; [ "$grep_code" -eq 0 ] && echo MATCH; [ "$grep_code" -le 1 ] || { echo "fleet: invalid --until regex" 1>&2; exit 2; }; fi`
     : "";
+  // A running job has no exit file yet. Keep that branch exit-0: a bare
+  // `[ -f ] && echo` as the last statement makes the poll exit 1 and reads as
+  // an inspection failure on every tick.
   return `dir="$HOME/.fleet/jobs/${id}"\n` +
     `[ -d "$dir" ] || { echo MISSING; exit 0; }\n` +
-    `[ -f "$dir/exit" ] && echo "EXIT:$(cat "$dir/exit")"\n` +
-    untilSrc;
+    `if [ -f "$dir/exit" ]; then echo "EXIT:$(cat "$dir/exit")"; fi\n` +
+    untilSrc +
+    `\nexit 0`;
 }
 
 /** Block until the job exits, or (with --until) its output matches a regex, or

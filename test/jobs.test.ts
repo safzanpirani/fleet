@@ -259,6 +259,51 @@ describe("detached job lifecycle", () => {
     }
   });
 
+  test("spawn expands a leading ~ in --cwd and records a missing cwd in the job output", async () => {
+    const home = mkdtempSync(join(tmpdir(), "fleet-job-cwd-"));
+    const mac = host("mac", "mac");
+    try {
+      mkdirSync(join(home, "work"), { recursive: true });
+      const ok = await runBash(unixSpawnScript(mac, "tilde-cwd", "pwd", "~/work"), home);
+      expect(ok.code, ok.stderr).toBe(0);
+      const okDir = join(home, ".fleet", "jobs", "tilde-cwd");
+      for (let i = 0; i < 100 && !Bun.file(join(okDir, "exit")).size; i++) await Bun.sleep(10);
+      expect(readFileSync(join(okDir, "cwd"), "utf8")).toBe(join(home, "work"));
+      expect(readFileSync(join(okDir, "exit"), "utf8").trim()).toBe("0");
+
+      const bad = await runBash(unixSpawnScript(mac, "missing-cwd", "pwd", "~/nope"), home);
+      expect(bad.code, bad.stderr).toBe(0);
+      const badDir = join(home, ".fleet", "jobs", "missing-cwd");
+      for (let i = 0; i < 100 && !Bun.file(join(badDir, "exit")).size; i++) await Bun.sleep(10);
+      expect(readFileSync(join(badDir, "exit"), "utf8").trim()).toBe("127");
+      expect(readFileSync(join(badDir, "out"), "utf8")).toContain("cwd not found: " + join(home, "nope"));
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test("polling a still-running job without --until exits 0 with no verdict", async () => {
+    const home = mkdtempSync(join(tmpdir(), "fleet-job-running-"));
+    const id = "still-running";
+    const dir = join(home, ".fleet", "jobs", id);
+    try {
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "out"), "starting\n");
+      const plain = await runBash(waitPoll(host("linux", "linux"), id), home);
+      expect(plain.code, plain.stderr).toBe(0);
+      expect(plain.stdout).not.toMatch(/EXIT:|MISSING|MATCH/);
+      const until = await runBash(waitPoll(host("linux", "linux"), id, "never"), home);
+      expect(until.code, until.stderr).toBe(0);
+      expect(until.stdout).not.toMatch(/EXIT:|MISSING|MATCH/);
+      writeFileSync(join(dir, "exit"), "3\n");
+      const done = await runBash(waitPoll(host("linux", "linux"), id), home);
+      expect(done.code).toBe(0);
+      expect(done.stdout).toContain("EXIT:3");
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   test("an invalid --until regex fails the poll instead of spinning", async () => {
     const home = mkdtempSync(join(tmpdir(), "fleet-job-regex-"));
     const id = "bad-regex";
