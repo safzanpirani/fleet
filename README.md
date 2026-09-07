@@ -196,14 +196,19 @@ fleet cu @windows install       # a whole group, in parallel
 fleet cu all install            # the entire fleet
 ```
 
-Installing takes a selector like any other fleet command, so provisioning ten
-machines is one call rather than ten. Each host runs its own OS's official
-installer (`install.ps1` on Windows, `install.sh` elsewhere) followed by an
-`autostart kick`, which registers the daemon to come back after a reboot —
-without it, the first reboot silently ends your computer-use setup. You get a
-result line per host plus an `n/N host(s) installed` tally, and a non-zero exit
-if any host failed, so a mixed fan-out tells you exactly which box needs another
-look. Windows prompts once for UAC elevation (the task runs at RunLevel=Highest).
+Each selected host runs its OS's official current-release installer (`install.ps1`
+on Windows, `install.sh` elsewhere). Re-run `install` to update. Windows registers
+the autostart task and starts it with `autostart kick`; UAC elevation is required
+once for RunLevel=Highest. Linux restarts an existing `cua-driver.service` systemd
+user unit, preserving its display environment. Configure that unit before using
+this command on Linux.
+
+Fleet reports a result for each host and returns a non-zero exit if a download,
+installation, or daemon restart fails.
+
+Cua-driver 0.24 supports `include_accessibility_tree:false` for screenshot-only
+window previews and `max_dimension` for thumbnails. Inspect the installed schema
+with `fleet cu <host> describe get_window_state`, then pass these options as JSON.
 
 ### Driving a desktop
 
@@ -375,9 +380,9 @@ clicking and typing in GUI apps, install [cua-driver](https://github.com/trycua/
 fleet cu @windows install       # …or a single host, or `all`
 ```
 
-Each host gets its own OS's installer plus an autostart kick, so the daemon
-returns after a reboot; you get a line per host and an `n/N host(s) installed`
-tally. See [Computer use](#computer-use-fleet-cu) for what the agent can then do
+Windows registers and starts an autostart task. Linux updates require an existing
+`cua-driver.service` user unit. You get a result for each selected host.
+See [Computer use](#computer-use-fleet-cu) for what the agent can then do
 with it, and skip this entirely if your agents only need a shell.
 
 ### Give the agent room to work

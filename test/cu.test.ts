@@ -51,16 +51,42 @@ describe("cuInstall", () => {
     expect(byHost.get("lin")!.cmd).toContain("install.sh");
   });
 
-  test("every host is kicked into autostart, so the daemon survives a reboot", async () => {
-    const cmds: string[] = [];
+  test("Linux restarts its user service; Windows kicks its autostart task", async () => {
+    const cmds = new Map<string, string>();
     await cuInstall(cfg, "all", {
       exec: async (target, cmd) => {
-        cmds.push(cmd);
+        cmds.set(target.name, cmd);
         return { host: target.name, ok: true, code: 0, stdout: "", stderr: "" };
       },
     });
-    expect(cmds).toHaveLength(3);
-    for (const cmd of cmds) expect(cmd).toContain("autostart kick");
+    expect(cmds.get("lin")).toContain("systemctl --user restart cua-driver.service");
+    expect(cmds.get("lin")).not.toContain("autostart kick");
+    expect(cmds.get("win")).toContain("autostart kick");
+  });
+
+  test.each([
+    { download: 22, install: 0, restart: 0, expected: 22 },
+    { download: 0, install: 7, restart: 0, expected: 7 },
+    { download: 0, install: 0, restart: 9, expected: 9 },
+    { download: 0, install: 0, restart: 0, expected: 0 },
+  ])("Linux install preserves download/install/restart failures: %j", async (scenario) => {
+    const [action] = await cuInstall(cfg, "lin", {
+      exec: async (target, command) => {
+        const script = `curl() { printf 'exit ${scenario.install}\\n'; return ${scenario.download}; }\n`
+          + `systemctl() { printf 'RESTART:%s\\n' "$*"; return ${scenario.restart}; }\n`
+          + command;
+        const proc = Bun.spawn(["/bin/bash", "-s"], {
+          stdin: new TextEncoder().encode(script), stdout: "pipe", stderr: "pipe",
+        });
+        const [code, stdout, stderr] = await Promise.all([
+          proc.exited, new Response(proc.stdout).text(), new Response(proc.stderr).text(),
+        ]);
+        return { host: target.name, code, ok: code === 0, stdout, stderr };
+      },
+    });
+    expect(action!.result.code).toBe(scenario.expected);
+    if (scenario.download || scenario.install) expect(action!.result.stdout).not.toContain("RESTART");
+    else expect(action!.result.stdout).toContain("RESTART:--user restart cua-driver.service");
   });
 
   test("one host failing does not hide the others' results", async () => {

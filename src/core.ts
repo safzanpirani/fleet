@@ -1193,17 +1193,20 @@ function cuaBin(os: Host["os"]): { prelude: string; invoke: string } {
   };
 }
 
-/** The official one-line cua-driver installer for one host, plus an autostart kick. */
+/** Install the current release, then restart the host's desktop daemon. */
 function cuInstallCmd(os: Host["os"]): { cmd: string; shell: Shell } {
   if (os === "windows") return {
     shell: "powershell",
-    cmd: `irm https://raw.githubusercontent.com/trycua/cua/main/libs/cua-driver/scripts/install.ps1 | iex; `
+    cmd: `$ErrorActionPreference='Stop'; irm https://raw.githubusercontent.com/trycua/cua/main/libs/cua-driver/scripts/install.ps1 | iex; `
       + `& "$env:LOCALAPPDATA\\Programs\\Cua\\cua-driver\\bin\\cua-driver.exe" autostart kick`,
   };
   return {
     shell: "bash",
-    cmd: `/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/trycua/cua/main/libs/cua-driver/scripts/install.sh)"; `
-      + `"$(command -v cua-driver || echo "$HOME/.local/bin/cua-driver")" autostart kick`,
+    cmd: `installer=$(curl -fsSL https://raw.githubusercontent.com/trycua/cua/main/libs/cua-driver/scripts/install.sh) || exit $?\n`
+      + `/bin/bash -c "$installer" || exit $?\n`
+      + (os === "linux"
+        ? `systemctl --user restart cua-driver.service`
+        : `"$(command -v cua-driver || echo "$HOME/.local/bin/cua-driver")" autostart kick`),
   };
 }
 

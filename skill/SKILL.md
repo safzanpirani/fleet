@@ -126,14 +126,21 @@ self-contained binary that runs a background `serve` daemon in the interactive s
 and exposes computer-use tools. Same interactive-desktop requirement as `fleet shot`
 (a Windows box needs a real or virtual display + a logged-in session).
 
-- **Install once per host:** `fleet cu <host> install` (runs the official installer +
-  `autostart kick`; registers the `cua-driver-serve` autostart task). One-time UAC elevation
-  on Windows for the RunLevel=Highest task.
+- **Install or update:** `fleet cu <selector> install` runs each host's official
+  current-release installer. Windows registers the `cua-driver-serve` autostart task
+  and runs `autostart kick`, with one-time UAC elevation for RunLevel=Highest.
+  Linux restarts the existing `cua-driver.service` systemd user unit, preserving its
+  display environment. Configure that unit before installing on Linux. Download,
+  installation, and service restart failures return a non-zero exit.
 - **Convenience verbs** (resolve the pid/window_id loop for you):
   - `fleet cu <host> apps [name]` — compact `pid  name` table (optional name filter).
   - `fleet cu <host> windows <pid|name>` — `window_id  title` table (name → pid auto-resolved).
   - `fleet cu <host> shot-window <pid|name> [--out f.png]` — resolve pid + first window +
     capture, in one call (auto-opens on Mac). This replaces the 3-step loop below.
+- **cua-driver 0.24:** `get_window_state` accepts `include_accessibility_tree:false`
+  for screenshot-only previews and `max_dimension` for thumbnails. Pass these fields
+  through raw JSON after checking `fleet cu <host> describe get_window_state`.
+  `capture_mode` is deprecated and ignored; it does not skip accessibility work.
 - **Raw passthrough:** `fleet cu <host> <cua-driver args…>` for anything else:
   - `fleet cu win-box list-tools` — every tool + description (authoritative per version).
   - `fleet cu win-box get_screen_size` / `list_apps` / `list_windows '{"pid":3848}'`
@@ -156,7 +163,8 @@ and exposes computer-use tools. Same interactive-desktop requirement as `fleet s
 - **JSON args:** pass the JSON as one arg; fleet pipes it via **stdin** (Windows
   PowerShell 5.1 strips quotes around JSON field names on native-command args — piping
   preserves them). `get_window_state` needs `window_id` (from `list_windows`); its image
-  is base64 inside the JSON, but `--out` / `--screenshot-out-file` writes it to a file.
+  is base64 inside the JSON. Fleet's `--out` sets cua-driver's `screenshot_out_file`
+  JSON field and pulls the resulting image locally.
 - Exposed as MCP tool `fleet_cu` (`{host, args[], image?}`; returns the PNG when `image:true`).
 
 ## MCP server
