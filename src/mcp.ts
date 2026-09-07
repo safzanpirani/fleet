@@ -10,7 +10,7 @@
  *
  * Run:   bun run src/mcp.ts        (config via FLEET_CONFIG or ./fleet.config.json)
  * Register with Claude Code:
- *        claude mcp add fleet -- bun run /Users/safzan/Development/fleet/src/mcp.ts
+ *        claude mcp add fleet -- bun run /path/to/fleet/src/mcp.ts
  *
  * stdio rule: nothing but JSON-RPC may touch stdout. All diagnostics go to
  * stderr (console.error); the action layer in core.ts never prints.

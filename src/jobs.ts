@@ -9,6 +9,7 @@
  *     cmd      — the command, verbatim (base64-decoded on the way in)
  *     cwd      — resolved working directory
  *     started  — epoch seconds at launch
+ *     umask    — original POSIX workload mask; spool files stay private
  *     pid      — pid of the detached session/process leader
  *     out      — combined stdout+stderr
  *     exit     — exit code (written only on completion → its presence = "done")
@@ -108,6 +109,7 @@ export function resolveJobRef(cfg: FleetConfig, a: string, b?: string): { host: 
 
 // ── spawn ─────────────────────────────────────────────────────────────────────
 export function unixSpawnScript(host: Host, id: string, cmd: string, cwd?: string): string {
+  assertId(id);
   // The runner is materialised on the host via a QUOTED heredoc (zero expansion,
   // so a cwd containing quotes/$ can't break it) and derives its own spool dir
   // from its path — the detached process needs no controller state.
@@ -117,11 +119,14 @@ export function unixSpawnScript(host: Host, id: string, cmd: string, cwd?: strin
     : "FLEET_JOB_ID=\"$id\" setsid \"$dir/run\" < /dev/null > /dev/null 2>&1 &";
   return [
     `set -e`,
+    `job_umask="$(umask)"`,
+    `umask 077`,
     `id='${id}'`,
     `base="$HOME/.fleet/jobs"`,
     `dir="$base/$id"`,
     `mkdir -p "$base"`,
     `mkdir "$dir"`,
+    `printf '%s' "$job_umask" > "$dir/umask"`,
     `printf '%s' '${b64(cmd)}' | base64 -d > "$dir/cmd"`,
     cwdSrc,
     `cwd="\${cwd:-$HOME}"`,
@@ -134,7 +139,7 @@ export function unixSpawnScript(host: Host, id: string, cmd: string, cwd?: strin
     `echo $$ > "$dir/pid"`,
     `cwd="$(cat "$dir/cwd")"`,
     `cd -- "$cwd" || { echo "fleet: cwd not found: $cwd" | tee "$dir/out" 1>&2; echo 127 > "$dir/exit"; exit 127; }`,
-    `bash "$dir/cmd" > "$dir/out" 2>&1`,
+    `(umask "$(cat "$dir/umask")"; bash "$dir/cmd") > "$dir/out" 2>&1`,
     `echo $? > "$dir/exit"`,
     `RUNEOF`,
     `chmod +x "$dir/run"`,
@@ -163,6 +168,7 @@ const WIN_RUNNER = [
 ].join("\n");
 
 function windowsSpawnScript(id: string, cmd: string, cwd?: string): string {
+  assertId(id);
   // Register an Interactive-logon task → start it → wait for the runner to record
   // its pid → unregister the task definition (the running instance is unaffected).
   return [
@@ -198,17 +204,26 @@ function windowsSpawnScript(id: string, cmd: string, cwd?: string): string {
 /** Launch a detached job on each host the selector resolves to. */
 export async function spawnJob(
   cfg: FleetConfig, sel: string, cmd: string, opts: { cwd?: string; label?: string } = {},
+  dependencies: { exec?: typeof exec; newId?: typeof newId } = {},
 ): Promise<SpawnResult[]> {
   const hosts = resolveHosts(cfg, sel);
   return Promise.all(hosts.map(async (h): Promise<SpawnResult> => {
-    const id = newId(opts.label);
+    const id = (dependencies.newId ?? newId)(opts.label);
     const script = h.os === "windows"
       ? windowsSpawnScript(id, cmd, opts.cwd)
       : unixSpawnScript(h, id, cmd, opts.cwd);
-    const r = await exec(h, script, shellFor(h));
-    const m = r.stdout.match(/OK\s+(\S+)\s+(\d+)/);
-    if (!r.ok || !m) return { host: h.name, ok: false, id: null, pid: null, error: r.stderr || r.stdout || "spawn failed" };
-    return { host: h.name, ok: true, id: m[1]!, pid: Number(m[2]) };
+    try {
+      const r = await (dependencies.exec ?? exec)(h, script, shellFor(h));
+      const m = r.stdout.match(/^OK ([a-z0-9-]+) ([1-9]\d*)\r?$/m);
+      if (!r.ok || !m || m[1] !== id) {
+        const detail = r.stderr || (r.stdout.includes("ERR no pid")
+          ? "Windows runner did not record a PID; check interactive login and task status" : "");
+        return { host: h.name, ok: false, id, pid: null, error: "launch unconfirmed; inspect this job before retrying" + (detail ? `: ${detail}` : "") };
+      }
+      return { host: h.name, ok: true, id, pid: Number(m[2]) };
+    } catch {
+      return { host: h.name, ok: false, id, pid: null, error: "launch unconfirmed; inspect this job before retrying" };
+    }
   }));
 }
 
@@ -219,6 +234,7 @@ base="$HOME/.fleet/jobs"
 [ -d "$base" ] || exit 0
 for d in "$base"/*/; do
   [ -d "$d" ] || continue
+  d="\${d%/}"
   id="$(basename "$d")"
   pid="$(cat "$d/pid" 2>/dev/null)"
   started="$(cat "$d/started" 2>/dev/null)"
@@ -346,18 +362,45 @@ export function killScript(host: Host, id: string): string {
       `"killed $jpid"`;
   }
 
+  // Preserve descendant identities before signalling: a runner can exit on TERM
+  // while its resistant children become orphans and still need escalation.
   const signal = host.os === "mac"
-    ? `kill_tree() {\n` +
-      `  tree_signal="$1"; tree_pid="$2"\n` +
-      `  for child in $(pgrep -P "$tree_pid" 2>/dev/null); do kill_tree "$tree_signal" "$child"; done\n` +
-      `  kill "-$tree_signal" "$tree_pid" 2>/dev/null || true\n` +
+    ? `tree_pids=(); tree_identities=()\n` +
+      `process_identity() {\n` +
+      `  local state\n` +
+      `  state="$(ps -p "$1" -o stat= 2>/dev/null)"\n` +
+      `  case "$state" in ''|*Z*) return 1 ;; esac\n` +
+      `  ps -p "$1" -o lstart= -o command= 2>/dev/null\n` +
       `}\n` +
-      `kill_tree TERM "$pid"`
+      `capture_tree() {\n` +
+      `  local tree_pid="$1" child identity\n` +
+      `  for child in $(pgrep -P "$tree_pid" 2>/dev/null); do capture_tree "$child"; done\n` +
+      `  identity="$(process_identity "$tree_pid")" || return 0\n` +
+      `  tree_pids+=("$tree_pid"); tree_identities+=("$identity")\n` +
+      `}\n` +
+      `tree_owned() {\n` +
+      `  local identity\n` +
+      `  identity="$(process_identity "\${tree_pids[$1]}")" || return 1\n` +
+      `  [ "$identity" = "\${tree_identities[$1]}" ]\n` +
+      `}\n` +
+      `tree_alive() {\n` +
+      `  local i\n` +
+      `  for i in "\${!tree_pids[@]}"; do tree_owned "$i" && return 0; done\n` +
+      `  return 1\n` +
+      `}\n` +
+      `signal_tree() {\n` +
+      `  local tree_signal="$1" i\n` +
+      `  for i in "\${!tree_pids[@]}"; do\n` +
+      `    if tree_owned "$i"; then kill "-$tree_signal" "\${tree_pids[$i]}" 2>/dev/null || true; fi\n` +
+      `  done\n` +
+      `}\n` +
+      `capture_tree "$pid"\nsignal_tree TERM`
     : `kill -TERM -"$pid" 2>/dev/null || true\nkill -TERM "$pid" 2>/dev/null || true`;
   const force = host.os === "mac"
-    ? `kill_tree KILL "$pid"`
+    ? `signal_tree KILL`
     : `kill -KILL -"$pid" 2>/dev/null || true\n  kill -KILL "$pid" 2>/dev/null || true`;
 
+  const running = host.os === "mac" ? "tree_alive" : 'is_owned "$pid" "$d/run"';
   return UNIX_OWNED_FN +
     `d="$HOME/.fleet/jobs/${id}"\n` +
     `[ ! -f "$d/exit" ] || { echo "fleet: job ${id} already exited" 1>&2; exit 1; }\n` +
@@ -366,13 +409,13 @@ export function killScript(host: Host, id: string): string {
     `is_owned "$pid" "$d/run" || { echo "fleet: refusing to kill pid $pid: it is not job ${id}" 1>&2; exit 1; }\n` +
     `${signal}\n` +
     `code=143\n` +
-    `i=0; while [ "$i" -lt 20 ] && is_owned "$pid" "$d/run"; do sleep 0.25; i=$((i+1)); done\n` +
-    `if is_owned "$pid" "$d/run"; then\n` +
+    `i=0; while [ "$i" -lt 20 ] && ${running}; do sleep 0.25; i=$((i+1)); done\n` +
+    `if ${running}; then\n` +
     `  ${force}\n` +
     `  code=137\n` +
-    `  i=0; while [ "$i" -lt 8 ] && is_owned "$pid" "$d/run"; do sleep 0.25; i=$((i+1)); done\n` +
+    `  i=0; while [ "$i" -lt 8 ] && ${running}; do sleep 0.25; i=$((i+1)); done\n` +
     `fi\n` +
-    `if is_owned "$pid" "$d/run"; then echo "fleet: pid $pid survived SIGKILL — not marking exited" 1>&2; exit 1; fi\n` +
+    `if ${running}; then echo "fleet: job process survived SIGKILL — not marking exited" 1>&2; exit 1; fi\n` +
     `[ -f "$d/exit" ] || echo "$code" > "$d/exit"\n` +
     `echo "killed $pid"`;
 }
@@ -391,81 +434,100 @@ export interface WaitOpts {
 }
 export interface JobWaitResult {
   host: string; id: string;
-  outcome: "exited" | "matched" | "timeout";
+  outcome: "exited" | "matched" | "timeout" | "dead";
   code: number | null;
   elapsedMs: number;
 }
 
 export function waitPoll(host: Host, id: string, until?: string): string {
+  assertId(id);
   if (host.os === "windows") {
     const untilSrc = until
       ? `$rx=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${b64(until)}')); try { if (Test-Path "$dir\\out") { if (Select-String -Path "$dir\\out" -Pattern $rx -EA Stop) { 'MATCH' } } } catch { Write-Error "fleet: invalid --until regex: $($_.Exception.Message)"; exit 2 }`
       : "";
     return [
+      WIN_OWNED_FN,
       `$dir="$env:USERPROFILE\\.fleet\\jobs\\${id}"`,
       `if (!(Test-Path $dir)) { 'MISSING'; exit 0 }`,
       `if (Test-Path "$dir\\exit") { 'EXIT:' + (Get-Content "$dir\\exit" -Raw).Trim() }`,
       untilSrc,
+      `if (!(Test-Path "$dir\\exit")) { $jpid=(Get-Content "$dir\\pid" -EA SilentlyContinue | Select-Object -First 1); if ($jpid -and -not (Test-FleetJobProcess ([int]$jpid) "$dir\\run.ps1")) { 'DEAD' } }`,
     ].join("\n");
   }
   const untilSrc = until
-    ? `rx="$(printf '%s' '${b64(until)}' | base64 -d)"; if [ -f "$dir/out" ]; then grep -qE "$rx" "$dir/out"; grep_code=$?; [ "$grep_code" -eq 0 ] && echo MATCH; [ "$grep_code" -le 1 ] || { echo "fleet: invalid --until regex" 1>&2; exit 2; }; fi`
+    ? `rx="$(printf '%s' '${b64(until)}' | base64 -d)"; if [ -f "$dir/out" ]; then grep -qE -- "$rx" "$dir/out"; grep_code=$?; [ "$grep_code" -eq 0 ] && echo MATCH; [ "$grep_code" -le 1 ] || { echo "fleet: invalid --until regex" 1>&2; exit 2; }; fi`
     : "";
   // A running job has no exit file yet. Keep that branch exit-0: a bare
   // `[ -f ] && echo` as the last statement makes the poll exit 1 and reads as
   // an inspection failure on every tick.
-  return `dir="$HOME/.fleet/jobs/${id}"\n` +
+  return UNIX_OWNED_FN + `dir="$HOME/.fleet/jobs/${id}"\n` +
     `[ -d "$dir" ] || { echo MISSING; exit 0; }\n` +
     `if [ -f "$dir/exit" ]; then echo "EXIT:$(cat "$dir/exit")"; fi\n` +
     untilSrc +
+    `\nif [ ! -f "$dir/exit" ]; then pid="$(cat "$dir/pid" 2>/dev/null)"; if [ -n "$pid" ] && ! is_owned "$pid" "$dir/run"; then echo DEAD; fi; fi` +
     `\nexit 0`;
 }
 
 /** Block until the job exits, or (with --until) its output matches a regex, or
  *  the timeout elapses. Polls the spool via repeated exec — same model as
  *  `fleet wait`. */
-export async function waitJob(cfg: FleetConfig, a: string, b: string | undefined, opts: WaitOpts = {}): Promise<JobWaitResult> {
+export async function waitJob(
+  cfg: FleetConfig, a: string, b: string | undefined, opts: WaitOpts = {},
+  dependencies: { exec?: typeof exec; now?: () => number; sleep?: (ms: number) => Promise<unknown> } = {},
+): Promise<JobWaitResult> {
   const { host, id } = resolveJobRef(cfg, a, b);
   const timeoutMs = opts.timeoutMs ?? 0;       // 0 = wait forever
   const intervalMs = opts.intervalMs ?? 3000;
+  if (!Number.isFinite(timeoutMs) || timeoutMs < 0) throw new Error("timeoutMs must be a finite nonnegative number");
+  if (!Number.isFinite(intervalMs) || intervalMs <= 0) throw new Error("intervalMs must be a finite positive number");
+  const now = dependencies.now ?? Date.now;
+  const sleep = dependencies.sleep ?? Bun.sleep;
+  const inspect = dependencies.exec ?? exec;
   const poll = waitPoll(host, id, opts.until);
-  const start = Date.now();
+  const start = now();
   let inspectionFailures = 0;
   let missingPolls = 0;
+  let deadPolls = 0;
   for (;;) {
-    const beforePoll = Date.now() - start;
+    const beforePoll = now() - start;
     if (timeoutMs && beforePoll >= timeoutMs)
       return { host: host.name, id, outcome: "timeout", code: null, elapsedMs: beforePoll };
     const remaining = timeoutMs ? Math.max(1, timeoutMs - beforePoll) : undefined;
-    const r = await exec(host, poll, shellFor(host), { timeoutMs: remaining });
-    const elapsed = Date.now() - start;
+    const r = await inspect(host, poll, shellFor(host), { timeoutMs: remaining });
+    const elapsed = now() - start;
     if (!r.ok) {
       if (r.code === 124 && timeoutMs)
         return { host: host.name, id, outcome: "timeout", code: null, elapsedMs: elapsed };
       inspectionFailures++;
+      deadPolls = 0;
+      if (r.code === 2) throw new Error(r.stderr || `invalid wait poll for ${id}`);
       if (inspectionFailures >= 3)
         throw new Error(r.stderr || `failed to inspect job ${id} after ${inspectionFailures} attempts (exit ${r.code})`);
       opts.onTick?.(`inspection failed; retrying (${inspectionFailures}/3)`, elapsed);
     } else {
       inspectionFailures = 0;
       if (/^MISSING$/m.test(r.stdout)) {
+        deadPolls = 0;
         missingPolls++;
         if (missingPolls >= 3) throw new Error(`no such job: ${id}`);
         opts.onTick?.(`job spool not visible; retrying (${missingPolls}/3)`, elapsed);
       } else {
         missingPolls = 0;
-        const exit = r.stdout.match(/EXIT:(-?\d+)/);
+        const exit = r.stdout.match(/^EXIT:(-?\d+)\r?$/m);
         if (opts.until && /^MATCH$/m.test(r.stdout))
           return { host: host.name, id, outcome: "matched", code: exit ? Number(exit[1]) : null, elapsedMs: elapsed };
         if (exit)
           return { host: host.name, id, outcome: "exited", code: Number(exit[1]), elapsedMs: elapsed };
+        deadPolls = /^DEAD\r?$/m.test(r.stdout) ? deadPolls + 1 : 0;
+        if (deadPolls >= 3)
+          return { host: host.name, id, outcome: "dead", code: null, elapsedMs: elapsed };
         opts.onTick?.(opts.until ? "waiting for match/exit" : "running", elapsed);
       }
     }
     if (timeoutMs && elapsed >= timeoutMs)
       return { host: host.name, id, outcome: "timeout", code: null, elapsedMs: elapsed };
     const sleepMs = timeoutMs ? Math.min(intervalMs, Math.max(0, timeoutMs - elapsed)) : intervalMs;
-    if (sleepMs > 0) await Bun.sleep(sleepMs);
+    if (sleepMs > 0) await sleep(sleepMs);
   }
 }
 
@@ -494,6 +556,7 @@ base="$HOME/.fleet/jobs"
 n=0
 for d in "$base"/*/; do
   [ -d "$d" ] || continue
+  d="\${d%/}"
   pid="$(cat "$d/pid" 2>/dev/null)"
   if [ -f "$d/exit" ]; then :
   elif is_owned "$pid" "$d/run"; then continue                       # running — never prune

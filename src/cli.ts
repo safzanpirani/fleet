@@ -12,7 +12,7 @@
  *   fleet reboot <sel> [--yes]        reboot the whole machine(s)
  *   fleet gpu [--json]                every GPU: util / free VRAM / temp / loaded model
  *   fleet disk [sel] [--json]         every volume: free space / % used (live, not the dashboard)
- *   fleet status [host] [--json]      live CPU/mem/disk from me.safzan.dev
+ *   fleet status [host] [--json]      live CPU/mem/disk from dash.example.com
  *   fleet top <host>                  live terminal btop for one host
  *   fleet logs <host> <svc> [-n N]    recent logs / status for a service
  *   fleet tools status [tool] [sel]   which boxes run a stale CLI tool / skill
@@ -27,6 +27,7 @@
  */
 import { loadConfig, resolveHosts } from "./config.ts";
 import type { FleetConfig } from "./config.ts";
+import { helpText } from "./help.ts";
 import { sshInteractive } from "./ssh.ts";
 import type { ExecResult } from "./ssh.ts";
 import {
@@ -34,7 +35,7 @@ import {
 } from "./jobs.ts";
 import type { JobRow } from "./jobs.ts";
 import {
-  pullFlag, pullVal, parseLeadingFlags, lsHosts, runExec, runScript, readScriptSource, editRemoteFile,
+  pullFlag, pullVal, parseFlags, parseLeadingFlags, lsHosts, runExec, runScript, readScriptSource, editRemoteFile,
   pushFile, pullFile, parseRemoteSpec, restartService, serviceLogs, svcStatus,
   gpuRows, diskRows, fetchDashboard, hostStatus, runRecipe, captureScreenshot, rebootHosts,
   cuInstall, cuRun, cuTools, cuDescribe, cuRecordStart, cuRecordStop, cuRecordStatus,
@@ -65,8 +66,8 @@ function numVal(rest: string[], flag: string, def: number, min = 1): number {
   const v = pullVal(rest, flag);
   if (v === undefined) return def;
   const n = Number(v);
-  if (!Number.isFinite(n) || n < min) die(`${flag} needs a number ≥ ${min} (got '${v}')`);
-  return Math.floor(n);
+  if (!Number.isSafeInteger(n) || n < min) die(`${flag} needs an integer ≥ ${min} (got '${v}')`);
+  return n;
 }
 /** A fleet flag written after the command — as its last token, or as the
  *  second-to-last token when the flag takes a value — was almost certainly meant
@@ -85,8 +86,8 @@ function numFlag(flags: Record<string, string | true>, flag: string, def: number
   const v = flags[flag];
   if (v === undefined) return def;
   const n = Number(v);
-  if (v === true || !Number.isFinite(n) || n < min) die(`${flag} needs a number ≥ ${min} (got '${v}')`);
-  return Math.floor(n);
+  if (v === true || !Number.isSafeInteger(n) || n < min) die(`${flag} needs an integer ≥ ${min} (got '${v}')`);
+  return n;
 }
 /** Interactive y/N gate for destructive actions. Returns true to proceed. With
  *  --yes it's a no-op; with no TTY (and no --yes) it refuses rather than hang. */
@@ -110,7 +111,12 @@ function printResult(r: ExecResult) {
   console.log(`${r.ok ? A.g("●") : A.r("●")} ${A.b(r.host)} ${A.d("· exit " + r.code)}`);
   const stdout = r.stdout.trimEnd();
   if (stdout) console.log(stdout.split("\n").map((l) => "  " + l).join("\n"));
-  if (r.stderr) console.log(A.d(r.stderr.split("\n").map((l) => "  " + l).join("\n")));
+  if (r.stderr) console.error(A.d(r.stderr.split("\n").map((l) => "  " + l).join("\n")));
+}
+
+function printRaw(r: ExecResult): void {
+  process.stdout.write(r.stdout);
+  if (r.stderr) process.stderr.write(r.stderr.endsWith("\n") ? r.stderr : r.stderr + "\n");
 }
 
 const SUBCOMMANDS = [
@@ -171,51 +177,14 @@ complete -F _fleet fleet`;
 
 async function dispatch(command: string | undefined, rest: string[], cfg: FleetConfig): Promise<number> {
   switch (command) {
-    case undefined: case "help": case "-h": case "--help": {
-      console.log(`${A.b("fleet")} — drive your fleet without quoting pain\n
-  fleet ls                        reachability of every host
-  fleet dt                        list live Daytona sandboxes (needs DAYTONA_API_KEY)
-  fleet exec [flags] <sel> <cmd…>  run a command, blocking   (flags BEFORE <sel>: --cwd dir --timeout S --wsl --raw --json)
-  fleet spawn [flags] <sel> <cmd…> launch a detached job (outlives ssh)   (flags BEFORE <sel>: --cwd dir --label name --json)
-  fleet jobs [<sel>]              list detached jobs across the fleet
-  fleet jobs tail <host:id> [-f]  stream a job's output   (log | kill | wait | prune)
-  fleet jobs wait <host:id>       block on exit   (--until <regex>, --timeout S)
-  fleet exec --script <f|-> <sel>  run a LOCAL script file (or stdin) remotely — no cp, no temp file
-  fleet cp <local…> <sel>:<dir>   push file(s) (fan-out ok; also pulls: <sel>:<path…> <dir>)
-  fleet edit <sel>:<path> --old S --new S   surgical in-place edit, prints the diff   (--all --dry-run)
-  fleet restart <host> <svc>      restart a configured service
-  fleet reboot <sel> [--yes]      reboot the whole machine(s)
-  fleet bios <sel> [--yes]        reboot into UEFI/BIOS firmware setup
-  fleet boot <machine>            which OS is live on a dual-boot box
-  fleet switch <machine> --to OS  reboot into the other OS, wait for it   (--yes)
-  fleet wait <host|machine> …     block until ssh/port/http/boot is ready
-  fleet gpu                       util / free VRAM / temp / loaded model
-  fleet disk [sel]                free space on every volume (live, all drives)
-  fleet status [host]             live stats from the dashboard   (--json)
-  fleet top <host>                live terminal btop for one host
-  fleet logs <host> <svc> [-n N]  recent logs for a service
-  fleet svc <svc> [sel]           status of a service across every host that has it
-  fleet shot <host> [--out f]     screenshot the remote desktop → local PNG
-  fleet cu <host> <args…>         computer-use via cua-driver (install | click/type/…)
-  fleet cu <sel> install          install cua-driver across a host, group, or all
-  fleet deploy <sel>              ship fleet source → host(s), bun install, restart   (--no-restart)
-  fleet tools status [tool] [sel] which boxes run a stale CLI tool / skill   (list | sync | stamp)
-  fleet tools sync <tool|--all> <sel>  ship a tool + its skill, stamp a manifest   (--max-parallel N with --all; default 2)
-  fleet run <recipe>              run a saved playbook
-  fleet doctor <host>             diagnose why a host is unreachable (ssh -vv + health)
-  fleet completion [bash|zsh]     shell completion (eval "$(fleet completion zsh)")
-  fleet ssh <host>                interactive shell\n
-  selectors: host | logical route | @linux @windows @mac @gpu | @<custom> | all | a,b,@gpu | dt:<sandbox id|name|prefix>
-  daytona:   exec/cp work on dt: sandboxes over the REST API — e.g. fleet exec dt:spore- "ls" (prefix must be unique)
-  hosts: ${Object.keys(cfg.hosts).join(", ")}
-  routes: ${Object.keys(cfg.routes ?? {}).join(", ") || "none"}
-  machines: ${Object.keys(cfg.machines ?? {}).join(", ") || "none"}
-  recipes: ${Object.keys(cfg.recipes ?? {}).join(", ") || "none"}`);
+    case undefined: case "help": case "-h": case "--help":
+      console.log(helpText(["help", ...rest]));
       return 0;
-    }
 
     case "ls": {
-      const json = pullFlag(rest, "--json");
+      const { flags, rest: pos } = parseFlags(rest, ["--json"], []);
+      if (pos.length) die("usage: fleet ls [--json]");
+      const json = flags["--json"] === true;
       const row = (h: { up: boolean; httpUp?: boolean; name: string; os: string; ssh: string; services: string[] }) => {
         const dot = h.up ? A.g("●") : h.httpUp ? A.y("◍") : A.r("○");
         const note = !h.up && h.httpUp ? A.y("ssh-down · http ok  ") : "";
@@ -228,7 +197,9 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
     }
 
     case "dt": {
-      const json = pullFlag(rest, "--json");
+      const { flags, rest: pos } = parseFlags(rest, ["--json"], []);
+      if (pos.length) die("usage: fleet dt [--json]");
+      const json = flags["--json"] === true;
       const { listSandboxes } = await import("./daytona.ts");
       const boxes = await listSandboxes();
       if (json) { console.log(JSON.stringify(boxes, null, 2)); return 0; }
@@ -249,8 +220,10 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
       const json = flags["--json"] === true;
       const wsl = flags["--wsl"] === true;
       const raw = flags["--raw"] === true; // print ONLY remote stdout — no header, no indent (for piping/backup)
+      if (raw && json) die("choose either --raw or --json");
       const cwd = typeof flags["--cwd"] === "string" && flags["--cwd"] ? flags["--cwd"] : undefined; // run in this dir (fails fast if missing)
       const timeout = numFlag(flags, "--timeout", 0, 0);  // wall-clock cap in seconds; 0 = none (FLEET_EXEC_TIMEOUT env also works)
+      const timeoutMs = flags["--timeout"] === undefined ? undefined : timeout * 1000;
       // --script ships a LOCAL file (or stdin) as the program: no cp to /tmp, no
       // remote leftovers, and the source never touches a shell command line.
       const scriptPath = typeof flags["--script"] === "string" && flags["--script"] ? flags["--script"] : undefined;
@@ -261,9 +234,9 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
         if (!sel) die("usage: fleet exec --script <file|-> [--interp cmd] [--cwd dir] [--timeout S] [--wsl] [--raw] [--json] <sel>");
         if (cmd) die(`fleet exec --script takes no command after <sel> (got '${cmd}') — the script IS the command`);
         const script = await readScriptSource(scriptPath);
-        const results = await runScript(cfg, await routeSelector(cfg, sel!), script, { wsl, cwd, timeoutMs: timeout * 1000 || undefined, interp });
+        const results = await runScript(cfg, await routeSelector(cfg, sel!), script, { wsl, cwd, timeoutMs, interp });
         if (json) console.log(JSON.stringify(results, null, 2));
-        else if (raw) results.forEach((r) => process.stdout.write(r.stdout));
+        else if (raw) results.forEach(printRaw);
         else results.forEach(printResult);
         return results.some((r) => !r.ok) ? 1 : 0;
       }
@@ -283,9 +256,9 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
         die(`'${trailing}' must come BEFORE the host selector: fleet exec ${trailing} ${sel} <cmd…>  (quote the whole command if it really ends in ${trailing})`);
       // a bare machine name (dual-boot box) auto-routes to whichever boot is live
       const target = await routeSelector(cfg, sel!);
-      const results = await runExec(cfg, target, cmd, { wsl, cwd, timeoutMs: timeout * 1000 || undefined });
+      const results = await runExec(cfg, target, cmd, { wsl, cwd, timeoutMs });
       if (json) console.log(JSON.stringify(results, null, 2));
-      else if (raw) results.forEach((r) => process.stdout.write(r.stdout));
+      else if (raw) results.forEach(printRaw);
       else results.forEach(printResult);
       return results.some((r) => !r.ok) ? 1 : 0;
     }
@@ -308,17 +281,36 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
       if (json) { console.log(JSON.stringify(results, null, 2)); return results.some((r) => !r.ok) ? 1 : 0; }
       for (const r of results) {
         if (r.ok) console.log(`${A.g("●")} ${A.b(r.host)} ${A.d("job")} ${A.c(r.id!)} ${A.d("· pid " + r.pid)}  ${A.d("fleet jobs tail " + r.host + ":" + r.id)}`);
-        else console.log(`${A.r("●")} ${A.b(r.host)} ${A.d("·")} ${A.y(r.error ?? "spawn failed")}`);
+        else console.error(`${A.r("●")} ${A.b(r.host + ":" + r.id)} ${A.y(r.error ?? "spawn failed")}\nInspect with fleet jobs log ${r.host}:${r.id} before retrying.`);
       }
       return results.some((r) => !r.ok) ? 1 : 0;
     }
 
     case "jobs": {
-      const json = pullFlag(rest, "--json");
+      // Normalize only owned aliases, then validate before resolving any host.
+      const parsed = parseFlags(rest, ["--json", "-f", "--follow", "--all"], ["-n", "--lines", "--until", "--timeout"]);
+      rest = parsed.rest;
+      const flags = parsed.flags;
+      for (const [alias, canonical] of [["--lines", "-n"], ["--follow", "-f"]] as const) {
+        if (flags[alias] === undefined) continue;
+        if (flags[canonical] !== undefined) die(`duplicate option: ${canonical} and ${alias}`);
+        flags[canonical] = flags[alias]!;
+        delete flags[alias];
+      }
+      const json = flags["--json"] === true;
       const verb = rest[0];
+      const allowed: Record<string, string[]> = {
+        list: ["--json"], log: ["--json"], tail: ["--json", "-n", "-f"],
+        kill: ["--json"], wait: ["--json", "--until", "--timeout"], prune: ["--json", "--all"],
+      };
+      const action = verb && Object.hasOwn(allowed, verb) ? verb : "list";
+      for (const flag of Object.keys(flags))
+        if (!allowed[action]!.includes(flag)) die(`${flag} is not valid for jobs ${action}`);
       const ADDRESSED = new Set(["log", "tail", "kill", "wait"]);
       if (verb && ADDRESSED.has(verb)) {
         rest.shift();
+        if (rest.length < 1 || rest.length > 2 || (rest[0]!.includes(":") && rest.length > 1))
+          die(`usage: fleet jobs ${verb} <host:id> (or <host> <id>); try fleet jobs ${verb} --help`);
         if (verb === "log") {
           const { host, output } = await jobLog(cfg, rest[0] ?? die("usage: fleet jobs log <host:id>"), rest[1]);
           if (json) console.log(JSON.stringify({ host, output }, null, 2));
@@ -326,44 +318,49 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
           return 0;
         }
         if (verb === "tail") {
-          const follow = pullFlag(rest, "-f") || pullFlag(rest, "--follow");
-          const n = numVal(rest, "-n", 40);
+          const follow = flags["-f"] === true;
+          if (follow && json) die("--json cannot be combined with --follow");
+          const n = numFlag(flags, "-n", 40);
           const a = rest[0] ?? die("usage: fleet jobs tail <host:id> [-n N] [-f]");
           if (follow) return await jobFollow(cfg, a, rest[1], n);
-          const { output } = await jobTail(cfg, a, rest[1], n);
-          process.stdout.write(output.endsWith("\n") || !output ? output : output + "\n");
+          const result = await jobTail(cfg, a, rest[1], n);
+          if (json) console.log(JSON.stringify(result, null, 2));
+          else process.stdout.write(result.output.endsWith("\n") || !result.output ? result.output : result.output + "\n");
           return 0;
         }
         if (verb === "kill") {
           const r = await killJob(cfg, rest[0] ?? die("usage: fleet jobs kill <host:id>"), rest[1]);
-          printResult(r);
+          if (json) console.log(JSON.stringify(r, null, 2));
+          else printResult(r);
           return r.ok ? 0 : 1;
         }
         if (verb === "wait") {
-          const until = pullVal(rest, "--until");
-          const timeout = numVal(rest, "--timeout", 0, 0) * 1000;
+          const until = typeof flags["--until"] === "string" ? flags["--until"] : undefined;
+          const timeout = numFlag(flags, "--timeout", 0, 0) * 1000;
           const a = rest[0] ?? die("usage: fleet jobs wait <host:id> [--until regex] [--timeout S]");
           const label = until ? `match /${until}/` : "exit";
-          const progress = json ? process.stderr : process.stdout;
+          const progress = process.stderr;
           const r = await waitJob(cfg, a, rest[1], {
             until, timeoutMs: timeout,
-            onTick: (s, ms) => progress.write(A.d(`\r◎ ${a} ${label}: ${s} ${Math.round(ms / 1000)}s   `)),
+            onTick: progress.isTTY ? (s, ms) => progress.write(A.d(`\r◎ ${a} ${label}: ${s} ${Math.round(ms / 1000)}s   `)) : undefined,
           });
-          progress.write("\r\x1b[K");
+          if (progress.isTTY) progress.write("\r\x1b[K");
           // exit code is scriptable: matched → 0, timeout → 124 (timeout(1) convention),
           // exited → the job's own code (so `fleet jobs wait X && deploy` works).
-          const exitCode = r.outcome === "matched" ? 0 : r.outcome === "timeout" ? 124 : (r.code ?? 0);
+          const exitCode = r.outcome === "matched" ? 0 : r.outcome === "timeout" ? 124 : (r.code ?? 1);
           if (json) { console.log(JSON.stringify(r, null, 2)); return exitCode; }
           const tag = r.outcome === "matched" ? A.g("● matched") : r.outcome === "exited"
-            ? (r.code === 0 ? A.g("● exit 0") : A.r("● exit " + r.code)) : A.y("○ timeout");
+            ? (r.code === 0 ? A.g("● exit 0") : A.r("● exit " + r.code)) : A.y("○ " + r.outcome);
           console.log(`${tag} ${A.b(r.host + ":" + r.id)} ${A.d(`(${Math.round(r.elapsedMs / 1000)}s)`)}`);
           return exitCode;
         }
       }
       if (verb === "prune") {
         rest.shift();
-        const all = pullFlag(rest, "--all");
+        if (rest.length > 1) die("usage: fleet jobs prune [<sel>] [--all] [--json]");
+        const all = flags["--all"] === true;
         const out = await pruneJobs(cfg, await routeSelector(cfg, rest[0] ?? "all"), all);
+        if (json) { console.log(JSON.stringify(out, null, 2)); return out.some((o) => o.error) ? 1 : 0; }
         for (const o of out) {
           if (o.error) console.log(`${A.r("✗")} ${A.b(o.host)} ${A.y("prune failed: " + o.error)}`);
           else console.log(`${A.d("⌫")} ${A.b(o.host)} ${A.d("pruned " + o.removed + " job(s)")}`);
@@ -371,6 +368,8 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
         return out.some((o) => o.error) ? 1 : 0;
       }
       // bare list (optional selector)
+      if (verb === "list") rest.shift();
+      if (rest.length > 1) die("usage: fleet jobs [list] [<sel>] [--json]");
       const listErrors: string[] = [];
       const rows = await listJobs(cfg, await routeSelector(cfg, rest[0] ?? "all"),
         (h, e) => listErrors.push(`${h}: ${e}`));
@@ -385,8 +384,10 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
     }
 
     case "cp": {
-      const json = pullFlag(rest, "--json");
-      const recursive = pullFlag(rest, "-r") || pullFlag(rest, "--recursive");
+      const parsed = parseFlags(rest, ["--json", "-r", "--recursive"], []);
+      rest = parsed.rest;
+      const json = parsed.flags["--json"] === true;
+      const recursive = parsed.flags["-r"] === true || parsed.flags["--recursive"] === true;
       const usage = "usage: fleet cp [-r] <local...> <sel>:<remote-dir>   |   fleet cp [-r] <sel>:<remote...> <local-dir>";
       // Everything but the last token is a source; the last token is the destination.
       // With >1 source the destination must be a directory (scp enforces that).
@@ -421,14 +422,16 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
     case "edit": {
       // Unlike exec there is no free-form remote command here, so flags are safe
       // to accept anywhere — `fleet edit host:/path --old X --new Y` reads best.
-      const json = pullFlag(rest, "--json");
-      const wsl = pullFlag(rest, "--wsl");
-      const all = pullFlag(rest, "--all");          // replace every match instead of demanding a unique one
-      const dryRun = pullFlag(rest, "--dry-run");   // show the diff, write nothing
-      const old = pullVal(rest, "--old");
-      const neu = pullVal(rest, "--new") ?? "";     // omitted --new means "delete the matched text"
-      const target = rest.shift();
-      if (!target || old === undefined)
+      const { flags, rest: pos } = parseFlags(rest,
+        ["--json", "--wsl", "--all", "--dry-run"], ["--old", "--new"], false, ["--new"]);
+      const json = flags["--json"] === true;
+      const wsl = flags["--wsl"] === true;
+      const all = flags["--all"] === true;
+      const dryRun = flags["--dry-run"] === true;
+      const old = flags["--old"] as string | undefined;
+      const neu = (flags["--new"] as string | undefined) ?? "";
+      const [target] = pos;
+      if (!target || old === undefined || pos.length !== 1)
         die("usage: fleet edit [--all] [--dry-run] [--wsl] [--json] <sel>:<path> --old <str> --new <str>");
       const spec = parseRemoteSpec(cfg, target!);
       if (!spec) die(`fleet edit needs a <sel>:<path> target (got '${target}')`);
@@ -447,8 +450,9 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
     }
 
     case "restart": {
-      const [sel, svcName] = rest;
-      if (!sel || !svcName) die("usage: fleet restart <sel> <service>");
+      const { rest: pos } = parseFlags(rest, [], []);
+      const [sel, svcName] = pos;
+      if (!sel || !svcName || pos.length !== 2) die("usage: fleet restart <sel> <service>");
       const actions = await restartService(cfg, await routeSelector(cfg, sel!), svcName!);
       for (const a of actions) {
         console.log(A.d(`↻ ${a.host} :: ${a.service} (${a.type})`));
@@ -458,9 +462,10 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
     }
 
     case "reboot": {
-      const yes = pullFlag(rest, "--yes") || pullFlag(rest, "-y");
-      const sel = rest[0];
-      if (!sel) die("usage: fleet reboot <sel> [--yes]");
+      const { flags, rest: pos } = parseFlags(rest, ["--yes", "-y"], []);
+      const yes = flags["--yes"] === true || flags["-y"] === true;
+      const [sel] = pos;
+      if (!sel || pos.length !== 1) die("usage: fleet reboot <sel> [--yes]");
       const routed = await routeSelector(cfg, sel!);
       const hosts = resolveHosts(cfg, routed).map((h) => h.name);
       if (!await confirm(`reboot ${A.b(hosts.join(", "))} (this drops the connection)`, yes)) return 1;
@@ -471,9 +476,10 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
     }
 
     case "bios": {
-      const yes = pullFlag(rest, "--yes") || pullFlag(rest, "-y");
-      const sel = rest[0];
-      if (!sel) die("usage: fleet bios <sel> [--yes]");
+      const { flags, rest: pos } = parseFlags(rest, ["--yes", "-y"], []);
+      const yes = flags["--yes"] === true || flags["-y"] === true;
+      const [sel] = pos;
+      if (!sel || pos.length !== 1) die("usage: fleet bios <sel> [--yes]");
       const routed = await routeSelector(cfg, sel!);
       const hosts = resolveHosts(cfg, routed).map((h) => h.name);
       if (!await confirm(`reboot ${hosts.join(", ")} into BIOS/UEFI setup (drops the connection)`, yes)) return 1;
@@ -484,9 +490,10 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
     }
 
     case "logs": {
-      const n = numVal(rest, "-n", 30);
-      const [sel, svcName] = rest;
-      if (!sel || !svcName) die("usage: fleet logs <sel> <service> [-n N]");
+      const { flags, rest: pos } = parseFlags(rest, [], ["-n"]);
+      const n = numFlag(flags, "-n", 30);
+      const [sel, svcName] = pos;
+      if (!sel || !svcName || pos.length !== 2) die("usage: fleet logs <sel> <service> [-n N]");
       const actions = await serviceLogs(cfg, await routeSelector(cfg, sel!), svcName!, n);
       for (const a of actions) {
         if (actions.length > 1) console.log(A.d(`— ${a.host} :: ${a.service}`));
@@ -496,10 +503,11 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
     }
 
     case "svc": case "service": {
-      const json = pullFlag(rest, "--json");
-      const name = rest[0];
-      const sel = rest[1] ?? "all";
-      if (!name) die("usage: fleet svc <service> [sel]   (status across every host that has it)");
+      const { flags, rest: pos } = parseFlags(rest, ["--json"], []);
+      const json = flags["--json"] === true;
+      const name = pos[0];
+      const sel = pos[1] ?? "all";
+      if (!name || pos.length > 2) die("usage: fleet svc <service> [sel]   (status across every host that has it)");
       const rows = await svcStatus(cfg, await routeSelector(cfg, sel), name!);
       if (json) { console.log(JSON.stringify(rows, null, 2)); return rows.some((r) => !r.up) ? 1 : 0; }
       for (const r of rows)
@@ -508,7 +516,9 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
     }
 
     case "gpu": {
-      const json = pullFlag(rest, "--json");
+      const { flags, rest: pos } = parseFlags(rest, ["--json"], []);
+      if (pos.length) die("usage: fleet gpu [--json]");
+      const json = flags["--json"] === true;
       const rows = await gpuRows(cfg);
       if (!rows.length) die("no GPUs reported by the dashboard");
       if (json) { console.log(JSON.stringify(rows, null, 2)); return 0; }
@@ -518,8 +528,10 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
     }
 
     case "disk": {
-      const json = pullFlag(rest, "--json");
-      const sel = rest[0] ?? "all";
+      const { flags, rest: pos } = parseFlags(rest, ["--json"], []);
+      if (pos.length > 1) die("usage: fleet disk [<sel>] [--json]");
+      const json = flags["--json"] === true;
+      const sel = pos[0] ?? "all";
       const rows = await diskRows(cfg, await routeSelector(cfg, sel));
       if (!rows.length) die(`no volumes reported by ${sel}`);
       if (json) { console.log(JSON.stringify(rows, null, 2)); return 0; }
@@ -536,8 +548,10 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
     }
 
     case "status": {
-      const json = pullFlag(rest, "--json");
-      const filter = rest[0];
+      const { flags, rest: pos } = parseFlags(rest, ["--json"], []);
+      if (pos.length > 1) die("usage: fleet status [<host>] [--json]");
+      const json = flags["--json"] === true;
+      const filter = pos[0];
       if (json) {
         // preserve the old `--json` shape: the full raw dashboard payload
         console.log(JSON.stringify(await fetchDashboard(cfg), null, 2));
@@ -557,19 +571,21 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
     }
 
     case "top": {
-      const sel = rest[0];
-      if (!sel) die("usage: fleet top <host>");
+      const { rest: pos } = parseFlags(rest, [], []);
+      const [sel] = pos;
+      if (!sel || pos.length !== 1) die("usage: fleet top <host>");
       const host = resolveHosts(cfg, await routeSelector(cfg, sel))[0]!.name;
       return await topLoop(cfg, host);
     }
 
     case "shot": case "screenshot": {
-      const noOpen = pullFlag(rest, "--no-open");
-      const grid = pullFlag(rest, "--grid");
-      const gridStep = numVal(rest, "--grid-step", 100);
-      const out = pullVal(rest, "--out");
-      const sel = rest[0];
-      if (!sel) die("usage: fleet shot <host> [--out file.png] [--grid [--grid-step N]] [--no-open]");
+      const { flags, rest: pos } = parseFlags(rest, ["--no-open", "--grid"], ["--grid-step", "--out"]);
+      const noOpen = flags["--no-open"] === true;
+      const grid = flags["--grid"] === true;
+      const gridStep = numFlag(flags, "--grid-step", 100);
+      const out = flags["--out"] as string | undefined;
+      const [sel] = pos;
+      if (!sel || pos.length !== 1) die("usage: fleet shot <host> [--out file.png] [--grid [--grid-step N]] [--no-open]");
       const routed = await routeSelector(cfg, sel);
       const host = resolveHosts(cfg, routed)[0]!;
       const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
@@ -584,9 +600,10 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
     }
 
     case "browse": {
-      const sel = rest.shift();
-      if (!sel || rest.length > 1) die("usage: fleet browse <host> [url]");
-      const result = await browseHost(cfg, await routeSelector(cfg, sel), rest[0]);
+      const { rest: pos } = parseFlags(rest, [], []);
+      const [sel, url] = pos;
+      if (!sel || pos.length > 2) die("usage: fleet browse <host> [url]");
+      const result = await browseHost(cfg, await routeSelector(cfg, sel), url);
       console.log(result.endpoint);
       console.log(JSON.stringify(result.targets, null, 2));
       return 0;
@@ -679,16 +696,22 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
         const local = out ?? `${sel}-${q!.replace(/[^a-z0-9]+/gi, "_")}-${new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19)}.${await preferredImageExt()}`;
         const r = await cuShotWindow(cfg, target, q!, local);
         printResult(r.result);
-        if (r.localImage) {
-          await applyGrid(r.localImage);
-          console.log(`${A.g("●")} ${A.d(`${r.app.name} w${r.window.window_id} →`)} ${r.localImage}${grid ? A.d(" (grid)") : ""}`);
-          openImg(r.localImage);
+        if (!r.localImage) {
+          if (r.result.ok) console.error(A.r("capture did not produce a local image"));
+          return 1;
         }
+        await applyGrid(r.localImage);
+        console.log(`${A.g("●")} ${A.d(`${r.app.name} w${r.window.window_id} →`)} ${r.localImage}${grid ? A.d(" (grid)") : ""}`);
+        openImg(r.localImage);
         return r.result.ok ? 0 : 1;
       }
 
       const r = await cuRun(cfg, target, rest, out);   // pull an image only when --out is given
       printResult(r.result);
+      if (out && !r.localImage) {
+        if (r.result.ok) console.error(A.r("capture did not produce a local image"));
+        return 1;
+      }
       if (r.localImage) {
         await applyGrid(r.localImage);
         console.log(`${A.g("●")} ${A.d("image →")} ${r.localImage}${grid ? A.d(" (grid)") : ""}`);
@@ -698,9 +721,10 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
     }
 
     case "boot": {
-      const json = pullFlag(rest, "--json");
-      const sel = rest[0];
-      if (!sel) die("usage: fleet boot <machine> [--json]");
+      const { flags, rest: pos } = parseFlags(rest, ["--json"], []);
+      const json = flags["--json"] === true;
+      const [sel] = pos;
+      if (!sel || pos.length !== 1) die("usage: fleet boot <machine> [--json]");
       const st = await bootState(cfg, sel);
       if (json) { console.log(JSON.stringify(st, null, 2)); return st.live ? 0 : 1; }
       const tag = st.live
@@ -713,12 +737,13 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
     }
 
     case "switch": {
-      const to = pullVal(rest, "--to");
-      const yes = pullFlag(rest, "--yes") || pullFlag(rest, "-y");
-      const noWait = pullFlag(rest, "--no-wait");
-      const timeout = numVal(rest, "--timeout", 180) * 1000;
-      const sel = rest[0];
-      if (!sel || !to) die("usage: fleet switch <machine> --to <os> [--yes] [--no-wait] [--timeout S]");
+      const { flags, rest: pos } = parseFlags(rest, ["--yes", "-y", "--no-wait"], ["--to", "--timeout"]);
+      const to = flags["--to"] as string | undefined;
+      const yes = flags["--yes"] === true || flags["-y"] === true;
+      const noWait = flags["--no-wait"] === true;
+      const timeout = numFlag(flags, "--timeout", 180) * 1000;
+      const [sel] = pos;
+      if (!sel || !to || pos.length !== 1) die("usage: fleet switch <machine> --to <os> [--yes] [--no-wait] [--timeout S]");
       // switch reboots the box into another OS — same destructive gate as reboot
       if (!await confirm(`switch ${A.b(sel)} → ${A.b(to)} (reboots into the other OS)`, yes)) return 1;
       console.log(A.d(`◎ switching ${sel} → ${to} …`));
@@ -731,28 +756,24 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
     }
 
     case "wait": {
+      const { flags, rest: pos } = parseFlags(rest, ["--json", "--ssh"],
+        ["--port", "--http", "--status", "--boot", "--timeout", "--interval"]);
       const primaryFlags = ["--ssh", "--port", "--http", "--boot"];
-      const requestedConditions = rest.filter((arg) => primaryFlags.includes(arg));
+      const requestedConditions = primaryFlags.filter((flag) => flags[flag] !== undefined);
       if (requestedConditions.length > 1)
         die(`fleet wait accepts one condition, got ${requestedConditions.join(", ")}`);
-      const hasStatus = rest.includes("--status");
-      if (hasStatus && !rest.includes("--http")) die("--status requires --http");
-      for (const flag of ["--port", "--http", "--status", "--boot", "--timeout", "--interval"]) {
-        const index = rest.indexOf(flag);
-        if (index >= 0 && (index + 1 >= rest.length || rest[index + 1]!.startsWith("--")))
-          die(`${flag} requires a value`);
-      }
-      const json = pullFlag(rest, "--json");
-      pullFlag(rest, "--ssh");
-      const port = numVal(rest, "--port", 0, 0);        // 0 = flag absent
-      const http = pullVal(rest, "--http");
-      const status = numVal(rest, "--status", 0, hasStatus ? 100 : 0);
+      if (flags["--status"] !== undefined && flags["--http"] === undefined) die("--status requires --http");
+      const json = flags["--json"] === true;
+      const port = numFlag(flags, "--port", 0);
+      if (port > 65535) die("--port needs a TCP port from 1 to 65535");
+      const http = flags["--http"] as string | undefined;
+      const status = numFlag(flags, "--status", 0, 100);
       if (status > 599) die(`--status needs an HTTP status from 100 to 599 (got '${status}')`);
-      const boot = pullVal(rest, "--boot");
-      const timeout = numVal(rest, "--timeout", 120) * 1000;
-      const interval = numVal(rest, "--interval", 3) * 1000;
-      const sel = rest[0];
-      if (!sel) die("usage: fleet wait <host|machine> [--ssh | --port N | --http URL [--status N] | --boot OS] [--timeout S] [--interval S]");
+      const boot = flags["--boot"] as string | undefined;
+      const timeout = numFlag(flags, "--timeout", 120) * 1000;
+      const interval = numFlag(flags, "--interval", 3) * 1000;
+      const [sel] = pos;
+      if (!sel || pos.length !== 1) die("usage: fleet wait <host|machine> [--ssh | --port N | --http URL [--status N] | --boot OS] [--timeout S] [--interval S]");
       const cond: Parameters<typeof waitFor>[2] = { timeoutMs: timeout, intervalMs: interval };
       if (boot) cond.boot = boot;
       else if (http) { cond.http = http; if (status) cond.status = status; }
@@ -770,7 +791,9 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
     }
 
     case "run": {
-      const name = rest[0] ?? die("usage: fleet run <recipe>");
+      const { rest: pos } = parseFlags(rest, [], []);
+      const [name] = pos;
+      if (!name || pos.length !== 1) die("usage: fleet run <recipe>");
       const steps = cfg.recipes?.[name!];
       if (!steps) die(`unknown recipe '${name}' (have: ${Object.keys(cfg.recipes ?? {}).join(", ") || "none"})`);
       console.log(A.c(`▶ recipe ${name} (${steps!.length} steps)`));
@@ -784,19 +807,14 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
     }
 
     case "deploy": {
-      const json = pullFlag(rest, "--json");
-      const hasRestart = rest.includes("--restart");
-      const restartIndex = rest.indexOf("--restart");
-      const restartValue = restartIndex >= 0 ? rest[restartIndex + 1] : undefined;
-      const hasNoRestart = rest.includes("--no-restart");
-      if (hasRestart && (!restartValue || restartValue.startsWith("--")))
-        die("--restart requires a configured service name");
-      if (hasRestart && hasNoRestart)
+      const { flags, rest: pos } = parseFlags(rest, ["--json", "--no-restart"], ["--restart"]);
+      const json = flags["--json"] === true;
+      const restartSvc = flags["--restart"] as string | undefined;
+      const noRestart = flags["--no-restart"] === true;
+      if (restartSvc && noRestart)
         die("choose either --restart <svc> or --no-restart, not both");
-      const noRestart = pullFlag(rest, "--no-restart");
-      const restartSvc = pullVal(rest, "--restart");
-      const sel = rest[0];
-      if (!sel) die("usage: fleet deploy <sel> [--restart <svc> | --no-restart]");
+      const [sel] = pos;
+      if (!sel || pos.length !== 1) die("usage: fleet deploy <sel> [--restart <svc> | --no-restart]");
       const restart = noRestart ? false : (restartSvc ?? true);
       (json ? console.error : console.log)(A.d(`◎ building + shipping fleet → ${sel} …`));
       const results = await deployHosts(cfg, await routeSelector(cfg, sel!), { restart });
@@ -811,15 +829,24 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
     }
 
     case "tools": {
-      const json = pullFlag(rest, "--json");
-      const sub = rest.shift() ?? "status";
+      const options = parseFlags(rest, ["--json", "--no-skill", "--all"], ["--max-parallel"]);
+      const json = options.flags["--json"] === true;
+      const sub = options.rest.shift() ?? "status";
+      if (!["list", "status", "sync", "stamp"].includes(sub)) die("usage: fleet tools [status|sync|list|stamp] …");
+      for (const flag of Object.keys(options.flags))
+        if (flag !== "--json" && sub !== "sync") die(`${flag} is only valid with tools sync`);
+      const maxArgs = sub === "list" ? 0 : sub === "stamp" || (sub === "sync" && options.flags["--all"]) ? 1 : 2;
+      if (options.rest.length > maxArgs) die(`too many arguments for tools ${sub}; try fleet tools --help`);
       const known = Object.keys(cfg.tools ?? {});
       if (!known.length) die("no `tools` block in fleet.config.json — nothing to track");
-      if (sub !== "sync" && rest.includes("--max-parallel"))
-        die("--max-parallel is only valid with multi-tool sync (`fleet tools sync --all`)");
 
       if (sub === "list") {
         const fingerprints = await fingerprintTools(cfg, known);
+        if (json) {
+          console.log(JSON.stringify(fingerprints.map((fp, index) => fp instanceof Error
+            ? { name: known[index], error: fp.message } : fp), null, 2));
+          return fingerprints.some((fp) => fp instanceof Error) ? 1 : 0;
+        }
         let failed = 0;
         for (let index = 0; index < known.length; index++) {
           const name = known[index]!;
@@ -833,13 +860,13 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
       if (sub === "status") {
         // `fleet tools status [tool] [sel]` — both optional. A leading arg that
         // names a registered tool selects that tool; anything else is a selector.
-        const args = rest.filter((a) => !a.startsWith("-"));
+        const args = options.rest;
         if (args.length > 1 && !known.includes(args[0]!))
           die("unknown tool '" + args[0] + "' in 'fleet tools status <tool> <sel>' (tools: " + known.join(", ") + ")");
         const tools = args[0] && known.includes(args[0]) ? [args.shift()!] : known;
         // No selector → each tool checks its own configured hosts (see toolsStatus).
         const rows = await toolsStatus(cfg, tools, args[0] ? await routeSelector(cfg, args[0]) : undefined);
-        if (json) { console.log(JSON.stringify(rows, null, 2)); return rows.some((r) => r.state === "stale") ? 1 : 0; }
+        if (json) { console.log(JSON.stringify(rows, null, 2)); return rows.some((r) => r.state !== "current") ? 1 : 0; }
         for (const tool of tools) {
           const mine = rows.filter((r) => r.tool === tool);
           const local = mine[0]?.local;
@@ -854,22 +881,19 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
             console.log(`  ${mark} ${A.b(r.host.padEnd(14))} ${detail}`);
           }
         }
-        return rows.some((r) => r.state === "stale") ? 1 : 0;
+        return rows.some((r) => r.state !== "current") ? 1 : 0;
       }
 
       if (sub === "sync") {
-        const noSkill = pullFlag(rest, "--no-skill");
-        const all = pullFlag(rest, "--all");
-        const hasMaxParallel = rest.includes("--max-parallel");
-        const requestedMaxParallel = pullVal(rest, "--max-parallel");
-        if (hasMaxParallel && requestedMaxParallel === undefined)
-          die("--max-parallel requires an integer value");
-        const args = rest.filter((a) => !a.startsWith("-"));
+        const noSkill = options.flags["--no-skill"] === true;
+        const all = options.flags["--all"] === true;
+        const requestedMaxParallel = options.flags["--max-parallel"] as string | undefined;
+        const args = options.rest;
         const tools = all ? known : (args[0] && known.includes(args[0]) ? [args.shift()!] : null);
         if (!tools) die(`usage: fleet tools sync <tool|--all> <sel> [--no-skill] [--max-parallel N]   (tools: ${known.join(", ")})`);
-        const sel = args[0] ?? (tools.length === 1 ? cfg.tools?.[tools[0]!]?.hosts : undefined);
+        const sel = args[0] ?? (!all && tools.length === 1 ? cfg.tools?.[tools[0]!]?.hosts : undefined);
         if (!sel) die("fleet tools sync needs a selector (or a `hosts` default on the tool)");
-        const maxParallel = toolSyncParallelism(tools.length, hasMaxParallel ? requestedMaxParallel : undefined);
+        const maxParallel = toolSyncParallelism(tools.length, requestedMaxParallel);
         const routed = await routeSelector(cfg, sel);
         const blocks = tools.length > 1
           ? await syncTools(cfg, tools, routed, { skill: !noSkill, maxParallel })
@@ -898,22 +922,32 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
 
       if (sub === "stamp") {
         // Write the current version + today's date into each skill's frontmatter.
-        const args = rest.filter((a) => !a.startsWith("-"));
+        const args = options.rest;
+        if (args[0] && !known.includes(args[0])) die(`unknown tool '${args[0]}'`);
         const tools = args[0] && known.includes(args[0]) ? [args[0]!] : known;
         const today = new Date().toISOString().slice(0, 10);
         let failed = 0;
+        const rows: { tool: string; changed?: boolean; version?: string; date?: string; error?: string; skipped?: string }[] = [];
         for (const tool of tools) {
           let fp;
           try { fp = await fingerprint(cfg, tool); }
           catch (error) {
             failed++;
-            console.log(`${A.r("✗")} ${A.b(tool.padEnd(12))} ${A.d(error instanceof Error ? error.message : String(error))}`);
+            const message = error instanceof Error ? error.message : String(error);
+            rows.push({ tool, error: message });
+            if (!json) console.error(`${A.r("✗")} ${A.b(tool.padEnd(12))} ${A.d(message)}`);
             continue;
           }
-          if (!fp.skillPath) { console.log(`${A.d("·")} ${A.b(tool.padEnd(12))} ${A.d("no skill")}`); continue; }
+          if (!fp.skillPath) {
+            rows.push({ tool, skipped: "no skill" });
+            if (!json) console.log(`${A.d("·")} ${A.b(tool.padEnd(12))} ${A.d("no skill")}`);
+            continue;
+          }
           const changed = await stampSkill(fp.skillPath, fp.version, today);
-          console.log(`${changed ? A.g("●") : A.d("·")} ${A.b(tool.padEnd(12))} ${A.d(`v${fp.version} · ${today}${changed ? "" : " (unchanged)"}`)}`);
+          rows.push({ tool, changed, version: fp.version, date: today });
+          if (!json) console.log(`${changed ? A.g("●") : A.d("·")} ${A.b(tool.padEnd(12))} ${A.d(`v${fp.version} · ${today}${changed ? "" : " (unchanged)"}`)}`);
         }
+        if (json) console.log(JSON.stringify(rows, null, 2));
         return failed ? 1 : 0;
       }
 
@@ -921,16 +955,18 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
     }
 
     case "completion": {
-      const shell = rest[0] ?? "bash";
-      if (shell !== "bash" && shell !== "zsh") die("usage: fleet completion [bash|zsh]");
+      const { rest: pos } = parseFlags(rest, [], []);
+      const shell = pos[0] ?? "bash";
+      if (pos.length > 1 || (shell !== "bash" && shell !== "zsh")) die("usage: fleet completion [bash|zsh]");
       console.log(completionScript(cfg, shell));
       return 0;
     }
 
     case "doctor": {
-      const json = pullFlag(rest, "--json");
-      const sel = rest[0];
-      if (!sel) die("usage: fleet doctor <host>");
+      const { flags, rest: pos } = parseFlags(rest, ["--json"], []);
+      const json = flags["--json"] === true;
+      const [sel] = pos;
+      if (!sel || pos.length !== 1) die("usage: fleet doctor <host>");
       const d = await diagnose(cfg, await routeSelector(cfg, sel!));
       if (json) { console.log(JSON.stringify(d, null, 2)); return d.sshUp ? 0 : 1; }
       const head = d.sshUp ? A.g(`● ${d.host} reachable`) : A.r(`○ ${d.host} unreachable`);
@@ -945,8 +981,9 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
     }
 
     case "ssh": {
-      const sel = rest[0];
-      if (!sel) die("usage: fleet ssh <host>");
+      const { rest: pos } = parseFlags(rest, [], []);
+      const [sel] = pos;
+      if (!sel || pos.length !== 1) die("usage: fleet ssh <host>");
       return await sshInteractive(resolveHosts(cfg, await routeSelector(cfg, sel))[0]!);
     }
 
@@ -989,8 +1026,11 @@ async function topLoop(cfg: FleetConfig, host: string): Promise<number> {
 
 if (import.meta.main) {
   const [, , command, ...rest] = process.argv;
-  loadConfig()
-    .then((cfg) => dispatch(command, rest, cfg))
+  Promise.resolve().then(async () => {
+    const help = helpText(command ? [command, ...rest] : []);
+    if (help !== undefined) { console.log(help); return 0; }
+    return dispatch(command, rest, await loadConfig());
+  })
     .then((code) => { process.exitCode = code; })
     .catch((e) => die(e.message));
 }

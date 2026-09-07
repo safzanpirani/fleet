@@ -51,7 +51,7 @@ export interface ToolSpec {
   entry?: string;       // entrypoint the launcher runs, relative to the install dir (default: src/cli.ts)
   dir?: string;         // install dir on hosts (default: ~/<name> | %USERPROFILE%\<name>)
   hosts?: string;       // default selector for `fleet tools sync <name>` (default: none — must be explicit)
-  exclude?: string[];   // extra tar excludes on top of node_modules/.git/dist
+  exclude?: string[];   // portable glob exclusions on top of node_modules/.git/dist
 }
 export interface FleetConfig {
   $comment?: string;

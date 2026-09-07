@@ -26,14 +26,21 @@ import { listSandboxes } from "./daytona.ts";
 import { toolsStatus } from "./tools.ts";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { unlink } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 
-/** Read a local image as base64, then delete it — MCP responses embed the bytes,
- *  so keeping the temp file around would just leak into tmpdir forever. */
+/** Each request owns its image directory, including partial capture output. */
+async function withTempImage<T>(prefix: string, capture: (path: string) => Promise<T>): Promise<T> {
+  const directory = await mkdtemp(join(tmpdir(), prefix));
+  try {
+    return await capture(join(directory, "image.png"));
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
+/** MCP responses embed the bytes; withTempImage removes the local artifacts. */
 async function consumeImage(path: string): Promise<string> {
-  const data = Buffer.from(await Bun.file(path).arrayBuffer()).toString("base64");
-  await unlink(path).catch(() => {});
-  return data;
+  return Buffer.from(await Bun.file(path).arrayBuffer()).toString("base64");
 }
 
 // ── plain-text renderers (no ANSI — agents read text) ─────────────────────────
@@ -104,7 +111,7 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     description: "Fetch recent logs / status for a configured service (journalctl on Linux, "
       + "Get-Service / schtasks query on Windows). Use fleet_ls for valid service names.",
     inputSchema: {
-      host: z.string().describe("Host name (or selector — first matched host is used)."),
+      host: z.string().describe("Host name or selector. Reads every matched host defining this service; skips hosts without it."),
       service: z.string().describe("Configured service name on that host."),
       lines: z.number().int().positive().optional().describe("How many log lines (default 30)."),
     },
@@ -156,7 +163,7 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     description: "Fetch the captured output of one detached job, addressed as host:id (from "
       + "fleet_jobs). Pass tail to get only the last N lines instead of the full log.",
     inputSchema: {
-      ref: z.string().describe("Job reference: \"host:id\" (e.g. \"oracle:mr0gnez7-iqd8\")."),
+      ref: z.string().describe("Job reference: \"host:id\" (e.g. \"web:mr0gnez7-iqd8\")."),
       tail: z.number().int().positive().optional().describe("Return only the last N lines (default: full log)."),
     },
     annotations: { readOnlyHint: true, openWorldHint: true },
@@ -337,10 +344,10 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     });
     const ok = r.outcome === "matched" || (r.outcome === "exited" && r.code === 0);
     const state = r.outcome === "matched" ? "matched"
-      : r.outcome === "timeout" ? "timeout" : `exit ${r.code}`;
+      : r.outcome === "timeout" ? "timeout" : r.outcome === "dead" ? "dead; inspect logs and artifacts before retrying" : `exit ${r.code}`;
     return text(
       `${ok ? "●" : "○"} ${r.host}:${r.id} · ${state} · ${Math.round(r.elapsedMs / 1000)}s`
-      + (r.outcome === "timeout" ? " · still running — call again or poll fleet_job_log" : ""),
+      + (r.outcome === "timeout" ? " · observation deadline expired; call again or poll fleet_job_log" : ""),
       !ok,
     );
   });
@@ -348,9 +355,9 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
   server.registerTool("fleet_tools_status", {
     title: "Which boxes have a stale CLI tool",
     description: "Report, per registered CLI tool, which hosts are running the current build "
-      + "and which have drifted. The verdict comes from a content hash of exactly what gets "
-      + "shipped (source + paired SKILL.md), so it cannot be fooled by a forgotten version "
-      + "bump. Use this before trusting that a tool or its skill is up to date on a remote box.",
+      + "and which have drifted. Compares local source and skill fingerprints with the last "
+      + "sync manifest. This does not verify the active launcher or detect edits after sync. "
+      + "Missing, stale, and unreachable targets report an error.",
     inputSchema: {
       tool: z.string().optional().describe("Single registered tool name (default: all of them)."),
       selector: z.string().optional().describe("Host selector (default: each tool's configured hosts)."),
@@ -369,7 +376,7 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       + (r.state === "current" ? ` (${r.local.version}/${r.local.hash})` : "")
       + (r.error ? ` \u2014 ${r.error.split("\n")[0]}` : ""),
     ).join("\n");
-    return text(out || "no rows");
+    return text(out || "no rows", rows.some((r) => r.state !== "current"));
   });
 
   server.registerTool("fleet_cu_tools", {
@@ -416,8 +423,7 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       gridStep: z.number().int().positive().max(1000).optional().describe("Grid spacing in pixels (default 100)."),
     },
     annotations: { openWorldHint: true },
-  }, async ({ host, grid, gridStep }) => {
-    const local = join(tmpdir(), `fleet_shot_${Date.now()}.png`);
+  }, async ({ host, grid, gridStep }) => withTempImage("fleet-shot-", async (local) => {
     try {
       const r = await captureScreenshot(cfg, await routeSelector(cfg, host), local);
       const gridApplied = grid ? await overlayGrid(r.localPath, gridStep ?? 100) : false;
@@ -430,7 +436,7 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     } catch (e) {
       return text((e as Error).message, true);
     }
-  });
+  }));
 
   server.registerTool("fleet_exec", {
     title: "Run a command on host(s)",
@@ -440,7 +446,7 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       + "bash for @linux/@mac, PowerShell for @windows (set wsl:true to run bash inside WSL on a "
       + "Windows box). " + sel,
     inputSchema: {
-      selector: z.string().describe("Host selector, e.g. \"maints\", \"@linux\", \"all\", \"vps,@gpu\"."),
+      selector: z.string().describe("Host selector, e.g. \"winbox\", \"@linux\", \"all\", \"vps,@gpu\"."),
       command: z.string().describe("Command to run, verbatim. Quotes/pipes/$ round-trip as-is."),
       wsl: z.boolean().optional().describe("Run the command inside WSL bash on a Windows host."),
       cwd: z.string().optional().describe("Working directory on the target (fails fast if missing)."),
@@ -574,7 +580,7 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       + "service / scheduled task — the right restart verb is chosen automatically). Use fleet_ls "
       + "to see each host's known service names.",
     inputSchema: {
-      host: z.string().describe("Host name (or any selector — the first matched host is used)."),
+      host: z.string().describe("Host name or selector. Restarts every matched host defining this service; skips hosts without it."),
       service: z.string().describe("Configured service name on that host."),
     },
     annotations: { destructiveHint: true, openWorldHint: true },
@@ -602,7 +608,7 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     const results = await spawnJob(cfg, await routeSelector(cfg, selector), command, { cwd, label });
     const out = results.map((r) => r.ok
       ? `● ${r.host} job ${r.id} · pid ${r.pid}  (track: fleet_jobs / fleet_job_log ${r.host}:${r.id})`
-      : `✗ ${r.host} · ${r.error ?? "spawn failed"}`).join("\n");
+      : `✗ ${r.host}:${r.id} · ${r.error ?? "spawn failed"}; inspect fleet_job_log before retrying`).join("\n");
     return text(out, results.some((r) => !r.ok));
   });
 
@@ -765,18 +771,20 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       const actions = await cuInstall(cfg, await routeSelector(cfg, host));
       return text(renderExec(actions.map((a) => a.result)), actions.some((a) => !a.result.ok));
     }
-    const local = image ? join(tmpdir(), `cua_${Date.now()}.png`) : undefined;
-    const r = await cuRun(cfg, await routeSelector(cfg, host), args, local);
-    const content: any[] = [{ type: "text" as const, text: renderExec([r.result]) }];
-    if (r.localImage) {
-      const gridApplied = grid ? await overlayGrid(r.localImage, gridStep ?? 100) : false;
-      if (grid) content[0].text += gridApplied
-        ? "\ncoordinate grid applied"
-        : "\ngrid skipped (python3 + Pillow required)";
-      const data = await consumeImage(r.localImage);
-      content.push({ type: "image" as const, data, mimeType: "image/png" });
-    }
-    return { content, isError: !r.result.ok };
+    const capture = async (local?: string) => {
+      const r = await cuRun(cfg, await routeSelector(cfg, host), args, local);
+      const content: any[] = [{ type: "text" as const, text: renderExec([r.result]) }];
+      if (r.localImage) {
+        const gridApplied = grid ? await overlayGrid(r.localImage, gridStep ?? 100) : false;
+        if (grid) content[0].text += gridApplied
+          ? "\ncoordinate grid applied"
+          : "\ngrid skipped (python3 + Pillow required)";
+        const data = await consumeImage(r.localImage);
+        content.push({ type: "image" as const, data, mimeType: "image/png" });
+      }
+      return { content, isError: !r.result.ok };
+    };
+    return image ? withTempImage("fleet-cua-", capture) : capture();
   });
 
   server.registerTool("fleet_cu_apps", {
@@ -827,9 +835,8 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       gridStep: z.number().int().positive().max(1000).optional().describe("Grid spacing in pixels (default 100)."),
     },
     annotations: { openWorldHint: true },
-  }, async ({ host, app, grid, gridStep }) => {
+  }, async ({ host, app, grid, gridStep }) => withTempImage("fleet-cua-window-", async (local) => {
     const target = await routeSelector(cfg, host);
-    const local = join(tmpdir(), `cua_window_${Date.now()}.png`);
     const r = await cuShotWindow(cfg, target, app, local);
     if (!r.result.ok || !r.localImage) return text(renderExec([r.result]), true);
     const gridApplied = grid ? await overlayGrid(r.localImage, gridStep ?? 100) : false;
@@ -839,7 +846,7 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
         + (grid ? gridApplied ? " · coordinate grid applied" : " · grid skipped (python3 + Pillow required)" : "") },
       { type: "image" as const, data, mimeType: "image/png" },
     ] };
-  });
+  }));
 
   server.registerTool("fleet_deploy", {
     title: "Deploy Fleet to host(s)",

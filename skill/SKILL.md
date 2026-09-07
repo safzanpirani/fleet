@@ -58,8 +58,8 @@ Tailscale. Reach for the LAN entry — tailnet traffic can leave the network and
 so copying anything large over the remote entry burns bandwidth for no gain.
 
 Name them so the transport is obvious: the plain name for the LAN box and a `-ts` suffix
-for its Tailscale twin (`server-pc` / `server-pc-ts`). `fleet ls` shows the ssh alias for
-every host, and a `routes` entry (`{"prefer": ["server-pc", "server-pc-ts"]}`) falls back
+for its Tailscale twin (`lan-host` / `lan-host-ts`). `fleet ls` shows the ssh alias for
+every host, and a `routes` entry (`{"prefer": ["lan-host", "lan-host-ts"]}`) falls back
 to Tailscale automatically only when the LAN box does not answer. Dual-boot `machines`
 probe LAN first too.
 
@@ -117,7 +117,7 @@ harness-backgrounded SSH session open for it.
   propagates the job's code, so `fleet jobs wait gpu-box:<id> && deploy` works.
 - Typical flow: `fleet spawn --cwd /srv/app gpu-box "./train.sh"` → `fleet jobs` to find it
   → `fleet jobs tail gpu-box:<id> -f` or `fleet jobs wait gpu-box:<id> --until '<rx>'` →
-  `fleet jobs prune` when done. **Not exposed over MCP yet** (CLI-only).
+  `fleet jobs prune` when done. MCP exposes bounded job waits and inspection; live tailing stays CLI-only.
 
 ## Computer use (`fleet cu`)
 
@@ -187,19 +187,18 @@ Run standalone with `bun run mcp` (honours `FLEET_CONFIG`); smoke-test end-to-en
 | `fleet_bios` | `selector` | `fleet bios <selector> --yes` |
 | `fleet_run` | `recipe` | `fleet run` |
 
-- `top` and `ssh` are **not** exposed — they need a live TTY. `spawn`/`jobs` are **not yet**
-  exposed either (CLI-only for now).
+- `top`, `ssh`, and live `jobs tail -f` remain CLI-only. Detached jobs and bounded waits are available over MCP.
 - Same rules as the CLI: pass `command` verbatim (don't escape), syntax is the target's
   native shell, and `restart`/`logs` services must be config-defined.
-- `fleet_restart` and `fleet_bios` are annotated `destructive`; `ls`/`logs`/`gpu`/`disk`/`status`/`screenshot` are
-  `readOnly` (always registered, even with the kill-switch on).
+- `fleet_restart` and `fleet_bios` are annotated `destructive`; `ls`/`logs`/`gpu`/`disk`/`status` are
+  `readOnly` where they only inspect state. Screenshot and computer-use tools execute on hosts and are hidden in read-only mode.
   Host, group, and recipe names are baked into the tool descriptions, so an agent sees
   valid selectors without a round-trip.
 - The CLI (`cli.ts`) and MCP server (`mcp.ts`) are both thin frontends over `src/core.ts`
   — one source of truth for the quoting-proof exec.
 
 **Remote endpoint:** fleet can also be deployed as a public HTTP MCP server (Streamable
-HTTP at `/mcp`, legacy SSE at `/sse`) for remote clients. It runs on one host as a service
+HTTP at `/mcp`; legacy `/sse` returns 410) for remote clients. It runs on one host as a service
 (`src/http.ts`, `buildServer` from `src/server.ts`) behind a reverse proxy / tunnel, and is
 **bearer-token gated** (`Authorization: Bearer <FLEET_MCP_TOKEN>`; the token lives only in
 the service env). `FLEET_MCP_READONLY=1` is the kill-switch (drops exec/cp/restart/run).
@@ -218,3 +217,18 @@ A route has an ordered `prefer` list of same-OS host entries.
 
 For one-off work on the local machine, or hosts not in `fleet.config.json`, use plain
 `ssh`/shell. `fleet` is for the configured fleet.
+
+## Validation and recovery contracts
+
+- Help is static: `fleet help <command>` works without configuration or network access.
+- Validate owned flags before dispatch. Value flags accept `--flag=value`; integer timeouts reject fractions. Remote command flags remain payload.
+- `fleet edit` uses literal replacement text. Omit `--new` or pass `--new ""` to delete. A present flag without a value is an error. Use `--old=--flag` for option-looking text.
+- Screenshot success requires a local PNG/WebP artifact. Failed transfers preserve existing output. Windows capture checks its interactive task's completion and errors.
+- Save each job reference. An unconfirmed launch keeps its attempted ID and is never automatically retried. Inspect the spool before another submission.
+- Wait deadlines stop observation, not jobs. Resume using the same job reference. CLI waits are unbounded by default; MCP waits require a finite timeout.
+- `tools status` compares manifests, not the active launcher or later remote edits. Missing and unreachable targets fail status checks.
+- Tool sync fingerprints and archives a copied snapshot with the same portable glob exclusions. Hashing retains one batch of up to 16 files per tool.
+- `--no-skill` leaves a skipped paired skill stale. Existing manifests may need one resync after the fingerprint format update.
+- Sync and deploy share a lock per installation directory and use unique archives. A timeout or disconnect retains the lock; inspect the operation before removing it or retrying.
+- Daytona defaults to five minutes and requires positive explicit timeouts. `--timeout 0` only disables SSH execution deadlines.
+- HTTP MCP limits request bodies to 16 MiB. Malformed JSON returns 400; oversized requests return 413.

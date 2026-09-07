@@ -137,4 +137,47 @@ describe("diffLines", () => {
     expect(d).toContain("+ 2 x");
     expect(d).toContain("+ 3 y");
   });
+
+  test("separated edits never print the unchanged middle with zero context", () => {
+    const before = "old\nPRIVATE_PLACEHOLDER\nold\n";
+    const after = "new\nPRIVATE_PLACEHOLDER\nnew\n";
+    const d = diffLines(before, after, 0);
+    expect(d).toContain("- 1 old");
+    expect(d).toContain("+ 3 new");
+    expect(d).not.toContain("PRIVATE_PLACEHOLDER");
+  });
+
+  test("separated edits align unchanged lines after inserted lines", () => {
+    const d = diffLines("old\nPRIVATE_PLACEHOLDER\nold\n", "new\nextra\nPRIVATE_PLACEHOLDER\nnew\nextra\n", 0);
+    expect(d).toContain("+ 2 extra");
+    expect(d).toContain("+ 5 extra");
+    expect(d).not.toContain("PRIVATE_PLACEHOLDER");
+  });
+
+  test("a repeated later line cannot pull an unchanged neighbor into a unique replacement", () => {
+    const before = "old\nPRIVATE_PLACEHOLDER\nold";
+    const after = before.replace("old\n", "new\n");
+    expect(diffLines(before, after, 0)).toBe("- 1 old\n+ 1 new");
+  });
+
+  test("separated edits preserve repeated unchanged lines inside the changed region", () => {
+    const before = "old\nrepeat\nPRIVATE_PLACEHOLDER\nrepeat\nold";
+    const after = "new\nrepeat\nPRIVATE_PLACEHOLDER\nrepeat\nnew";
+    expect(diffLines(before, after, 0)).toBe("- 1 old\n+ 1 new\n- 5 old\n+ 5 new");
+  });
+
+  test("a small edit in a large file trims unchanged prefix and suffix before alignment", () => {
+    const lines = Array.from({ length: 20_000 }, (_, i) => `unchanged ${i}`);
+    const before = lines.join("\n");
+    lines[10_000] = "replacement";
+    expect(diffLines(before, lines.join("\n"), 0)).toBe("- 10001 unchanged 10000\n+ 10001 replacement");
+  });
+
+  test("oversized alignment returns a bounded summary without source contents", () => {
+    const middle = Array.from({ length: 2000 }, (_, i) => `PRIVATE_PLACEHOLDER ${i}`).join("\n");
+    const d = diffLines(`old\n${middle}\nold`, `new\n${middle}\nnew`, 0);
+    expect(d).toContain("Diff omitted:");
+    expect(d).not.toContain("PRIVATE_PLACEHOLDER");
+    expect(d.length).toBeLessThan(150);
+  });
 });

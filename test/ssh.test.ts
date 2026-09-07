@@ -1,12 +1,12 @@
-import { test, expect, describe } from "bun:test";
-import { bashPathAssignment, buildArgs, scpRemotePath } from "../src/ssh.ts";
+import { test, expect, describe, spyOn } from "bun:test";
+import { bashEsc, bashPathAssignment, buildArgs, execStream, scpRemotePath, sshDiagnose } from "../src/ssh.ts";
 import type { Host } from "../src/config.ts";
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 
 const linux: Host = { name: "vps", ssh: "vps", os: "linux" };
-const win: Host = { name: "maints", ssh: "maints", os: "windows" };
+const win: Host = { name: "winbox", ssh: "winbox", os: "windows" };
 
 const decodeUtf16le = (b64: string) => Buffer.from(b64, "base64").toString("utf16le");
 // pull the value passed to a flag in an argv array
@@ -105,7 +105,18 @@ describe("buildArgs — windows (program over stdin)", () => {
     expect(args.slice(-2)).toEqual(["-Command", "-"]);
     expect(args).toContain("-NonInteractive");
     expect(args.join(" ")).not.toContain("rm -rf");
-    expect(new TextDecoder().decode(stdin!)).toBe(NASTY + "\n");
+    expect(new TextDecoder().decode(stdin!)).toBe(NASTY + "\n\n");
+  });
+
+  test("terminates final PowerShell multiline statements with an empty line", () => {
+    for (const command of [
+      "Write-Output @'\nhello\n'@",
+      "if ($true) {\n  Write-Output 'done'\n}",
+    ]) {
+      const { args, stdin } = buildArgs(win, command, "powershell");
+      expect(new TextDecoder().decode(stdin!)).toBe(command + "\n\n");
+      expect(args.join(" ")).not.toContain(command);
+    }
   });
 
   test("large scripts and secrets stay entirely in stdin", () => {
@@ -190,6 +201,30 @@ describe("Windows scp paths", () => {
   });
 });
 
+test("streamed commands retain their arguments through the remote shell", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "fleet-stream-"));
+  const log = join(dir, "job's output");
+  writeFileSync(log, "first\nlast line\n");
+  // SSH joins remote argv into one shell command; replay that boundary locally.
+  const completed = Bun.spawn(["true"], { stdout: "ignore", stderr: "ignore" });
+  await completed.exited;
+  const spawn = spyOn(Bun, "spawn").mockReturnValue(completed);
+  let remoteCommand = "";
+  try {
+    await execStream(linux, `tail -n 1 '${bashEsc(log)}'`);
+    const argv = spawn.mock.calls[0]![0] as string[];
+    remoteCommand = argv.slice(argv.indexOf(linux.ssh) + 1).join(" ");
+  } finally { spawn.mockRestore(); }
+  try {
+    const replay = Bun.spawn(["sh", "-c", remoteCommand], { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+    const [stdout, stderr, code] = await Promise.all([
+      new Response(replay.stdout).text(), new Response(replay.stderr).text(), replay.exited,
+    ]);
+    expect(code, stderr).toBe(0);
+    expect(stdout).toBe("last line\n");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 describe("stripClixml", () => {
   const { stripClixml } = require("../src/ssh.ts");
   const blob = `#< CLIXML
@@ -207,6 +242,55 @@ describe("stripClixml", () => {
 });
 
 describe("probe deadline cleanup", () => {
+  test("doctor bounds a hung SSH process and pipe inherited after SSH exits", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "fleet-doctor-deadline-"));
+    const childPidFile = join(dir, "child-pid");
+    const readyFile = join(dir, "ready");
+    try {
+      for (const inheritedPipe of [false, true]) {
+        rmSync(readyFile, { force: true });
+        const script = 'printf "diagnostic started\\n" >&2\n' + (inheritedPipe
+          ? 'sleep 10 &\nprintf "%s" "$!" > "$FLEET_TEST_CHILD_PID"\nprintf ready > "$FLEET_TEST_READY"\nexit 0\n'
+          : 'printf ready > "$FLEET_TEST_READY"\nexec sleep 10\n');
+        const proc = Bun.spawn(["sh", "-c", script], {
+          env: { ...process.env, FLEET_TEST_CHILD_PID: childPidFile, FLEET_TEST_READY: readyFile },
+          stdout: "pipe", stderr: "pipe",
+        });
+        try {
+          // Start the diagnostic deadline only after fixture output exists.
+          // Otherwise a loaded machine can kill sh before its first printf.
+          const readyDeadline = performance.now() + 2000;
+          while (!await Bun.file(readyFile).exists() && performance.now() < readyDeadline) await Bun.sleep(5);
+          expect(await Bun.file(readyFile).exists()).toBe(true);
+          if (inheritedPipe) expect(await proc.exited).toBe(0);
+          const spawn = spyOn(Bun, "spawn").mockReturnValue(proc);
+          try {
+            const started = performance.now();
+            const result = await sshDiagnose(linux, 0.2);
+            expect(result.ok).toBe(false);
+            expect(result.stderr).toContain("diagnostic started");
+            expect(result.stderr).toContain("SSH diagnosis timed out");
+            expect(performance.now() - started).toBeLessThan(1500);
+          } finally { spawn.mockRestore(); }
+          if (inheritedPipe) {
+            // It returned by cancelling inherited pipes, not by waiting for EOF.
+            const childPid = Number(await Bun.file(childPidFile).text());
+            expect(() => process.kill(childPid, 0)).not.toThrow();
+          }
+        } finally {
+          proc.kill("SIGKILL");
+          await proc.exited;
+        }
+      }
+    } finally {
+      if (await Bun.file(childPidFile).exists()) {
+        const pid = Number(await Bun.file(childPidFile).text());
+        try { process.kill(pid, "SIGKILL"); } catch { /* fixture already ended */ }
+      }
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 10_000);
+
   test("a successful fast probe clears its long timeout", async () => {
     const dir = mkdtempSync(join(tmpdir(), "fleet-probe-test-"));
     try {

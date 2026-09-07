@@ -50,17 +50,17 @@ fleet ls                            # reachability + services (◍ = ssh-down bu
 fleet exec win-box "nvidia-smi"      # run on one host
 fleet exec windows-auto "hostname"  # resolve a logical route before dispatch
 fleet exec all "uptime"             # run on every host, in parallel
-fleet exec --wsl web "uname -a"  # run inside WSL on a windows box
+fleet exec --wsl win-box "uname -a"  # run inside WSL on a windows box
 fleet dt                            # list Daytona sandboxes (DAYTONA_API_KEY)
-fleet exec --cwd /srv/app oracle "./build.sh"   # run in a dir; fails fast if missing
+fleet exec --cwd /srv/app web "./build.sh"   # run in a dir; fails fast if missing
 fleet exec --timeout 60 vps "slow-thing"        # wall-clock cap; a hung command exits 124
-fleet spawn --cwd /srv/app oracle "./train.sh"  # detached job that outlives ssh -> job id
+fleet spawn --cwd /srv/app web "./train.sh"  # detached job that outlives ssh -> job id
 fleet jobs                          # every detached job across the fleet
-fleet jobs tail oracle:mqtn19-9px -f# stream a job's output live
-fleet jobs wait oracle:mqtn19-9px --until 'Recovered.*1/1'   # block until match (or exit)
-fleet jobs kill oracle:mqtn19-9px   # signal the whole job process-group
+fleet jobs tail web:mqtn19-9px -f # stream a job's output live
+fleet jobs wait web:mqtn19-9px --until 'Recovered.*1/1'   # block until match (or exit)
+fleet jobs kill web:mqtn19-9px   # signal the whole job process-group
 fleet jobs prune                    # GC finished job spools
-fleet cp -r ./dist oracle:~/dist    # copy a dir (recursive); pull with  cp oracle:~/f.log ./
+fleet cp -r ./dist web:~/dist    # copy a dir (recursive); pull with  cp web:~/f.log ./
 fleet restart @linux cloudflared   # restart a configured service (fans out across the selector)
 fleet bios windows-auto --yes      # reboot directly into UEFI/BIOS firmware setup
 fleet svc cloudflared              # up/down of one service on every host that has it
@@ -113,9 +113,37 @@ fleet cp ./artifact.tgz dt:spore-:/home/daytona/artifact.tgz
 ```
 
 Daytona targets are Linux-only. A command deadline maps to exit 124, and
-recursive copy is not currently supported.
+recursive copy is not currently supported. Daytona uses a five-minute default
+timeout. Set a positive `--timeout` to change it; explicit `--timeout 0` is
+rejected for Daytona and only disables the cap for SSH.
+
+## CLI validation and screenshots
+
+Help works without configuration or network access: `fleet help exec`,
+`fleet jobs --help`, and `fleet help tools`. Fleet validates its own flags before
+contacting a host. Flags inside an opaque remote command remain command payload.
+Value flags support `--flag=value`; integer timeouts reject fractional values.
+
+`fleet edit` treats replacement text literally, including `$&`. Omitting `--new`
+or passing `--new ""` deletes the match. A present `--new` without a value fails.
+Use `--old=--flag` for option-looking text. Edit diffs omit unchanged context and
+return a content-free summary when line alignment exceeds its work limit.
+
+Screenshot commands require a local PNG/WebP artifact before reporting success.
+Transfers use temporary files and preserve existing output on failure. Windows
+capture checks its interactive task's completion and error records, then removes
+the task and temporary control files.
 
 ## Detached jobs
+
+`jobs list` aliases the bare listing command; `jobs tail --lines N` aliases `-n N`.
+Addressed commands accept both `host:id` and `host id`. Use `--json` for one JSON
+result; live `tail --follow` cannot combine with `--json`.
+
+Wait timeouts and Ctrl-C stop observation without cancelling the job. Resume
+with the same reference. Unconfirmed launches retain their attempted ID and are
+never retried automatically. Inspect their existing spool before resubmitting.
+
 `exec` is **foreground**: it blocks, streams nothing, and returns the remote exit
 code. `spawn` is **fire-and-track**: it launches a job that *outlives the SSH
 session* and hands back a job id. The controller stays stateless — the only state
@@ -124,12 +152,12 @@ lives on the host, under a per-host spool (`~/.fleet/jobs/<id>/`: `cmd`, `cwd`,
 quoting-proof `exec`. Jobs are addressed as `host:id`.
 
 ```sh
-fleet spawn --cwd /srv/app --label train oracle "long-running-thing"  # -> host:id, detaches
+fleet spawn --cwd /srv/app --label train web "long-running-thing"  # -> host:id, detaches
 fleet jobs                              # list (running ● / exited ○ / dead ✗) across the fleet
-fleet jobs log  oracle:<id>             # full output
-fleet jobs tail oracle:<id> -n 40 -f    # last N lines, optionally follow live
-fleet jobs wait oracle:<id> --until '<regex>' [--timeout S]   # block on match or exit
-fleet jobs kill oracle:<id>             # kill the whole process tree (TERM, escalates to KILL)
+fleet jobs log  web:<id>             # full output
+fleet jobs tail web:<id> -n 40 -f    # last N lines, optionally follow live
+fleet jobs wait web:<id> --until '<regex>' [--timeout S]   # block on match or exit
+fleet jobs kill web:<id>             # kill the whole process tree (TERM, escalates to KILL)
 fleet jobs prune [<sel>] [--all]        # remove finished spools (--all also drops dead)
 ```
 
@@ -141,7 +169,7 @@ under a still-running job. (Windows uses `taskkill /T /F` + the same
 confirm-then-sentinel dance.)
 
 `wait` is scriptable: it exits with the job's own code on completion, `0` on a
-`--until` match, `124` on timeout — so `fleet jobs wait oracle:<id> && deploy`
+`--until` match, `124` on timeout — so `fleet jobs wait web:<id> && deploy`
 works. `--label` prefixes a readable slug onto the job id.
 
 Works on **every OS**: Linux/mac launch via `setsid` (no privilege, survives
@@ -416,7 +444,7 @@ FLEET_MCP_TOKEN=<long-random> bun run src/http.ts     # or: bun run serve
   `ls`/`status`/`svc`/`gpu`/`logs`/`jobs`/`job_log`/`boot` are exposed.
 - **Binding:** defaults to `127.0.0.1:8787` (`FLEET_MCP_HOST` / `FLEET_MCP_PORT`) —
   only the local cloudflared should reach it; the token is the public gate.
-- Register in an MCP client with URL `https://fleet.example.com/mcp` (or `/sse`) and the
+- Register in an MCP client with URL `https://fleet.example.com/mcp` and the
   token as the API key. Smoke-test locally with `bun run scripts/smoke-http.ts`
   (and `FLEET_MCP_READONLY=1 bun run scripts/smoke-http.ts` for the kill-switch).
 
@@ -447,7 +475,8 @@ git-ignored `fleet.config.local.json` if you don't want hosts in git.
 | var | effect |
 |---|---|
 | `FLEET_CONFIG` | alternate config path |
-| `FLEET_EXEC_TIMEOUT` | default wall-clock cap (seconds) for every exec; per-call `--timeout` / MCP `timeout` wins. Unset/0 = no cap |
+| `FLEET_SOURCE_ROOT` | source checkout for deployment from a compiled binary |
+| `FLEET_EXEC_TIMEOUT` | default wall-clock cap in seconds; per-call timeout wins. Unset/0 disables the SSH cap; Daytona retains its five-minute default |
 | `FLEET_PROBE_TIMEOUT_MS` | reachability-probe cap (default 4000) |
 | `FLEET_WIN_SHELL` | force `pwsh` or `powershell` on every Windows host (overrides per-host `winShell`) |
 | `FLEET_NO_SSH_MUX` | `1` disables SSH connection multiplexing. By default fleet reuses one master connection per host (`ControlMaster=auto`, `ControlPersist=60s`, sockets under `~/.fleet/ssh/`) so fan-outs and poll loops don't re-handshake; a wedged socket is fixed by this flag or `rm ~/.fleet/ssh/cm-*` |
@@ -460,3 +489,30 @@ every machine, so no command has to survive multiple layers of quoting.
 ## Stack
 Bun + strict TypeScript. The CLI itself has zero runtime deps; the MCP server
 adds `@modelcontextprotocol/sdk` + `zod`. `bun run typecheck` to verify.
+
+## Tool synchronization and deployment
+
+`fleet tools status [tool] [selector] --json` compares local fingerprints with
+sync manifests. Missing, stale, or unreachable targets return exit 1. A current
+manifest does not verify the active launcher or detect remote edits after sync.
+
+Tool sync fingerprints and archives the same copied source snapshot. Portable
+exclusion globs apply to both operations. Hashing retains one batch of up to 16
+files per tool. Source and paired skill identities are separate: `--no-skill`
+leaves a skipped skill stale. Existing manifests may require one resync after
+this fingerprint format update.
+
+Sync and Fleet deployment use unique archives and a shared lock per installation
+directory. A timeout or disconnect retains the lock because installation may
+still be running. Inspect the previous operation before removing its lock or
+retrying. Overlay installations preserve runtime files; obsolete source files
+are not automatically removed.
+
+HTTP MCP request bodies are limited to 16 MiB. Malformed JSON returns 400 and
+oversized bodies return 413. Authentication remains mandatory outside health.
+
+## Development checks
+
+Run `bun run check` for TypeScript and the full test suite. `bun run build:local`
+builds a native candidate, verifies its macOS code signature where applicable,
+and runs help without configuration before replacing `dist/fleet-local`.

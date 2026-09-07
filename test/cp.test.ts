@@ -4,28 +4,28 @@ import type { FleetConfig, Host } from "../src/config.ts";
 
 const host = (name: string, os: Host["os"]): Host => ({ name, ssh: name, os });
 const cfg: FleetConfig = {
-  hosts: { oracle: host("oracle", "linux"), maints: host("maints", "windows") },
-  routes: { "oracle-auto": { prefer: ["oracle"] } },
-  groups: { cloud: ["oracle"] },
-  machines: { cachy: { boots: { linux: { host: "oracle" } } } },
+  hosts: { web: host("web", "linux"), winbox: host("winbox", "windows") },
+  routes: { "web-auto": { prefer: ["web"] } },
+  groups: { cloud: ["web"] },
+  machines: { dualboot: { boots: { linux: { host: "web" } } } },
 };
 
 describe("parseRemoteSpec (cp direction detection)", () => {
   test("host:path splits at the first colon", () =>
-    expect(parseRemoteSpec(cfg, "oracle:/tmp/x")).toEqual({ sel: "oracle", path: "/tmp/x" }));
+    expect(parseRemoteSpec(cfg, "web:/tmp/x")).toEqual({ sel: "web", path: "/tmp/x" }));
 
   test("@group / all / comma-list prefixes are recognised", () => {
     expect(parseRemoteSpec(cfg, "@cloud:~/x")?.sel).toBe("@cloud");
     expect(parseRemoteSpec(cfg, "@linux:~/x")?.sel).toBe("@linux");
     expect(parseRemoteSpec(cfg, "all:/x")?.sel).toBe("all");
-    expect(parseRemoteSpec(cfg, "oracle,maints:/x")?.sel).toBe("oracle,maints");
+    expect(parseRemoteSpec(cfg, "web,winbox:/x")?.sel).toBe("web,winbox");
   });
 
   test("a dual-boot machine name is a valid prefix", () =>
-    expect(parseRemoteSpec(cfg, "cachy:/x")?.sel).toBe("cachy"));
+    expect(parseRemoteSpec(cfg, "dualboot:/x")?.sel).toBe("dualboot"));
 
   test("a logical route name is a valid prefix", () =>
-    expect(parseRemoteSpec(cfg, "oracle-auto:/x")?.sel).toBe("oracle-auto"));
+    expect(parseRemoteSpec(cfg, "web-auto:/x")?.sel).toBe("web-auto"));
 
   test("a plain local path (no colon) is not a remote spec", () =>
     expect(parseRemoteSpec(cfg, "./dir/file.txt")).toBeNull());
@@ -34,8 +34,8 @@ describe("parseRemoteSpec (cp direction detection)", () => {
     expect(parseRemoteSpec(cfg, "C:\\Users\\me\\file.txt")).toBeNull());
 
   test("a Windows REMOTE path keeps its drive colon in the path half", () =>
-    expect(parseRemoteSpec(cfg, "maints:C:\\Users\\Admin\\out.png"))
-      .toEqual({ sel: "maints", path: "C:\\Users\\Admin\\out.png" }));
+    expect(parseRemoteSpec(cfg, "winbox:C:\\Users\\Admin\\out.png"))
+      .toEqual({ sel: "winbox", path: "C:\\Users\\Admin\\out.png" }));
 
   test("an unknown prefix is treated as a local path, not a host", () =>
     expect(parseRemoteSpec(cfg, "notahost:/x")).toBeNull());

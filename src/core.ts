@@ -10,10 +10,11 @@ import type { FleetConfig, Host, Service, ServiceType, Machine } from "./config.
 import { exec, probe, scp, scpPull, sshDiagnose, bashEsc, bashPathAssignment, psEsc } from "./ssh.ts";
 import type { ExecResult, Shell } from "./ssh.ts";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { createConnection } from "node:net";
-import { mkdir, readdir } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rename, rm } from "node:fs/promises";
 import { createHash } from "node:crypto";
+import { installLockScript } from "./install-lock.ts";
 
 // ── tiny arg helpers (shared by cli flag parsing + recipe step parsing) ──────
 export function pullFlag(rest: string[], flag: string): boolean {
@@ -26,6 +27,7 @@ export function pullVal(rest: string[], flag: string): string | undefined {
   const i = rest.indexOf(flag);
   if (i < 0) return undefined;
   const v = rest[i + 1];
+  if (v === undefined || v === "" || v.startsWith("--")) throw new Error(`${flag} requires a value`);
   rest.splice(i, 2);
   return v;
 }
@@ -37,15 +39,39 @@ export function pullVal(rest: string[], flag: string): string | undefined {
 export function parseLeadingFlags(
   argv: string[], boolFlags: readonly string[], valFlags: readonly string[],
 ): { flags: Record<string, string | true>; rest: string[] } {
+  return parseFlags(argv, boolFlags, valFlags, true);
+}
+
+/** Parse owned options. Use leadingOnly when the remaining tokens are a remote command. */
+export function parseFlags(
+  argv: string[], boolFlags: readonly string[], valFlags: readonly string[], leadingOnly = false,
+  allowEmptyValues: readonly string[] = [],
+): { flags: Record<string, string | true>; rest: string[] } {
   const flags: Record<string, string | true> = {};
-  let i = 0;
-  for (; i < argv.length; i++) {
-    const t = argv[i]!;
-    if (boolFlags.includes(t)) { flags[t] = true; continue; }
-    if (valFlags.includes(t)) { flags[t] = argv[i + 1] ?? ""; i++; continue; }
-    break; // first non-flag token = the selector
+  const rest: string[] = [];
+  for (let i = 0; i < argv.length; i++) {
+    const token = argv[i]!;
+    if (token === "--") { rest.push(...argv.slice(i + 1)); break; }
+    const equals = token.startsWith("--") ? token.indexOf("=") : -1;
+    const t = equals > 0 ? token.slice(0, equals) : token;
+    if (Object.hasOwn(flags, t)) throw new Error(`duplicate option: ${t}`);
+    if (boolFlags.includes(t)) {
+      if (equals > 0) throw new Error(`${t} does not take a value`);
+      flags[t] = true; continue;
+    }
+    if (valFlags.includes(t)) {
+      const value = equals > 0 ? token.slice(equals + 1) : argv[++i];
+      if (value === undefined || (value === "" && !allowEmptyValues.includes(t)) ||
+          (equals < 0 && (value.startsWith("--") || boolFlags.includes(value) || valFlags.includes(value))))
+        throw new Error(`${t} requires a value`);
+      flags[t] = value;
+      continue;
+    }
+    if (t.startsWith("-")) throw new Error(`unknown option: ${t} (try fleet help)`);
+    if (leadingOnly) { rest.push(...argv.slice(i)); break; }
+    rest.push(token);
   }
-  return { flags, rest: argv.slice(i) };
+  return { flags, rest };
 }
 /** Split a string into tokens, honouring "double quotes" (quotes are dropped). */
 export function splitArgs(s: string): string[] {
@@ -357,19 +383,60 @@ export interface EditResult {
 
 /** Unified-ish diff of just the changed regions, with `ctx` lines of context. */
 export function diffLines(before: string, after: string, ctx = 2): string {
+  if (before === after) return "";
   const a = before.split("\n"), b = after.split("\n");
-  // changed span = first and last line index where the two differ
-  let lo = 0;
-  while (lo < a.length && lo < b.length && a[lo] === b[lo]) lo++;
-  let ea = a.length - 1, eb = b.length - 1;
-  while (ea >= lo && eb >= lo && a[ea] === b[eb]) { ea--; eb--; }
-  if (lo > ea && lo > eb) return "";
-  const out: string[] = [];
-  for (let i = Math.max(0, lo - ctx); i < lo; i++) out.push(`  ${i + 1} ${a[i]}`);
-  for (let i = lo; i <= ea; i++) out.push(`- ${i + 1} ${a[i]}`);
-  for (let i = lo; i <= eb; i++) out.push(`+ ${i + 1} ${b[i]}`);
-  for (let i = ea + 1; i <= Math.min(a.length - 1, ea + ctx); i++) out.push(`  ${i + 1} ${a[i]}`);
-  return out.join("\n");
+  const context = Number.isFinite(ctx) ? Math.max(0, Math.floor(ctx)) : 0;
+  let start = 0;
+  while (start < a.length && start < b.length && a[start] === b[start]) start++;
+  let endA = a.length, endB = b.length;
+  while (endA > start && endB > start && a[endA - 1] === b[endB - 1]) { endA--; endB--; }
+  const height = endA - start, width = endB - start, stride = width + 1;
+  // LCS preserves repeated lines without greedy anchors pulling unchanged lines
+  // into the diff. Cap both work and allocation; a summary is safer than a
+  // fallback that dumps the entire region, which may contain credentials.
+  const cells = (height + 1) * stride;
+  if (cells > 1_000_000)
+    return `Diff omitted: changed region exceeds the alignment limit (${height} old lines, ${width} new lines).`;
+  const lcs = new Uint32Array(cells);
+  for (let i = height - 1; i >= 0; i--)
+    for (let j = width - 1; j >= 0; j--)
+      lcs[i * stride + j] = a[start + i] === b[start + j]
+        ? 1 + lcs[(i + 1) * stride + j + 1]!
+        : Math.max(lcs[(i + 1) * stride + j]!, lcs[i * stride + j + 1]!);
+
+  const rows: { changed: boolean; text: string }[] = [];
+  for (let i = Math.max(0, start - context); i < start; i++)
+    rows.push({ changed: false, text: `  ${i + 1} ${a[i]}` });
+  let i = start, j = start;
+  while (i < endA || j < endB) {
+    if (i < endA && j < endB && a[i] === b[j]) {
+      rows.push({ changed: false, text: `  ${i + 1} ${a[i]}` });
+      i++; j++;
+    } else if (i < endA && (j === endB ||
+        lcs[(i - start + 1) * stride + j - start]! >= lcs[(i - start) * stride + j - start + 1]!)) {
+      rows.push({ changed: true, text: `- ${i + 1} ${a[i]}` });
+      i++;
+    } else {
+      rows.push({ changed: true, text: `+ ${j + 1} ${b[j]}` });
+      j++;
+    }
+  }
+  for (let k = endA; k < Math.min(a.length, endA + context); k++)
+    rows.push({ changed: false, text: `  ${k + 1} ${a[k]}` });
+
+  // Merge context windows in linear time even when ctx covers the whole file.
+  const ranges: { from: number; to: number }[] = [];
+  rows.forEach((row, index) => {
+    if (!row.changed) return;
+    const from = Math.max(0, index - context), to = Math.min(rows.length, index + context + 1);
+    const previous = ranges.at(-1);
+    if (previous && from <= previous.to) previous.to = to;
+    else ranges.push({ from, to });
+  });
+  const output: string[] = [];
+  for (const { from, to } of ranges)
+    for (let k = from; k < to; k++) output.push(rows[k]!.text);
+  return output.join("\n");
 }
 
 /** Replace `oldStr` with `newStr` in a remote file on every selected host.
@@ -390,7 +457,7 @@ export async function editRemoteFile(
       if (n === 0) return { ...base, ok: false, error: `--old not found in ${path}` };
       if (n > 1 && !opts.all)
         return { ...base, ok: false, error: `--old matches ${n} times in ${path} — pass --all to replace every one, or extend --old until it is unique` };
-      const next = opts.all ? text.split(oldStr).join(newStr) : text.replace(oldStr, newStr);
+      const next = opts.all ? text.split(oldStr).join(newStr) : text.replace(oldStr, () => newStr);
       // Remote edits commonly target env/config files. Unchanged neighbors can
       // contain credentials, so show only the lines that will change.
       const diff = diffLines(text, next, 0);
@@ -455,7 +522,8 @@ export async function resolveDeploySourceRoot(opts: DeploySourceOptions = {}): P
 function deployDir(h: Host): string {
   return h.deploy?.dir ?? (h.os === "windows" ? "$env:USERPROFILE\\fleet" : "$HOME/fleet");
 }
-export function deployScript(h: Host): { cmd: string; shell: Shell } {
+export function deployScript(h: Host, archive = "fleet-deploy.tgz"): { cmd: string; shell: Shell } {
+  if (!/^[a-z0-9.-]+$/.test(archive)) throw new Error("invalid deployment archive");
   const dir = deployDir(h);
   if (h.os === "windows") return { shell: "powershell", cmd: [
     `$ErrorActionPreference='Stop'`,
@@ -464,7 +532,7 @@ export function deployScript(h: Host): { cmd: string; shell: Shell } {
     `$dir="${dir}"`,
     `try {`,
     `New-Item -ItemType Directory -Force -Path $dir | Out-Null`,
-    `tar -xzf "$env:USERPROFILE\\fleet-deploy.tgz" -C $dir`,
+    `tar -xzf "$env:USERPROFILE\\${archive}" -C $dir`,
     `if($LASTEXITCODE -ne 0){throw "tar extraction failed with exit $LASTEXITCODE"}`,
     `Set-Location $dir`,
     `& $bun install 2>&1 | Out-Null`,
@@ -477,16 +545,16 @@ export function deployScript(h: Host): { cmd: string; shell: Shell } {
     `if(-not $resolved -or [IO.Path]::GetFullPath($resolved) -ne [IO.Path]::GetFullPath("$shim\\fleet.cmd")){throw "deployed Fleet is shadowed by '$resolved'; put $shim first on PATH"}`,
     `"deployed to $dir (bun: $bun)"`,
     `} finally {`,
-    `Remove-Item "$env:USERPROFILE\\fleet-deploy.tgz" -Force -EA SilentlyContinue`,
+    `Remove-Item "$env:USERPROFILE\\${archive}" -Force -EA SilentlyContinue`,
     `}`,
   ].join("\n") };
   return { shell: "bash", cmd: [
     `set -e`,
-    `trap 'rm -f "$HOME/fleet-deploy.tgz"' EXIT`,
+    `trap 'rm -f "$HOME/${archive}"' EXIT`,
     h.deploy?.bun ? `bun='${h.deploy.bun}'` : `bun="$(command -v bun || echo "$HOME/.bun/bin/bun")"`,
     `dir="${dir}"`,
     `mkdir -p "$dir"`,
-    `tar -xzf "$HOME/fleet-deploy.tgz" -C "$dir"`,
+    `tar -xzf "$HOME/${archive}" -C "$dir"`,
     `cd "$dir"`,
     `"$bun" install >/dev/null 2>&1`,
     `mkdir -p "$HOME/.local/bin"`,
@@ -504,15 +572,59 @@ function deployRestartName(h: Host, restart: boolean | string): string | undefin
   if (typeof restart === "string") return restart;
   return h.deploy?.service ?? (h.services?.["fleet-mcp"] ? "fleet-mcp" : undefined);
 }
-async function deployOne(cfg: FleetConfig, h: Host, tarLocal: string, restart: boolean | string): Promise<DeployResult> {
-  const pushed = await scp(h, tarLocal, "fleet-deploy.tgz");
-  if (!pushed.ok) return { host: h.name, ok: false, dir: deployDir(h), result: pushed };
-  const { cmd, shell } = deployScript(h);
-  const result = await exec(h, cmd, shell);
-  if (!result.ok) return { host: h.name, ok: false, dir: deployDir(h), result };
-  const svc = deployRestartName(h, restart);
-  const restarted = svc ? await restartService(cfg, h.name, svc) : undefined;
-  return { host: h.name, ok: restarted ? restarted.every((a) => a.result.ok) : true, dir: deployDir(h), result, restarted };
+export async function deployOne(
+  cfg: FleetConfig, h: Host, tarLocal: string, restart: boolean | string,
+  deps: { exec?: typeof exec; scp?: typeof scp; restart?: typeof restartService } = {},
+): Promise<DeployResult> {
+  const token = crypto.randomUUID();
+  const archive = `fleet-deploy-${token}.tgz`;
+  const dir = deployDir(h);
+  const run = deps.exec ?? exec;
+  const lock = installLockScript(h, dir, token);
+  const acquired = await run(h, lock.cmd, lock.shell);
+  if (!acquired.ok) return { host: h.name, ok: false, dir, result: acquired };
+  let unconfirmed = false;
+  let installing = false;
+  let outcome: DeployResult;
+  try {
+    const pushed = await (deps.scp ?? scp)(h, tarLocal, archive);
+    if (!pushed.ok) {
+      unconfirmed = pushed.code === 124 || pushed.code === 255;
+      outcome = { host: h.name, ok: false, dir, result: pushed };
+    } else {
+      const { cmd, shell } = deployScript(h, archive);
+      installing = true;
+      const result = await run(h, cmd, shell);
+      unconfirmed = result.code === 124 || result.code === 255;
+      installing = unconfirmed;
+      const svc = result.ok ? deployRestartName(h, restart) : undefined;
+      if (svc) installing = true;
+      const restarted = svc ? await (deps.restart ?? restartService)(cfg, h.name, svc) : undefined;
+      unconfirmed ||= restarted?.some((a) => a.result.code === 124 || a.result.code === 255) ?? false;
+      installing = unconfirmed;
+      outcome = { host: h.name, ok: result.ok && (restarted?.every((a) => a.result.ok) ?? true), dir, result, restarted };
+    }
+  } catch (error) {
+    unconfirmed = installing;
+    outcome = { host: h.name, ok: false, dir, result: { host: h.name, ok: false, code: unconfirmed ? 255 : 1,
+      stdout: "", stderr: error instanceof Error ? error.message : String(error) } };
+  }
+  if (unconfirmed) {
+    outcome.ok = false;
+    outcome.result = { ...outcome.result, ok: false, code: outcome.result.code || 255,
+      stderr: `${outcome.result.stderr}\ndeployment outcome is unconfirmed; inspect ${archive} and the installation lock before another deployment`.trim() };
+    return outcome;
+  }
+  const release = installLockScript(h, dir, token, true, archive);
+  try {
+    const cleaned = await run(h, release.cmd, release.shell);
+    if (!cleaned.ok) outcome = { ...outcome, ok: false, result: { ...cleaned,
+      stderr: [outcome.result.stderr, `deployment cleanup: ${cleaned.stderr || `exit ${cleaned.code}`}`].filter(Boolean).join("\n") } };
+  } catch (error) {
+    outcome = { ...outcome, ok: false, result: { ...outcome.result, ok: false, code: 1,
+      stderr: `deployment cleanup failed: ${error instanceof Error ? error.message : String(error)}` } };
+  }
+  return outcome;
 }
 /** Build a tarball of the fleet source on the controller, ship it to each host
  *  the selector resolves to, extract + `bun install`, then optionally restart the
@@ -527,10 +639,11 @@ export async function deployHosts(
       throw new Error(`cannot deploy ${host.name}: restart service '${service}' is not configured (available: ${Object.keys(host.services ?? {}).join(", ") || "none"})`);
   }
   const sourceRoot = await resolveDeploySourceRoot();
-  const tar = join(tmpdir(), `fleet-deploy-${Date.now()}.tgz`);
+  const staging = await mkdtemp(join(tmpdir(), "fleet-deploy-"));
+  const tar = join(staging, "source.tgz");
   try {
     const build = Bun.spawn(
-      ["tar", "czf", tar, "-C", sourceRoot, "--exclude", "node_modules", "--exclude", ".git", "--exclude", "dist", "."],
+      ["tar", "czf", tar, "-C", sourceRoot, "--exclude", "node_modules", "--exclude", ".git", "--exclude", "dist", "--exclude", ".scratch", "."],
       { env: { ...process.env, COPYFILE_DISABLE: "1" }, stdout: "ignore", stderr: "pipe" });
     const [buildCode, buildError] = await Promise.all([
       build.exited,
@@ -539,7 +652,7 @@ export async function deployHosts(
     if (buildCode !== 0) throw new Error("tarball build failed: " + buildError.trim());
     return await Promise.all(hosts.map((h) => deployOne(cfg, h, tar, opts.restart ?? true)));
   } finally {
-    await Bun.spawn(["rm", "-f", tar]).exited;
+    await rm(staging, { recursive: true, force: true });
   }
 }
 
@@ -656,8 +769,17 @@ async function resolveLiveHostOrSelf(
   probeHost?: (host: Host) => Promise<boolean>,
 ): Promise<string> {
   if (cfg.hosts[name]) return name;
-  if (cfg.routes?.[name]) return routeSelector(cfg, name, { probe: probeHost });
-  try { return await resolveLiveHost(cfg, name, { probe: probeHost }); } catch { return name; }
+  if (cfg.routes?.[name]) {
+    const route = cfg.routes[name];
+    for (const candidate of route.prefer) {
+      const host = cfg.hosts[candidate];
+      if (!host) throw new Error(`route ${name} references unknown host '${candidate}'`);
+      if (await (probeHost ?? probe)(host)) return candidate;
+    }
+    return name;
+  }
+  if (cfg.machines?.[name]) return (await bootState(cfg, name, { probe: probeHost })).liveHost ?? name;
+  return name;
 }
 
 /** Resolve logical routes or dual-boot machine names anywhere in a selector.
@@ -754,10 +876,11 @@ async function probeOnce(
   target: string,
   c: WaitCond,
   remainingMs: number,
+  probeHost: typeof probe = probe,
 ): Promise<{ ok: boolean; detail: string }> {
   const deadlineAt = Date.now() + remainingMs;
   const timeLeft = () => Math.max(1, deadlineAt - Date.now());
-  const boundedProbe = (host: Host) => probe(host, timeLeft());
+  const boundedProbe = (host: Host) => probeHost(host, timeLeft());
   if (c.boot) {
     const st = await bootState(cfg, target, { probe: boundedProbe });
     return { ok: st.live === c.boot, detail: `live=${st.live ?? "off"}` };
@@ -773,6 +896,8 @@ async function probeOnce(
   }
   if (c.port != null) {
     const name = await resolveLiveHostOrSelf(cfg, target, boundedProbe);
+    if (!cfg.hosts[name] && (cfg.routes?.[target] || cfg.machines?.[target]))
+      return { ok: false, detail: "no reachable transport" };
     const addr = cfg.hosts[name]?.ssh ?? target;
     const open = await probePort(addr, c.port, timeLeft());
     return { ok: open, detail: `:${c.port} ${open ? "open" : "closed"}` };
@@ -784,13 +909,20 @@ async function probeOnce(
   return { ok: up, detail: up ? "ssh up" : "ssh down" };
 }
 
-export async function waitFor(cfg: FleetConfig, target: string, c: WaitCond): Promise<WaitResult> {
+export async function waitFor(
+  cfg: FleetConfig, target: string, c: WaitCond, deps: { probe?: typeof probe } = {},
+): Promise<WaitResult> {
   const timeoutMs = c.timeoutMs ?? 120_000, intervalMs = c.intervalMs ?? 3_000;
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || !Number.isFinite(intervalMs) || intervalMs <= 0)
+    throw new Error("wait timeout and interval must be finite positive numbers");
+  if (c.boot && !getMachine(cfg, target).boots[c.boot]) throw new Error(`machine ${target} has no boot '${c.boot}'`);
+  if (!c.http && c.port == null && !cfg.hosts[target] && !cfg.routes?.[target] && !cfg.machines?.[target])
+    throw new Error(`unknown host, route, or machine: ${target}`);
   const start = Date.now(); let attempts = 0, lastDetail = "";
   while (Date.now() - start < timeoutMs) {
     attempts++;
     const remaining = Math.max(1, timeoutMs - (Date.now() - start));
-    const { ok, detail } = await probeOnce(cfg, target, c, remaining);
+    const { ok, detail } = await probeOnce(cfg, target, c, remaining, deps.probe);
     lastDetail = detail;
     const elapsed = Date.now() - start;
     c.onTick?.(detail, elapsed);
@@ -817,29 +949,54 @@ export async function preferredImageExt(): Promise<"webp" | "png"> {
 /** Pull a remote image to `finalOut`. If finalOut is .webp and cwebp exists,
  *  transcode locally (lossless — crisp UI text, smaller than PNG); otherwise
  *  fall back to .png. Returns the ExecResult of the pull and the actual path. */
-async function deliverImage(
+export async function validateImageArtifact(path: string): Promise<void> {
+  const file = Bun.file(path);
+  if (!await file.exists()) throw new Error(`capture produced no local image: ${path}`);
+  const header = Buffer.from(await file.slice(0, 32).arrayBuffer());
+  if (header.length < 24) throw new Error(`capture produced an empty or truncated image: ${path}`);
+  const png = header.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
+  if (png) {
+    const tail = Buffer.from(await file.slice(-12).arrayBuffer());
+    if (header.toString("ascii", 12, 16) === "IHDR" && header.readUInt32BE(16) > 0 && header.readUInt32BE(20) > 0 &&
+        tail.equals(Buffer.from([0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130]))) return;
+  } else if (header.toString("ascii", 0, 4) === "RIFF" && header.toString("ascii", 8, 12) === "WEBP" &&
+             header.readUInt32LE(4) + 8 === file.size) return;
+  throw new Error(`capture produced an invalid or incomplete PNG/WebP image: ${path}`);
+}
+
+export async function deliverImage(
   host: Host, remotePath: string, finalOut: string,
+  deps: { pull?: typeof scpPull } = {},
 ): Promise<{ result: ExecResult; path: string }> {
   const remote = host.os === "windows" ? remotePath.replace(/\\/g, "/") : remotePath;
   const wantWebp = /\.webp$/i.test(finalOut);
   const cwebp = wantWebp ? await findCwebp() : null;
 
-  if (wantWebp && !cwebp) {                       // no transcoder → honest .png
-    const png = finalOut.replace(/\.webp$/i, ".png");
-    return { result: await scpPull(host, remote, png), path: png };
+  const path = wantWebp && !cwebp ? finalOut.replace(/\.webp$/i, ".png") : finalOut;
+  const parent = dirname(resolve(path));
+  await mkdir(parent, { recursive: true });
+  const staging = await mkdtemp(join(parent, ".fleet-image-"));
+  try {
+    const png = join(staging, "capture.png");
+    const pull = await (deps.pull ?? scpPull)(host, remote, png);
+    if (!pull.ok) return { result: pull, path };
+    await validateImageArtifact(png);
+    let candidate = png;
+    if (wantWebp && cwebp) {
+      candidate = join(staging, "capture.webp");
+      const proc = Bun.spawn([cwebp, "-lossless", "-quiet", png, "-o", candidate], { stdout: "ignore", stderr: "pipe" });
+      const [code, stderr] = await Promise.all([proc.exited, new Response(proc.stderr).text()]);
+      if (code !== 0) return { result: { ...pull, ok: false, code, stderr: `cwebp failed: ${stderr}` }, path };
+      await validateImageArtifact(candidate);
+    }
+    await rename(candidate, resolve(path));
+    return { result: pull, path };
+  } catch (error) {
+    return { result: { host: host.name, ok: false, code: 1, stdout: "",
+      stderr: error instanceof Error ? error.message : String(error) }, path };
+  } finally {
+    await rm(staging, { recursive: true, force: true });
   }
-  if (wantWebp && cwebp) {
-    // unique per call so concurrent captures to the same finalOut can't clobber
-    const tmp = `${finalOut}.${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}.tmp.png`;
-    const pull = await scpPull(host, remote, tmp);
-    if (!pull.ok) return { result: pull, path: finalOut };
-    const proc = Bun.spawn([cwebp, "-lossless", "-quiet", tmp, "-o", finalOut], { stdout: "ignore", stderr: "pipe" });
-    const code = await proc.exited;
-    await Bun.spawn(["rm", "-f", tmp]).exited;
-    if (code !== 0) return { result: { ...pull, ok: false, stderr: `cwebp failed: ${await new Response(proc.stderr).text()}` }, path: finalOut };
-    return { result: pull, path: finalOut };
-  }
-  return { result: await scpPull(host, remote, finalOut), path: finalOut };
 }
 
 /** Overlay a labeled pixel-coordinate grid on a local image (in place) so an
@@ -905,7 +1062,7 @@ Image.alpha_composite(im, ov).convert("RGB").save(path)
 /** Per-OS command that captures the screen to a temp file and prints the path
  *  as its last stdout line. Best-effort on Linux (needs grim/scrot/imagemagick
  *  + a reachable display). Windows/mac capture the active interactive session. */
-function captureCmd(os: Host["os"]): { cmd: string; shell: Shell } {
+export function captureCmd(os: Host["os"]): { cmd: string; shell: Shell } {
   if (os === "windows") return { shell: "powershell", cmd: [
     // sshd runs in session 0 (no desktop), so a direct CopyFromScreen captures a
     // blank virtual screen. Run the grab inside the logged-in user's interactive
@@ -913,35 +1070,58 @@ function captureCmd(os: Host["os"]): { cmd: string; shell: Shell } {
     `$ErrorActionPreference='Stop'`,
     `$out = Join-Path $env:TEMP ('fleet_shot_' + [guid]::NewGuid().ToString('N') + '.png')`,
     `$ps1 = [System.IO.Path]::ChangeExtension($out,'ps1')`,
-    `$script = @"`,
-    `Add-Type -AssemblyName System.Windows.Forms,System.Drawing`,
-    "`$vs=[System.Windows.Forms.SystemInformation]::VirtualScreen",
-    "`$bmp=New-Object System.Drawing.Bitmap(`$vs.Width,`$vs.Height)",
-    "`$g=[System.Drawing.Graphics]::FromImage(`$bmp)",
-    "`$g.CopyFromScreen(`$vs.Location,[System.Drawing.Point]::Empty,`$vs.Size)",
-    "`$bmp.Save('$out',[System.Drawing.Imaging.ImageFormat]::Png)",
-    "`$g.Dispose(); `$bmp.Dispose()",
-    `"@`,
+    `$script = @'`,
+    `$ErrorActionPreference='Stop'`,
+    `$out=[IO.Path]::ChangeExtension($MyInvocation.MyCommand.Path,'png')`,
+    `$code=0; $bmp=$null; $g=$null`,
+    `try {`,
+    `  Add-Type -AssemblyName System.Windows.Forms,System.Drawing`,
+    `  $vs=[System.Windows.Forms.SystemInformation]::VirtualScreen`,
+    `  $bmp=New-Object System.Drawing.Bitmap($vs.Width,$vs.Height)`,
+    `  $g=[System.Drawing.Graphics]::FromImage($bmp)`,
+    `  $g.CopyFromScreen($vs.Location,[System.Drawing.Point]::Empty,$vs.Size)`,
+    `  $bmp.Save($out,[System.Drawing.Imaging.ImageFormat]::Png)`,
+    `} catch { $code=1; [IO.File]::WriteAllText("$out.error",[string]$_) }`,
+    `finally { if($g){$g.Dispose()}; if($bmp){$bmp.Dispose()} }`,
+    `[IO.File]::WriteAllText("$out.done",[string]$code)`,
+    `exit $code`,
+    `'@`,
     `Set-Content -LiteralPath $ps1 -Value $script -Encoding UTF8`,
     `$tn = 'fleet_shot_' + [guid]::NewGuid().ToString('N')`,
-    `schtasks /Create /TN $tn /TR "powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \`"$ps1\`"" /SC ONCE /ST 00:00 /IT /F | Out-Null`,
-    `schtasks /Run /TN $tn | Out-Null`,
+    `$created=$false; $captured=$false`,
+    `try {`,
+    `$psexe=(Get-Process -Id $PID).Path`,
+    `$action=New-ScheduledTaskAction -Execute $psexe -Argument ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $ps1 + '"')`,
+    `$principal=New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited`,
+    `Register-ScheduledTask -TaskName $tn -Action $action -Principal $principal -Force | Out-Null; $created=$true`,
+    `Start-ScheduledTask -TaskName $tn`,
     `$deadline=(Get-Date).AddSeconds(12)`,
-    `while(-not (Test-Path $out) -and (Get-Date) -lt $deadline){ Start-Sleep -Milliseconds 200 }`,
-    `schtasks /Delete /TN $tn /F | Out-Null`,
-    `Remove-Item -LiteralPath $ps1 -ErrorAction SilentlyContinue`,
-    `if(-not (Test-Path $out)){ Write-Error 'capture produced no file — is a user logged in interactively?'; exit 4 }`,
+    `while(-not (Test-Path -LiteralPath "$out.done") -and (Get-Date) -lt $deadline){ Start-Sleep -Milliseconds 200 }`,
+    `$taskResult=(Get-ScheduledTaskInfo -TaskName $tn -ErrorAction SilentlyContinue).LastTaskResult`,
+    `if(-not (Test-Path -LiteralPath "$out.done")){throw "capture task did not finish (task result $taskResult); is a user logged in interactively?"}`,
+    `$captureCode=[IO.File]::ReadAllText("$out.done").Trim()`,
+    `if($captureCode -ne '0'){ $detail=Get-Content -LiteralPath "$out.error" -Raw -ErrorAction SilentlyContinue; throw "capture task failed (exit $captureCode; task result $taskResult): $detail" }`,
+    `if(-not (Test-Path -LiteralPath $out) -or (Get-Item -LiteralPath $out).Length -le 0){throw "capture task completed without a nonempty image (task result $taskResult)"}`,
+    `$captured=$true`,
     `Write-Output $out`,
+    `exit 0`,
+    `} catch { Write-Error $_ -ErrorAction Continue; exit 4 } finally {`,
+    `  if($created){ Stop-ScheduledTask -TaskName $tn -ErrorAction SilentlyContinue; Unregister-ScheduledTask -TaskName $tn -Confirm:$false -ErrorAction SilentlyContinue }`,
+    `  Remove-Item -LiteralPath $ps1,"$out.done","$out.error" -Force -ErrorAction SilentlyContinue`,
+    `  if(-not $captured){Remove-Item -LiteralPath $out -Force -ErrorAction SilentlyContinue}`,
+    `}`,
   ].join("\n") };
   if (os === "mac") return { shell: "bash", cmd:
-    `t="$(mktemp -t fleet_shot)"; p="$t.png"; rm -f "$t"; screencapture -x "$p"; echo "$p"` };
+    `set -e; t="$(mktemp -t fleet_shot)"; p="$t.png"; rm -f "$t"; screencapture -x "$p"; [ -s "$p" ]; echo "$p"` };
   // linux: try wayland (grim) then X11 (scrot / imagemagick import)
   return { shell: "bash", cmd: [
+    `set -e`,
     `p="/tmp/fleet_shot_$$.png"`,
     `if command -v grim >/dev/null 2>&1; then grim "$p"`,
     `elif command -v scrot >/dev/null 2>&1; then scrot "$p"`,
     `elif command -v import >/dev/null 2>&1; then DISPLAY="\${DISPLAY:-:0}" import -window root "$p"`,
     `else echo "no screenshot tool (install grim, scrot, or imagemagick)" >&2; exit 3; fi`,
+    `[ -s "$p" ] || { echo "capture produced no image" >&2; exit 4; }`,
     `echo "$p"`,
   ].join("\n") };
 }
@@ -958,10 +1138,12 @@ export interface ScreenshotResult {
 /** Capture a screenshot on the first selected host and pull it to `localPath`. */
 export async function captureScreenshot(
   cfg: FleetConfig, sel: string, localPath: string,
+  deps: { exec?: typeof exec; deliver?: typeof deliverImage } = {},
 ): Promise<ScreenshotResult> {
   const host = resolveHosts(cfg, sel)[0]!;
+  const run = deps.exec ?? exec;
   const { cmd, shell } = captureCmd(host.os);
-  const capture = await exec(host, cmd, shell);
+  const capture = await run(host, cmd, shell);
   if (!capture.ok) throw new Error(
     `screenshot capture failed on ${host.name}: ${capture.stderr || capture.stdout || "exit " + capture.code}`);
 
@@ -970,11 +1152,15 @@ export async function captureScreenshot(
 
   // deliverImage normalizes the Windows path for scp and optionally transcodes
   // to webp locally; `path` is the actual file written (.webp or .png fallback).
-  const { result: pull, path } = await deliverImage(host, remotePath, localPath);
-  const cleanup = rmCmd(host.os, remotePath);
-  await exec(host, cleanup.cmd, cleanup.shell).catch(() => {});   // best-effort
-  if (!pull.ok) throw new Error(`could not pull screenshot from ${host.name}: ${pull.stderr || "scp exit " + pull.code}`);
-  return { host: host.name, localPath: path, remotePath, capture, pull };
+  try {
+    const { result: pull, path } = await (deps.deliver ?? deliverImage)(host, remotePath, localPath);
+    if (!pull.ok) throw new Error(`could not pull screenshot from ${host.name}: ${pull.stderr || "scp exit " + pull.code}`);
+    await validateImageArtifact(path);
+    return { host: host.name, localPath: path, remotePath, capture, pull };
+  } finally {
+    const cleanup = rmCmd(host.os, remotePath);
+    await run(host, cleanup.cmd, cleanup.shell).catch(() => {});
+  }
 }
 
 // ── computer-use (cua-driver passthrough) ────────────────────────────────────
@@ -1095,14 +1281,14 @@ export async function cuRun(
        `$out = Join-Path $env:TEMP ('cua_' + [guid]::NewGuid().ToString('N') + '.png')`,
        `$driverOutput = @(${cuInvocation(args, host.os, invoke, "out")} 2>&1); $driverSucceeded = $?; $driverCode = $LASTEXITCODE`,
        `$driverOutput | Write-Output`,
-       `if (Test-Path $out) { Write-Output ('${IMG_SENTINEL}' + $out) }`,
+       `if ((Test-Path -LiteralPath $out) -and (Get-Item -LiteralPath $out).Length -gt 0) { Write-Output ('${IMG_SENTINEL}' + $out) }`,
        `if (-not $driverSucceeded) { if ($null -ne $driverCode -and $driverCode -ne 0) { exit $driverCode }; exit 1 }`,
        `if ($null -ne $driverCode -and $driverCode -ne 0) { exit $driverCode }`].join("\n")
     : [prelude,
        `out="${"${TMPDIR:-/tmp}"}/cua_shot_$$_$RANDOM.png"; rm -f "$out"`,
        `${cuInvocation(args, host.os, invoke, "out")} 2>&1`,
        `driver_code=$?`,
-       `if [ -f "$out" ]; then echo "${IMG_SENTINEL}$out"; fi`,
+       `if [ -s "$out" ]; then echo "${IMG_SENTINEL}$out"; fi`,
        `exit "$driver_code"`].join("\n");
   const raw = await runExec(host, cmd, shell);
 
@@ -1113,15 +1299,25 @@ export async function cuRun(
     ...raw,
     stdout: lines.filter((l) => !l.trim().startsWith(IMG_SENTINEL)).join("\n").trimEnd(),
   };
-  if (!imgLine) return { host: host.name, result };   // no image → surface cua's message as-is
+  if (!imgLine) return { host: host.name, result: {
+    ...result, ok: false, code: result.code || 1,
+    stderr: [result.stderr, "cua-driver produced no requested image"].filter(Boolean).join("\n"),
+  } };
 
   const remote = imgLine.trim().slice(IMG_SENTINEL.length);
-  const { result: pull, path } = await deliverImage(host, remote, imageOut);
-  const rm = rmCmd(host.os, remote);
-  await exec(host, rm.cmd, rm.shell).catch(() => {});
-  if (!pull.ok) return { host: host.name,
-    result: { ...result, ok: false, stderr: `${result.stderr}\nimage pull failed: ${pull.stderr}`.trim() } };
-  return { host: host.name, result, localImage: path };
+  try {
+    if (!result.ok) return { host: host.name, result };
+    const { result: pull, path } = await deliverImage(host, remote, imageOut);
+    if (!pull.ok) return { host: host.name,
+      result: { ...result, ok: false, code: pull.code || 1, stderr: `${result.stderr}\nimage pull failed: ${pull.stderr}`.trim() } };
+    return { host: host.name, result, localImage: path };
+  } catch (error) {
+    return { host: host.name, result: { ...result, ok: false, code: 1,
+      stderr: error instanceof Error ? error.message : String(error) } };
+  } finally {
+    const cleanup = rmCmd(host.os, remote);
+    await runExec(host, cleanup.cmd, cleanup.shell).catch(() => {});
+  }
 }
 
 /** Self-documenting cua-driver tool list, with an optional case-insensitive
@@ -1348,6 +1544,7 @@ export async function cuResolvePid(cfg: FleetConfig, sel: string, query: string)
  *  cua-driver is invoked 3× but locally on the host, where it's cheap. */
 export async function cuShotWindow(
   cfg: FleetConfig, sel: string, query: string, imageOut: string,
+  deps: { exec?: typeof exec; deliver?: typeof deliverImage } = {},
 ): Promise<CuResult & { app: CuApp; window: CuWindow }> {
   const host = resolveHosts(cfg, sel)[0]!;
   if (host.os !== "windows") {
@@ -1365,6 +1562,7 @@ export async function cuShotWindow(
   const { prelude, invoke } = cuaBin(host.os);
   const q = query.replace(/'/g, "''");
   const cmd = [
+    `$ErrorActionPreference='Stop'`,
     prelude,
     `$q = '${q}'`,
     // resolve pid: numeric → that pid; else first (active-preferred) name match
@@ -1380,23 +1578,37 @@ export async function cuShotWindow(
     `if (-not $w) { Write-Error "pid $tpid ($tname) has no capturable windows"; exit 3 }`,
     // capture to temp; keep stdout clean, surface cua errors only on failure
     `$out = Join-Path $env:TEMP ('cua_' + [guid]::NewGuid().ToString('N') + '.png')`,
-    `$payload = '{"pid":' + $tpid + ',"window_id":' + $w.window_id + ',"capture_mode":"vision","screenshot_out_file":"' + ($out -replace '\\\\','\\\\') + '"}'`,
+    `$payload = @{ pid=$tpid; window_id=$w.window_id; capture_mode='vision'; screenshot_out_file=$out } | ConvertTo-Json -Compress`,
     `$err = ($payload | ${invoke} get_window_state 2>&1)`,
-    `if (Test-Path $out) { Write-Output ('${IMG_SENTINEL}' + $out + '|' + $tpid + '|' + $w.window_id + '|' + $tname + '|' + $w.title) }`,
+    `$driverSucceeded=$?; $driverCode=$LASTEXITCODE`,
+    `if(-not $driverSucceeded -or ($null -ne $driverCode -and $driverCode -ne 0)){Write-Output $err; if($driverCode){exit $driverCode}; exit 1}`,
+    `if ((Test-Path -LiteralPath $out) -and (Get-Item -LiteralPath $out).Length -gt 0) { Write-Output ('${IMG_SENTINEL}' + $out + '|' + $tpid + '|' + $w.window_id + '|' + $tname + '|' + $w.title) }`,
     `else { Write-Output $err; exit 4 }`,
   ].join("\n");
 
-  const raw = await exec(host, cmd, "powershell");
+  const run = deps.exec ?? exec;
+  const raw = await run(host, cmd, "powershell");
   const imgLine = raw.stdout.split("\n").find((l) => l.trim().startsWith(IMG_SENTINEL));
-  if (!imgLine) return { host: host.name, result: raw, app: { name: query, pid: 0 }, window: { window_id: 0, title: "", pid: 0 } };
+  if (!imgLine) return { host: host.name, result: {
+    ...raw, ok: false, code: raw.code || 1,
+    stderr: [raw.stderr, "cua-driver produced no requested window image"].filter(Boolean).join("\n"),
+  }, app: { name: query, pid: 0 }, window: { window_id: 0, title: "", pid: 0 } };
 
   const [rpath, rpid, rwid, rname, ...rtitle] = imgLine.trim().slice(IMG_SENTINEL.length).split("|");
-  const { result: pull, path } = await deliverImage(host, rpath!, imageOut);
-  await exec(host, `Remove-Item -LiteralPath '${psEsc(rpath!)}' -EA SilentlyContinue`, "powershell").catch(() => {});
   const app: CuApp = { name: rname!, pid: Number(rpid) };
   const window: CuWindow = { window_id: Number(rwid), title: rtitle.join("|"), pid: Number(rpid) };
-  if (!pull.ok) return { host: host.name, result: { ...raw, ok: false, stderr: `image pull failed: ${pull.stderr}` }, app, window };
-  return { host: host.name, result: { ...raw, stdout: "" }, localImage: path, app, window };
+  try {
+    if (!raw.ok) return { host: host.name, result: raw, app, window };
+    const { result: pull, path } = await (deps.deliver ?? deliverImage)(host, rpath!, imageOut);
+    if (!pull.ok) return { host: host.name, result: { ...raw, ok: false, code: pull.code || 1, stderr: `image pull failed: ${pull.stderr}` }, app, window };
+    await validateImageArtifact(path);
+    return { host: host.name, result: { ...raw, stdout: "" }, localImage: path, app, window };
+  } catch (error) {
+    return { host: host.name, result: { ...raw, ok: false, code: 1,
+      stderr: error instanceof Error ? error.message : String(error) }, app, window };
+  } finally {
+    await run(host, `Remove-Item -LiteralPath '${psEsc(rpath!)}' -EA SilentlyContinue`, "powershell").catch(() => {});
+  }
 }
 
 // ── restart / logs (resolve a configured service on the first selected host) ──
@@ -1641,9 +1853,9 @@ export type ParsedRecipeStep =
 function recipeNumber(value: string | true | undefined, flag: string, fallback: number, min: number): number {
   if (value === undefined) return fallback;
   const parsed = Number(value);
-  if (value === true || !Number.isFinite(parsed) || parsed < min)
-    throw new Error(`${flag} needs a number ≥ ${min} (got '${value}')`);
-  return Math.floor(parsed);
+  if (value === true || !Number.isSafeInteger(parsed) || parsed < min)
+    throw new Error(`${flag} needs an integer ≥ ${min} (got '${value}')`);
+  return parsed;
 }
 
 /** Parse Fleet-owned flags only before the selector. The rest of an exec step is
@@ -1671,7 +1883,7 @@ export function parseRecipeStep(cfg: FleetConfig, step: string): ParsedRecipeSte
         command,
         wsl: flags["--wsl"] === true,
         ...(typeof cwdValue === "string" ? { cwd: cwdValue } : {}),
-        ...(timeoutS > 0 ? { timeoutMs: timeoutS * 1000 } : {}),
+        ...(flags["--timeout"] !== undefined ? { timeoutMs: timeoutS * 1000 } : {}),
       };
     }
     case "restart": {

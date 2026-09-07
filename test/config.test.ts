@@ -8,14 +8,14 @@ const host = (name: string, os: Host["os"], gpu = false): Host =>
 const cfg: FleetConfig = {
   hosts: {
     vps: host("vps", "linux"),
-    oracle: host("oracle", "linux"),
-    maints: host("maints", "windows", true),
+    web: host("web", "linux"),
+    winbox: host("winbox", "windows", true),
     main: host("main", "windows"),
     mac: host("mac", "mac"),
     gpubox: host("gpubox", "linux", true),
   },
   groups: {
-    cloud: ["vps", "oracle"],
+    cloud: ["vps", "web"],
     broken: ["vps", "ghost"],   // references a host that doesn't exist
   },
 };
@@ -45,26 +45,26 @@ describe("resolveHosts", () => {
   });
 
   test("@linux / @windows / @mac filter by os", () => {
-    expect(names("@linux").sort()).toEqual(["gpubox", "oracle", "vps"]);
-    expect(names("@windows").sort()).toEqual(["main", "maints"]);
+    expect(names("@linux").sort()).toEqual(["gpubox", "vps", "web"]);
+    expect(names("@windows").sort()).toEqual(["main", "winbox"]);
     expect(names("@mac")).toEqual(["mac"]);
   });
 
   test("@gpu filters by the gpu flag", () =>
-    expect(names("@gpu").sort()).toEqual(["gpubox", "maints"]));
+    expect(names("@gpu").sort()).toEqual(["gpubox", "winbox"]));
 
-  test("custom group expands", () => expect(names("@cloud")).toEqual(["vps", "oracle"]));
+  test("custom group expands", () => expect(names("@cloud")).toEqual(["vps", "web"]));
 
   test("unknown group throws", () =>
     expect(() => resolveHosts(cfg, "@whatever")).toThrow(/unknown group @whatever/));
 
   test("comma-mix dedupes and preserves first-seen order", () =>
-    // oracle, then @cloud adds vps (oracle dup), then @gpu adds maints+gpubox
-    // in host-declaration order — maints is declared before gpubox.
-    expect(names("oracle,@cloud,vps,@gpu")).toEqual(["oracle", "vps", "maints", "gpubox"]));
+    // web, then @cloud adds vps (web dup), then @gpu adds winbox+gpubox
+    // in host-declaration order — winbox is declared before gpubox.
+    expect(names("web,@cloud,vps,@gpu")).toEqual(["web", "vps", "winbox", "gpubox"]));
 
   test("whitespace around comma tokens is tolerated", () =>
-    expect(names(" vps , oracle ")).toEqual(["vps", "oracle"]));
+    expect(names(" vps , web ")).toEqual(["vps", "web"]));
 
   test("empty selector throws", () => expect(() => resolveHosts(cfg, "")).toThrow(/no hosts matched/));
 
@@ -112,7 +112,7 @@ describe("validateConfig", () => {
 
   test("cdp accepts absolute HTTP endpoints and rejects other values", () => {
     const ok = base();
-    ok.hosts.vps!.cdp = "http://100.91.226.87:9223";
+    ok.hosts.vps!.cdp = "http://192.0.2.10:9223";
     expect(() => validateConfig(ok, "t")).not.toThrow();
 
     const bad = base();
@@ -205,15 +205,15 @@ describe("validateConfig", () => {
 
   test("tools registry: root is required, fields are typed, typos are loud", () => {
     const ok = base();
-    ok.tools = { tg: { root: "~/Development/tg", hosts: "oracle", exclude: ["fixtures"] } };
+    ok.tools = { tg: { root: "~/Development/tg", hosts: "web", exclude: ["fixtures"] } };
     expect(() => validateConfig(ok, "t")).not.toThrow();
 
     const noRoot = base();
-    noRoot.tools = { tg: { hosts: "oracle" } as any };
+    noRoot.tools = { tg: { hosts: "web" } as any };
     expect(() => validateConfig(noRoot, "t")).toThrow(/tools\.tg.*root/);
 
     const typo = base();
-    typo.tools = { tg: { root: "~/x", host: "oracle" } as any };
+    typo.tools = { tg: { root: "~/x", host: "web" } as any };
     expect(() => validateConfig(typo, "t")).toThrow(/tools\.tg.*'host'/);
 
     const badExclude = base();

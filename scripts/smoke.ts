@@ -11,27 +11,30 @@ const transport = new StdioClientTransport({
 });
 const client = new Client({ name: "fleet-smoke", version: "1.0.0" });
 
-function show(title: string, res: any) {
+function show(title: string, res: any, expectError = false) {
   const t = (res.content ?? []).map((c: any) => c.text ?? "").join("\n");
   console.log(`\n### ${title}${res.isError ? "  [isError]" : ""}\n${t}`);
+  if ((res.isError === true) !== expectError || !t.trim())
+    throw new Error(`${title}: unexpected or empty tool result`);
 }
 
-await client.connect(transport);
+try {
+  await client.connect(transport);
 
-const { tools } = await client.listTools();
-console.log("tools:", tools.map((t) => t.name).join(", "));
-console.log("fleet_exec schema:", JSON.stringify(tools.find((t) => t.name === "fleet_exec")?.inputSchema));
+  const { tools } = await client.listTools();
+  console.log("tools:", tools.map((t) => t.name).join(", "));
+  console.log("fleet_exec schema:", JSON.stringify(tools.find((t) => t.name === "fleet_exec")?.inputSchema));
 
-show("fleet_status {}", await client.callTool({ name: "fleet_status", arguments: {} }));
+  show("fleet_status {}", await client.callTool({ name: "fleet_status", arguments: {} }));
 
-show("fleet_restart (bogus → expect isError)",
-  await client.callTool({ name: "fleet_restart", arguments: { host: "oracle", service: "does-not-exist" } }));
+  show("fleet_restart (bogus → expect isError)",
+    await client.callTool({ name: "fleet_restart", arguments: { host: "web", service: "does-not-exist" } }), true);
 
-show("fleet_exec oracle 'echo + quotes round-trip'",
-  await client.callTool({ name: "fleet_exec", arguments: {
-    selector: "oracle",
-    command: `echo 'fleet-mcp ok: "a & b | c" $HOME='"$HOME"`,
-  } }));
+  show("fleet_exec web 'echo + quotes round-trip'",
+    await client.callTool({ name: "fleet_exec", arguments: {
+      selector: "web",
+      command: `echo 'fleet-mcp ok: "a & b | c" $HOME='"$HOME"`,
+    } }));
 
-await client.close();
-console.log("\nsmoke: done");
+  console.log("\nsmoke: done");
+} finally { await client.close(); }

@@ -18,23 +18,21 @@ describe("parseLeadingFlags", () => {
 
   test("leading flags are consumed, selector + command left verbatim", () => {
     const { flags, rest } = parseLeadingFlags(
-      ["--wsl", "--cwd", "/srv", "maints", "uname", "-a"], BOOLS, VALS);
+      ["--wsl", "--cwd", "/srv", "winbox", "uname", "-a"], BOOLS, VALS);
     expect(flags["--wsl"]).toBe(true);
     expect(flags["--cwd"]).toBe("/srv");
-    expect(rest).toEqual(["maints", "uname", "-a"]);
+    expect(rest).toEqual(["winbox", "uname", "-a"]);
   });
 
   test("flags INSIDE the command are never hijacked", () => {
     const { flags, rest } = parseLeadingFlags(
-      ["oracle", "echo", "keep", "--wsl", "these", "--json", "flags", "--cwd", "/x"], BOOLS, VALS);
+      ["web", "echo", "keep", "--wsl", "these", "--json", "flags", "--cwd", "/x"], BOOLS, VALS);
     expect(flags).toEqual({});
-    expect(rest.join(" ")).toBe("echo keep --wsl these --json flags --cwd /x".replace("echo ", "oracle echo "));
+    expect(rest.join(" ")).toBe("echo keep --wsl these --json flags --cwd /x".replace("echo ", "web echo "));
   });
 
-  test("a flag-valued token stops nothing: value is taken verbatim", () => {
-    const { flags, rest } = parseLeadingFlags(["--cwd", "--json", "vps", "ls"], BOOLS, VALS);
-    expect(flags["--cwd"]).toBe("--json"); // consumed as the value, garbage in → visible out
-    expect(rest).toEqual(["vps", "ls"]);
+  test("an option cannot silently become another option's value", () => {
+    expect(() => parseLeadingFlags(["--cwd", "--json", "vps", "ls"], BOOLS, VALS)).toThrow("--cwd requires a value");
   });
 
   test("no flags at all", () => {
@@ -43,10 +41,10 @@ describe("parseLeadingFlags", () => {
     expect(rest).toEqual(["vps", "uptime"]);
   });
 
-  test("value flag at end of argv yields empty string, not crash", () => {
-    const { flags, rest } = parseLeadingFlags(["--cwd"], BOOLS, VALS);
-    expect(flags["--cwd"]).toBe("");
-    expect(rest).toEqual([]);
+  test("missing, unknown, and repeated options fail before dispatch", () => {
+    expect(() => parseLeadingFlags(["--cwd"], BOOLS, VALS)).toThrow("--cwd requires a value");
+    expect(() => parseLeadingFlags(["--typo", "vps", "ls"], BOOLS, VALS)).toThrow("unknown option");
+    expect(() => parseLeadingFlags(["--json", "--json", "vps", "ls"], BOOLS, VALS)).toThrow("duplicate option");
   });
 });
 
@@ -70,10 +68,10 @@ describe("logical routes", () => {
     const cfg: FleetConfig = {
       hosts: {
         main: routeHost("main"),
-        maints: routeHost("maints"),
+        winbox: routeHost("winbox"),
       },
       routes: {
-        "main-win": { prefer: ["main", "maints"] },
+        "main-win": { prefer: ["main", "winbox"] },
       },
     };
     const probed: string[] = [];
@@ -93,10 +91,10 @@ describe("logical routes", () => {
     const cfg: FleetConfig = {
       hosts: {
         main: routeHost("main"),
-        maints: routeHost("maints"),
+        winbox: routeHost("winbox"),
       },
       routes: {
-        "main-win": { prefer: ["main", "maints"] },
+        "main-win": { prefer: ["main", "winbox"] },
       },
     };
     const probed: string[] = [];
@@ -104,22 +102,22 @@ describe("logical routes", () => {
     const selected = await routeSelector(cfg, "main-win", {
       probe: async (host) => {
         probed.push(host.name);
-        return host.name === "maints";
+        return host.name === "winbox";
       },
     });
 
-    expect(selected).toBe("maints");
-    expect(probed).toEqual(["main", "maints"]);
+    expect(selected).toBe("winbox");
+    expect(probed).toEqual(["main", "winbox"]);
   });
 
   test("explicit transport names bypass auto-routing", async () => {
     const cfg: FleetConfig = {
       hosts: {
         main: routeHost("main"),
-        maints: routeHost("maints"),
+        winbox: routeHost("winbox"),
       },
       routes: {
-        "main-win": { prefer: ["main", "maints"] },
+        "main-win": { prefer: ["main", "winbox"] },
       },
     };
     const neverProbe = async (): Promise<boolean> => {
@@ -127,17 +125,17 @@ describe("logical routes", () => {
     };
 
     expect(await routeSelector(cfg, "main", { probe: neverProbe })).toBe("main");
-    expect(await routeSelector(cfg, "maints", { probe: neverProbe })).toBe("maints");
+    expect(await routeSelector(cfg, "winbox", { probe: neverProbe })).toBe("winbox");
   });
 
   test("routes compose inside comma selectors and duplicate routes probe once", async () => {
     const cfg: FleetConfig = {
       hosts: {
         main: routeHost("main"),
-        maints: routeHost("maints"),
+        winbox: routeHost("winbox"),
         other: routeHost("other"),
       },
-      routes: { "main-win": { prefer: ["main", "maints"] } },
+      routes: { "main-win": { prefer: ["main", "winbox"] } },
     };
     const probed: string[] = [];
     const selected = await routeSelector(cfg, "main-win,other,main-win", {
@@ -151,32 +149,32 @@ describe("logical routes", () => {
     const cfg: FleetConfig = {
       hosts: {
         main: routeHost("main"),
-        maints: routeHost("maints"),
+        winbox: routeHost("winbox"),
       },
       routes: {
-        "main-win": { prefer: ["main", "maints"] },
+        "main-win": { prefer: ["main", "winbox"] },
       },
     };
 
     expect(routeSelector(cfg, "main-win", { probe: async () => false }))
-      .rejects.toThrow("route main-win is not reachable (tried: main, maints)");
+      .rejects.toThrow("route main-win is not reachable (tried: main, winbox)");
   });
 });
 
 describe("recipes", () => {
   const cfg: FleetConfig = {
     hosts: {
-      oracle: { name: "oracle", ssh: "oracle", os: "linux" },
+      web: { name: "web", ssh: "web", os: "linux" },
       main: routeHost("main"),
-      maints: routeHost("maints"),
+      winbox: routeHost("winbox"),
     },
-    routes: { "main-win": { prefer: ["main", "maints"] } },
+    routes: { "main-win": { prefer: ["main", "winbox"] } },
   };
 
   test("exec flags inside the remote command stay payload", () => {
-    expect(parseRecipeStep(cfg, "exec oracle echo keep --wsl --json --raw --cwd /x")).toEqual({
+    expect(parseRecipeStep(cfg, "exec web echo keep --wsl --json --raw --cwd /x")).toEqual({
       kind: "exec",
-      selector: "oracle",
+      selector: "web",
       command: "echo keep --wsl --json --raw --cwd /x",
       wsl: false,
     });
@@ -191,7 +189,9 @@ describe("recipes", () => {
       cwd: "/srv",
       timeoutMs: 8000,
     });
-    expect(() => parseRecipeStep(cfg, "exec --timeout nope oracle true")).toThrow(/--timeout needs a number/);
+    expect(() => parseRecipeStep(cfg, "exec --timeout nope web true")).toThrow(/--timeout needs an integer/);
+    expect(() => parseRecipeStep(cfg, "exec --timeout 0.5 web true")).toThrow(/--timeout needs an integer/);
+    expect(parseRecipeStep(cfg, "exec --timeout 0 web true")).toMatchObject({ timeoutMs: 0 });
   });
 
   test("cp parses logical and Daytona remote selectors without slicing at the wrong colon", () => {
@@ -206,6 +206,27 @@ describe("recipes", () => {
 });
 
 describe("hard deadlines and deploy source", () => {
+  test("wait retries an unavailable logical route until it becomes reachable", async () => {
+    const cfg: FleetConfig = { hosts: { local: { name: "local", ssh: "unused", os: "linux" } },
+      routes: { route: { prefer: ["local"] } } };
+    let probes = 0;
+    const result = await waitFor(cfg, "route", { timeoutMs: 200, intervalMs: 5 }, {
+      probe: async () => ++probes > 1,
+    });
+    expect(result.ok).toBe(true);
+    expect(result.attempts).toBe(2);
+    expect(probes).toBe(3);
+  });
+
+  test("wait returns timeout for a down route and rejects unknown targets immediately", async () => {
+    const cfg: FleetConfig = { hosts: { local: { name: "local", ssh: "unused", os: "linux" } },
+      routes: { route: { prefer: ["local"] } } };
+    const result = await waitFor(cfg, "route", { timeoutMs: 30, intervalMs: 5 }, { probe: async () => false });
+    expect(result.ok).toBe(false);
+    expect(result.attempts).toBeGreaterThan(1);
+    await expect(waitFor(cfg, "typo", { timeoutMs: 100 })).rejects.toThrow("unknown host");
+  });
+
   test("remote writes refuse to replace POSIX symlinks", async () => {
     const root = mkdtempSync(join(tmpdir(), "fleet-edit-symlink-"));
     const target = join(root, "target");
@@ -275,7 +296,7 @@ describe("hard deadlines and deploy source", () => {
   });
 
   test("deploy installs an absolute-Bun launcher and rejects shadowing on POSIX", () => {
-    const { cmd, shell } = deployScript({ name: "ampere", ssh: "ampere", os: "linux" });
+    const { cmd, shell } = deployScript({ name: "linuxbox", ssh: "linuxbox", os: "linux" });
     expect(shell).toBe("bash");
     expect(cmd).toContain('exec "$bun" "$dir/src/cli.ts" "\\$@"');
     expect(cmd).toContain('chmod 755 "$HOME/.local/bin/fleet"');

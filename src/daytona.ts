@@ -168,6 +168,9 @@ export async function dtExec(
   command: string,
   opts: { cwd?: string; timeoutMs?: number } = {},
 ): Promise<ExecResult> {
+  if (opts.timeoutMs === 0)
+    return { host: host.name, ok: false, code: 1, stdout: "",
+      stderr: "Daytona execution requires a finite timeout; use --timeout with positive seconds (default: 300s) or spawn a detached job" };
   const timeoutMs = opts.timeoutMs && opts.timeoutMs > 0 ? opts.timeoutMs : DEFAULT_EXEC_TIMEOUT_S * 1000;
   const timeoutS = Math.max(1, Math.ceil(timeoutMs / 1000));
   try {
@@ -237,7 +240,7 @@ export async function dtPush(host: Host, local: string, remote: string): Promise
 }
 
 export async function dtPull(host: Host, remote: string, local: string): Promise<ExecResult> {
-  const partial = `${local}.fleet-part-${process.pid}-${Date.now()}`;
+  const partial = `${local}.fleet-part-${crypto.randomUUID()}`;
   try {
     const res = await withSandboxId(host.ssh,
       (id) => api("download", toolboxPath(id, "/files/download", { path: remote })));

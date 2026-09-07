@@ -112,7 +112,7 @@ async function resolveWinBin(host: Host, timeoutMs = 0): Promise<WinBin> {
       { stdout: "pipe", stderr: "ignore" });
     let timedOut = false;
     const timer = timeoutMs > 0
-      ? setTimeout(() => { timedOut = true; proc.kill(); }, timeoutMs)
+      ? setTimeout(() => { timedOut = true; proc.kill("SIGKILL"); }, timeoutMs)
       : null;
     const out = (await new Response(proc.stdout).text()).trim();
     await proc.exited;
@@ -148,7 +148,8 @@ export function buildArgs(host: Host, command: string, shell: Shell, winBin: Win
     // and removes Windows' EncodedCommand length ceiling.
     const script = cwd ? withCwdPwsh(command, cwd) : command;
     return { args: [...ssh, winBin, "-NoProfile", "-NonInteractive", "-Command", "-"],
-      stdin: new TextEncoder().encode(script + "\n") };
+      // -Command - needs an empty line to submit a final multiline statement.
+      stdin: new TextEncoder().encode(script + "\n\n") };
   }
 
   // linux / mac: feed the script to `bash -ls` via stdin — zero interpolation
@@ -196,7 +197,7 @@ export async function exec(
     if (shell !== "auto" && shell !== "bash")
       return { host: host.name, ok: false, code: 1, stdout: "",
         stderr: `${host.name} is a daytona sandbox — only bash is available` };
-    return dtExec(host, command, { cwd: opts.cwd, timeoutMs: opts.timeoutMs ?? EXEC_TIMEOUT_MS });
+    return dtExec(host, command, { cwd: opts.cwd, timeoutMs: opts.timeoutMs ?? (EXEC_TIMEOUT_MS || undefined) });
   }
   const resolved: Shell = shell === "auto"
     ? (host.os === "windows" ? "powershell" : "bash")
@@ -218,7 +219,7 @@ export async function exec(
   });
   let timedOut = false;
   const timer = timeoutMs > 0
-    ? setTimeout(() => { timedOut = true; proc.kill(); }, remainingMs)
+    ? setTimeout(() => { timedOut = true; proc.kill("SIGKILL"); }, remainingMs)
     : null;
   const [stdout, stderr, code] = await Promise.all([
     new Response(proc.stdout).text(),
@@ -271,7 +272,7 @@ export async function probe(host: Host, capMs = PROBE_CAP_MS): Promise<boolean> 
  *  the local ssh, which ends the remote tail. */
 export function execStream(host: Host, command: string): Promise<number> {
   const proc = Bun.spawn(["ssh", "-tt", ...controlOpts(), "-o", "BatchMode=yes", "-o", "ConnectTimeout=15",
-    host.ssh, "bash", "-lc", command],
+    host.ssh, "bash", "-lc", `'${bashEsc(command)}'`],
     { stdin: "inherit", stdout: "inherit", stderr: "inherit" });
   return proc.exited;
 }
@@ -280,17 +281,46 @@ export function execStream(host: Host, command: string): Promise<number> {
  *  `fleet doctor`. Returns whether it connected, the timing, and the raw verbose
  *  log to mine for the failure reason. */
 export async function sshDiagnose(host: Host, timeoutS = 8): Promise<{ ok: boolean; stderr: string; ms: number }> {
+  if (!Number.isFinite(timeoutS) || timeoutS <= 0) throw new Error("diagnostic timeout must be finite and positive");
   const start = Date.now();
-  // Deliberately NO controlOpts(): doctor must diagnose a FRESH connection —
-  // riding an existing master would mask the very failures it exists to find.
-  const proc = Bun.spawn(["ssh", "-vv", "-o", "BatchMode=yes", "-o", `ConnectTimeout=${timeoutS}`,
+  // Override config-defined masters too: doctor must test a fresh connection.
+  const proc = Bun.spawn(["ssh", "-vv", "-o", "ControlMaster=no", "-o", "ControlPath=none",
+    "-o", "BatchMode=yes", "-o", `ConnectTimeout=${Math.max(1, Math.ceil(timeoutS))}`,
     host.ssh, "echo fleet-ok"], { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
-  const [stdout, stderr, code] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ]);
-  return { ok: code === 0 && stdout.includes("fleet-ok"), stderr, ms: Date.now() - start };
+  const readers = [proc.stdout.getReader(), proc.stderr.getReader()];
+  const read = async (reader: (typeof readers)[number]) => {
+    const decoder = new TextDecoder();
+    let output = "";
+    try {
+      for (;;) {
+        const chunk = await reader.read();
+        if (chunk.done) return output + decoder.decode();
+        output += decoder.decode(chunk.value, { stream: true });
+      }
+    } finally { reader.releaseLock(); }
+  };
+  let timedOut = false;
+  let cancelTimer: ReturnType<typeof setTimeout> | undefined;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    proc.kill("SIGKILL");
+    // Give buffered diagnostics one event-loop turn to drain after the kill,
+    // then close pipes that another process may have inherited from SSH.
+    cancelTimer = setTimeout(() => {
+      for (const reader of readers) void reader.cancel().catch(() => {});
+    }, 10);
+  }, timeoutS * 1000);
+  try {
+    const [stdout, stderr, code] = await Promise.all([read(readers[0]!), read(readers[1]!), proc.exited]);
+    return {
+      ok: !timedOut && code === 0 && stdout.includes("fleet-ok"),
+      stderr: timedOut ? `${stderr}\nfleet: SSH diagnosis timed out after ${timeoutS}s`.trim() : stderr,
+      ms: Date.now() - start,
+    };
+  } finally {
+    clearTimeout(timer);
+    if (cancelTimer) clearTimeout(cancelTimer);
+  }
 }
 
 /** Windows equivalent of `execStream`: live-follow a PowerShell command (e.g.

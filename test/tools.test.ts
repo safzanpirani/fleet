@@ -1,6 +1,6 @@
-import { test, expect, describe } from "bun:test";
+import { test, expect, describe, spyOn } from "bun:test";
 import { chmodSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
-import { readdir } from "node:fs/promises";
+import { copyFile, mkdir, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import {
@@ -15,10 +15,13 @@ import {
   skillDestinations,
   stampSkill,
   syncTools,
+  syncTool,
   toolDir,
   toolsStatus,
   toolSyncParallelism,
+  toolSyncLockScript,
 } from "../src/tools.ts";
+import * as ssh from "../src/ssh.ts";
 import type { FleetConfig, Host } from "../src/config.ts";
 import type { MultiToolSyncResult, ToolSyncResult } from "../src/tools.ts";
 
@@ -36,7 +39,7 @@ function makeTool(version = "1.2.3"): string {
   return root;
 }
 const cfgFor = (root: string, extra: Record<string, unknown> = {}): FleetConfig => ({
-  hosts: { oracle: host("oracle", "linux"), main: host("main", "windows") },
+  hosts: { web: host("web", "linux"), main: host("main", "windows") },
   tools: { demo: { root, ...extra } },
 });
 
@@ -58,6 +61,37 @@ async function completeInOrder(
 }
 
 describe("bounded deterministic concurrency", () => {
+  test("hashing does not read beyond one batch while its first file is pending", async () => {
+    const gate = deferred();
+    const reads: string[] = [];
+    const pending = hashFiles("/unused", ["a", "b", "c", "d"], undefined, {
+      maxParallel: 2,
+      readFile: async (path) => {
+        reads.push(basename(path));
+        if (path.endsWith("/a")) await gate.promise;
+        return new TextEncoder().encode(path);
+      },
+    });
+    await Bun.sleep(5);
+    expect(reads).toEqual(["a", "b"]);
+    gate.resolve();
+    await pending;
+    expect(reads).toEqual(["a", "b", "c", "d"]);
+  });
+
+  test("mapPool drains in-flight work before returning a failure", async () => {
+    const gate = deferred();
+    let settled = false;
+    const pending = mapPool([0, 1], 2, async (n) => {
+      if (n === 0) throw new Error("failed");
+      await gate.promise;
+    });
+    void pending.catch(() => { settled = true; });
+    await Bun.sleep(5);
+    expect(settled).toBe(false);
+    gate.resolve();
+    await expect(pending).rejects.toThrow("failed");
+  });
   test("mapPool caps active work and returns input order after reverse completion", async () => {
     let active = 0;
     let peak = 0;
@@ -190,13 +224,15 @@ describe("bounded deterministic concurrency", () => {
     const manifest = {
       tool: "demo", version: "1.0.0", hash: "abc123", syncedAt: "2026-08-31T00:00:00Z", dir: "$HOME/demo",
     };
-    const posix = installScript(host("oracle", "linux"), { name: "demo" }, "$HOME/demo", manifest, "demo").cmd;
+    const posix = installScript(host("web", "linux"), { name: "demo" }, "$HOME/demo", manifest, "demo").cmd;
     expect(posix).toContain('(cd "$dir" && "$bun" install >/dev/null 2>&1)');
     expect(posix).not.toContain("|| true");
     expect(posix.indexOf('"$bun" install')).toBeLessThan(posix.indexOf("LAUNCHER"));
 
     const windows = installScript(host("main", "windows"), { name: "demo" }, "$env:USERPROFILE\\demo", manifest, "demo").cmd;
     expect(windows).toContain("$installCode=$LASTEXITCODE");
+    expect(windows).toContain('if ($LASTEXITCODE -ne 0) { throw "tar extraction failed with exit $LASTEXITCODE" }');
+    expect(windows.indexOf("tar extraction failed")).toBeLessThan(windows.indexOf("$installCode=0"));
     expect(windows).toContain('if ($installCode -ne 0) { throw "bun install failed with exit $installCode" }');
     expect(windows.indexOf("$installCode -ne 0")).toBeLessThan(windows.indexOf("Set-Content -Path"));
   });
@@ -272,12 +308,12 @@ describe("bounded deterministic concurrency", () => {
   test("multi-tool sync JSON is one parseable value in registry order", () => {
     const result = (tool: string): ToolSyncResult => ({
       tool,
-      host: "oracle",
+      host: "web",
       ok: true,
       dir: `/${tool}`,
       version: "1.0.0",
       hash: `hash-${tool}`,
-      result: { host: "oracle", ok: true, code: 0, stdout: "", stderr: "" },
+      result: { host: "web", ok: true, code: 0, stdout: "", stderr: "" },
     });
     const blocks: MultiToolSyncResult[] = [
       { tool: "alpha", results: [result("alpha")] },
@@ -545,12 +581,12 @@ describe("serial and default concurrency equality", () => {
     const cfg = { hosts: {} } as FleetConfig;
     const resultFor = (tool: string): ToolSyncResult[] => [{
       tool,
-      host: "oracle",
+      host: "web",
       ok: true,
       dir: `/${tool}`,
       version: "1.0.0",
       hash: `hash-${tool}`,
-      result: { host: "oracle", ok: true, code: 0, stdout: tool, stderr: "" },
+      result: { host: "web", ok: true, code: 0, stdout: tool, stderr: "" },
     }];
     const serial = await syncTools(cfg, names, "all", {
       maxParallel: 1,
@@ -592,22 +628,180 @@ describe("resolveTool", () => {
 
 describe("toolDir", () => {
   test("per-OS defaults", () => {
-    expect(toolDir({ name: "tg" }, host("oracle", "linux"))).toBe("$HOME/tg");
+    expect(toolDir({ name: "tg" }, host("web", "linux"))).toBe("$HOME/tg");
     expect(toolDir({ name: "tg" }, host("main", "windows"))).toBe("$env:USERPROFILE\\tg");
   });
   test("explicit dir wins on every OS", () => {
-    expect(toolDir({ name: "tg", dir: "/opt/tg" }, host("oracle", "linux"))).toBe("/opt/tg");
+    expect(toolDir({ name: "tg", dir: "/opt/tg" }, host("web", "linux"))).toBe("/opt/tg");
   });
 });
 
 describe("skillDestinations", () => {
   test("installs paired skills for every supported agent on POSIX", async () => {
-    expect(await skillDestinations(host("oracle", "linux"), "fleet")).toEqual([
+    expect(await skillDestinations(host("web", "linux"), "fleet")).toEqual([
       ".claude/skills/fleet/SKILL.md",
       ".agents/skills/fleet/SKILL.md",
       ".openclaw/skills/fleet/SKILL.md",
     ]);
   });
+});
+
+async function localScript(home: string, cmd: string): Promise<ssh.ExecResult> {
+  const proc = Bun.spawn(["bash", "-s"], {
+    cwd: home,
+    env: { ...process.env, HOME: home, PATH: `${join(home, "bin")}:${process.env.PATH}` },
+    stdin: new TextEncoder().encode(cmd), stdout: "pipe", stderr: "pipe",
+  });
+  const [stdout, stderr, code] = await Promise.all([
+    new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited,
+  ]);
+  return { host: "web", ok: code === 0, code, stdout, stderr };
+}
+
+describe("tool installation transactions", () => {
+  test("Windows locks use exclusive create and close the owner stream", () => {
+    const h = host("main", "windows");
+    const acquire = toolSyncLockScript(h, "$env:USERPROFILE\\demo", "owner-one").cmd;
+    expect(acquire).toContain("[System.IO.FileMode]::CreateNew");
+    expect(acquire).toContain("[System.IO.FileShare]::None");
+    expect(acquire).toContain("$lockStream.Write($ownerBytes, 0, $ownerBytes.Length)");
+    expect(acquire).toContain("finally { $lockStream.Dispose() }");
+    expect(acquire).not.toContain("New-Item -ItemType Directory -Path $lock");
+    const release = toolSyncLockScript(h, "$env:USERPROFILE\\demo", "owner-one", true).cmd;
+    expect(release.indexOf("[System.IO.File]::ReadAllText($lock)")).toBeLessThan(release.indexOf("[System.IO.File]::Delete($lock)"));
+  });
+
+  test("destination locks reject overlap and require the same owner for release", async () => {
+    const home = mkdtempSync(join(tmpdir(), "fleet-lock-"));
+    try {
+      const h = host("web", "linux");
+      const run = (token: string, release = false) => localScript(home,
+        toolSyncLockScript(h, "$HOME/custom-install", token, release).cmd);
+      expect((await run("first")).ok).toBe(true);
+      const blocked = await run("second");
+      expect(blocked.ok).toBe(false);
+      expect(blocked.stderr).toContain("installation locked");
+      expect((await run("second", true)).ok).toBe(false);
+      expect((await run("first", true)).ok).toBe(true);
+      expect((await run("second")).ok).toBe(true);
+      expect((await run("second", true)).ok).toBe(true);
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+
+  test("sync ships its fingerprinted snapshot and records skipped skills truthfully", async () => {
+    const root = makeTool();
+    const home = mkdtempSync(join(tmpdir(), "fleet-sync-host-"));
+    const cfg = cfgFor(root, { exclude: ["skills", "*.log", "src/private/**"] });
+    mkdirSync(join(home, "bin"));
+    writeFileSync(join(home, "bin", "bun"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    writeFileSync(join(root, "src", "trace.log"), "excluded");
+    mkdirSync(join(root, "src", "private"));
+    writeFileSync(join(root, "src", "private", "hidden.ts"), "excluded");
+    writeFileSync(join(root, "line\nbreak.txt"), "unusual filename");
+    symlinkSync("src/cli.ts", join(root, "entry-link"));
+    const initial = await fingerprint(cfg, "demo");
+    const archives: string[] = [];
+    const localArchives: string[] = [];
+    let editOnUpload = true;
+    const execute = spyOn(ssh, "exec").mockImplementation(async (_h, cmd) => localScript(home, cmd));
+    const transfer = spyOn(ssh, "scp").mockImplementation(async (_h, local, remote) => {
+      if (typeof local !== "string") throw new Error("unexpected multi-file copy");
+      await mkdir(join(home, remote, ".."), { recursive: true });
+      await copyFile(local, join(home, remote));
+      if (remote.endsWith(".tgz")) {
+        archives.push(remote);
+        localArchives.push(local);
+        if (editOnUpload) {
+          editOnUpload = false;
+          writeFileSync(join(root, "src", "cli.ts"), "edited during upload");
+          writeFileSync(join(root, "skills", "demo", "SKILL.md"), "edited skill during upload");
+        }
+      }
+      return { host: "web", ok: true, code: 0, stdout: "", stderr: "" };
+    });
+    try {
+      const [installed] = await syncTool(cfg, "demo", "web");
+      expect(installed?.ok, installed?.error).toBe(true);
+      expect(installed?.hash).toBe(initial.hash);
+      expect(await Bun.file(join(home, "demo", "src", "cli.ts")).text()).toBe("console.log('hi')\n");
+      expect(await Bun.file(join(home, "demo", "line\nbreak.txt")).text()).toBe("unusual filename");
+      expect(await Bun.file(join(home, "demo", "entry-link")).text()).toBe("console.log('hi')\n");
+      expect(await Bun.file(join(home, "demo", "src", "trace.log")).exists()).toBe(false);
+      expect(await Bun.file(join(home, "demo", "src", "private", "hidden.ts")).exists()).toBe(false);
+      const manifestPath = join(home, ".fleet-tools", "demo.json");
+      expect((await Bun.file(manifestPath).json()).skill).toBe(initial.skillHash);
+      expect(await Bun.file(join(home, ".agents", "skills", "demo", "SKILL.md")).text()).toContain("# demo");
+
+      const [skipped] = await syncTool(cfg, "demo", "web", { skill: false });
+      expect(skipped?.ok, skipped?.error).toBe(true);
+      const skippedManifest = await Bun.file(manifestPath).json();
+      expect(skippedManifest.skillSkipped).toBe(true);
+      expect(skippedManifest.skill).toBeUndefined();
+      expect(skippedManifest.hash).toBe(`skill-skipped:${skippedManifest.sourceHash}`);
+      expect((await toolsStatus(cfg, ["demo"], "web"))[0]?.state).toBe("stale");
+      const legacyRows = await toolsStatus(cfg, ["demo"], "web", {
+        fingerprint: async () => ({ name: "demo", version: "1.2.3", hash: skippedManifest.sourceHash, files: 1, root }),
+      });
+      expect(legacyRows[0]?.state).toBe("stale");
+
+      const [resynced] = await syncTool(cfg, "demo", "web");
+      expect(resynced?.ok, resynced?.error).toBe(true);
+      expect((await toolsStatus(cfg, ["demo"], "web"))[0]?.state).toBe("current");
+      expect(new Set(archives).size).toBe(3);
+      expect(new Set(localArchives).size).toBe(3);
+      for (const path of localArchives) expect(await Bun.file(path).exists()).toBe(false);
+      expect(readdirSync(home).some((name) => name.endsWith(".tgz") || name.endsWith(".fleet-install-lock"))).toBe(false);
+    } finally {
+      transfer.mockRestore(); execute.mockRestore();
+      rmSync(root, { recursive: true, force: true }); rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test("a failed archive upload releases the installation lock", async () => {
+    const root = makeTool();
+    const home = mkdtempSync(join(tmpdir(), "fleet-sync-failed-"));
+    const execute = spyOn(ssh, "exec").mockImplementation(async (_h, cmd) => localScript(home, cmd));
+    const transfer = spyOn(ssh, "scp").mockRejectedValue(new Error("upload failed"));
+    try {
+      const [result] = await syncTool(cfgFor(root), "demo", "web");
+      expect(result?.ok).toBe(false);
+      expect(result?.error).toContain("upload failed");
+      expect(readdirSync(home).some((name) => name.endsWith(".fleet-install-lock"))).toBe(false);
+      expect(await Bun.file(join(home, ".fleet-tools", "demo.json")).exists()).toBe(false);
+    } finally {
+      transfer.mockRestore(); execute.mockRestore();
+      rmSync(root, { recursive: true, force: true }); rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  for (const failure of [124, 255, "throw"] as const) {
+    test(`an unconfirmed installer (${failure}) retains its lock and archive`, async () => {
+      const root = makeTool();
+      const home = mkdtempSync(join(tmpdir(), "fleet-sync-unconfirmed-"));
+      const execute = spyOn(ssh, "exec").mockImplementation(async (_h, cmd) => {
+        if (cmd.includes("tar -xzf")) {
+          if (failure === "throw") throw new Error("connection lost");
+          return { host: "web", ok: false, code: failure, stdout: "", stderr: "connection lost" };
+        }
+        return localScript(home, cmd);
+      });
+      const transfer = spyOn(ssh, "scp").mockImplementation(async (_h, local, remote) => {
+        if (typeof local !== "string") throw new Error("unexpected sources");
+        await copyFile(local, join(home, remote));
+        return { host: "web", ok: true, code: 0, stdout: "", stderr: "" };
+      });
+      try {
+        const [result] = await syncTool(cfgFor(root), "demo", "web", { skill: false });
+        expect(result?.ok).toBe(false);
+        expect(result?.error).toContain("outcome is unconfirmed");
+        expect(readdirSync(home).some((name) => name.endsWith(".tgz"))).toBe(true);
+        expect(await Bun.file(join(home, "demo.fleet-install-lock", "owner")).exists()).toBe(true);
+      } finally {
+        transfer.mockRestore(); execute.mockRestore();
+        rmSync(root, { recursive: true, force: true }); rmSync(home, { recursive: true, force: true });
+      }
+    });
+  }
 });
 
 describe("fingerprint", () => {

@@ -84,7 +84,7 @@ try {
 
   const res = await client.callTool({ name: "fleet_status", arguments: {} });
   const t = (res.content as any[]).map((c) => c.text ?? "").join("\n");
-  check("fleet_status returns text", t.length > 0);
+  check("fleet_status succeeds and returns text", res.isError !== true && t.trim().length > 0);
   console.log("\n--- fleet_status ---\n" + t.split("\n").slice(0, 6).join("\n"));
 
   await client.close();

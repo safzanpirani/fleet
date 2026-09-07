@@ -17,14 +17,16 @@
  *               changed, never whether a box is current (a forgotten bump would
  *               otherwise report "in sync" while shipping different bytes).
  */
-import { join, basename } from "node:path";
+import { join, basename, dirname, relative } from "node:path";
 import { homedir, tmpdir } from "node:os";
-import { lstat, readlink, readdir, stat } from "node:fs/promises";
+import { copyFile, chmod, lstat, mkdir, mkdtemp, readlink, readdir, rm, stat, symlink } from "node:fs/promises";
 import type { Dirent } from "node:fs";
 import type { FleetConfig, Host, ToolSpec } from "./config.ts";
 import { resolveHosts } from "./config.ts";
 import { exec, scp } from "./ssh.ts";
 import type { ExecResult } from "./ssh.ts";
+import { installLockScript as toolSyncLockScript } from "./install-lock.ts";
+export { installLockScript as toolSyncLockScript } from "./install-lock.ts";
 
 /** Where every host records what it has: one small JSON file per tool, all in
  *  one directory so a single `cat` reads the whole inventory in one round-trip. */
@@ -56,7 +58,9 @@ export async function mapPool<T, R>(
       results[index] = await run(items[index]!, index);
     }
   };
-  await Promise.all(Array.from({ length: Math.min(maxParallel, items.length) }, worker));
+  const settled = await Promise.allSettled(Array.from({ length: Math.min(maxParallel, items.length) }, worker));
+  const failed = settled.find((result) => result.status === "rejected");
+  if (failed?.status === "rejected") throw failed.reason;
   return results;
 }
 
@@ -67,6 +71,8 @@ export interface ToolFingerprint {
   files: number;
   root: string;
   skillPath?: string;      // absolute path to SKILL.md on the controller
+  sourceHash?: string;
+  skillHash?: string;
 }
 export interface ToolManifest {
   tool: string;
@@ -75,6 +81,8 @@ export interface ToolManifest {
   syncedAt: string;        // ISO date, stamped by the controller at sync time
   dir: string;
   skill?: string;          // hash of the SKILL.md that was pushed alongside
+  sourceHash?: string;
+  skillSkipped?: boolean;
 }
 export type ToolState = "current" | "stale" | "missing" | "unreachable";
 export interface ToolStatusRow {
@@ -118,7 +126,7 @@ export async function shippedFiles(
     readDirectory?: (path: string, options: { withFileTypes: true }) => Promise<Dirent[]>;
   } = {},
 ): Promise<string[]> {
-  const skip = new Set([...ALWAYS_EXCLUDE, ...exclude]);
+  const skip = [...ALWAYS_EXCLUDE, ...exclude].map((pattern) => new Bun.Glob(pattern.replace(/^\.\//, "").replace(/\/$/, "")));
   const readDirectory = options.readDirectory ?? readdir;
   const out: string[] = [];
   let directories = [{ path: root, rel: "" }];
@@ -136,8 +144,11 @@ export async function shippedFiles(
     for (const { rel, entries } of levels) {
       const directory = rel ? join(root, rel) : root;
       for (const entry of entries) {
-        if (skip.has(entry.name)) continue;
         const childRel = rel ? `${rel}/${entry.name}` : entry.name;
+        // Match at any path component, as tar exclusions do. Resolve the file
+        // set here once; archive creation consumes this exact selection.
+        const parts = childRel.split("/");
+        if (skip.some((pattern) => parts.some((_, index) => pattern.match(parts.slice(index).join("/"))))) continue;
         if (entry.isDirectory()) nextDirectories.push({ path: join(directory, entry.name), rel: childRel });
         else if (entry.isFile() || entry.isSymbolicLink()) out.push(childRel);
       }
@@ -174,16 +185,9 @@ export async function hashFiles(
   const inspectSymlink = options.inspectSymlink ?? (options.readFile
     ? async () => null
     : async (path: string) => (await lstat(path)).isSymbolicLink() ? readlink(path) : null);
-  const contents = await mapPool(
-    inputs,
-    options.maxParallel ?? FILE_IO_PARALLELISM,
-    async ({ path, preserveSymlink }) => {
-      const target = preserveSymlink ? await inspectSymlink(path) : null;
-      return target === null
-        ? { kind: 0, bytes: await readFile(path) }
-        : { kind: 1, bytes: new TextEncoder().encode(target) };
-    },
-  );
+  const parallelism = options.maxParallel ?? FILE_IO_PARALLELISM;
+  if (!Number.isInteger(parallelism) || parallelism < 1)
+    throw new Error(`maxParallel must be an integer ≥ 1 (got ${parallelism})`);
   const h = new Bun.CryptoHasher("sha256");
   h.update("fleet-tools-fingerprint-v2\0");
   const updateFrame = (bytes: Uint8Array): void => {
@@ -192,11 +196,20 @@ export async function hashFiles(
     h.update(length);
     h.update(bytes);
   };
-  for (let index = 0; index < inputs.length; index++) {
-    const content = contents[index]!;
-    h.update(new Uint8Array([content.kind]));
-    updateFrame(new TextEncoder().encode(inputs[index]!.logical));
-    updateFrame(content.bytes);
+  for (let start = 0; start < inputs.length; start += parallelism) {
+    const batch = inputs.slice(start, start + parallelism);
+    const contents = await mapPool(batch, parallelism, async ({ path, preserveSymlink }) => {
+      const target = preserveSymlink ? await inspectSymlink(path) : null;
+      return target === null
+        ? { kind: 0, bytes: await readFile(path) }
+        : { kind: 1, bytes: new TextEncoder().encode(target) };
+    });
+    for (let index = 0; index < batch.length; index++) {
+      const content = contents[index]!;
+      h.update(new Uint8Array([content.kind]));
+      updateFrame(new TextEncoder().encode(batch[index]!.logical));
+      updateFrame(content.bytes);
+    }
   }
   return h.digest("hex").slice(0, 12);
 }
@@ -232,20 +245,22 @@ export async function fingerprint(cfg: FleetConfig, name: string): Promise<ToolF
   if (!st?.isDirectory()) throw new Error(`tools.${name}.root is not a directory: ${spec.root}`);
   const files = await shippedFiles(spec.root, spec.exclude ?? []);
   if (!files.length) throw new Error(`tools.${name}: nothing to ship from ${spec.root}`);
+  return fingerprintSource(spec, files, await findSkill(spec));
+}
+
+async function fingerprintSource(spec: ReturnType<typeof resolveTool>, files: string[], skillPath?: string): Promise<ToolFingerprint> {
   let version = "0.0.0";
   const pkg = join(spec.root, "package.json");
   if (await Bun.file(pkg).exists())
     version = ((await Bun.file(pkg).json()) as { version?: string }).version ?? "0.0.0";
-  const skillPath = await findSkill(spec);
-  // A skill kept outside the source tree (the common case — most tools only ever
-  // had one under ~/.claude/skills) is still part of what gets shipped, so it
-  // must be part of the fingerprint. Otherwise editing only the SKILL.md leaves
-  // every box reporting "current" while running yesterday's instructions.
-  const external = skillPath && !skillPath.startsWith(spec.root + "/")
-    ? { as: "SKILL.md", path: skillPath } : undefined;
+  const sourceHash = await hashFiles(spec.root, files);
+  const skillHash = skillPath ? await fileHash(skillPath) : undefined;
+  const hash = skillHash
+    ? new Bun.CryptoHasher("sha256").update(`fleet-tools-fingerprint-v3\0${sourceHash}\0${skillHash}`).digest("hex").slice(0, 12)
+    : sourceHash;
   return {
-    name, version, files: files.length, root: spec.root, skillPath,
-    hash: await hashFiles(spec.root, files, external),
+    name: spec.name, version, files: files.length, root: spec.root, skillPath,
+    hash, sourceHash, skillHash,
   };
 }
 
@@ -287,6 +302,9 @@ export async function readManifests(h: Host): Promise<{ manifests: ToolManifest[
 
 function verdict(local: ToolFingerprint, remote: ToolManifest | undefined): ToolState {
   if (!remote) return "missing";
+  if (remote.sourceHash && local.sourceHash)
+    return remote.sourceHash === local.sourceHash && (!local.skillHash || remote.skill === local.skillHash)
+      ? "current" : "stale";
   return remote.hash === local.hash ? "current" : "stale";
 }
 
@@ -358,6 +376,7 @@ export interface ToolSyncResult {
 
 export function installScript(
   h: Host, spec: { name: string; entry?: string }, dir: string, manifest: ToolManifest, bin: string,
+  archive = `${spec.name}-sync.tgz`,
 ): { cmd: string; shell: "bash" | "powershell" } {
   const entry = spec.entry ?? "src/cli.ts";
   // `dir` is a shell expression ($HOME/tg) until the host expands it, so the
@@ -371,12 +390,13 @@ export function installScript(
       `$bun=(Get-Command bun -EA SilentlyContinue).Source; if(-not $bun){$bun="$env:USERPROFILE\\.bun\\bin\\bun.exe"}`,
       `$dir="${dir}"`,
       `New-Item -ItemType Directory -Force -Path $dir | Out-Null`,
-      `tar -xzf "$env:USERPROFILE\\${spec.name}-sync.tgz" -C $dir`,
+      `tar -xzf "$env:USERPROFILE\\${archive}" -C $dir`,
+      `if ($LASTEXITCODE -ne 0) { throw "tar extraction failed with exit $LASTEXITCODE" }`,
       `$installCode=0`,
       `Push-Location $dir`,
       `try { & $bun install 2>&1 | Out-Null; $installCode=$LASTEXITCODE } finally { Pop-Location }`,
       `if ($installCode -ne 0) { throw "bun install failed with exit $installCode" }`,
-      `Remove-Item "$env:USERPROFILE\\${spec.name}-sync.tgz" -Force -EA SilentlyContinue`,
+      `Remove-Item "$env:USERPROFILE\\${archive}" -Force -EA SilentlyContinue`,
       // A .cmd shim on PATH is the Windows equivalent of the posix launcher.
       `$shim="$env:USERPROFILE\\.local\\bin"`,
       `New-Item -ItemType Directory -Force -Path $shim | Out-Null`,
@@ -392,9 +412,9 @@ export function installScript(
     `bun="$(command -v bun || echo "$HOME/.bun/bin/bun")"`,
     `dir="${dir}"`,
     `mkdir -p "$dir" "$HOME/.local/bin" "${MANIFEST_DIR_POSIX}"`,
-    `tar -xzf "$HOME/${spec.name}-sync.tgz" -C "$dir"`,
+    `tar -xzf "$HOME/${archive}" -C "$dir"`,
     `(cd "$dir" && "$bun" install >/dev/null 2>&1)`,
-    `rm -f "$HOME/${spec.name}-sync.tgz"`,
+    `rm -f "$HOME/${archive}"`,
     // Unquoted heredoc: $bun/$dir expand as the launcher is written, \$@ does not.
     // A symlink into src/cli.ts with a `#!/usr/bin/env bun` shebang would look
     // equivalent and isn't — ~/.bun/bin is absent from a non-interactive ssh
@@ -427,12 +447,57 @@ export async function skillDestinations(h: Host, name: string): Promise<string[]
  *  SKILL.md in every supported agent root → manifest. The manifest is written last and only on success, so a
  *  half-finished sync reports stale rather than falsely claiming to be current. */
 async function syncOne(
-  cfg: FleetConfig, spec: ReturnType<typeof resolveTool>, fp: ToolFingerprint,
+  spec: ReturnType<typeof resolveTool>, fp: ToolFingerprint,
   h: Host, tarLocal: string, opts: { skill?: boolean } = {},
 ): Promise<ToolSyncResult> {
   const dir = toolDir(spec, h);
   const base = { tool: spec.name, host: h.name, dir, version: fp.version, hash: fp.hash };
-  const pushed = await scp(h, tarLocal, `${spec.name}-sync.tgz`);
+  const token = crypto.randomUUID();
+  const archive = `fleet-tool-${token}.tgz`;
+  const lock = toolSyncLockScript(h, dir, token);
+  let acquired: ExecResult;
+  try { acquired = await exec(h, lock.cmd, lock.shell); }
+  catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { ...base, ok: false, error: message, result: { host: h.name, ok: false, code: 1, stdout: "", stderr: message } };
+  }
+  if (!acquired.ok) return { ...base, ok: false, result: acquired, error: acquired.stderr || "tool sync lock failed" };
+  let outcome: ToolSyncResult;
+  try {
+    outcome = await installToolPayload(spec, fp, h, tarLocal, archive, opts);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    outcome = { ...base, ok: false, error: message, result: { host: h.name, ok: false, code: 1, stdout: "", stderr: message } };
+  }
+  if (outcome.result.code === 124 || outcome.result.code === 255) {
+    outcome.ok = false;
+    outcome.error = [outcome.error, `installation outcome is unconfirmed; installation lock retained; inspect the remote operation and archive ${archive} before removing the lock`].filter(Boolean).join("; ");
+    return outcome;
+  }
+  const release = toolSyncLockScript(h, dir, token, true, archive);
+  try {
+    const cleaned = await exec(h, release.cmd, release.shell);
+    if (!cleaned.ok) {
+      outcome.ok = false;
+      outcome.error = [outcome.error, `sync cleanup: ${cleaned.stderr || `exit ${cleaned.code}`}`].filter(Boolean).join("; ");
+      if (outcome.result.ok) outcome.result = cleaned;
+    }
+  } catch (error) {
+    outcome.ok = false;
+    outcome.error = [outcome.error, `sync cleanup: ${error instanceof Error ? error.message : String(error)}`].filter(Boolean).join("; ");
+    if (outcome.result.ok)
+      outcome.result = { host: h.name, ok: false, code: 1, stdout: outcome.result.stdout, stderr: outcome.error };
+  }
+  return outcome;
+}
+
+async function installToolPayload(
+  spec: ReturnType<typeof resolveTool>, fp: ToolFingerprint, h: Host,
+  tarLocal: string, archive: string, opts: { skill?: boolean },
+): Promise<ToolSyncResult> {
+  const dir = toolDir(spec, h);
+  const base = { tool: spec.name, host: h.name, dir, version: fp.version, hash: fp.hash };
+  const pushed = await scp(h, tarLocal, archive);
   if (!pushed.ok) return { ...base, ok: false, result: pushed, error: pushed.stderr || "scp failed" };
 
   let skillPushed = false;
@@ -456,12 +521,17 @@ async function syncOne(
   }
 
   const manifest: ToolManifest = {
-    tool: spec.name, version: fp.version, hash: fp.hash, dir,
+    tool: spec.name, version: fp.version, hash: !skillPushed && fp.skillPath ? `skill-skipped:${fp.sourceHash ?? fp.hash}` : fp.hash, dir,
+    sourceHash: fp.sourceHash,
     syncedAt: new Date().toISOString().slice(0, 19) + "Z",
-    ...(fp.skillPath ? { skill: await fileHash(fp.skillPath) } : {}),
+    ...(skillPushed ? { skill: fp.skillHash } : fp.skillPath ? { skillSkipped: true } : {}),
   };
-  const { cmd, shell } = installScript(h, spec, dir, manifest, spec.bin ?? spec.name);
-  const result = await exec(h, cmd, shell);
+  const { cmd, shell } = installScript(h, spec, dir, manifest, spec.bin ?? spec.name, archive);
+  let result: ExecResult;
+  try { result = await exec(h, cmd, shell); }
+  catch (error) {
+    result = { host: h.name, ok: false, code: 255, stdout: "", stderr: error instanceof Error ? error.message : String(error) };
+  }
   return { ...base, ok: result.ok, result, skill: skillPushed, ...(result.ok ? {} : { error: result.stderr }) };
 }
 
@@ -475,18 +545,47 @@ export async function syncTool(
   cfg: FleetConfig, name: string, sel: string, opts: { skill?: boolean } = {},
 ): Promise<ToolSyncResult[]> {
   const spec = resolveTool(cfg, name);
-  const fp = await fingerprint(cfg, name);
   const hosts = resolveHosts(cfg, sel);
-  const tar = join(tmpdir(), `${name}-sync-${process.pid}.tgz`);
-  const excludes = [...ALWAYS_EXCLUDE, ...(spec.exclude ?? [])].flatMap((e) => ["--exclude", e]);
-  const build = Bun.spawn(["tar", "czf", tar, "-C", spec.root, ...excludes, "."],
-    { env: { ...process.env, COPYFILE_DISABLE: "1" }, stdout: "ignore", stderr: "pipe" });
-  if (await build.exited !== 0)
-    throw new Error(`tarball build failed for ${name}: ${(await new Response(build.stderr).text()).trim()}`);
+  const stage = await mkdtemp(join(tmpdir(), "fleet-tool-sync-"));
   try {
-    return await Promise.all(hosts.map((h) => syncOne(cfg, spec, fp, h, tar, opts)));
+    const source = join(stage, "source");
+    await mkdir(source);
+    const files = await shippedFiles(spec.root, spec.exclude ?? []);
+    if (!files.length) throw new Error(`tools.${name}: nothing to ship from ${spec.root}`);
+    // Hash and archive one immutable local snapshot. A controller edit during a
+    // transfer cannot change the manifest or the files delivered to later hosts.
+    await mapPool(files, FILE_IO_PARALLELISM, async (rel) => {
+      const from = join(spec.root, rel), to = join(source, rel);
+      const metadata = await lstat(from);
+      await mkdir(dirname(to), { recursive: true });
+      if (metadata.isSymbolicLink()) await symlink(await readlink(from), to);
+      else {
+        await copyFile(from, to);
+        await chmod(to, metadata.mode);
+      }
+    });
+    const originalSkill = await findSkill(spec);
+    let skillPath: string | undefined;
+    if (originalSkill) {
+      const rel = relative(spec.root, originalSkill);
+      skillPath = join(stage, "SKILL.md");
+      // Prefer the captured file when it belongs to the shipment. Symlinks are
+      // copied from the controller because their targets may be external.
+      const captured = files.includes(rel) && !(await lstat(join(source, rel))).isSymbolicLink();
+      await copyFile(captured ? join(source, rel) : originalSkill, skillPath);
+    }
+    const fp = await fingerprintSource({ ...spec, root: source }, files, skillPath);
+    fp.root = spec.root;
+    const fileList = join(stage, "files");
+    await Bun.write(fileList, files.map((rel) => `./${rel}\0`).join(""));
+    const tar = join(stage, "source.tgz");
+    const build = Bun.spawn(["tar", "czf", tar, "-C", source, "--null", "--no-recursion", "-T", fileList],
+      { env: { ...process.env, COPYFILE_DISABLE: "1" }, stdout: "ignore", stderr: "pipe" });
+    const [code, stderr] = await Promise.all([build.exited, new Response(build.stderr).text()]);
+    if (code !== 0) throw new Error(`tarball build failed for ${name}: ${stderr.trim()}`);
+    return await Promise.all(hosts.map((h) => syncOne(spec, fp, h, tar, opts)));
   } finally {
-    await Bun.spawn(["rm", "-f", tar]).exited;
+    await rm(stage, { recursive: true, force: true });
   }
 }
 

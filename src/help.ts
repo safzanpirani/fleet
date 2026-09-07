@@ -1,0 +1,71 @@
+/** Static help must work without configuration, SSH, or a dashboard. */
+const usage: Record<string, string> = {
+  ls: "ls [--json]                         list host reachability and services",
+  dt: "dt [--json]                         list Daytona sandboxes",
+  exec: "exec [--cwd DIR] [--timeout S] [--wsl] [--raw | --json] <sel> <cmd…>\n  fleet exec --script <file|-> [--interp CMD] [--cwd DIR] [--timeout S] [--wsl] [--raw | --json] <sel>",
+  spawn: "spawn [--cwd DIR] [--label NAME] [--json] <sel> <cmd…>",
+  jobs: "jobs [list] [<sel>] [--json]\n  fleet jobs log <host:id> [--json]\n  fleet jobs tail <host:id> [-n N | --lines N] [-f | --follow] [--json]\n  fleet jobs wait <host:id> [--until REGEX] [--timeout S] [--json]\n  fleet jobs kill <host:id> [--json]\n  fleet jobs prune [<sel>] [--all] [--json]",
+  cp: "cp [-r | --recursive] [--json] <local…> <sel>:<remote>\n  fleet cp [-r | --recursive] [--json] <sel>:<remote…> <local>",
+  edit: "edit <sel>:<path> --old TEXT [--new TEXT] [--all] [--dry-run] [--wsl] [--json]",
+  restart: "restart <sel> <service>",
+  reboot: "reboot <sel> [--yes | -y]",
+  bios: "bios <sel> [--yes | -y]",
+  boot: "boot <machine> [--json]",
+  switch: "switch <machine> --to OS [--yes | -y] [--no-wait] [--timeout S]",
+  wait: "wait <host|machine> [--ssh | --port N | --http URL [--status N] | --boot OS]\n    [--timeout S] [--interval S] [--json]",
+  gpu: "gpu [--json]                        read GPU stats from the dashboard",
+  disk: "disk [<sel>] [--json]                read mounted-volume space from hosts",
+  status: "status [<host>] [--json]             read dashboard stats",
+  top: "top <host>                          live dashboard; Ctrl-C exits",
+  logs: "logs <sel> <service> [-n N]          read configured service logs",
+  svc: "svc <service> [<sel>] [--json]        check a service across hosts",
+  shot: "shot <host> [--out FILE] [--grid] [--grid-step N] [--no-open]",
+  cu: "cu <host> <tool> [JSON] [--out FILE] [--grid] [--grid-step N] [--no-open]\n  fleet cu <sel> install\n  fleet cu <host> tools [FILTER] | describe <tool> | apps [FILTER]\n  fleet cu <host> windows <pid|app> | shot-window <pid|app> [--out FILE]\n  fleet cu <host> record start|stop|status [--out DIR]",
+  browse: "browse <host> [URL]                  verify configured CDP and list targets",
+  run: "run <recipe>                        run configured steps; stop on failure",
+  deploy: "deploy <sel> [--restart SERVICE | --no-restart] [--json]",
+  tools: "tools list [--json]\n  fleet tools status [tool] [<sel>] [--json]\n  fleet tools sync <tool|--all> [<sel>] [--no-skill] [--max-parallel N] [--json]\n  fleet tools stamp [tool] [--json]",
+  doctor: "doctor <host> [--json]               diagnose SSH and health reachability",
+  completion: "completion [bash|zsh]               emit shell completion using config",
+  ssh: "ssh <host>                          open an interactive SSH session",
+  help: "help [command [subcommand]]         show help without loading config",
+};
+
+const detail: Record<string, string> = {
+  exec: "Put Fleet flags BEFORE the selector. Quote the remote command as one argument.\nYour local shell expands unquoted variables before Fleet receives them. For multiline\ncode or credentials, use a protected script file or stdin with --script. Untyped stdin\nrequires --interp. --raw keeps stdout unchanged and sends remote diagnostics to stderr.\n--timeout is seconds; 0 disables the SSH cap. Daytona requires a positive timeout.\nA timeout does not prove the remote command stopped. Inspect its outcome before retrying non-idempotent work. Use spawn for long jobs.",
+  spawn: "Put flags BEFORE the selector. Save the returned host:id. Commands and output persist\nin the remote job spool; do not put credentials in the command. Reconnect with jobs\nlog/tail/wait. An unconfirmed launch includes the attempted id; inspect it before\nsubmitting again. Fleet never automatically retries a launch.",
+  jobs: "Addressed verbs also accept <host> <id>. tail defaults to 40 lines. --json cannot\nbe combined with --follow. Options may precede or follow the job reference.\nwait defaults to no overall deadline; use --timeout S for bounded automation.\nExit codes: 0 on match or successful exit, the job code on failure, 124 on timeout,\n1 on dead jobs or inspection errors. A regex match proves only that text appeared.\nA dead job has no verified runner and no exit record. Inspect its logs and artifacts.\nTimeout or Ctrl-C stops observation; it does not cancel or restart the remote job.\nResume observation by running the same wait command. prune removes finished spools;\n--all also removes dead spools. Save needed logs before pruning.",
+  tools: "status uses each tool's configured hosts unless you supply a selector. It compares\nthe local content fingerprint with the last sync manifest. It does not verify the\nactive launcher or detect files edited after sync. Exit 1 means stale, missing, or\nunreachable targets; exit 0 requires every selected row to be current.\nsync defaults to the tool's configured hosts. --all requires a selector. Multi-tool\nsync defaults to two tools at a time. stamp updates skill version/date locally.",
+  cp: "Use one call for multiple files. Multiple sources require a directory destination.\nPush can fan out; pull requires exactly one host. Quote remote globs. A trailing /\nrequests a directory destination. Copy does not verify the active service or launcher.\nRemote-to-remote and recursive Daytona copies are unsupported.",
+  wait: "Defaults: SSH condition, 120-second timeout, 3-second interval. Choose one condition.\nExit 0 means ready; exit 1 means the deadline expired or the probe failed. HTTP status\ndefaults to 200. A listening port does not prove application-level success.",
+  edit: "Omitting --new or passing --new \"\" deletes the matched text. A present --new\nwithout a value is an error. Use --old=--flag for option-looking literal text.\nFleet requires one match unless --all is set, checks for concurrent modification,\nand prints changed lines. --dry-run does not write.",
+};
+
+const aliases: Record<string, string> = { service: "svc", screenshot: "shot", computer: "cu" };
+const subcommands: Record<string, string[]> = {
+  jobs: ["list", "log", "tail", "wait", "kill", "prune"],
+  tools: ["list", "status", "sync", "stamp"],
+};
+
+export function helpText(argv: string[]): string | undefined {
+  let [command, ...rest] = argv;
+  if (!command || command === "--help" || command === "-h") { command = "help"; }
+  if (command === "help") { command = rest.shift(); }
+  else {
+    // Only consume a help-only command prefix. Never steal a payload's --help.
+    const helpAt = rest.findIndex((arg) => arg === "--help" || arg === "-h");
+    if (helpAt < 0 || helpAt !== rest.length - 1) return undefined;
+    const prefix = rest.slice(0, helpAt);
+    if (prefix.length && !(prefix.length === 1 && subcommands[command]?.includes(prefix[0]!))) return undefined;
+    rest = prefix;
+  }
+  if (!command) return "fleet - remote commands, detached jobs, transfers, and tool sync\n\n"
+    + Object.values(usage).map((line) => `  fleet ${line}`).join("\n")
+    + "\n\nSelectors: host | logical route | @group | all | a,b,@group | dt:<sandbox>\n"
+    + "Run fleet ls for configured hosts. Run fleet help <command> for defaults and recovery.\n"
+    + "Help performs no configuration reads or network operations.\n";
+  command = aliases[command] ?? command;
+  if (!usage[command] || rest.length > 1 || (rest.length && !subcommands[command]?.includes(rest[0]!)))
+    throw new Error(`unknown help topic: ${[command, ...rest].join(" ")}`);
+  return `Usage: fleet ${usage[command]}\n${detail[command] ? "\n" + detail[command] + "\n" : ""}`;
+}

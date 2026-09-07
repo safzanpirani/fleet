@@ -20,6 +20,12 @@ function daytona(name: string): Host {
 }
 
 describe("Daytona transport", () => {
+  test("an explicit unbounded timeout fails before making an API request", async () => {
+    delete process.env.DAYTONA_API_KEY;
+    const result = await dtExec(daytona("fixture"), "true", { timeoutMs: 0 });
+    expect(result.ok).toBe(false);
+    expect(result.stderr).toContain("requires a finite timeout");
+  });
   test("execute requires the documented response shape", async () => {
     const token = `shape-${Date.now()}`;
     const server = Bun.serve({

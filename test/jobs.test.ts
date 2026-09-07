@@ -1,27 +1,27 @@
 import { test, expect, describe, spyOn } from "bun:test";
-import { jobLog, jobTail, killScript, resolveJobRef, parseRows, newId, unixSpawnScript, waitJob, waitPoll } from "../src/jobs.ts";
+import { jobLog, jobTail, killScript, listJobs, pruneJobs, resolveJobRef, parseRows, newId, spawnJob, unixSpawnScript, waitJob, waitPoll } from "../src/jobs.ts";
 import * as ssh from "../src/ssh.ts";
 import type { FleetConfig, Host } from "../src/config.ts";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const host = (name: string, os: Host["os"]): Host => ({ name, ssh: name, os });
 const cfg: FleetConfig = {
-  hosts: { oracle: host("oracle", "linux"), maints: host("maints", "windows") },
-  groups: { cloud: ["oracle", "maints"] },
+  hosts: { web: host("web", "linux"), winbox: host("winbox", "windows") },
+  groups: { cloud: ["web", "winbox"] },
 };
 
 describe("resolveJobRef", () => {
   test("two-arg form: host + id", () => {
-    const { host, id } = resolveJobRef(cfg, "oracle", "abc123-xy");
-    expect(host.name).toBe("oracle");
+    const { host, id } = resolveJobRef(cfg, "web", "abc123-xy");
+    expect(host.name).toBe("web");
     expect(id).toBe("abc123-xy");
   });
 
   test("collapsed host:id form", () => {
-    const { host, id } = resolveJobRef(cfg, "oracle:abc123-xy");
-    expect(host.name).toBe("oracle");
+    const { host, id } = resolveJobRef(cfg, "web:abc123-xy");
+    expect(host.name).toBe("web");
     expect(id).toBe("abc123-xy");
   });
 
@@ -32,15 +32,15 @@ describe("resolveJobRef", () => {
   });
 
   test("label-prefixed id (contains hyphens) round-trips", () =>
-    expect(resolveJobRef(cfg, "oracle:my-train-mr0g-rzgy").id).toBe("my-train-mr0g-rzgy"));
+    expect(resolveJobRef(cfg, "web:my-train-mr0g-rzgy").id).toBe("my-train-mr0g-rzgy"));
 
   test("missing id throws usage", () =>
-    expect(() => resolveJobRef(cfg, "oracle")).toThrow(/usage:/));
+    expect(() => resolveJobRef(cfg, "web")).toThrow(/usage:/));
 
   test("id outside [a-z0-9-] is rejected (path-injection guard)", () => {
-    expect(() => resolveJobRef(cfg, "oracle", "../etc")).toThrow(/bad job id/);
-    expect(() => resolveJobRef(cfg, "oracle", "a b")).toThrow(/bad job id/);
-    expect(() => resolveJobRef(cfg, "oracle:$(whoami)")).toThrow(/bad job id/);
+    expect(() => resolveJobRef(cfg, "web", "../etc")).toThrow(/bad job id/);
+    expect(() => resolveJobRef(cfg, "web", "a b")).toThrow(/bad job id/);
+    expect(() => resolveJobRef(cfg, "web:$(whoami)")).toThrow(/bad job id/);
   });
 
   test("a selector that resolves to >1 host is rejected", () =>
@@ -49,15 +49,15 @@ describe("resolveJobRef", () => {
 
 describe("parseRows", () => {
   test("parses a well-formed row", () => {
-    const [r] = parseRows("oracle", "id1\trunning\t-\t4242\t1700000000\techo hi");
+    const [r] = parseRows("web", "id1\trunning\t-\t4242\t1700000000\techo hi");
     expect(r).toEqual({
-      host: "oracle", id: "id1", status: "running",
+      host: "web", id: "id1", status: "running",
       code: null, pid: 4242, started: 1700000000, cmd: "echo hi",
     });
   });
 
   test("exited row carries the exit code; '-' fields become null", () => {
-    const [r] = parseRows("oracle", "id2\texited\t0\t-\t-\tdone");
+    const [r] = parseRows("web", "id2\texited\t0\t-\t-\tdone");
     expect(r!.status).toBe("exited");
     expect(r!.code).toBe(0);
     expect(r!.pid).toBeNull();
@@ -65,19 +65,19 @@ describe("parseRows", () => {
   });
 
   test("strips trailing CR (windows CRLF output)", () =>
-    expect(parseRows("maints", "id3\texited\t1\t100\t1700\tcmd\r")[0]!.cmd).toBe("cmd"));
+    expect(parseRows("winbox", "id3\texited\t1\t100\t1700\tcmd\r")[0]!.cmd).toBe("cmd"));
 
   test("a command containing tabs is preserved (rejoined)", () =>
-    expect(parseRows("oracle", "id4\trunning\t-\t1\t2\ta\tb\tc")[0]!.cmd).toBe("a\tb\tc"));
+    expect(parseRows("web", "id4\trunning\t-\t1\t2\ta\tb\tc")[0]!.cmd).toBe("a\tb\tc"));
 
   test("blank lines are skipped", () =>
-    expect(parseRows("oracle", "\nid5\trunning\t-\t1\t2\tx\n\n").length).toBe(1));
+    expect(parseRows("web", "\nid5\trunning\t-\t1\t2\tx\n\n").length).toBe(1));
 
   test("an unrecognised status token degrades to 'dead', never garbage", () =>
-    expect(parseRows("oracle", "id6\tWARNING: whatever\t-\t1\t2\tx")[0]!.status).toBe("dead"));
+    expect(parseRows("web", "id6\tWARNING: whatever\t-\t1\t2\tx")[0]!.status).toBe("dead"));
 
   test("non-numeric code/pid/started become null, not NaN", () => {
-    const [r] = parseRows("oracle", "id7\texited\tabc\txyz\tnope\tx");
+    const [r] = parseRows("web", "id7\texited\tabc\txyz\tnope\tx");
     expect(r!.code).toBeNull();
     expect(r!.pid).toBeNull();
     expect(r!.started).toBeNull();
@@ -99,7 +99,7 @@ describe("newId", () => {
 
 describe("killScript", () => {
   test("Windows diagnostic delimits the pid variable before a colon", () => {
-    const script = killScript(host("maints", "windows"), "job-123");
+    const script = killScript(host("winbox", "windows"), "job-123");
     expect(script).toContain("pid $($jpid): it is not job job-123");
     expect(script).not.toContain("pid $jpid:");
   });
@@ -130,8 +130,8 @@ describe("job log and tail", () => {
       return { host: remoteHost.name, ok: result.code === 0, ...result };
     });
     try {
-      expect(await jobLog(cfg, "oracle", id)).toEqual({ host: "oracle", output: "" });
-      expect(await jobTail(cfg, "oracle", id, 10)).toEqual({ host: "oracle", output: "" });
+      expect(await jobLog(cfg, "web", id)).toEqual({ host: "web", output: "" });
+      expect(await jobTail(cfg, "web", id, 10)).toEqual({ host: "web", output: "" });
     } finally {
       execSpy.mockRestore();
       rmSync(home, { recursive: true, force: true });
@@ -145,8 +145,8 @@ describe("job log and tail", () => {
       return { host: remoteHost.name, ok: result.code === 0, ...result };
     });
     try {
-      await expect(jobLog(cfg, "oracle", "missing-job")).rejects.toThrow("fleet: no such job: missing-job");
-      await expect(jobTail(cfg, "oracle", "missing-job", 10)).rejects.toThrow("fleet: no such job: missing-job");
+      await expect(jobLog(cfg, "web", "missing-job")).rejects.toThrow("fleet: no such job: missing-job");
+      await expect(jobTail(cfg, "web", "missing-job", 10)).rejects.toThrow("fleet: no such job: missing-job");
     } finally {
       execSpy.mockRestore();
       rmSync(home, { recursive: true, force: true });
@@ -155,11 +155,11 @@ describe("job log and tail", () => {
 
   test("Windows log and tail scripts fail a missing spool but allow a missing output file", async () => {
     const execSpy = spyOn(ssh, "exec").mockResolvedValue({
-      host: "maints", ok: true, code: 0, stdout: "", stderr: "",
+      host: "winbox", ok: true, code: 0, stdout: "", stderr: "",
     });
     try {
-      await jobLog(cfg, "maints", "windows-job");
-      await jobTail(cfg, "maints", "windows-job", 10);
+      await jobLog(cfg, "winbox", "windows-job");
+      await jobTail(cfg, "winbox", "windows-job", 10);
       for (const call of execSpy.mock.calls) {
         const script = call[1];
         expect(script).toContain("Test-Path -LiteralPath $d -PathType Container");
@@ -174,13 +174,13 @@ describe("job log and tail", () => {
 
   test("log and tail throw a useful fallback for every failed exec", async () => {
     const execSpy = spyOn(ssh, "exec").mockResolvedValue({
-      host: "oracle", ok: false, code: 255, stdout: "", stderr: "",
+      host: "web", ok: false, code: 255, stdout: "", stderr: "",
     });
     try {
-      await expect(jobLog(cfg, "oracle", "failed-job")).rejects.toThrow(
+      await expect(jobLog(cfg, "web", "failed-job")).rejects.toThrow(
         "failed to read job failed-job output (exit 255)",
       );
-      await expect(jobTail(cfg, "oracle", "failed-job", 10)).rejects.toThrow(
+      await expect(jobTail(cfg, "web", "failed-job", 10)).rejects.toThrow(
         "failed to tail job failed-job output (exit 255)",
       );
     } finally {
@@ -190,17 +190,193 @@ describe("job log and tail", () => {
 });
 
 describe("detached job lifecycle", () => {
+  test("list and prune preserve a live macOS job spool", async () => {
+    const fixtureHome = mkdtempSync(join(tmpdir(), "fleet-job-live-prune-"));
+    const local = host("local", "mac");
+    const fixtureConfig: FleetConfig = { hosts: { local }, groups: {} };
+    const dir = join(fixtureHome, ".fleet", "jobs", "live-job");
+    const execSpy = spyOn(ssh, "exec").mockImplementation(async (h, script) => {
+      const r = await runBash(script, fixtureHome);
+      return { host: h.name, ok: r.code === 0, ...r };
+    });
+    try {
+      const launch = await runBash(unixSpawnScript(local, "live-job",
+        'for i in {1..100}; do [ -f "$HOME/release" ] && break; sleep 0.05; done'), fixtureHome);
+      expect(launch.code, launch.stderr).toBe(0);
+      expect(await listJobs(fixtureConfig, "local")).toMatchObject([{ id: "live-job", status: "running" }]);
+      expect(await pruneJobs(fixtureConfig, "local", true)).toEqual([{ host: "local", removed: 0 }]);
+      expect(await Bun.file(join(dir, "run")).exists()).toBe(true);
+      expect(() => process.kill(Number(readFileSync(join(dir, "pid"), "utf8")), 0)).not.toThrow();
+    } finally {
+      execSpy.mockRestore();
+      writeFileSync(join(fixtureHome, "release"), "");
+      for (let i = 0; i < 200 && !Bun.file(join(dir, "exit")).size; i++) await Bun.sleep(10);
+      rmSync(fixtureHome, { recursive: true, force: true });
+    }
+  });
+
+  test("macOS kill escalates against resistant descendants after their runner exits", async () => {
+    const fixtureHome = mkdtempSync(join(tmpdir(), "fleet-job-kill-tree-"));
+    const local = host("local", "mac");
+    const dir = join(fixtureHome, ".fleet", "jobs", "resistant-job");
+    const unrelated = Bun.spawn(["sleep", "30"], { stdout: "ignore", stderr: "ignore" });
+    const pids: number[] = [];
+    const running = async (pid: number) => {
+      const ps = Bun.spawn(["ps", "-p", String(pid), "-o", "stat="], { stdout: "pipe", stderr: "ignore" });
+      const state = (await new Response(ps.stdout).text()).trim();
+      await ps.exited;
+      return state !== "" && !state.includes("Z");
+    };
+    try {
+      const launch = await runBash(unixSpawnScript(local, "resistant-job",
+        'trap "" TERM\necho $$ > "$HOME/workload-pid"\nsleep 30 &\necho $! > "$HOME/leaf-pid"\nwait'), fixtureHome);
+      expect(launch.code, launch.stderr).toBe(0);
+      pids.push(Number(readFileSync(join(dir, "pid"), "utf8")));
+      for (let i = 0; i < 100 && !Bun.file(join(fixtureHome, "leaf-pid")).size; i++) await Bun.sleep(10);
+      pids.push(Number(readFileSync(join(fixtureHome, "workload-pid"), "utf8")),
+        Number(readFileSync(join(fixtureHome, "leaf-pid"), "utf8")));
+      const killed = await runBash(killScript(local, "resistant-job"), fixtureHome);
+      expect(killed.code, killed.stderr).toBe(0);
+      for (const pid of pids) expect(await running(pid)).toBe(false);
+      // Preserve a runner exit record if TERM completed its immediate shell;
+      // escalation still has to remove the resistant descendants.
+      expect(["137", "143"]).toContain(readFileSync(join(dir, "exit"), "utf8").trim());
+      expect(await running(unrelated.pid)).toBe(true);
+    } finally {
+      for (const pid of pids) { try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ } }
+      unrelated.kill();
+      await unrelated.exited;
+      rmSync(fixtureHome, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  test("unconfirmed launches retain each attempted id and never retry", async () => {
+    const attempts: string[] = [];
+    const results = await spawnJob(cfg, "@cloud", "echo fixture", {}, {
+      newId: () => "attempt-id",
+      exec: async (h) => {
+        attempts.push(h.name);
+        if (h.os === "windows") throw new Error("transport disconnected");
+        return { host: h.name, ok: false, code: 255, stdout: "", stderr: "connection lost" };
+      },
+    });
+    expect(attempts).toEqual(["web", "winbox"]);
+    expect(results).toHaveLength(2);
+    for (const r of results) {
+      expect(r).toMatchObject({ ok: false, id: "attempt-id", pid: null });
+      expect(r.error).toContain("inspect this job before retrying");
+    }
+  });
+
+  test("spawn does not accept another job's acknowledgement", async () => {
+    const [r] = await spawnJob(cfg, "web", "echo fixture", {}, {
+      newId: () => "expected-id",
+      exec: async () => ({ host: "web", ok: true, code: 0, stdout: "OK other-id 123\n", stderr: "" }),
+    });
+    expect(r).toMatchObject({ ok: false, id: "expected-id" });
+  });
+
+  test("wait detects a dead runner without mistaking a reused PID for ownership", async () => {
+    const home = mkdtempSync(join(tmpdir(), "fleet-job-dead-"));
+    const sleeper = Bun.spawn(["sleep", "10"], { stdout: "ignore", stderr: "ignore" });
+    const id = "dead-runner";
+    const dir = join(home, ".fleet", "jobs", id);
+    let inspections = 0;
+    try {
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "pid"), String(sleeper.pid));
+      const result = await waitJob(cfg, "web", id, { intervalMs: 1, timeoutMs: 1000 }, {
+        exec: async (h, script) => {
+          inspections++;
+          const r = await runBash(script, home);
+          return { host: h.name, ok: r.code === 0, ...r };
+        },
+      });
+      expect(result).toMatchObject({ outcome: "dead", code: null });
+      expect(inspections).toBe(3);
+      expect(() => process.kill(sleeper.pid, 0)).not.toThrow();
+      expect(await Bun.file(join(dir, "exit")).exists()).toBe(false);
+    } finally {
+      sleeper.kill();
+      await sleeper.exited;
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test("wait permits an exit record to arrive after a dead observation", async () => {
+    const outputs = ["DEAD\n", "EXIT:7\n"];
+    const result = await waitJob(cfg, "web:race", undefined, { intervalMs: 1 }, {
+      exec: async () => ({ host: "web", ok: true, code: 0, stdout: outputs.shift()!, stderr: "" }),
+    });
+    expect(result).toMatchObject({ outcome: "exited", code: 7 });
+  });
+
+  test("wait validates timing and does not retry permanent poll failures", async () => {
+    for (const opts of [{ timeoutMs: NaN }, { timeoutMs: -1 }, { intervalMs: 0 }, { intervalMs: Infinity }])
+      await expect(waitJob(cfg, "web:bad", undefined, opts)).rejects.toThrow("must be a finite");
+    let calls = 0;
+    await expect(waitJob(cfg, "web:regex", undefined, {}, {
+      exec: async () => {
+        calls++;
+        return { host: "web", ok: false, code: 2, stdout: "", stderr: "invalid --until regex" };
+      },
+    })).rejects.toThrow("invalid --until regex");
+    expect(calls).toBe(1);
+  });
+
+  test("a deadline preserves the remote job and a new wait observes completion", async () => {
+    const home = mkdtempSync(join(tmpdir(), "fleet-job-resume-"));
+    const id = "resume-job";
+    const dir = join(home, ".fleet", "jobs", id);
+    const inspect: typeof ssh.exec = async (h, script) => {
+      const r = await runBash(script, home);
+      return { host: h.name, ok: r.code === 0, ...r };
+    };
+    try {
+      const launch = await runBash("umask 022\n" + unixSpawnScript(host("local", "mac"), id,
+        'for i in {1..100}; do [ -f "$HOME/release" ] && break; sleep 0.05; done; touch "$HOME/artifact"; printf done; exit 7'), home);
+      expect(launch.code, launch.stderr).toBe(0);
+      expect(statSync(dir).mode & 0o777).toBe(0o700);
+      expect(statSync(join(dir, "cmd")).mode & 0o777).toBe(0o600);
+      const first = await waitJob(cfg, "web", id, { timeoutMs: 60, intervalMs: 10 }, { exec: inspect });
+      expect(first.outcome).toBe("timeout");
+      expect(await Bun.file(join(dir, "exit")).exists()).toBe(false);
+      writeFileSync(join(home, "release"), "");
+      const second = await waitJob(cfg, "web", id, { timeoutMs: 2000, intervalMs: 10 }, { exec: inspect });
+      expect(second).toMatchObject({ outcome: "exited", code: 7 });
+      expect(readFileSync(join(dir, "out"), "utf8")).toBe("done");
+      expect(statSync(join(dir, "out")).mode & 0o777).toBe(0o600);
+      expect(statSync(join(home, "artifact")).mode & 0o777).toBe(0o644);
+    } finally {
+      writeFileSync(join(home, "release"), "");
+      // Finish the bounded fixture runner before removing its spool.
+      for (let i = 0; i < 100 && !Bun.file(join(dir, "exit")).size; i++) await Bun.sleep(10);
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test("a regex beginning with a dash is data, not a grep option", async () => {
+    const home = mkdtempSync(join(tmpdir(), "fleet-job-dash-"));
+    try {
+      const dir = join(home, ".fleet", "jobs", "dash-regex");
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "out"), "--ready\n");
+      const r = await runBash(waitPoll(host("local", "mac"), "dash-regex", "--ready"), home);
+      expect(r.code, r.stderr).toBe(0);
+      expect(r.stdout).toContain("MATCH");
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
   test("Linux launch stamps an ownership marker for runner command-line changes", () => {
-    const script = unixSpawnScript(host("oracle", "linux"), "owned-job", "true");
+    const script = unixSpawnScript(host("web", "linux"), "owned-job", "true");
     expect(script).toContain('FLEET_JOB_ID="$id" setsid');
   });
 
   test("wait retries transient inspection failures", async () => {
     const execSpy = spyOn(ssh, "exec")
-      .mockResolvedValueOnce({ host: "oracle", ok: false, code: 255, stdout: "", stderr: "connection reset" })
-      .mockResolvedValueOnce({ host: "oracle", ok: true, code: 0, stdout: "EXIT:0\n", stderr: "" });
+      .mockResolvedValueOnce({ host: "web", ok: false, code: 255, stdout: "", stderr: "connection reset" })
+      .mockResolvedValueOnce({ host: "web", ok: true, code: 0, stdout: "EXIT:0\n", stderr: "" });
     try {
-      const result = await waitJob(cfg, "oracle:retry-job", undefined, { intervalMs: 1 });
+      const result = await waitJob(cfg, "web:retry-job", undefined, { intervalMs: 1 });
       expect(result).toMatchObject({ outcome: "exited", code: 0 });
       expect(execSpy).toHaveBeenCalledTimes(2);
     } finally {
@@ -210,10 +386,10 @@ describe("detached job lifecycle", () => {
 
   test("wait tolerates brief spool visibility delay", async () => {
     const execSpy = spyOn(ssh, "exec")
-      .mockResolvedValueOnce({ host: "oracle", ok: true, code: 0, stdout: "MISSING\n", stderr: "" })
-      .mockResolvedValueOnce({ host: "oracle", ok: true, code: 0, stdout: "EXIT:7\n", stderr: "" });
+      .mockResolvedValueOnce({ host: "web", ok: true, code: 0, stdout: "MISSING\n", stderr: "" })
+      .mockResolvedValueOnce({ host: "web", ok: true, code: 0, stdout: "EXIT:7\n", stderr: "" });
     try {
-      const result = await waitJob(cfg, "oracle:late-spool", undefined, { intervalMs: 1 });
+      const result = await waitJob(cfg, "web:late-spool", undefined, { intervalMs: 1 });
       expect(result).toMatchObject({ outcome: "exited", code: 7 });
     } finally {
       execSpy.mockRestore();

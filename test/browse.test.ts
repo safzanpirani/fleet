@@ -4,9 +4,9 @@ import type { FleetConfig } from "../src/config.ts";
 
 const cfg: FleetConfig = {
   hosts: {
-    ampere: {
-      name: "ampere",
-      ssh: "ampere",
+    linuxbox: {
+      name: "linuxbox",
+      ssh: "linuxbox",
       os: "linux",
       cdp: "http://browser.test:9223/",
     },
@@ -17,7 +17,7 @@ const cfg: FleetConfig = {
 describe("browseHost", () => {
   test("verifies CDP, opens a URL with PUT, then lists targets", async () => {
     const requests: Array<{ url: string; method: string }> = [];
-    const result = await browseHost(cfg, "ampere", "https://example.com/a?b=c", {
+    const result = await browseHost(cfg, "linuxbox", "https://example.com/a?b=c", {
       fetch: async (input, init) => {
         const url = String(input);
         requests.push({ url, method: init?.method ?? "GET" });
@@ -42,7 +42,7 @@ describe("browseHost", () => {
 
   test("a CDP request has a bounded deadline", async () => {
     const started = performance.now();
-    await expect(browseHost(cfg, "ampere", undefined, {
+    await expect(browseHost(cfg, "linuxbox", undefined, {
       timeoutMs: 20,
       fetch: async (_input, init) => new Promise<Response>((_resolve, reject) => {
         const signal = init?.signal;
