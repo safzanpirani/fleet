@@ -999,61 +999,206 @@ export async function deliverImage(
   }
 }
 
+export interface GridOptions {
+  /** Labeled major gridline spacing, in image pixels (default 100). */
+  step?: number;
+  /** Unlabeled tick spacing along the edges and major lines (default step/4). */
+  minorStep?: number;
+  /** Bottom status strip stating the coordinate frame the labels are in. */
+  caption?: string;
+  /** Top warning strip — used when something can eat input (a modal, a popup). */
+  banner?: string;
+  /** Crosshair at the point a click with these coordinates would land on. */
+  probe?: { x: number; y: number; label?: string };
+  /** Draw "x,y" labels at interior major crossings, not just at the edges. */
+  crossLabels?: boolean;
+}
+
 /** Overlay a labeled pixel-coordinate grid on a local image (in place) so an
- *  agent can read off x,y before a cua click (coords are window-local pixels).
+ *  agent can read off x,y before a cua click.
  *
  *  Labels are RAW IMAGE PIXELS on purpose — do NOT add a HiDPI/logical scale.
- *  For the path that actually clicks (`fleet cu --grid`) the grid is drawn on
- *  cua-driver's own --screenshot-out-file output, and cua clicks in that same
- *  screenshot's pixel space, so pixel labels == click coords. A scale transform
- *  here would re-introduce a 2× miss on Retina, not fix one. (`shot --grid` is
- *  view-only.) Font path list covers macOS/Linux/Windows; label boxes are sized
- *  from real glyph metrics so the fallback bitmap font still fits.
+ *  cua-driver records a per-pid resize ratio whenever a window capture is
+ *  downscaled to `max_image_dimension` (`set_ratio(pid, original_w / output_w)`)
+ *  and multiplies every incoming pixel `x,y` by it, so coordinates read off the
+ *  returned PNG are exactly what `click` wants. A scale transform here would
+ *  double-apply that correction. (`shot --grid` is view-only.)
+ *
+ *  The ratio is keyed by PID ALONE and is replaced by the next capture of ANY
+ *  window of that pid — so whatever capture the coordinates were read off must
+ *  be the last one taken before the click. `cuAct` guarantees that ordering;
+ *  a hand-rolled sequence of raw `fleet cu` calls does not.
+ *
+ *  Font path list covers macOS/Linux/Windows; label boxes are sized from real
+ *  glyph metrics so the fallback bitmap font still fits. Line and label colours
+ *  are chosen per segment from the underlying luminance, because a fixed palette
+ *  disappears against saturated artwork.
  *  Best-effort: needs python3 + Pillow locally; returns false if unavailable. */
-export async function overlayGrid(imagePath: string, step = 100): Promise<boolean> {
+export async function overlayGrid(imagePath: string, opts: number | GridOptions = {}): Promise<boolean> {
+  const o: GridOptions = typeof opts === "number" ? { step: opts } : (opts ?? {});
+  let step = o.step ?? 100;
   if (!Number.isFinite(step) || step <= 0) step = 100;   // guard: range(…, 0) throws
+  let minor = o.minorStep ?? Math.round(step / 4);
+  if (!Number.isFinite(minor) || minor <= 0 || minor >= step) minor = Math.max(1, Math.round(step / 4));
+  const spec = JSON.stringify({
+    step, minor,
+    caption: o.caption ?? "",
+    banner: o.banner ?? "",
+    probe: o.probe && Number.isFinite(o.probe.x) && Number.isFinite(o.probe.y)
+      ? { x: Math.round(o.probe.x), y: Math.round(o.probe.y), label: o.probe.label ?? "" }
+      : null,
+    cross: o.crossLabels !== false,
+  });
   const py = `
-import sys
+import json, sys
 from PIL import Image, ImageDraw, ImageFont
-path, step = sys.argv[1], int(sys.argv[2])
-im = Image.open(path).convert("RGBA")
+path = sys.argv[1]
+o = json.loads(sys.argv[2])
+step, minor = int(o["step"]), int(o["minor"])
+im = Image.open(path).convert("RGB")
 w, h = im.size
+src = im.load()
 ov = Image.new("RGBA", im.size, (0, 0, 0, 0))
 d = ImageDraw.Draw(ov)
 # first available monospace across macOS / Linux / Windows (falls back to PIL's
 # tiny bitmap font only if none exist — then label boxes still fit, see measure())
 font = None
+tiny = None
 for cand in ("/System/Library/Fonts/Menlo.ttc",
              "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
              "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
              "/Library/Fonts/Arial.ttf",
              "C:\\\\Windows\\\\Fonts\\\\consola.ttf"):
-    try: font = ImageFont.truetype(cand, 12); break
-    except Exception: pass
-if font is None: font = ImageFont.load_default()
-def measure(s):
-    l, t, r, b = font.getbbox(s)
+    try:
+        font = ImageFont.truetype(cand, 12)
+        tiny = ImageFont.truetype(cand, 10)
+        break
+    except Exception:
+        pass
+if font is None:
+    font = ImageFont.load_default()
+if tiny is None:
+    tiny = font
+
+def measure(s, f):
+    l, t, r, b = f.getbbox(s)
     return r - l, b - t
-def line(p0, p1, major):
-    d.line([p0, p1], fill=(0, 0, 0, 90), width=3 if major else 2)   # dark underlay
-    d.line([p0, p1], fill=(80, 200, 255, 180) if major else (255, 60, 60, 90), width=1)
-def tag(x, y, s):
-    tw, th = measure(s)
-    x = max(0, min(x, w - tw - 3)); y = max(0, min(y, h - th - 3))
-    d.rectangle([x - 1, y - 1, x + tw + 2, y + th + 2], fill=(0, 0, 0, 175))
-    d.text((x, y), s, fill=(120, 255, 120, 255), font=font)
-major = step * 5
-for x in range(0, w, step): line((x, 0), (x, h), x % major == 0)
-for y in range(0, h, step): line((0, y), (w, y), y % major == 0)
+
+def lum(x, y):
+    x = 0 if x < 0 else (w - 1 if x >= w else x)
+    y = 0 if y < 0 else (h - 1 if y >= h else y)
+    p = src[x, y]
+    return 0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2]
+
+def lum_line(x0, y0, x1, y1, n=9):
+    t = 0.0
+    for i in range(n):
+        f = i / (n - 1) if n > 1 else 0.0
+        t += lum(int(x0 + (x1 - x0) * f), int(y0 + (y1 - y0) * f))
+    return t / n
+
+def lum_box(x0, y0, x1, y1):
+    t, n = 0.0, 0
+    sx = max(1, (x1 - x0) // 4)
+    sy = max(1, (y1 - y0) // 3)
+    for x in range(int(x0), int(x1) + 1, sx):
+        for y in range(int(y0), int(y1) + 1, sy):
+            t += lum(x, y); n += 1
+    return t / n if n else 0.0
+
+# ── gridlines, coloured per segment against what is underneath ───────────────
+def seg(x0, y0, x1, y1):
+    bright = lum_line(x0, y0, x1, y1) > 140
+    under = (255, 255, 255, 130) if bright else (0, 0, 0, 150)
+    over = (0, 0, 0, 205) if bright else (95, 210, 255, 215)
+    d.line([(x0, y0), (x1, y1)], fill=under, width=3)
+    d.line([(x0, y0), (x1, y1)], fill=over, width=1)
+
+for x in range(0, w, step):
+    for y0 in range(0, h, step):
+        seg(x, y0, x, min(y0 + step, h - 1))
+for y in range(0, h, step):
+    for x0 in range(0, w, step):
+        seg(x0, y, min(x0 + step, w - 1), y)
+
+# ── minor ticks: unlabeled, for sub-cell aim on ~30px toolbar icons ──────────
+def tick(x0, y0, x1, y1):
+    bright = lum_line(x0, y0, x1, y1, 3) > 140
+    d.line([(x0, y0), (x1, y1)], fill=(0, 0, 0, 165) if bright else (255, 255, 255, 165), width=1)
+
+for x in range(0, w, minor):
+    if x % step == 0:
+        continue
+    tick(x, 0, x, 6); tick(x, h - 7, x, h - 1)
+    for gy in range(0, h, step):
+        tick(x, gy - 3, x, gy + 3)
+for y in range(0, h, minor):
+    if y % step == 0:
+        continue
+    tick(0, y, 6, y); tick(w - 7, y, w - 1, y)
+    for gx in range(0, w, step):
+        tick(gx - 3, y, gx + 3, y)
+
+# ── labels: opaque plate + luminance-picked ink, so saturated art stays legible
+def tag(x, y, s, f=font, alpha=235):
+    tw, th = measure(s, f)
+    x = max(1, min(int(x), w - tw - 4))
+    y = max(1, min(int(y), h - th - 4))
+    bright = lum_box(x - 1, y - 1, x + tw + 2, y + th + 2) > 140
+    ink = (255, 255, 255, 255) if bright else (150, 255, 150, 255)
+    edge = (255, 255, 255, 190) if bright else (0, 0, 0, 230)
+    d.rectangle([x - 2, y - 2, x + tw + 3, y + th + 3], fill=(0, 0, 0, alpha), outline=edge)
+    d.text((x, y), s, fill=ink, font=f)
+    return tw, th
+
+banner = o.get("banner") or ""
+caption = o.get("caption") or ""
+top_pad = 24 if banner else 0
+bot_pad = 22 if caption else 0
+
 # label every gridline near both edges so a coordinate is always close to a click
 for x in range(0, w, step):
-    tag(x + 2, 1, str(x)); tag(x + 2, h - 16, str(x))
+    tag(x + 3, top_pad + 2, str(x))
+    tag(x + 3, h - bot_pad - 17, str(x))
 for y in range(step, h, step):
-    s = str(y); tw, _ = measure(s)
-    tag(1, y + 1, s); tag(w - tw - 3, y + 1, s)
-Image.alpha_composite(im, ov).convert("RGB").save(path)
+    s = str(y)
+    tw, _ = measure(s, font)
+    tag(3, y + 2, s)
+    tag(w - tw - 5, y + 2, s)
+
+# interior crossings: "x,y" at every other major, so the centre of a big capture
+# does not require tracing a line back to an edge
+if o.get("cross"):
+    cx_step, cy_step = step * 2, step * 2
+    for x in range(cx_step, w, cx_step):
+        for y in range(cy_step, h, cy_step):
+            if y < top_pad + 20 or y > h - bot_pad - 20:
+                continue
+            tag(x + 4, y + 4, "%d,%d" % (x, y), tiny, 205)
+
+probe = o.get("probe")
+if probe:
+    cx, cy = int(probe["x"]), int(probe["y"])
+    for r, col, wd in ((0, (0, 0, 0, 220), 4), (0, (255, 60, 220, 255), 2)):
+        d.line([(cx - 20, cy), (cx - 5, cy)], fill=col, width=wd)
+        d.line([(cx + 5, cy), (cx + 20, cy)], fill=col, width=wd)
+        d.line([(cx, cy - 20), (cx, cy - 5)], fill=col, width=wd)
+        d.line([(cx, cy + 5), (cx, cy + 20)], fill=col, width=wd)
+    d.ellipse([cx - 11, cy - 11, cx + 11, cy + 11], outline=(0, 0, 0, 220), width=4)
+    d.ellipse([cx - 11, cy - 11, cx + 11, cy + 11], outline=(255, 60, 220, 255), width=2)
+    tag(cx + 16, cy + 16, probe.get("label") or ("click -> %d,%d" % (cx, cy)))
+
+# ── strips last, so nothing is drawn over the warning ────────────────────────
+if banner:
+    d.rectangle([0, 0, w, top_pad - 1], fill=(150, 20, 20, 240))
+    d.text((6, 5), banner[:220], fill=(255, 255, 255, 255), font=font)
+if caption:
+    d.rectangle([0, h - bot_pad, w, h], fill=(16, 16, 20, 240))
+    d.text((6, h - bot_pad + 4), caption[:260], fill=(190, 230, 255, 255), font=font)
+
+Image.alpha_composite(im.convert("RGBA"), ov).convert("RGB").save(path)
 `;
-  const proc = Bun.spawn(["python3", "-c", py, imagePath, String(step)], { stdout: "ignore", stderr: "pipe" });
+  const proc = Bun.spawn(["python3", "-c", py, imagePath, spec], { stdout: "ignore", stderr: "pipe" });
   if (await proc.exited === 0) return true;
   return false;
 }
@@ -1533,85 +1678,791 @@ export async function cuWindows(
   return { windows, result };
 }
 
-/** Resolve a pid from a numeric string or an app-name substring. */
-export async function cuResolvePid(cfg: FleetConfig, sel: string, query: string): Promise<CuApp> {
-  if (/^\d+$/.test(query)) return { name: query, pid: Number(query) };
-  const { apps } = await cuApps(cfg, sel, query);
-  const m = apps.find((a) => a.active) ?? apps[0];
-  if (!m) throw new Error(`no app matching "${query}" on the host (try: fleet cu ${sel} apps)`);
-  return m;
+// ── computer-use: window model, targeting, coordinate space, verified acts ───
+// Everything below resolves a caller's fuzzy target ("Playnite", "Playnite.
+// DesktopApp", a pid, a window title) to ONE exact (pid, window_id) and keeps
+// that pair attached to every call it makes. Two facts from cua-driver drive the
+// design and are worth stating once:
+//
+//  1. `click`/`press_key`/`hotkey`/`scroll` take `window_id` as OPTIONAL and
+//     "pick the frontmost window of pid" when it is omitted. With a modal open,
+//     the frontmost window IS the modal, so window-local coordinates get
+//     anchored to the dialog's frame and land somewhere unrelated — the class of
+//     bug that reads as "the coordinate space is inconsistent". Fleet always
+//     sends an explicit window_id.
+//  2. `get_window_state` downscales its screenshot to `max_image_dimension` and
+//     records the resize ratio PER PID (not per window). Incoming pixel x,y are
+//     multiplied by that ratio, so coordinates are in the returned PNG's space —
+//     but only until the next capture of any window of the same pid. Captures
+//     are therefore ordered so the targeted window is always captured LAST.
+
+const SEP_SENTINEL = "__FLEET_SEP__";
+const CAP_SENTINEL = "__FLEET_CAP__";
+const END_SENTINEL = "__FLEET_END__";
+const HASH_SENTINEL = "__FLEET_HASH__";
+
+/** One top-level window, normalized across cua-driver's two reported shapes:
+ *  `windows[]` (nested `bounds`) and `_legacy_windows[]` (flat x/y/width/height).
+ *  `z_index` counts UP toward the front — the desktop's Program Manager is 0. */
+export interface CuWindowInfo {
+  window_id: number; pid: number; title: string; app_name?: string;
+  x: number; y: number; width: number; height: number;
+  on_screen: boolean; minimized: boolean; z_index: number;
 }
 
-/** Capture a window by app-name-or-pid. Resolve (pid → window) + capture happen
- *  in a SINGLE remote script (one SSH round-trip) + one scp pull — not five.
- *  cua-driver is invoked 3× but locally on the host, where it's cheap. */
+/** Everything one `list_apps` + `list_windows` + `get_config` round-trip yields.
+ *  Target resolution is a pure function of this, so every subcommand matches
+ *  names identically and the matching is unit-testable without a host. */
+export interface CuSnapshot {
+  apps: CuApp[]; windows: CuWindowInfo[]; maxImageDimension: number; result: ExecResult;
+}
+
+export interface CuCaptureSize { width: number; height: number; scale: number }
+
+/** A resolved, unambiguous target: one pid, one window, and what else that pid
+ *  has on screen that could be eating the input. */
+export interface CuTarget {
+  pid: number;
+  name: string;
+  /** Which identity matched the caller's query — reported so a surprising
+   *  resolution is visible instead of silent. */
+  matched: "pid" | "process" | "app" | "title";
+  window: CuWindowInfo;
+  /** Other on-screen, non-minimized windows owned by the same pid. */
+  siblings: CuWindowInfo[];
+  /** Siblings sitting ABOVE the target window. On Windows these are owned
+   *  popups and modal dialogs; a modal one swallows input to the parent while
+   *  a capture of the parent alone still looks completely normal. */
+  blockers: CuWindowInfo[];
+  /** Predicted `get_window_state` screenshot size — the space `x,y` live in. */
+  capture: CuCaptureSize;
+}
+
+function normalizeWindow(raw: any): CuWindowInfo | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const b = raw.bounds && typeof raw.bounds === "object" ? raw.bounds : raw;
+  const id = Number(raw.window_id);
+  const pid = Number(raw.pid);
+  if (!Number.isFinite(id) || !Number.isFinite(pid)) return undefined;
+  const num = (v: unknown) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+  return {
+    window_id: id, pid,
+    title: String(raw.title ?? ""),
+    app_name: raw.app_name ? String(raw.app_name) : undefined,
+    x: num(b.x), y: num(b.y), width: num(b.width), height: num(b.height),
+    on_screen: raw.is_on_screen !== false,
+    minimized: raw.minimized === true,
+    z_index: num(raw.z_index),
+  };
+}
+
+/** `list_windows` output → typed windows, tolerant of all three shapes it has
+ *  shipped (bare array, `{windows}`, `{_legacy_windows}`). */
+export function parseCuWindows(data: any): CuWindowInfo[] {
+  const rows = Array.isArray(data) ? data : data?.windows ?? data?._legacy_windows ?? [];
+  if (!Array.isArray(rows)) return [];
+  return rows.flatMap((r) => { const w = normalizeWindow(r); return w ? [w] : []; });
+}
+
+/** Predict the screenshot `get_window_state` will return for a window. The
+ *  driver fits the long edge to `max_image_dimension` and floors, so this is the
+ *  exact pixel space `click` coordinates live in — known before any capture. */
+export function cuCaptureSize(win: { width: number; height: number }, maxDim: number): CuCaptureSize {
+  const long = Math.max(win.width, win.height);
+  const scale = maxDim > 0 && long > maxDim ? maxDim / long : 1;
+  return {
+    width: Math.max(1, Math.floor(win.width * scale)),
+    height: Math.max(1, Math.floor(win.height * scale)),
+    scale,
+  };
+}
+
+/** One round trip for everything targeting needs: the app list (display names),
+ *  the full window list (process names, titles, bounds, z-order) and the driver
+ *  config (the downscale ceiling). */
+export async function cuSnapshot(
+  cfg: FleetConfig, sel: string, deps: { exec?: typeof exec } = {},
+): Promise<CuSnapshot> {
+  const host = resolveHosts(cfg, sel)[0]!;
+  const win = host.os === "windows";
+  const { prelude, invoke } = cuaBin(host.os);
+  const mark = win ? `Write-Output '${SEP_SENTINEL}'` : `echo '${SEP_SENTINEL}'`;
+  const cmd = [prelude, `${invoke} list_apps`, mark, `${invoke} list_windows`, mark, `${invoke} get_config`]
+    .join("\n");
+  const result = await (deps.exec ?? exec)(host, cmd, win ? "powershell" : "bash");
+  if (!result.ok) return { apps: [], windows: [], maxImageDimension: 0, result };
+
+  const [appsRaw = "", windowsRaw = "", configRaw = ""] = result.stdout.split(SEP_SENTINEL);
+  const safe = <T>(fn: () => T, fallback: T): T => { try { return fn(); } catch { return fallback; } };
+  const appData = safe(() => extractJson(appsRaw), null);
+  const apps: CuApp[] = Array.isArray(appData) ? appData : appData?.apps ?? [];
+  const windows = safe(() => parseCuWindows(extractJson(windowsRaw)), []);
+  const maxImageDimension = safe(() => Number(extractJson(configRaw)?.max_image_dimension) || 0, 0);
+  return { apps, windows, maxImageDimension, result };
+}
+
+/** Match key for a process/app name: case- and extension-insensitive, so
+ *  "Playnite.DesktopApp.exe", "Playnite.DesktopApp" and "playnite" all meet. */
+const stripExe = (s: string) => s.toLowerCase().replace(/\.(exe|app)$/i, "").trim();
+/** The same trim WITHOUT lowercasing — display names keep the process's own
+ *  capitalization, which is what the caller typed and will recognize. */
+const displayName = (s: string) => s.replace(/\.(exe|app)$/i, "").trim();
+
+/** Every name a pid answers to, gathered from BOTH sources. `list_apps` reports
+ *  the display name ("Playnite") and `list_windows` the process image name
+ *  ("Playnite.DesktopApp.exe") plus window titles — so a query that matches any
+ *  of them resolves, instead of only whichever list a given subcommand happened
+ *  to call. */
+function identitiesByPid(snap: CuSnapshot): Map<number, { names: string[]; display: string; active: boolean }> {
+  const byPid = new Map<number, { names: string[]; display: string; active: boolean }>();
+  const add = (pid: number, name: string | undefined, display?: string, active?: boolean) => {
+    if (!Number.isFinite(pid)) return;
+    const entry = byPid.get(pid) ?? { names: [], display: display ?? name ?? String(pid), active: false };
+    if (name) {
+      for (const variant of [name, stripExe(name)]) {
+        const v = variant.toLowerCase().trim();
+        if (v && !entry.names.includes(v)) entry.names.push(v);
+      }
+    }
+    if (display) entry.display = display;
+    if (active) entry.active = true;
+    byPid.set(pid, entry);
+  };
+  for (const a of snap.apps) add(a.pid, a.name, a.name, a.active === true);
+  // Titles are matched separately below. Folding them in here would make a
+  // title hit report itself as a process-name hit, hiding WHY a query resolved.
+  for (const w of snap.windows)
+    add(w.pid, w.app_name, byPid.get(w.pid)?.display ?? (displayName(w.app_name ?? "") || undefined));
+  return byPid;
+}
+
+/** Pick the window Fleet will address for a pid: the biggest on-screen,
+ *  non-minimized one. Deliberately NOT the frontmost — a modal dialog is
+ *  frontmost and small, and anchoring window-local coordinates to it is exactly
+ *  the failure this module exists to prevent. Area already separates a dialog
+ *  from its parent, so equal-area windows tie-break toward the front: two
+ *  document windows of the same size means the visible one is the one meant. */
+function mainWindowFor(windows: CuWindowInfo[]): CuWindowInfo | undefined {
+  const usable = windows.filter((w) => w.on_screen && !w.minimized && w.width > 0 && w.height > 0);
+  const pool = usable.length ? usable : windows;
+  return [...pool].sort((a, b) =>
+    (b.width * b.height) - (a.width * a.height) || b.z_index - a.z_index)[0];
+}
+
+const overlaps = (a: CuWindowInfo, b: CuWindowInfo) =>
+  a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height;
+
+/** True when `w` looks like a modal dialog over `main` rather than a second
+ *  document window: above it, smaller than it, and drawn over it. */
+export function cuLooksModal(main: CuWindowInfo, w: CuWindowInfo): boolean {
+  return w.z_index > main.z_index
+    && w.width * w.height < main.width * main.height
+    && overlaps(main, w);
+}
+
+/** Resolve a fuzzy query against a snapshot. Pure — no host access.
+ *  Accepts a pid, a process image name (with or without `.exe`), an app display
+ *  name, or a window title, exact-first then prefix then substring. */
+export function cuResolveTargetFrom(snap: CuSnapshot, query: string): CuTarget {
+  const q = query.trim();
+  const byPid = identitiesByPid(snap);
+  const windowsFor = (pid: number) => snap.windows.filter((w) => w.pid === pid);
+
+  let pid: number | undefined;
+  let matched: CuTarget["matched"] = "pid";
+
+  if (/^\d+$/.test(q)) {
+    pid = Number(q);
+  } else {
+    const needle = q.toLowerCase();
+    const bare = stripExe(q);
+    const score = (pidKey: number) => {
+      const entry = byPid.get(pidKey)!;
+      const titles = windowsFor(pidKey).map((w) => w.title.toLowerCase());
+      const procs = entry.names;
+      if (procs.some((n) => n === needle || n === bare)) return { rank: 0, how: "process" as const };
+      if (titles.some((t) => t === needle)) return { rank: 1, how: "title" as const };
+      if (procs.some((n) => n.startsWith(bare))) return { rank: 2, how: "process" as const };
+      if (procs.some((n) => n.includes(bare))) return { rank: 3, how: "app" as const };
+      if (titles.some((t) => t.includes(needle))) return { rank: 4, how: "title" as const };
+      return undefined;
+    };
+    const ranked = [...byPid.keys()]
+      .flatMap((p) => { const s = score(p); return s ? [{ pid: p, ...s }] : []; })
+      .sort((a, b) => a.rank - b.rank
+        || Number(windowsFor(b.pid).some((w) => w.on_screen)) - Number(windowsFor(a.pid).some((w) => w.on_screen))
+        || Number(byPid.get(b.pid)!.active) - Number(byPid.get(a.pid)!.active)
+        || windowsFor(b.pid).length - windowsFor(a.pid).length);
+    if (ranked[0]) { pid = ranked[0].pid; matched = ranked[0].how; }
+  }
+
+  if (pid === undefined) {
+    const known = [...new Set([...byPid.values()].map((e) => e.display))].sort().slice(0, 12);
+    throw new Error(
+      `no app, process, or window title matching "${query}"`
+      + (known.length ? ` (on screen: ${known.join(", ")}…)` : "")
+      + ` — try: fleet cu <host> apps  |  fleet cu <host> windows`);
+  }
+
+  const mine = windowsFor(pid);
+  const window = mainWindowFor(mine);
+  const name = byPid.get(pid)?.display ?? String(pid);
+  if (!window) throw new Error(
+    `${name} (pid ${pid}) has no top-level windows cua-driver can address`
+    + ` — it may be running without a desktop window, or in another session`);
+
+  const siblings = mine.filter((w) =>
+    w.window_id !== window.window_id && w.on_screen && !w.minimized && w.width > 1 && w.height > 1);
+  const blockers = siblings.filter((w) => w.z_index > window.z_index);
+  return {
+    pid, name, matched, window, siblings, blockers,
+    capture: cuCaptureSize(window, snap.maxImageDimension),
+  };
+}
+
+/** Snapshot + resolve in one call. */
+export async function cuResolveTarget(
+  cfg: FleetConfig, sel: string, query: string,
+  deps: { snapshot?: typeof cuSnapshot; exec?: typeof exec } = {},
+): Promise<{ target: CuTarget; snapshot: CuSnapshot }> {
+  const snapshot = await (deps.snapshot ?? cuSnapshot)(cfg, sel, { exec: deps.exec });
+  if (!snapshot.result.ok) throw new Error(
+    `cua-driver could not list the desktop on ${snapshot.result.host}: `
+    + (snapshot.result.stderr || snapshot.result.stdout || `exit ${snapshot.result.code}`));
+  return { target: cuResolveTargetFrom(snapshot, query), snapshot };
+}
+
+/** One line naming what could be eating input, for a warning banner. */
+export function cuBlockerNote(target: CuTarget): string | undefined {
+  if (!target.blockers.length) return undefined;
+  const describe = (w: CuWindowInfo) =>
+    `${w.title || "(untitled)"} [w${w.window_id} ${w.width}x${w.height}]`
+    + (cuLooksModal(target.window, w) ? " modal" : "");
+  return `BLOCKED? ${target.name} owns ${target.blockers.length} window(s) above the captured one: `
+    + target.blockers.map(describe).join(" · ");
+}
+
+/** Translate a caller's point into the window-local screenshot pixels `click`
+ *  expects, and REFUSE anything that resolves outside the target window rather
+ *  than letting it land in whatever app happens to be there. */
+export function cuResolvePoint(
+  target: CuTarget, x: number, y: number, space: "window" | "screen" = "window",
+): { x: number; y: number } {
+  const { capture, window: win } = target;
+  const local = space === "screen"
+    ? { x: (x - win.x) * (capture.width / Math.max(1, win.width)),
+        y: (y - win.y) * (capture.height / Math.max(1, win.height)) }
+    : { x, y };
+  const px = Math.round(local.x);
+  const py = Math.round(local.y);
+  if (px < 0 || py < 0 || px >= capture.width || py >= capture.height) {
+    const frame = `${win.width}x${win.height} at (${win.x},${win.y})`;
+    throw new Error(
+      `(${x}, ${y}) in ${space} space resolves to (${px}, ${py}), outside ${target.name} `
+      + `w${win.window_id} — its click space is 0..${capture.width - 1} x 0..${capture.height - 1} `
+      + `(window bounds ${frame}).\n`
+      + `Read coordinates off \`shot-window ${target.name} --grid\`, or pass `
+      + `--space ${space === "window" ? "screen" : "window"} if they were in the other frame.`);
+  }
+  return { x: px, y: py };
+}
+
+/** The caption burned into every window capture, so the frame the numbers are in
+ *  is never something the reader has to remember or infer. */
+export function cuGridCaption(target: CuTarget): string {
+  const { window: w, capture } = target;
+  return `window-local px · ${target.name} · pid ${target.pid} · window_id ${w.window_id}`
+    + ` · origin = this window's top-left · ${capture.width}x${capture.height}`
+    + (capture.scale < 1 ? ` (window ${w.width}x${w.height} downscaled ${capture.scale.toFixed(3)}x)` : "");
+}
+
+// ── window capture (with owned popups composited in) ─────────────────────────
+
+export interface CuCapture {
+  window: CuWindowInfo;
+  remotePath: string;
+  localPath?: string;
+  width: number; height: number;
+  bounds: { x: number; y: number; width: number; height: number };
+}
+
+/** Per-capture remote block. `cuInvocation(..., outVar)` splices the shell's own
+ *  temp path into the JSON, so no path has to be guessed locally.
+ *  `include_accessibility_tree:false` skips the UIA walk entirely — the capture
+ *  is ~2x faster and the reply is a few hundred bytes instead of a tree. */
+function cuCaptureBlock(os: Host["os"], invoke: string, pid: number, windowId: number, idx: number): string {
+  const args = ["get_window_state", JSON.stringify({ pid, window_id: windowId, include_accessibility_tree: false })];
+  if (os === "windows") return [
+    `$out = Join-Path $env:TEMP ('fleet_cu_' + [guid]::NewGuid().ToString('N') + '.png')`,
+    `Write-Output ('${CAP_SENTINEL}${windowId}|' + $out)`,
+    `${cuInvocation(args, os, invoke, "out")} 2>&1 | Write-Output`,
+    `Write-Output '${END_SENTINEL}'`,
+  ].join("\n");
+  return [
+    `out="\${TMPDIR:-/tmp}/fleet_cu_$$_${idx}.png"; rm -f "$out"`,
+    `echo '${CAP_SENTINEL}${windowId}|'"$out"`,
+    `${cuInvocation(args, os, invoke, "out")} 2>&1`,
+    `echo '${END_SENTINEL}'`,
+  ].join("\n");
+}
+
+function parseCaptureBlocks(stdout: string): { windowId: number; remotePath: string; body: string }[] {
+  const out: { windowId: number; remotePath: string; body: string }[] = [];
+  let cursor = 0;
+  for (;;) {
+    const start = stdout.indexOf(CAP_SENTINEL, cursor);
+    if (start < 0) break;
+    const headEnd = stdout.indexOf("\n", start);
+    if (headEnd < 0) break;
+    const head = stdout.slice(start + CAP_SENTINEL.length, headEnd).trim();
+    const bar = head.indexOf("|");
+    const end = stdout.indexOf(END_SENTINEL, headEnd);
+    const body = stdout.slice(headEnd + 1, end < 0 ? undefined : end);
+    if (bar > 0) out.push({
+      windowId: Number(head.slice(0, bar)),
+      remotePath: head.slice(bar + 1).trim(),
+      body,
+    });
+    if (end < 0) break;
+    cursor = end + END_SENTINEL.length;
+  }
+  return out;
+}
+
+function captureFromBlock(
+  win: CuWindowInfo, remotePath: string, body: string, fallback: CuCaptureSize,
+): CuCapture {
+  let width = fallback.width, height = fallback.height;
+  let bounds = { x: win.x, y: win.y, width: win.width, height: win.height };
+  try {
+    const json = extractJson(body);
+    if (Number(json?.screenshot_width) > 0) width = Number(json.screenshot_width);
+    if (Number(json?.screenshot_height) > 0) height = Number(json.screenshot_height);
+    const b = json?.window_bounds;
+    if (b && Number.isFinite(Number(b.width))) bounds = {
+      x: Number(b.x) || 0, y: Number(b.y) || 0,
+      width: Number(b.width), height: Number(b.height),
+    };
+  } catch { /* driver printed a message instead of JSON; sizes stay predicted */ }
+  return { window: win, remotePath, width, height, bounds };
+}
+
+export interface CuShotWindowResult extends CuResult {
+  target: CuTarget;
+  /** Back-compat with the pre-targeting shape. */
+  app: CuApp;
+  window: CuWindow;
+  main?: CuCapture;
+  composited: CuWindowInfo[];
+  warning?: string;
+}
+
+/** Capture a window by pid / process name / app name / window title.
+ *
+ *  Owned popups and modal dialogs are captured too and composited onto the
+ *  result, because a lone capture of a blocked window looks completely normal —
+ *  the single most expensive failure mode this tool had. The target window is
+ *  captured LAST on purpose: cua-driver's resize ratio is keyed by pid alone, so
+ *  the final capture is the one that defines the click coordinate space. */
 export async function cuShotWindow(
   cfg: FleetConfig, sel: string, query: string, imageOut: string,
-  deps: { exec?: typeof exec; deliver?: typeof deliverImage } = {},
-): Promise<CuResult & { app: CuApp; window: CuWindow }> {
+  deps: {
+    exec?: typeof exec; deliver?: typeof deliverImage; snapshot?: typeof cuSnapshot;
+    composite?: typeof compositeWindows;
+  } = {},
+  opts: { composite?: boolean } = {},
+): Promise<CuShotWindowResult> {
   const host = resolveHosts(cfg, sel)[0]!;
-  if (host.os !== "windows") {
-    // mac/linux: keep the simple composed path (no host-side JSON parser assumed)
-    const app = await cuResolvePid(cfg, sel, query);
-    const { windows } = await cuWindows(cfg, sel, app.pid);
-    const window = windows[0];
-    if (!window) throw new Error(`pid ${app.pid} (${app.name}) has no capturable windows`);
-    const r = await cuRun(cfg, sel,
-      ["get_window_state", JSON.stringify({ pid: app.pid, window_id: window.window_id, capture_mode: "vision" })],
-      imageOut);
-    return { ...r, app, window };
-  }
-
+  const run = deps.exec ?? exec;
+  const { target } = await cuResolveTarget(cfg, sel, query, { snapshot: deps.snapshot, exec: deps.exec });
   const { prelude, invoke } = cuaBin(host.os);
-  const q = query.replace(/'/g, "''");
-  const cmd = [
-    `$ErrorActionPreference='Stop'`,
+
+  const wantComposite = opts.composite !== false && target.blockers.length > 0;
+  const order = [...(wantComposite ? target.blockers.slice(0, 4) : []), target.window];
+  const script = [
+    host.os === "windows" ? `$ErrorActionPreference='Continue'` : `set +e`,
     prelude,
-    `$q = '${q}'`,
-    // resolve pid: numeric → that pid; else first (active-preferred) name match
-    `if ($q -match '^[0-9]+$') { $tpid = [int]$q; $tname = $q } else {`,
-    `  $apps = (${invoke} list_apps | ConvertFrom-Json).apps`,
-    `  $m = @($apps | Where-Object { $_.name -match [regex]::Escape($q) } | Sort-Object { -[int][bool]$_.active }) | Select-Object -First 1`,
-    `  if (-not $m) { Write-Error "no app matching '$q' (try: fleet cu ${sel} apps)"; exit 2 }`,
-    `  $tpid = $m.pid; $tname = $m.name }`,
-    // first window for that pid (list_windows returns an object, not a bare array)
-    `$wp = ('{"pid":' + $tpid + '}') | ${invoke} list_windows | ConvertFrom-Json`,
-    `$wins = if ($wp.windows) { $wp.windows } elseif ($wp._legacy_windows) { $wp._legacy_windows } else { $wp }`,
-    `$w = @($wins) | Select-Object -First 1`,
-    `if (-not $w) { Write-Error "pid $tpid ($tname) has no capturable windows"; exit 3 }`,
-    // capture to temp; keep stdout clean, surface cua errors only on failure
-    `$out = Join-Path $env:TEMP ('cua_' + [guid]::NewGuid().ToString('N') + '.png')`,
-    `$payload = @{ pid=$tpid; window_id=$w.window_id; capture_mode='vision'; screenshot_out_file=$out } | ConvertTo-Json -Compress`,
-    `$err = ($payload | ${invoke} get_window_state 2>&1)`,
-    `$driverSucceeded=$?; $driverCode=$LASTEXITCODE`,
-    `if(-not $driverSucceeded -or ($null -ne $driverCode -and $driverCode -ne 0)){Write-Output $err; if($driverCode){exit $driverCode}; exit 1}`,
-    `if ((Test-Path -LiteralPath $out) -and (Get-Item -LiteralPath $out).Length -gt 0) { Write-Output ('${IMG_SENTINEL}' + $out + '|' + $tpid + '|' + $w.window_id + '|' + $tname + '|' + $w.title) }`,
-    `else { Write-Output $err; exit 4 }`,
+    ...order.map((w, i) => cuCaptureBlock(host.os, invoke, target.pid, w.window_id, i)),
   ].join("\n");
 
-  const run = deps.exec ?? exec;
-  const raw = await run(host, cmd, "powershell");
-  const imgLine = raw.stdout.split("\n").find((l) => l.trim().startsWith(IMG_SENTINEL));
-  if (!imgLine) return { host: host.name, result: {
-    ...raw, ok: false, code: raw.code || 1,
-    stderr: [raw.stderr, "cua-driver produced no requested window image"].filter(Boolean).join("\n"),
-  }, app: { name: query, pid: 0 }, window: { window_id: 0, title: "", pid: 0 } };
+  const raw = await run(host, script, host.os === "windows" ? "powershell" : "bash");
+  const blocks = parseCaptureBlocks(raw.stdout);
+  const byId = new Map(blocks.map((b) => [b.windowId, b]));
+  const mainBlock = byId.get(target.window.window_id);
 
-  const [rpath, rpid, rwid, rname, ...rtitle] = imgLine.trim().slice(IMG_SENTINEL.length).split("|");
-  const app: CuApp = { name: rname!, pid: Number(rpid) };
-  const window: CuWindow = { window_id: Number(rwid), title: rtitle.join("|"), pid: Number(rpid) };
+  const app: CuApp = { name: target.name, pid: target.pid };
+  const window: CuWindow = {
+    window_id: target.window.window_id, title: target.window.title, pid: target.pid,
+    width: target.window.width, height: target.window.height,
+  };
+  const fail = (stderr: string): CuShotWindowResult => ({
+    host: host.name, target, app, window, composited: [],
+    result: { ...raw, ok: false, code: raw.code || 1, stderr: [raw.stderr, stderr].filter(Boolean).join("\n") },
+  });
+  if (!mainBlock) return fail(
+    `cua-driver produced no requested window image for ${target.name} w${target.window.window_id}`
+    + (raw.stdout.trim() ? `\n${raw.stdout.trim()}` : ""));
+
+  const main = captureFromBlock(target.window, mainBlock.remotePath, mainBlock.body, target.capture);
+  // The predicted size comes from get_config; the capture just reported the real
+  // one. Prefer it, so a probe and any later bounds check are exact even if the
+  // config read was the part that failed.
+  target.capture = { ...target.capture, width: main.width, height: main.height };
+  const extras = order.slice(0, -1).flatMap((w) => {
+    const b = byId.get(w.window_id);
+    return b ? [captureFromBlock(w, b.remotePath, b.body, cuCaptureSize(w, 0))] : [];
+  });
+  const remotePaths = [main, ...extras].map((c) => c.remotePath);
+
+  const warning = cuBlockerNote(target);
   try {
-    if (!raw.ok) return { host: host.name, result: raw, app, window };
-    const { result: pull, path } = await (deps.deliver ?? deliverImage)(host, rpath!, imageOut);
-    if (!pull.ok) return { host: host.name, result: { ...raw, ok: false, code: pull.code || 1, stderr: `image pull failed: ${pull.stderr}` }, app, window };
+    const { result: pull, path } = await (deps.deliver ?? deliverImage)(host, main.remotePath, imageOut);
+    if (!pull.ok) return fail(`image pull failed: ${pull.stderr || `scp exit ${pull.code}`}`);
     await validateImageArtifact(path);
-    return { host: host.name, result: { ...raw, stdout: "" }, localImage: path, app, window };
+    main.localPath = path;
+
+    const composited: CuWindowInfo[] = [];
+    for (const extra of extras) {
+      const staged = `${path}.blocker-${extra.window.window_id}.png`;
+      const got = await (deps.deliver ?? deliverImage)(host, extra.remotePath, staged);
+      if (!got.result.ok) continue;
+      extra.localPath = got.path;
+      if (await (deps.composite ?? compositeWindows)(path, main, extra)) composited.push(extra.window);
+      await rm(got.path, { force: true }).catch(() => {});
+    }
+
+    return {
+      host: host.name, target, app, window, main, composited, warning,
+      result: { ...raw, stdout: "" }, localImage: path,
+    };
   } catch (error) {
-    return { host: host.name, result: { ...raw, ok: false, code: 1,
-      stderr: error instanceof Error ? error.message : String(error) }, app, window };
+    return fail(error instanceof Error ? error.message : String(error));
   } finally {
-    await run(host, `Remove-Item -LiteralPath '${psEsc(rpath!)}' -EA SilentlyContinue`, "powershell").catch(() => {});
+    for (const remote of remotePaths) {
+      const cleanup = rmCmd(host.os, remote);
+      await run(host, cleanup.cmd, cleanup.shell).catch(() => {});
+    }
   }
+}
+
+/** Paste one owned popup onto the target window's capture at its true relative
+ *  position, rescaled into the target's pixel space (each capture is downscaled
+ *  by its own long edge, so the two are not in the same scale). Outlined and
+ *  labeled so a composited dialog is never mistaken for part of the app.
+ *  Best-effort: needs python3 + Pillow, same as the grid. */
+export async function compositeWindows(
+  basePath: string, base: CuCapture, overlay: CuCapture,
+): Promise<boolean> {
+  if (!overlay.localPath) return false;
+  const sx = base.width / Math.max(1, base.bounds.width);
+  const sy = base.height / Math.max(1, base.bounds.height);
+  const spec = JSON.stringify({
+    src: overlay.localPath,
+    x: Math.round((overlay.bounds.x - base.bounds.x) * sx),
+    y: Math.round((overlay.bounds.y - base.bounds.y) * sy),
+    w: Math.max(1, Math.round(overlay.bounds.width * sx)),
+    h: Math.max(1, Math.round(overlay.bounds.height * sy)),
+    label: (overlay.window.title || "dialog").slice(0, 60),
+  });
+  const py = `
+import json, sys
+from PIL import Image, ImageDraw, ImageFont
+base_path, spec = sys.argv[1], json.loads(sys.argv[2])
+base = Image.open(base_path).convert("RGB")
+over = Image.open(spec["src"]).convert("RGB").resize((spec["w"], spec["h"]), Image.LANCZOS)
+x, y = spec["x"], spec["y"]
+base.paste(over, (x, y))
+d = ImageDraw.Draw(base)
+d.rectangle([x, y, x + spec["w"] - 1, y + spec["h"] - 1], outline=(255, 60, 60), width=3)
+font = None
+for cand in ("/System/Library/Fonts/Menlo.ttc",
+             "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+             "/usr/share/fonts/TTF/DejaVuSansMono.ttf"):
+    try: font = ImageFont.truetype(cand, 12); break
+    except Exception: pass
+if font is None: font = ImageFont.load_default()
+tag = "composited: " + spec["label"]
+l, t, r, b = font.getbbox(tag)
+th = b - t
+# above the popup when there is room, otherwise inside its top edge — a dialog
+# that covers the whole capture would push the label off-canvas entirely.
+ty = y - th - 6 if y - th - 6 >= 0 else y + 2
+d.rectangle([x, ty, x + (r - l) + 8, ty + th + 6], fill=(190, 30, 30))
+d.text((x + 4, ty + 3), tag, fill=(255, 255, 255), font=font)
+base.save(base_path)
+`;
+  const proc = Bun.spawn(["python3", "-c", py, basePath, spec], { stdout: "ignore", stderr: "pipe" });
+  return await proc.exited === 0;
+}
+
+// ── verified actions (before/after bitmap hash instead of "unverifiable") ────
+
+export type CuEffect = "changed" | "no_change" | "indeterminate";
+
+export interface CuActResult extends CuResult {
+  target: CuTarget;
+  /** What the window's pixels actually did — the thing cua-driver's own
+   *  `effect: "unverifiable"` never tells you. */
+  effect: CuEffect;
+  reason?: string;
+  /** cua-driver's own reply to the action call, verbatim. */
+  driverOutput: string;
+  hashes: string[];
+  payload: Record<string, unknown>;
+}
+
+function cuHashBlock(os: Host["os"], invoke: string, pid: number, windowId: number, tag: string): string {
+  const args = ["get_window_state", JSON.stringify({ pid, window_id: windowId, include_accessibility_tree: false })];
+  if (os === "windows") return [
+    `$out${tag} = Join-Path $env:TEMP ('fleet_cu_' + [guid]::NewGuid().ToString('N') + '.png')`,
+    `$null = (${cuInvocation(args, os, invoke, `out${tag}`)} 2>&1)`,
+    `$h${tag} = if (Test-Path -LiteralPath $out${tag}) { (Get-FileHash -LiteralPath $out${tag} -Algorithm SHA256).Hash } else { '' }`,
+    `Write-Output ('${HASH_SENTINEL}${tag}|' + $h${tag})`,
+  ].join("\n");
+  return [
+    `out${tag}="\${TMPDIR:-/tmp}/fleet_cu_$$_${tag}.png"; rm -f "$out${tag}"`,
+    `${cuInvocation(args, os, invoke, `out${tag}`)} >/dev/null 2>&1`,
+    `h${tag}="$(_fleet_hash "$out${tag}")"`,
+    `echo "${HASH_SENTINEL}${tag}|$h${tag}"`,
+  ].join("\n");
+}
+
+/** Run one input action against an exact (pid, window_id) and report what the
+ *  window's pixels did.
+ *
+ *  Capture A, act, capture B. A == B is a definitive no-op in two captures. When
+ *  they differ, a third capture separates "the action changed something" from
+ *  "this window repaints on its own" (a clock, a spinner, playing video), which
+ *  a single before/after hash would report as a false positive.
+ *
+ *  All of it is ONE ssh round trip; the captures are local to the host and cost
+ *  ~1s each. That replaces the screenshot-after-every-action loop that
+ *  `effect: "unverifiable"` forced. */
+export async function cuAct(
+  cfg: FleetConfig, sel: string, query: string, tool: string, payload: Record<string, unknown>,
+  opts: {
+    settleMs?: number; imageOut?: string;
+    /** Validated and translated against the resolved target, so a caller never
+     *  has to resolve the window twice to convert one point. */
+    point?: { x: number; y: number; space?: "window" | "screen" };
+  } = {},
+  deps: { exec?: typeof exec; deliver?: typeof deliverImage; snapshot?: typeof cuSnapshot } = {},
+): Promise<CuActResult> {
+  const host = resolveHosts(cfg, sel)[0]!;
+  const run = deps.exec ?? exec;
+  const { target } = await cuResolveTarget(cfg, sel, query, { snapshot: deps.snapshot, exec: deps.exec });
+  const { prelude, invoke } = cuaBin(host.os);
+  const win = host.os === "windows";
+  const settle = Math.max(0, Math.round(opts.settleMs ?? 400));
+
+  // window_id is ALWAYS sent: omitted, cua-driver targets the pid's frontmost
+  // window, which is the modal when one is open.
+  const point = opts.point
+    ? cuResolvePoint(target, opts.point.x, opts.point.y, opts.point.space ?? "window")
+    : undefined;
+  const full = { pid: target.pid, window_id: target.window.window_id, ...payload, ...point };
+  const actArgs = [tool, JSON.stringify(full)];
+  const sleep = win ? `Start-Sleep -Milliseconds ${settle}` : `sleep ${(settle / 1000).toFixed(3)}`;
+  const hashOf = (tag: string) => cuHashBlock(host.os, invoke, target.pid, target.window.window_id, tag);
+  const wantImage = Boolean(opts.imageOut);
+
+  const script = win ? [
+    `$ErrorActionPreference='Continue'`,
+    prelude,
+    hashOf("A"),
+    `$act = (${cuInvocation(actArgs, host.os, invoke)} 2>&1)`,
+    `Write-Output '${CAP_SENTINEL}act|'`,
+    `$act | Write-Output`,
+    `Write-Output '${END_SENTINEL}'`,
+    sleep,
+    hashOf("B"),
+    `if ($hA -ne $hB) { ${sleep}`,
+    hashOf("C"),
+    `}`,
+    `$keep = if ($outC) { $outC } else { $outB }`,
+    // Hand the after-image back only when it was asked for; otherwise delete it
+    // here, so the common verify-only call does not pay a round trip to clean up.
+    wantImage
+      ? `if ((Test-Path -LiteralPath $keep) -and (Get-Item -LiteralPath $keep).Length -gt 0) { Write-Output ('${IMG_SENTINEL}' + $keep) }`
+      : `Remove-Item -LiteralPath $keep -Force -EA SilentlyContinue`,
+    `Remove-Item -LiteralPath $outA -Force -EA SilentlyContinue`,
+    `if ($outC) { Remove-Item -LiteralPath $outB -Force -EA SilentlyContinue }`,
+  ].join("\n") : [
+    `_fleet_hash() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" 2>/dev/null | cut -d' ' -f1; else shasum -a 256 "$1" 2>/dev/null | cut -d' ' -f1; fi; }`,
+    prelude,
+    hashOf("A"),
+    `echo '${CAP_SENTINEL}act|'`,
+    `${cuInvocation(actArgs, host.os, invoke)} 2>&1`,
+    `echo '${END_SENTINEL}'`,
+    sleep,
+    hashOf("B"),
+    `keep="$outB"`,
+    `if [ "$hA" != "$hB" ]; then ${sleep}`,
+    hashOf("C"),
+    `keep="$outC"; rm -f "$outB"`,
+    `fi`,
+    `rm -f "$outA"`,
+    wantImage
+      ? `if [ -s "$keep" ]; then echo "${IMG_SENTINEL}$keep"; fi`
+      : `rm -f "$keep"`,
+  ].join("\n");
+
+  const raw = await run(host, script, win ? "powershell" : "bash");
+  const hash = (tag: string) => {
+    const line = raw.stdout.split("\n").find((l) => l.trim().startsWith(`${HASH_SENTINEL}${tag}|`));
+    return line ? line.trim().slice(HASH_SENTINEL.length + tag.length + 1) : "";
+  };
+  const [hA, hB, hC] = [hash("A"), hash("B"), hash("C")];
+  // The action's own reply is framed by the same sentinels as a capture block,
+  // with an empty path where a capture would name its PNG.
+  const blocks = parseCaptureBlocks(raw.stdout);
+  const driverOutput = (blocks.find((b) => !b.remotePath) ?? blocks[0])?.body.trim() ?? "";
+
+  let effect: CuEffect = "indeterminate";
+  let reason: string | undefined;
+  if (!hA || !hB) {
+    reason = "a window capture failed, so the before/after comparison could not run";
+  } else if (hA === hB) {
+    effect = "no_change";
+  } else if (hC && hB !== hC) {
+    reason = "the window is still repainting on its own (animation, video, a live clock)"
+      + " — the pixels moved, but not provably because of this action";
+  } else {
+    effect = "changed";
+  }
+
+  const imgLine = wantImage
+    ? raw.stdout.split("\n").find((l) => l.trim().startsWith(IMG_SENTINEL))
+    : undefined;
+  const remote = imgLine ? imgLine.trim().slice(IMG_SENTINEL.length) : undefined;
+  const base: CuActResult = {
+    host: host.name, target, effect, reason, driverOutput,
+    hashes: [hA, hB, hC].filter(Boolean),
+    payload: full,
+    result: { ...raw, stdout: driverOutput },
+  };
+
+  if (!remote || !opts.imageOut) return base;
+  try {
+    const { result: pull, path } = await (deps.deliver ?? deliverImage)(host, remote, opts.imageOut);
+    if (!pull.ok) return { ...base, result: { ...base.result, stderr:
+      [base.result.stderr, `image pull failed: ${pull.stderr}`].filter(Boolean).join("\n") } };
+    await validateImageArtifact(path);
+    return { ...base, localImage: path };
+  } finally {
+    const cleanup = rmCmd(host.os, remote);
+    await run(host, cleanup.cmd, cleanup.shell).catch(() => {});
+  }
+}
+
+// ── output shaping: don't ship kilobytes that say nothing ───────────────────
+
+/** `get_window_state` returns its full envelope even when the UIA walk found
+ *  nothing — 391 KB of empty tree with `degraded: true`, `element_count: 0`. The
+ *  diagnostic is the only part that carries information, and the one thing the
+ *  caller most needs to know (element addressing is unavailable here, use
+ *  pixels) was never stated at all. Collapse it and say so. */
+export function compactCuOutput(
+  args: string[], result: ExecResult,
+): { result: ExecResult; suppressedBytes: number } {
+  if (!result.ok || args[0] !== "get_window_state") return { result, suppressedBytes: 0 };
+  let json: any;
+  try { json = extractJson(result.stdout); } catch { return { result, suppressedBytes: 0 }; }
+  if (!json || typeof json !== "object") return { result, suppressedBytes: 0 };
+
+  const count = Number(json.element_count ?? json.total_element_count ?? json.returned_element_count ?? NaN);
+  const degraded = json.degraded === true;
+  if (!degraded && !(Number.isFinite(count) && count === 0)) return { result, suppressedBytes: 0 };
+
+  const b = json.window_bounds ?? {};
+  const lines = [
+    `get_window_state: degraded — ${Number.isFinite(count) ? count : 0} accessibility elements`
+    + (json.degraded_reason ? ` (${json.degraded_reason})` : ""),
+    `  window: ${json.app_name ?? "?"} · pid ${json.pid ?? "?"} · window_id ${json.window_id ?? "?"}`
+    + (json.window_title ? ` · ${json.window_title}` : ""),
+    `  bounds: ${b.width ?? "?"}x${b.height ?? "?"} at (${b.x ?? "?"},${b.y ?? "?"})`
+    + (json.screenshot_width ? ` · screenshot ${json.screenshot_width}x${json.screenshot_height}` : ""),
+    json.screenshot_file_path ? `  screenshot: ${json.screenshot_file_path}` : "",
+    `  element_index / element_token are UNAVAILABLE for this window. Address it with`,
+    `  pixel x,y read off the screenshot (fleet cu <host> shot-window <app> --grid).`,
+  ].filter(Boolean);
+  const suppressedBytes = Math.max(0, result.stdout.length - lines.join("\n").length);
+  return {
+    result: { ...result, stdout: `${lines.join("\n")}\n  (${suppressedBytes} bytes of empty tree suppressed; --full to see it)` },
+    suppressedBytes,
+  };
+}
+
+/** `describe <tool>` output trimmed to what a caller needs to build one call:
+ *  the name, the first sentences of the description, and the schema's field
+ *  names with one-line summaries. The full text is ~2 KB of prose per tool and
+ *  its advice is written for the general case, not the window in front of you. */
+export function briefDescribe(
+  stdout: string, opts: { elementsAvailable?: boolean } = {},
+): string {
+  const nameLine = stdout.split("\n").find((l) => l.trim().startsWith("name:"))?.trim() ?? "";
+  const descStart = stdout.indexOf("description:");
+  const schemaStart = stdout.indexOf("input_schema:");
+  const prose = descStart >= 0
+    ? stdout.slice(descStart + "description:".length, schemaStart < 0 ? undefined : schemaStart).trim()
+    : "";
+  let sentences = prose.replace(/\s+/g, " ").split(/(?<=[.!?])\s+/);
+  // The stock prose pushes element_index hard. On a window whose UIA tree is
+  // empty that advice cannot be followed at all, so when the caller has told us
+  // which window they mean (and it has no tree), drop it rather than print it
+  // directly under a line saying the opposite.
+  const dropped = opts.elementsAvailable === false;
+  if (dropped) sentences = sentences.filter((line) => !/element_index|element_token/i.test(line));
+  const summary = sentences.slice(0, 3).join(" ");
+
+  const out = [nameLine, "", summary,
+    ...(dropped ? ["", "(element-addressing guidance removed: the probed window exposes no UIA tree;"
+      + " use pixel x,y)"] : [])];
+  if (schemaStart >= 0) {
+    try {
+      const schema = extractJson(stdout.slice(schemaStart));
+      const required: string[] = Array.isArray(schema?.required) ? schema.required : [];
+      const props = schema?.properties ?? {};
+      out.push("", `fields${required.length ? ` (required: ${required.join(", ")})` : ""}:`);
+      for (const [key, value] of Object.entries<any>(props)) {
+        if (dropped && /^(element_index|element_token|snapshot_id)$/.test(key)) continue;
+        const type = Array.isArray(value?.enum) ? value.enum.join("|") : value?.type ?? "?";
+        const one = String(value?.description ?? "").replace(/\s+/g, " ").split(/(?<=[.!?])\s/)[0] ?? "";
+        out.push(`  ${key} <${type}>${one ? ` — ${one.slice(0, 110)}` : ""}`);
+      }
+    } catch { out.push("", stdout.slice(schemaStart).trim()); }
+  }
+  return out.join("\n").trim();
+}
+
+/** Whether element addressing is actually available on one window, so the
+ *  advice a caller reads matches the target in front of them instead of the
+ *  general case. Costs one cheap tree-only call (no screenshot). */
+export async function cuElementSupport(
+  cfg: FleetConfig, sel: string, query: string,
+  deps: { run?: typeof cuRun; snapshot?: typeof cuSnapshot } = {},
+): Promise<{ target: CuTarget; elements: number; available: boolean; note: string }> {
+  const { target } = await cuResolveTarget(cfg, sel, query, { snapshot: deps.snapshot });
+  const { result } = await (deps.run ?? cuRun)(cfg, sel, ["get_window_state", JSON.stringify({
+    pid: target.pid, window_id: target.window.window_id, include_screenshot: false, max_elements: 40,
+  })]);
+  let elements = 0;
+  let degraded = false;
+  try {
+    const json = extractJson(result.stdout);
+    elements = Number(json?.total_element_count ?? json?.element_count
+      ?? (Array.isArray(json?.elements) ? json.elements.length : 0)) || 0;
+    degraded = json?.degraded === true;
+  } catch { /* leave it at zero — treated as unavailable below */ }
+  const available = elements > 0 && !degraded;
+  const where = `${target.name} w${target.window.window_id}`;
+  return {
+    target, elements, available,
+    note: available
+      ? `element_index: available for ${where} (${elements}+ elements) — prefer it over pixels.`
+      : `element_index: UNAVAILABLE for ${where} (UIA tree empty). Use pixel x,y; `
+        + `element_index and element_token cannot resolve on this window.`,
+  };
 }
 
 // ── restart / logs (resolve a configured service on the first selected host) ──

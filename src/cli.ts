@@ -39,7 +39,9 @@ import {
   pushFile, pullFile, parseRemoteSpec, restartService, serviceLogs, svcStatus,
   gpuRows, diskRows, fetchDashboard, hostStatus, runRecipe, captureScreenshot, rebootHosts,
   cuInstall, cuRun, cuTools, cuDescribe, cuRecordStart, cuRecordStop, cuRecordStatus,
-  cuApps, cuWindows, cuResolvePid, cuShotWindow, browseHost, preferredImageExt, overlayGrid,
+  cuApps, cuShotWindow, browseHost, preferredImageExt, overlayGrid,
+  cuSnapshot, cuResolveTargetFrom, cuResolvePoint, cuAct, cuBlockerNote,
+  cuGridCaption, cuElementSupport, compactCuOutput, briefDescribe,
   bootState, switchMachine, waitFor, routeSelector, deployHosts, diagnose, firmwareRebootHosts,
 } from "./core.ts";
 import {
@@ -52,7 +54,7 @@ import {
   toolSyncParallelism,
   stampSkill,
 } from "./tools.ts";
-import type { ServiceAction } from "./core.ts";
+import type { ServiceAction, CuTarget, GridOptions } from "./core.ts";
 
 const A = {
   g: (s: string) => `\x1b[32m${s}\x1b[0m`, r: (s: string) => `\x1b[31m${s}\x1b[0m`,
@@ -613,17 +615,53 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
       const noOpen = pullFlag(rest, "--no-open");
       const grid = pullFlag(rest, "--grid");
       const gridStep = numVal(rest, "--grid-step", 100);
+      const gridMinor = numVal(rest, "--grid-minor", 0, 0);
+      const noCross = pullFlag(rest, "--no-cross-labels");
+      const noComposite = pullFlag(rest, "--no-composite");
+      const full = pullFlag(rest, "--full");
+      const brief = pullFlag(rest, "--brief");
+      const forApp = pullVal(rest, "--for");
+      const probeArg = pullVal(rest, "--probe");
+      const spaceArg = pullVal(rest, "--space");
+      const button = pullVal(rest, "--button");
+      const clickCount = numVal(rest, "--count", 1);
+      const settle = numVal(rest, "--settle", 400, 0);
+      const foreground = pullFlag(rest, "--foreground");
+      const wantShot = pullFlag(rest, "--shot");
       const out = pullVal(rest, "--out");
       const sel = rest.shift();
       if (!sel) die("usage: fleet cu <host> <cua-driver args…> [--out f.png] [--grid]  |  fleet cu <sel> install");
       const target = await routeSelector(cfg, sel);
-      const applyGrid = async (p?: string) => {
-        if (p && grid && !await overlayGrid(p, gridStep))
-          console.error(A.y("grid overlay skipped (need python3 + Pillow)"));
-      };
+
+      if (spaceArg && spaceArg !== "window" && spaceArg !== "screen")
+        die(`--space must be window or screen (got '${spaceArg}')`);
+      const space = (spaceArg ?? "window") as "window" | "screen";
+      const probe = (() => {
+        if (!probeArg) return undefined;
+        const m = probeArg.match(/^\s*(-?\d+)\s*[, ]\s*(-?\d+)\s*$/);
+        if (!m) die(`--probe needs X,Y (got '${probeArg}')`);
+        return { x: Number(m![1]), y: Number(m![2]) };
+      })();
+
+      const autoName = (q: string) =>
+        `${sel}-${q.replace(/[^a-z0-9]+/gi, "_")}-${new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19)}`;
       const openImg = (p?: string) => {
         if (p && !noOpen && process.platform === "darwin")
           Bun.spawn(["open", p], { stdout: "ignore", stderr: "ignore" });
+      };
+      /** Grid options carrying the frame the numbers are in, plus whatever is
+       *  sitting above the window — the two things a bare capture never said. */
+      const gridOpts = (t?: CuTarget, banner?: string, mark?: { x: number; y: number }): GridOptions => ({
+        step: gridStep,
+        minorStep: gridMinor || undefined,
+        crossLabels: !noCross,
+        caption: t ? cuGridCaption(t) : undefined,
+        banner,
+        probe: mark ? { ...mark, label: `probe -> ${mark.x},${mark.y}` } : undefined,
+      });
+      const applyGrid = async (p: string | undefined, opts: GridOptions) => {
+        if (!p || !grid) return;
+        if (!await overlayGrid(p, opts)) console.error(A.y("grid overlay skipped (need python3 + Pillow)"));
       };
       const verb = rest[0];
 
@@ -643,11 +681,21 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
         return r.result.ok ? 0 : 1;
       }
       if (verb === "describe") {
-        const tool = rest[1] ?? die("usage: fleet cu <host> describe <tool>");
-        if (rest.length > 2) die("usage: fleet cu <host> describe <tool>");
+        const tool = rest[1] ?? die("usage: fleet cu <host> describe <tool> [--brief] [--for <app>]");
+        if (rest.length > 2) die("usage: fleet cu <host> describe <tool> [--brief] [--for <app>]");
+        // --for grounds the advice in the window actually in front of the caller:
+        // "prefer element_index" is wrong guidance for a window with no UIA tree.
+        let elementsAvailable: boolean | undefined;
+        if (forApp) {
+          const support = await cuElementSupport(cfg, target, forApp);
+          elementsAvailable = support.available;
+          console.log(`${support.available ? A.g("●") : A.y("▲")} ${support.note}`);
+        }
         const r = await cuDescribe(cfg, target, tool!);
-        printResult(r.result);
-        return r.result.ok ? 0 : 1;
+        if (!r.result.ok) { printResult(r.result); return 1; }
+        if (brief) console.log(briefDescribe(r.result.stdout, { elementsAvailable }));
+        else printResult(r.result);
+        return 0;
       }
       if (verb === "record") {
         const action = rest[1];
@@ -672,7 +720,7 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
         }
         die("usage: fleet cu <host> record start|stop|status [--out dir]");
       }
-      // convenience verbs (item 3) — cut the list→list→build-JSON loop
+      // convenience verbs — cut the list→list→build-JSON loop
       if (verb === "apps") {
         const { apps, result } = await cuApps(cfg, target, rest[1]);
         if (!result.ok) { printResult(result); return 1; }
@@ -682,38 +730,132 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
         return 0;
       }
       if (verb === "windows") {
-        const q = rest[1] ?? die("usage: fleet cu <host> windows <pid|app-name>");
-        const { pid } = await cuResolvePid(cfg, target, q!);
-        const { windows, result } = await cuWindows(cfg, target, pid);
-        if (!result.ok) { printResult(result); return 1; }
-        for (const w of windows)
-          console.log(`${A.d((w.window_id + "").padStart(8))}  ${w.title || A.d("(untitled)")}`);
-        console.log(A.d(`${windows.length} window(s) for pid ${pid}`));
+        if (rest.length > 2) die("usage: fleet cu <host> windows [pid|process|app|title]");
+        const snapshot = await cuSnapshot(cfg, target);
+        if (!snapshot.result.ok) { printResult(snapshot.result); return 1; }
+        const q = rest[1];
+        if (!q) {
+          for (const w of [...snapshot.windows].sort((a, b) => b.z_index - a.z_index))
+            console.log(`${A.d((w.window_id + "").padStart(9))} ${A.d((w.pid + "").padStart(7))}  `
+              + `${A.b((w.app_name ?? "?").padEnd(24))} ${w.title || A.d("(untitled)")}`
+              + A.d(`  ${w.width}x${w.height}@${w.x},${w.y}${w.minimized ? " min" : ""}${w.on_screen ? "" : " offscreen"}`));
+          console.log(A.d(`${snapshot.windows.length} top-level window(s)`));
+          return 0;
+        }
+        const t = cuResolveTargetFrom(snapshot, q);
+        const mark = (w: { window_id: number }) => w.window_id === t.window.window_id
+          ? A.g("→ target")
+          : t.blockers.some((b) => b.window_id === w.window_id) ? A.r("▲ above target") : A.d("  sibling");
+        for (const w of snapshot.windows.filter((w) => w.pid === t.pid).sort((a, b) => b.z_index - a.z_index))
+          console.log(`${mark(w)} ${A.d((w.window_id + "").padStart(9))}  ${w.title || A.d("(untitled)")}`
+            + A.d(`  ${w.width}x${w.height}@${w.x},${w.y} z${w.z_index}`));
+        console.log(A.d(`${t.name} · pid ${t.pid} · matched on ${t.matched}`
+          + ` · click space ${t.capture.width}x${t.capture.height}`));
+        const note = cuBlockerNote(t);
+        if (note) console.error(A.r(`▲ ${note}`));
         return 0;
       }
       if (verb === "shot-window" || verb === "win") {
-        const q = rest[1] ?? die("usage: fleet cu <host> shot-window <pid|app-name> [--out f.png]");
-        const local = out ?? `${sel}-${q!.replace(/[^a-z0-9]+/gi, "_")}-${new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19)}.${await preferredImageExt()}`;
-        const r = await cuShotWindow(cfg, target, q!, local);
-        printResult(r.result);
+        const q = rest[1] ?? die("usage: fleet cu <host> shot-window <pid|process|app|title> [--out f.png]");
+        if (rest.length > 2) die("usage: fleet cu <host> shot-window <pid|process|app|title> [--out f.png]");
+        const local = out ?? `${autoName(q!)}.${await preferredImageExt()}`;
+        const r = await cuShotWindow(cfg, target, q!, local, {}, { composite: !noComposite });
         if (!r.localImage) {
+          printResult(r.result);
           if (r.result.ok) console.error(A.r("capture did not produce a local image"));
           return 1;
         }
-        await applyGrid(r.localImage);
-        console.log(`${A.g("●")} ${A.d(`${r.app.name} w${r.window.window_id} →`)} ${r.localImage}${grid ? A.d(" (grid)") : ""}`);
+        if (r.result.stderr) console.error(A.d(r.result.stderr));
+        const mark = probe ? cuResolvePoint(r.target, probe.x, probe.y, space) : undefined;
+        await applyGrid(r.localImage, gridOpts(r.target, r.warning, mark));
+        console.log(`${A.g("●")} ${A.d(`${r.target.name} pid ${r.target.pid} w${r.target.window.window_id} →`)}`
+          + ` ${r.localImage}${grid ? A.d(" (grid)") : ""}`);
+        if (r.composited.length)
+          console.error(A.y(`▲ composited ${r.composited.length} owned window(s) onto the capture: `
+            + r.composited.map((w) => w.title || `w${w.window_id}`).join(", ")));
+        if (r.warning) console.error(A.r(`▲ ${r.warning}`));
+        if (mark) console.log(A.d(`  probe ${probe!.x},${probe!.y} (${space}) → window-local ${mark.x},${mark.y}`));
         openImg(r.localImage);
+        return 0;
+      }
+
+      // ── verified input: resolve → act → prove the pixels moved ─────────────
+      const ACT_VERBS = ["click", "key", "type", "act"] as const;
+      if (ACT_VERBS.includes(verb as typeof ACT_VERBS[number])) {
+        const q = rest[1] ?? die(`usage: fleet cu <host> ${verb} <pid|process|app|title> …`);
+        const shotPath = wantShot || out ? (out ?? `${autoName(q)}.${await preferredImageExt()}`) : undefined;
+
+        let tool = verb!;
+        let payload: Record<string, unknown> = {};
+        let point: { x: number; y: number; space: "window" | "screen" } | undefined;
+        let summary = "";
+        if (verb === "click") {
+          const [xs, ys] = [rest[2], rest[3]];
+          if (rest.length !== 4) die("usage: fleet cu <host> click <app> <x> <y> [--space window|screen]");
+          const [x, y] = [Number(xs), Number(ys)];
+          if (!Number.isFinite(x) || !Number.isFinite(y)) die(`click needs numeric x y (got '${xs} ${ys}')`);
+          if (button && !["left", "right", "middle"].includes(button))
+            die(`--button must be left, right, or middle (got '${button}')`);
+          point = { x, y, space };
+          payload = { count: clickCount, ...(button ? { button } : {}) };
+          summary = `click ${x},${y}`
+            + (space === "screen" ? A.d(" (screen)") : "")
+            + (clickCount > 1 ? ` x${clickCount}` : "");
+        } else if (verb === "key") {
+          if (rest.length !== 3) die("usage: fleet cu <host> key <app> <key>");
+          tool = "press_key";
+          payload = { key: rest[2] };
+          summary = `press_key ${rest[2]}`;
+        } else if (verb === "type") {
+          if (rest.length !== 3) die("usage: fleet cu <host> type <app> <text>");
+          tool = "type_text";
+          payload = { text: rest[2] };
+          summary = `type_text ${JSON.stringify(rest[2]!.slice(0, 40))}`;
+        } else {
+          if (rest.length < 3 || rest.length > 4) die("usage: fleet cu <host> act <app> <tool> [JSON]");
+          tool = rest[2]!;
+          if (rest[3]) {
+            try { payload = JSON.parse(rest[3]!); }
+            catch { die(`act needs valid JSON for ${tool} (got '${rest[3]}')`); }
+          }
+          summary = tool;
+        }
+        if (foreground) payload.delivery_mode = "foreground";
+
+        const r = await cuAct(cfg, target, q, tool, payload,
+          { settleMs: settle, imageOut: shotPath, point });
+        if (point && typeof r.payload.x === "number")
+          summary = `click ${r.payload.x},${r.payload.y}`
+            + (space === "screen" ? A.d(` (from screen ${point.x},${point.y})`) : "")
+            + (clickCount > 1 ? ` x${clickCount}` : "");
+        const badge = r.effect === "changed" ? A.g("● changed")
+          : r.effect === "no_change" ? A.y("○ no_change") : A.d("? indeterminate");
+        console.log(`${badge} ${A.b(r.target.name)} ${A.d(`pid ${r.target.pid} w${r.target.window.window_id}`)} `
+          + `${A.d("·")} ${summary}`);
+        if (r.reason) console.log(A.d(`  ${r.reason}`));
+        if (r.driverOutput) console.log(r.driverOutput.split("\n").map((l) => "  " + l).join("\n"));
+        if (r.result.stderr) console.error(A.d(r.result.stderr.split("\n").map((l) => "  " + l).join("\n")));
+        const note = cuBlockerNote(r.target);
+        if (note) console.error(A.r(`▲ ${note}`));
+        if (r.localImage) {
+          await applyGrid(r.localImage, gridOpts(r.target, note));
+          console.log(`${A.g("●")} ${A.d("after →")} ${r.localImage}${grid ? A.d(" (grid)") : ""}`);
+          openImg(r.localImage);
+        }
         return r.result.ok ? 0 : 1;
       }
 
       const r = await cuRun(cfg, target, rest, out);   // pull an image only when --out is given
-      printResult(r.result);
+      // get_window_state ships its whole envelope even when the UIA walk found
+      // nothing; --full opts back into the raw body.
+      const shaped = full ? { result: r.result } : compactCuOutput(rest, r.result);
+      printResult(shaped.result);
       if (out && !r.localImage) {
         if (r.result.ok) console.error(A.r("capture did not produce a local image"));
         return 1;
       }
       if (r.localImage) {
-        await applyGrid(r.localImage);
+        await applyGrid(r.localImage, gridOpts());
         console.log(`${A.g("●")} ${A.d("image →")} ${r.localImage}${grid ? A.d(" (grid)") : ""}`);
         openImg(r.localImage);
       }

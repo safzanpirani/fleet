@@ -42,6 +42,7 @@ const MUTATING_TOOLS = [
   "fleet_browse",
   "fleet_cp",
   "fleet_cu",
+  "fleet_cu_act",
   "fleet_cu_apps",
   "fleet_cu_screenshot_window",
   "fleet_cu_windows",
@@ -130,9 +131,18 @@ describe("Fleet MCP parity", () => {
     const cu = spyOn(core, "cuRun").mockImplementation(async (_cfg, host, _args, local) => ({
       host, result: result(host), localImage: await capture(host, local),
     }));
+    const fixtureWindow = {
+      window_id: 1, pid: 1, title: "fixture", app_name: "fixture.exe",
+      x: 0, y: 0, width: 800, height: 600, on_screen: true, minimized: false, z_index: 1,
+    };
     const window = spyOn(core, "cuShotWindow").mockImplementation(async (_cfg, host, _app, local) => ({
       host, result: result(host), localImage: await capture(host, local),
       app: { pid: 1, name: "fixture" }, window: { pid: 1, window_id: 1, title: "fixture" },
+      target: {
+        pid: 1, name: "fixture", matched: "app" as const, window: fixtureWindow,
+        siblings: [], blockers: [], capture: { width: 800, height: 600, scale: 1 },
+      },
+      composited: [],
     }));
     const now = spyOn(Date, "now").mockReturnValue(1000);
     try {

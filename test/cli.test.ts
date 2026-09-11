@@ -255,7 +255,16 @@ describe("machine-readable CLI output", () => {
       writeFileSync(config, JSON.stringify({
         hosts: { local: { ssh: "local", os: "windows", winShell: "powershell" } },
       }));
-      executable(join(bin, "ssh"), "#!/bin/sh\ncat >/dev/null\nprintf 'driver completed without output\\n'\n");
+      // shot-window resolves the target first, so the stub answers the snapshot
+      // round trip and then produces no capture — the case the assertion is about.
+      const snapshot = '{"apps":[{"name":"Demo","pid":1,"active":true}]}\\n__FLEET_SEP__\\n'
+        + '{"windows":[{"window_id":7,"pid":1,"title":"Demo","app_name":"demo.exe",'
+        + '"bounds":{"x":0,"y":0,"width":800,"height":600},"is_on_screen":true,'
+        + '"minimized":false,"z_index":3}]}\\n__FLEET_SEP__\\n{"max_image_dimension":1568}\\n';
+      executable(join(bin, "ssh"),
+        "#!/bin/sh\nscript=$(cat)\ncase \"$script\" in\n"
+        + `  *list_apps*) printf '${snapshot}' ;;\n`
+        + "  *) printf 'driver completed without output\\n' ;;\nesac\n");
       const copied = join(root, "scp-called");
       executable(join(bin, "scp"), `#!/bin/sh\ntouch '${copied}'\nexit 0\n`);
       const image = join(root, "capture.png");

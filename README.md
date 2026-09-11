@@ -212,13 +212,40 @@ with `fleet cu <host> describe get_window_state`, then pass these options as JSO
 
 ### Driving a desktop
 
-The convenience verbs collapse cua-driver's pid → window_id → capture loop:
+Every verb takes the same kind of target: a pid, a process name (with or without
+`.exe`), an app display name, or a window title.
 
 ```sh
 fleet cu web apps                       # pid + name table (optional name filter)
-fleet cu web windows firefox            # window_id + title (name resolves to a pid)
-fleet cu web shot-window firefox --out w.png   # resolve + capture in one round-trip
+fleet cu web windows                    # every top-level window on the desktop
+fleet cu web windows firefox            # one process's windows, blockers flagged
+fleet cu web shot-window firefox --grid --out w.png
 ```
+
+### Input you can trust
+
+`click`, `key`, `type` and `act` resolve the target, address it explicitly, and
+report what the window's pixels **actually did**:
+
+```sh
+fleet cu web click firefox 166 447      # ● changed / ○ no_change / ? indeterminate
+fleet cu web key firefox escape
+fleet cu web type firefox "hello"
+fleet cu web act firefox scroll '{"direction":"down"}'
+```
+
+This exists because cua-driver's own `effect` field returns `"unverifiable"` for
+input that worked and input that silently did nothing, alike. Fleet hashes the
+window bitmap before and after the action instead, and takes a third capture when
+they differ so a window that repaints on its own (a clock, a spinner, video) is
+not reported as a false change. One ssh round trip.
+
+The immediate payoff: a background click that reports `no_change` tells you the
+target's input stack dropped it, and `--foreground` is the fix — a decision that
+otherwise costs a screenshot after every single action.
+
+Shared flags: `--space window|screen`, `--button`, `--count`, `--foreground`,
+`--settle MS`, and `--shot [--grid]` to pull the after-image.
 
 Anything else passes straight through to cua-driver:
 
@@ -226,18 +253,38 @@ Anything else passes straight through to cua-driver:
 fleet cu web list-tools                 # authoritative tool list for the installed version
 fleet cu web get_screen_size
 fleet cu web click '{"pid":3848,"window_id":66756,"x":100,"y":200}'
-fleet cu web type_text '{"text":"hello"}'
 ```
 
+- **Always send `window_id`.** Omitted, cua-driver targets the process's
+  *frontmost* window — which is the modal dialog whenever one is open, so
+  window-local coordinates get anchored to the dialog's frame and the click lands
+  somewhere unrelated, often in another application. The verbs above always send
+  it; raw passthrough is on you.
+- **A capture of one window is not the whole truth.** A modal dialog over a window
+  swallows all input while the window underneath still looks entirely normal.
+  `shot-window` captures the process's owned popups too, composites them onto the
+  result, and prints a `BLOCKED?` warning naming them. For anything it cannot see,
+  verify with a full `fleet shot <host>`.
 - **Coordinates are window-local pixels**, not screen-global. Add `--grid`
-  (`--grid-step N`) to any capture to overlay a labeled coordinate ruler and read
-  the numbers off before clicking.
+  (`--grid-step N`) to any capture for a labeled coordinate ruler; on
+  `shot-window` the image also carries a caption strip stating the exact frame
+  (pid, window_id, origin) the numbers are in. `--probe X,Y` draws a crosshair
+  where a click would land without clicking, and a point that resolves outside the
+  target window is refused rather than delivered to whatever is underneath it.
+- **Empty accessibility trees.** `get_window_state` on a WPF, canvas or
+  custom-drawn window returns `degraded: true, element_count: 0` and still ships
+  its entire envelope — megabytes of nothing. Fleet collapses that to the
+  diagnostic plus the fact the payload never states: element addressing is
+  unavailable there, use pixels. `--full` restores the raw body, and
+  `describe <tool> --brief --for <target>` probes the real window and drops the
+  "prefer element_index" advice when that window has no tree to index.
 - **JSON args are piped over stdin**, not passed as argv — Windows PowerShell 5.1
   strips the quotes around JSON field names on native-command args, and piping
   preserves them.
 - An image comes back only when you pass `--out` (or use `shot-window`).
-- Exposed to agents as the `fleet_cu` MCP tool; `args: ["install"]` fans out over
-  a selector there too.
+- Exposed to agents as `fleet_cu` (raw), `fleet_cu_act` (verified input),
+  `fleet_cu_windows`, `fleet_cu_screenshot_window` and `fleet_cu_describe`;
+  `args: ["install"]` fans out over a selector there too.
 
 ## Agent setup
 

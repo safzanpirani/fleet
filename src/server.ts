@@ -16,7 +16,9 @@ import {
   lsHosts, runExec, runScript, readScriptSource, editRemoteFile, pushFile, pullFile, restartService, serviceLogs,
   gpuRows, diskRows, hostStatus, runRecipe, captureScreenshot, overlayGrid, cuRun,
   cuInstall, cuTools, cuDescribe, cuRecordStart, cuRecordStop, cuRecordStatus,
-  cuApps, cuResolvePid, cuWindows, cuShotWindow, browseHost, deployHosts, diagnose,
+  cuApps, cuShotWindow, browseHost, deployHosts, diagnose,
+  cuSnapshot, cuResolveTargetFrom, cuResolvePoint, cuAct, cuBlockerNote,
+  cuGridCaption, cuElementSupport, compactCuOutput, briefDescribe,
   rebootHosts, firmwareRebootHosts, bootState, switchMachine, waitFor, routeSelector, svcStatus,
 } from "./core.ts";
 import {
@@ -395,15 +397,34 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
 
   server.registerTool("fleet_cu_describe", {
     title: "Describe one cua-driver tool",
-    description: "Return cua-driver's installed description and input schema for one tool. " + sel,
+    description: "Return cua-driver's installed description and input schema for one tool. "
+      + "Set brief:true for the name, the first sentences, and the field list instead of the "
+      + "full prose. Set forApp to ground the advice in one real window: the stock text tells "
+      + "you to prefer element_index, which cannot resolve at all on a window whose "
+      + "accessibility tree is empty. " + sel,
     inputSchema: {
       host: z.string().describe("Host name or selector (first matched host is used)."),
       tool: z.string().min(1).describe("Exact cua-driver tool name."),
+      brief: z.boolean().optional().describe("Trim to name, summary, and field list."),
+      forApp: z.string().optional()
+        .describe("PID, process name, app name, or window title to check element support against."),
     },
     annotations: { readOnlyHint: true, openWorldHint: true },
-  }, async ({ host, tool }) => {
-    const r = await cuDescribe(cfg, await routeSelector(cfg, host), tool);
-    return text(renderExec([r.result]), !r.result.ok);
+  }, async ({ host, tool, brief, forApp }) => {
+    const target = await routeSelector(cfg, host);
+    const prefix: string[] = [];
+    let elementsAvailable: boolean | undefined;
+    if (forApp) {
+      try {
+        const support = await cuElementSupport(cfg, target, forApp);
+        elementsAvailable = support.available;
+        prefix.push(support.note, "");
+      } catch (error) { prefix.push(error instanceof Error ? error.message : String(error), ""); }
+    }
+    const r = await cuDescribe(cfg, target, tool);
+    if (!r.result.ok) return text([...prefix, renderExec([r.result])].join("\n"), true);
+    return text([...prefix,
+      brief ? briefDescribe(r.result.stdout, { elementsAvailable }) : r.result.stdout].join("\n"));
   });
 
   // ── mutating tools (skipped when readOnly — the kill-switch) ─────────────────
@@ -773,7 +794,10 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     }
     const capture = async (local?: string) => {
       const r = await cuRun(cfg, await routeSelector(cfg, host), args, local);
-      const content: any[] = [{ type: "text" as const, text: renderExec([r.result]) }];
+      // get_window_state returns its whole envelope even when the UIA walk found
+      // nothing — hundreds of KB whose only information is "degraded".
+      const shaped = compactCuOutput(args, r.result).result;
+      const content: any[] = [{ type: "text" as const, text: renderExec([shaped]) }];
       if (r.localImage) {
         const gridApplied = grid ? await overlayGrid(r.localImage, gridStep ?? 100) : false;
         if (grid) content[0].text += gridApplied
@@ -806,47 +830,157 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
   });
 
   server.registerTool("fleet_cu_windows", {
-    title: "List an application's windows",
-    description: "Resolve an application by PID or name and list its desktop windows. " + sel,
+    title: "List desktop windows",
+    description: "List top-level windows. With app, resolve it by PID, process name, app name, "
+      + "or window title and show only that process's windows — marking the one Fleet targets "
+      + "and any window sitting ABOVE it. A window above the target is usually a modal dialog, "
+      + "and it silently swallows every click and keystroke aimed at the window underneath. "
+      + "Omit app to list every top-level window on the desktop. " + sel,
     inputSchema: {
       host: z.string().describe("Host name or selector (first matched host is used)."),
-      app: z.string().describe("Numeric PID or case-insensitive app-name substring."),
+      app: z.string().optional()
+        .describe("PID, process name (Playnite.DesktopApp[.exe]), app name, or window title."),
     },
     annotations: { openWorldHint: true },
   }, async ({ host, app }) => {
     const target = await routeSelector(cfg, host);
-    const resolved = await cuResolvePid(cfg, target, app);
-    const { windows, result } = await cuWindows(cfg, target, resolved.pid);
-    if (!result.ok) return text(renderExec([result]), true);
-    return text([
-      ...windows.map((window) => `${String(window.window_id).padStart(8)}  ${window.title || "(untitled)"}`),
-      `${windows.length} window(s) for ${resolved.name} (pid ${resolved.pid})`,
-    ].join("\n"));
+    const snapshot = await cuSnapshot(cfg, target);
+    if (!snapshot.result.ok) return text(renderExec([snapshot.result]), true);
+    if (!app) {
+      const rows = [...snapshot.windows].sort((a, b) => b.z_index - a.z_index).map((w) =>
+        `${String(w.window_id).padStart(9)} ${String(w.pid).padStart(7)}  ${(w.app_name ?? "?").padEnd(24)} `
+        + `${w.title || "(untitled)"}  ${w.width}x${w.height}@${w.x},${w.y}`);
+      return text([...rows, `${snapshot.windows.length} top-level window(s)`].join("\n"));
+    }
+    try {
+      const t = cuResolveTargetFrom(snapshot, app);
+      const mark = (id: number) => id === t.window.window_id ? "-> target"
+        : t.blockers.some((b) => b.window_id === id) ? "!! above target" : "   sibling";
+      const rows = snapshot.windows.filter((w) => w.pid === t.pid)
+        .sort((a, b) => b.z_index - a.z_index)
+        .map((w) => `${mark(w.window_id)} ${String(w.window_id).padStart(9)}  `
+          + `${w.title || "(untitled)"}  ${w.width}x${w.height}@${w.x},${w.y} z${w.z_index}`);
+      const note = cuBlockerNote(t);
+      return text([
+        ...rows,
+        `${t.name} · pid ${t.pid} · matched on ${t.matched} · click space ${t.capture.width}x${t.capture.height}`,
+        ...(note ? [note] : []),
+      ].join("\n"));
+    } catch (error) {
+      return text(error instanceof Error ? error.message : String(error), true);
+    }
   });
 
   server.registerTool("fleet_cu_screenshot_window", {
     title: "Screenshot an application window",
-    description: "Resolve an application by PID or name, capture its first window, and return "
-      + "the image. This composes app discovery, window discovery, and capture efficiently. " + sel,
+    description: "Resolve an application by PID, process name, app name, or window title, capture "
+      + "the window, and return the image. Owned popups and modal dialogs the process has open "
+      + "ARE COMPOSITED onto the capture and named in the reply — a capture of the window alone "
+      + "looks completely normal while a modal underneath it eats every click. With grid, the "
+      + "image carries a caption stating the exact coordinate frame (pid, window_id, origin) that "
+      + "its numbers are in. Use probe to draw a crosshair where a click at those coordinates "
+      + "would actually land, without clicking. " + sel,
     inputSchema: {
       host: z.string().describe("Host name or selector (first matched host is used)."),
-      app: z.string().describe("Numeric PID or case-insensitive app-name substring."),
+      app: z.string().describe("PID, process name (Playnite.DesktopApp[.exe]), app name, or window title."),
       grid: z.boolean().optional().describe("Overlay a labeled coordinate grid on the returned image."),
       gridStep: z.number().int().positive().max(1000).optional().describe("Grid spacing in pixels (default 100)."),
+      probe: z.object({ x: z.number(), y: z.number() }).optional()
+        .describe("Draw a crosshair where a click at this point would land. Verifies aim without clicking."),
+      space: z.enum(["window", "screen"]).optional()
+        .describe("Coordinate frame of probe. window (default) = pixels in this capture; screen = desktop pixels."),
+      composite: z.boolean().optional().describe("Set false to capture the target window alone (default true)."),
     },
     annotations: { openWorldHint: true },
-  }, async ({ host, app, grid, gridStep }) => withTempImage("fleet-cua-window-", async (local) => {
+  }, async ({ host, app, grid, gridStep, probe, space, composite }) =>
+    withTempImage("fleet-cua-window-", async (local) => {
+      const target = await routeSelector(cfg, host);
+      const r = await cuShotWindow(cfg, target, app, local, {}, { composite: composite !== false });
+      if (!r.result.ok || !r.localImage) return text(renderExec([r.result]), true);
+      let mark: { x: number; y: number } | undefined;
+      if (probe) {
+        try { mark = cuResolvePoint(r.target, probe.x, probe.y, space ?? "window"); }
+        catch (error) { return text(error instanceof Error ? error.message : String(error), true); }
+      }
+      const gridApplied = grid ? await overlayGrid(r.localImage, {
+        step: gridStep ?? 100,
+        caption: cuGridCaption(r.target),
+        banner: r.warning,
+        probe: mark ? { ...mark, label: `probe -> ${mark.x},${mark.y}` } : undefined,
+      }) : false;
+      const lines = [
+        `${r.target.name} · pid ${r.target.pid} · window_id ${r.target.window.window_id}`
+        + ` · click space ${r.target.capture.width}x${r.target.capture.height} (window-local pixels)`,
+        ...(r.composited.length
+          ? [`composited ${r.composited.length} owned window(s): `
+             + r.composited.map((w) => w.title || `w${w.window_id}`).join(", ")] : []),
+        ...(r.warning ? [r.warning] : []),
+        ...(mark ? [`probe ${probe!.x},${probe!.y} (${space ?? "window"}) -> window-local ${mark.x},${mark.y}`] : []),
+        ...(grid ? [gridApplied ? "coordinate grid applied" : "grid skipped (python3 + Pillow required)"] : []),
+      ];
+      const data = await consumeImage(r.localImage);
+      return { content: [
+        { type: "text" as const, text: lines.join("\n") },
+        { type: "image" as const, data, mimeType: "image/png" },
+      ] };
+    }));
+
+  server.registerTool("fleet_cu_act", {
+    title: "Act on a window and verify the effect",
+    description: "Send one input action to an exact (pid, window_id) and report WHAT THE WINDOW'S "
+      + "PIXELS DID: changed, no_change, or indeterminate. cua-driver's own `effect` field returns "
+      + "\"unverifiable\" for successful and no-op input alike, so this hashes the window bitmap "
+      + "before and after instead, and takes a third capture to separate a real change from a "
+      + "window that repaints on its own. window_id is always sent explicitly — omitted, cua-driver "
+      + "targets the process's FRONTMOST window, which is the modal dialog when one is open, and "
+      + "window-local coordinates then land somewhere unrelated. Pixel coordinates are validated "
+      + "against the window and refused when they fall outside it. " + sel,
+    inputSchema: {
+      host: z.string().describe("Host name or selector (first matched host is used)."),
+      app: z.string().describe("PID, process name, app name, or window title."),
+      tool: z.string().describe("cua-driver input tool: click, press_key, type_text, scroll, hotkey, …"),
+      args: z.record(z.string(), z.any()).optional()
+        .describe("Tool arguments WITHOUT pid/window_id — Fleet supplies those."),
+      x: z.number().optional().describe("Pixel X, validated and translated into window-local space."),
+      y: z.number().optional().describe("Pixel Y, validated and translated into window-local space."),
+      space: z.enum(["window", "screen"]).optional()
+        .describe("Frame for x/y. window (default) = pixels in the shot-window capture; screen = desktop."),
+      settleMs: z.number().int().min(0).max(10000).optional()
+        .describe("Wait before the after-capture (default 400)."),
+      screenshot: z.boolean().optional().describe("Return the after image."),
+      grid: z.boolean().optional().describe("Overlay the coordinate grid on the after image."),
+    },
+    annotations: { openWorldHint: true },
+  }, async ({ host, app, tool, args, x, y, space, settleMs, screenshot, grid }) => {
     const target = await routeSelector(cfg, host);
-    const r = await cuShotWindow(cfg, target, app, local);
-    if (!r.result.ok || !r.localImage) return text(renderExec([r.result]), true);
-    const gridApplied = grid ? await overlayGrid(r.localImage, gridStep ?? 100) : false;
-    const data = await consumeImage(r.localImage);
-    return { content: [
-      { type: "text" as const, text: `${r.app.name} · window ${r.window.window_id}`
-        + (grid ? gridApplied ? " · coordinate grid applied" : " · grid skipped (python3 + Pillow required)" : "") },
-      { type: "image" as const, data, mimeType: "image/png" },
-    ] };
-  }));
+    const run = async (local?: string) => {
+      if ((x === undefined) !== (y === undefined))
+        return text("x and y must be given together", true);
+      const r = await cuAct(cfg, target, app, tool, { ...(args ?? {}) }, {
+        settleMs, imageOut: local,
+        point: x !== undefined && y !== undefined ? { x, y, space: space ?? "window" } : undefined,
+      });
+      const note = cuBlockerNote(r.target);
+      const lines = [
+        `effect: ${r.effect}${r.reason ? ` — ${r.reason}` : ""}`,
+        `${r.target.name} · pid ${r.target.pid} · window_id ${r.target.window.window_id} · ${tool}`,
+        ...(note ? [note] : []),
+        ...(r.driverOutput ? ["", r.driverOutput] : []),
+        ...(r.result.stderr ? ["", r.result.stderr] : []),
+      ];
+      const content: any[] = [{ type: "text" as const, text: lines.join("\n") }];
+      if (r.localImage) {
+        if (grid) await overlayGrid(r.localImage, { caption: cuGridCaption(r.target), banner: note });
+        content.push({ type: "image" as const, data: await consumeImage(r.localImage), mimeType: "image/png" });
+      }
+      return { content, isError: !r.result.ok };
+    };
+    try {
+      return screenshot || grid ? await withTempImage("fleet-cua-act-", run) : await run();
+    } catch (error) {
+      return text(error instanceof Error ? error.message : String(error), true);
+    }
+  });
 
   server.registerTool("fleet_deploy", {
     title: "Deploy Fleet to host(s)",

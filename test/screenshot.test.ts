@@ -11,6 +11,18 @@ const cfg: FleetConfig = { hosts: { win: host } };
 const success = (stdout = ""): ExecResult => ({ host: host.name, ok: true, code: 0, stdout, stderr: "" });
 const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=", "base64");
 
+/** cuShotWindow resolves the target before capturing; these tests are about the
+ *  capture-and-transfer half, so targeting is answered from a fixture. */
+const snapshotStub = async () => ({
+  apps: [{ name: "Demo", pid: 123, active: true }],
+  windows: [{
+    window_id: 7, pid: 123, title: "Window", app_name: "demo.exe",
+    x: 0, y: 0, width: 800, height: 600, on_screen: true, minimized: false, z_index: 3,
+  }],
+  maxImageDimension: 1568,
+  result: success(),
+});
+
 describe("capture artifacts", () => {
   test("exit zero without a capture path fails every requested-image action", async () => {
     const deps = { exec: async () => success() };
@@ -18,7 +30,7 @@ describe("capture artifacts", () => {
     const raw = await cuRun(cfg, "win", ["get_window_state"], "unused.png", deps);
     expect(raw.result.ok).toBe(false);
     expect(raw.result.code).not.toBe(0);
-    const window = await cuShotWindow(cfg, "win", "123", "unused.png", deps);
+    const window = await cuShotWindow(cfg, "win", "123", "unused.png", { ...deps, snapshot: snapshotStub });
     expect(window.result.ok).toBe(false);
     expect(window.result.code).not.toBe(0);
     expect(window.localImage).toBeUndefined();
@@ -79,9 +91,10 @@ describe("capture artifacts", () => {
     const calls: string[] = [];
     try {
       const result = await cuShotWindow(cfg, "win", "123", output, {
+        snapshot: snapshotStub,
         exec: async (_host, command) => {
           calls.push(command);
-          return success("__FLEET_IMG__C:\\Temp\\window.png|123|456|Demo|Window");
+          return success("__FLEET_CAP__7|C:\\Temp\\window.png\n{}\n__FLEET_END__");
         },
         deliver: async () => ({ result: success(), path: output }),
       });

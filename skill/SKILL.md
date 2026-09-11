@@ -40,6 +40,8 @@ fleet exec win-box "nvidia-smi"
 | `fleet edit <sel>:<path> --old S --new S` | Edit a remote file in place, reject ambiguous matches, and print the diff. |
 | `fleet shot <host> [--out f] [--grid] [--no-open]` | Screenshot the remote desktop → local image (webp default; `--grid` overlays a coord ruler). Alias: `fleet screenshot`. |
 | `fleet cu <host> <args…> [--out f.png]` | Computer-use via [cua-driver](https://github.com/trycua/cua): `install`, or pass a tool + JSON (`click`, `type_text`, `get_window_state`…). |
+| `fleet cu <host> click\|key\|type\|act <target> …` | Verified input: resolves the target, sends an explicit `window_id`, reports `changed` / `no_change` / `indeterminate`. |
+| `fleet cu <host> windows [target]` · `shot-window <target>` | List windows (blockers flagged) or capture one, with owned popups composited in. |
 | `fleet restart <host> <service>` | Restart a **configured** service (see config). |
 | `fleet bios <sel> [--yes]` | Reboot Windows UEFI/systemd Linux hosts into firmware setup. |
 | `fleet logs <host> <service> [-n N]` | Recent logs / status for a service. |
@@ -132,11 +134,61 @@ and exposes computer-use tools. Same interactive-desktop requirement as `fleet s
   Linux restarts the existing `cua-driver.service` systemd user unit, preserving its
   display environment. Configure that unit before installing on Linux. Download,
   installation, and service restart failures return a non-zero exit.
+- **Target by anything.** Every verb takes a pid, a process name (with or without
+  `.exe`), an app display name, or a window title. One resolver serves all of them,
+  and it reports which identity matched.
 - **Convenience verbs** (resolve the pid/window_id loop for you):
   - `fleet cu <host> apps [name]` — compact `pid  name` table (optional name filter).
-  - `fleet cu <host> windows <pid|name>` — `window_id  title` table (name → pid auto-resolved).
-  - `fleet cu <host> shot-window <pid|name> [--out f.png]` — resolve pid + first window +
-    capture, in one call (auto-opens on Mac). This replaces the 3-step loop below.
+  - `fleet cu <host> windows [target]` — every top-level window, or one process's
+    windows with the one Fleet targets marked and anything **above** it flagged.
+  - `fleet cu <host> shot-window <target> [--out f.png] [--grid] [--probe X,Y]` —
+    resolve target + window + capture in one call (auto-opens on Mac).
+- **Verified input** — `click`, `key`, `type`, and generic `act` resolve the target,
+  send an explicit `window_id`, and report what the window's pixels **actually did**:
+  - `fleet cu win-box click firefox 166 447` → `● changed` / `○ no_change` / `? indeterminate`
+  - `fleet cu win-box key firefox escape` · `fleet cu win-box type firefox "hello"`
+  - `fleet cu win-box act firefox <tool> '{…}'` for any other input tool
+  - Flags: `--space window|screen`, `--button`, `--count`, `--foreground`,
+    `--settle MS`, `--shot [--grid]` to pull the after-image.
+  Fleet hashes the window bitmap before and after, and takes a third capture when they
+  differ so an animating window is not reported as a false change. One ssh round trip.
+  Do not build your own click-then-screenshot loop; this is it.
+- **Traps that cost whole sessions.** The verbs above handle each one; they still bite
+  raw passthrough:
+  1. **Omitting `window_id` does not mean "the main window".** cua-driver targets the
+     process's **frontmost** window instead — the modal dialog whenever one is open — so
+     window-local coordinates get anchored to the dialog's frame and the click lands
+     somewhere unrelated, often in another application. With no `pid` either, `x,y` are
+     desktop coordinates. Always send both.
+  2. **`shot-window` alone can hide a blocker.** A window with a modal over it captures
+     completely normally, and `windows <target>` reporting one window does not prove
+     nothing else is up. Fleet composites owned popups onto the capture and prints
+     `BLOCKED? …` naming them. For anything it cannot see — another app's overlay, a
+     system dialog — verify with a full `fleet shot <host>`, not `shot-window`.
+  3. **`effect: "unverifiable"` is not a result.** cua-driver returns it for successful
+     input, for input that silently no-ops, and for hotkeys alike. Infer nothing from it;
+     read Fleet's `changed` / `no_change` verdict instead.
+  4. **On Windows, `window_id` is a real HWND you cannot use over ssh.** Window handles
+     are per-session, and the ssh shell runs in session 0 while the desktop is session 1,
+     so `IsWindow()` from `fleet exec` returns false on a perfectly valid handle. Drive
+     the window through cua-driver, or run user32 calls inside the interactive session.
+  5. **Launching a GUI app over ssh puts it in session 0, with no window.** cua-driver
+     will never see it. Relaunch it in the interactive session — on Windows,
+     `schtasks /create /sc once /ru <user> /it /rl LIMITED …` then `schtasks /run`.
+     `/rl LIMITED` is not optional: without it the app runs elevated, which makes some
+     apps throw a modal that blocks all input, and anything it launches inherits admin.
+- **Coordinates survive only until the next capture of the same pid.** cua-driver stores
+  its downscale ratio per **pid**, not per window, and rescales every incoming `x,y` by
+  whatever the last capture set. Read coordinates off the most recent capture of the
+  window you are clicking. The verbs capture immediately before acting; a hand-rolled
+  sequence of raw `cu` calls does not.
+- **Empty accessibility trees.** `get_window_state` on a WPF/canvas/custom-drawn window
+  returns `degraded: true`, `element_count: 0` — and still ships its whole envelope,
+  megabytes of it. Fleet collapses that to the diagnostic plus "use pixels"; `--full`
+  restores the raw body. `element_index` cannot resolve at all on such a window, so the
+  tool's own "prefer element_index" advice does not apply:
+  `fleet cu <host> describe click --brief --for <target>` probes the real window and says
+  which addressing mode actually works.
 - **cua-driver 0.24:** `get_window_state` accepts `include_accessibility_tree:false`
   for screenshot-only previews and `max_dimension` for thumbnails. Pass these fields
   through raw JSON after checking `fleet cu <host> describe get_window_state`.
@@ -159,7 +211,17 @@ and exposes computer-use tools. Same interactive-desktop requirement as `fleet s
   not five. Plain `cu` calls are ~1.3s each.
 - **`--grid` [--grid-step N]** overlays a labeled pixel-coordinate grid (default 100px) on
   any capture (`shot`, `cu --out`, `shot-window`) — read off x,y before a click, since cua
-  coords are **window-local pixels**. Needs python3 + Pillow locally (best-effort).
+  coords are **window-local pixels**. On `shot-window` the image also carries a caption
+  strip stating the exact frame (`pid`, `window_id`, origin, and the capture's own size),
+  a red banner when something owns a window above the target, minor ticks every 25px for
+  small toolbar icons, `x,y` labels at interior crossings, and line/label colours picked
+  per segment from the underlying luminance so saturated artwork stays readable.
+  Needs python3 + Pillow locally (best-effort).
+- **`--probe X,Y`** draws a crosshair where a click at those coordinates would land,
+  resolved through the same conversion the click path uses — aim verification without
+  clicking. **`--space window|screen`** says which frame `X,Y` are in; a point that
+  resolves outside the target window is refused rather than delivered to whatever is
+  underneath it there.
 - **JSON args:** pass the JSON as one arg; fleet pipes it via **stdin** (Windows
   PowerShell 5.1 strips quotes around JSON field names on native-command args — piping
   preserves them). `get_window_state` needs `window_id` (from `list_windows`); its image
@@ -187,6 +249,7 @@ Run standalone with `bun run mcp` (honours `FLEET_CONFIG`); smoke-test end-to-en
 | `fleet_cp` | `local`, `selector`, `remote` | `fleet cp` |
 | `fleet_screenshot` | `host` | `fleet shot` (returns the PNG as an image) |
 | `fleet_cu` | `host`, `args[]`, `image?` | `fleet cu` (computer-use; returns PNG when `image`) |
+| `fleet_cu_act` | `host`, `app`, `tool`, `x?`, `y?`, `space?` | verified input; returns `changed` / `no_change` / `indeterminate` |
 | `fleet_restart` | `host`, `service` | `fleet restart` |
 | `fleet_logs` | `host`, `service`, `lines?` | `fleet logs` |
 | `fleet_gpu` | — | `fleet gpu` |
