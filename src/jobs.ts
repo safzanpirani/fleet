@@ -52,7 +52,23 @@ function lineCount(n: number, fallback = 40): number {
 // A pid is not proof of ownership: operating systems reuse them. Every
 // destructive or "running" check also verifies that the process command line
 // names this exact job's generated runner.
-const UNIX_OWNED_FN = `
+const UNIX_EXIT_FNS = `
+read_exit() {
+  local value
+  value="$(cat "$1/exit" 2>/dev/null)" || return 1
+  [[ "$value" =~ ^-?[0-9]+$ ]] || return 1
+  printf '%s\\n' "$value"
+}
+publish_exit() {
+  local destination="$1" code="$2" pending
+  pending="$(mktemp "$destination/.exit.XXXXXX")" || return 1
+  if printf '%s\\n' "$code" > "$pending" && mv -f -- "$pending" "$destination/exit"; then return 0; fi
+  rm -f -- "$pending"
+  return 1
+}
+`;
+
+const UNIX_OWNED_FN = UNIX_EXIT_FNS + `
 is_owned() {
   owned_pid="$1"
   owned_runner="$2"
@@ -69,7 +85,25 @@ is_owned() {
 }
 `;
 
-const WIN_OWNED_FN = `
+const WIN_EXIT_FNS = `
+function Get-FleetJobExit([string]$Directory) {
+  try { $value = [IO.File]::ReadAllText((Join-Path $Directory 'exit')).Trim() } catch { return $null }
+  if ($value -match '^-?[0-9]+$') { return $value }
+  return $null
+}
+function Set-FleetJobExit([string]$Directory, [int]$Code) {
+  if ($null -ne (Get-FleetJobExit $Directory)) { return }
+  $path = Join-Path $Directory 'exit'
+  $pending = Join-Path $Directory ('.exit.' + [guid]::NewGuid().ToString('N'))
+  try {
+    [IO.File]::WriteAllText($pending, [string]$Code)
+    if ([IO.File]::Exists($path)) { [IO.File]::Replace($pending, $path, $null) }
+    else { [IO.File]::Move($pending, $path) }
+  } finally { if ([IO.File]::Exists($pending)) { [IO.File]::Delete($pending) } }
+}
+`;
+
+const WIN_OWNED_FN = WIN_EXIT_FNS + `
 function Test-FleetJobProcess([int]$ProcessId, [string]$Runner) {
   $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$ProcessId" -EA SilentlyContinue
   return ($null -ne $proc -and $proc.CommandLine -and $proc.CommandLine.Contains($Runner))
@@ -135,12 +169,13 @@ export function unixSpawnScript(host: Host, id: string, cmd: string, cwd?: strin
     `date +%s > "$dir/started"`,
     `cat > "$dir/run" <<'RUNEOF'`,
     `#!/bin/bash`,
+    UNIX_EXIT_FNS,
     `dir="$(cd "$(dirname "$0")" && pwd)"`,
     `echo $$ > "$dir/pid"`,
     `cwd="$(cat "$dir/cwd")"`,
-    `cd -- "$cwd" || { echo "fleet: cwd not found: $cwd" | tee "$dir/out" 1>&2; echo 127 > "$dir/exit"; exit 127; }`,
+    `cd -- "$cwd" || { echo "fleet: cwd not found: $cwd" | tee "$dir/out" 1>&2; publish_exit "$dir" 127; exit 127; }`,
     `(umask "$(cat "$dir/umask")"; bash "$dir/cmd") > "$dir/out" 2>&1`,
-    `echo $? > "$dir/exit"`,
+    `publish_exit "$dir" "$?"`,
     `RUNEOF`,
     `chmod +x "$dir/run"`,
     launch,
@@ -157,14 +192,15 @@ export function unixSpawnScript(host: Host, id: string, cmd: string, cwd?: strin
 // the `exit` file == "done"). Base64'd into the spawn script below.
 const WIN_RUNNER = [
   `$ErrorActionPreference='Continue'`,
+  WIN_EXIT_FNS,
   `$dir = Split-Path -Parent $MyInvocation.MyCommand.Path`,
   `$PID | Set-Content -Encoding ascii "$dir\\pid"`,
   `$cwd = (Get-Content "$dir\\cwd" -Raw).Trim()`,
-  `try { Set-Location -LiteralPath $cwd -ErrorAction Stop } catch { "fleet: cwd not found: $cwd" | Set-Content "$dir\\out"; '127' | Set-Content -Encoding ascii "$dir\\exit"; exit }`,
+  `try { Set-Location -LiteralPath $cwd -ErrorAction Stop } catch { "fleet: cwd not found: $cwd" | Set-Content "$dir\\out"; Set-FleetJobExit $dir 127; exit }`,
   `$global:LASTEXITCODE = 0`,
   `try { & "$dir\\cmd.ps1" *> "$dir\\out" 2>&1; $code = $LASTEXITCODE } catch { $_ | Out-File -Append "$dir\\out"; $code = 1 }`,
   `if ($null -eq $code) { $code = 0 }`,
-  `$code | Set-Content -Encoding ascii "$dir\\exit"`,
+  `Set-FleetJobExit $dir $code`,
 ].join("\n");
 
 function windowsSpawnScript(id: string, cmd: string, cwd?: string): string {
@@ -238,7 +274,7 @@ for d in "$base"/*/; do
   id="$(basename "$d")"
   pid="$(cat "$d/pid" 2>/dev/null)"
   started="$(cat "$d/started" 2>/dev/null)"
-  if [ -f "$d/exit" ]; then st="exited"; code="$(cat "$d/exit" 2>/dev/null)"
+  if code="$(read_exit "$d")"; then st="exited"
   elif is_owned "$pid" "$d/run"; then st="running"; code="-"
   else st="dead"; code="-"; fi
   cmd="$(tr '\\n\\t' '  ' < "$d/cmd" 2>/dev/null | cut -c1-160)"
@@ -254,7 +290,8 @@ foreach ($d in (Get-ChildItem -Directory $base -EA SilentlyContinue)) {
   $p=$d.FullName; $id=$d.Name
   $jpid=(Get-Content "$p\\pid" -EA SilentlyContinue | Select-Object -First 1)
   $started=(Get-Content "$p\\started" -EA SilentlyContinue | Select-Object -First 1)
-  if (Test-Path "$p\\exit") { $st="exited"; $code=(Get-Content "$p\\exit" -EA SilentlyContinue | Select-Object -First 1) }
+  $code=Get-FleetJobExit $p
+  if ($null -ne $code) { $st="exited" }
   elseif ($jpid -and (Test-FleetJobProcess ([int]$jpid) "$p\\run.ps1")) { $st="running"; $code="-" }
   else { $st="dead"; $code="-" }
   $cmd=(Get-Content "$p\\cmd.ps1" -Raw -EA SilentlyContinue)
@@ -351,59 +388,66 @@ export function killScript(host: Host, id: string): string {
   if (host.os === "windows") {
     return WIN_OWNED_FN +
       `$d="$env:USERPROFILE\\.fleet\\jobs\\${id}"\n` +
-      `if (Test-Path "$d\\exit") { Write-Error "fleet: job ${id} already exited"; exit 1 }\n` +
+      `if ($null -ne (Get-FleetJobExit $d)) { Write-Error "fleet: job ${id} already exited"; exit 1 }\n` +
       `$jpid=(Get-Content "$d\\pid" -EA SilentlyContinue | Select-Object -First 1)\n` +
       `if (-not $jpid) { Write-Error "fleet: no such job: ${id}"; exit 1 }\n` +
       `if (-not (Test-FleetJobProcess ([int]$jpid) "$d\\run.ps1")) { Write-Error "fleet: refusing to kill pid $($jpid): it is not job ${id}"; exit 1 }\n` +
       `taskkill /PID $jpid /T /F 2>&1 | Out-Null\n` +
       `for ($i=0; $i -lt 40; $i++) { if (-not (Test-FleetJobProcess ([int]$jpid) "$d\\run.ps1")) { break }; Start-Sleep -Milliseconds 250 }\n` +
       `if (Test-FleetJobProcess ([int]$jpid) "$d\\run.ps1") { Write-Error "fleet: pid $jpid survived taskkill /F — not marking exited"; exit 1 }\n` +
-      `if (!(Test-Path "$d\\exit")) { '137' | Set-Content -Encoding ascii "$d\\exit" }\n` +
+      `Set-FleetJobExit $d 137\n` +
       `"killed $jpid"`;
   }
 
   // Preserve descendant identities before signalling: a runner can exit on TERM
   // while its resistant children become orphans and still need escalation.
-  const signal = host.os === "mac"
-    ? `tree_pids=(); tree_identities=()\n` +
-      `process_identity() {\n` +
-      `  local state\n` +
-      `  state="$(ps -p "$1" -o stat= 2>/dev/null)"\n` +
-      `  case "$state" in ''|*Z*) return 1 ;; esac\n` +
-      `  ps -p "$1" -o lstart= -o command= 2>/dev/null\n` +
-      `}\n` +
-      `capture_tree() {\n` +
-      `  local tree_pid="$1" child identity\n` +
-      `  for child in $(pgrep -P "$tree_pid" 2>/dev/null); do capture_tree "$child"; done\n` +
-      `  identity="$(process_identity "$tree_pid")" || return 0\n` +
-      `  tree_pids+=("$tree_pid"); tree_identities+=("$identity")\n` +
-      `}\n` +
-      `tree_owned() {\n` +
-      `  local identity\n` +
-      `  identity="$(process_identity "\${tree_pids[$1]}")" || return 1\n` +
-      `  [ "$identity" = "\${tree_identities[$1]}" ]\n` +
-      `}\n` +
-      `tree_alive() {\n` +
-      `  local i\n` +
-      `  for i in "\${!tree_pids[@]}"; do tree_owned "$i" && return 0; done\n` +
-      `  return 1\n` +
-      `}\n` +
-      `signal_tree() {\n` +
-      `  local tree_signal="$1" i\n` +
-      `  for i in "\${!tree_pids[@]}"; do\n` +
-      `    if tree_owned "$i"; then kill "-$tree_signal" "\${tree_pids[$i]}" 2>/dev/null || true; fi\n` +
-      `  done\n` +
-      `}\n` +
-      `capture_tree "$pid"\nsignal_tree TERM`
-    : `kill -TERM -"$pid" 2>/dev/null || true\nkill -TERM "$pid" 2>/dev/null || true`;
-  const force = host.os === "mac"
-    ? `signal_tree KILL`
-    : `kill -KILL -"$pid" 2>/dev/null || true\n  kill -KILL "$pid" 2>/dev/null || true`;
+  const signal = `command -v ps >/dev/null && command -v pgrep >/dev/null || { echo "fleet: cancellation requires ps and pgrep" >&2; exit 1; }\n` +
+    `tree_pids=(); tree_identities=()\n` +
+    `process_identity() {\n` +
+    `  local state identity\n` +
+    `  state="$(ps -p "$1" -o stat= 2>/dev/null)"\n` +
+    `  case "$state" in ''|*Z*) return 1 ;; esac\n` +
+    `  if [ -r "/proc/$1/stat" ]; then\n` +
+    `    identity="$(cat "/proc/$1/stat" 2>/dev/null)" || return 1\n` +
+    `    identity="\${identity##*) }"\n` +
+    `    set -- $identity\n` +
+    `    [ "$1" != Z ] && [ "$1" != X ] || return 1\n` +
+    `    printf '%s\\n' "\${20}"\n` +
+    `  else\n` +
+    `    ps -p "$1" -o lstart= -o command= 2>/dev/null\n` +
+    `  fi\n` +
+    `}\n` +
+    `capture_tree() {\n` +
+    `  local tree_pid="$1" child identity children listed\n` +
+    `  children="$(pgrep -P "$tree_pid" 2>/dev/null)"; listed=$?\n` +
+    `  [ "$listed" -le 1 ] || return 1\n` +
+    `  for child in $children; do capture_tree "$child" || return 1; done\n` +
+    `  identity="$(process_identity "$tree_pid")" || return 0\n` +
+    `  tree_pids+=("$tree_pid"); tree_identities+=("$identity")\n` +
+    `}\n` +
+    `tree_owned() {\n` +
+    `  local identity\n` +
+    `  identity="$(process_identity "\${tree_pids[$1]}")" || return 1\n` +
+    `  [ "$identity" = "\${tree_identities[$1]}" ]\n` +
+    `}\n` +
+    `tree_alive() {\n` +
+    `  local i\n` +
+    `  for i in "\${!tree_pids[@]}"; do tree_owned "$i" && return 0; done\n` +
+    `  return 1\n` +
+    `}\n` +
+    `signal_tree() {\n` +
+    `  local tree_signal="$1" i\n` +
+    `  for i in "\${!tree_pids[@]}"; do\n` +
+    `    if tree_owned "$i"; then kill "-$tree_signal" "\${tree_pids[$i]}" 2>/dev/null || true; fi\n` +
+    `  done\n` +
+    `}\n` +
+    `capture_tree "$pid" || { echo "fleet: could not enumerate the job process tree; no signals sent" >&2; exit 1; }\nsignal_tree TERM`;
+  const force = `signal_tree KILL`;
 
-  const running = host.os === "mac" ? "tree_alive" : 'is_owned "$pid" "$d/run"';
+  const running = "tree_alive";
   return UNIX_OWNED_FN +
     `d="$HOME/.fleet/jobs/${id}"\n` +
-    `[ ! -f "$d/exit" ] || { echo "fleet: job ${id} already exited" 1>&2; exit 1; }\n` +
+    `if read_exit "$d" >/dev/null; then echo "fleet: job ${id} already exited" 1>&2; exit 1; fi\n` +
     `pid="$(cat "$d/pid" 2>/dev/null)"\n` +
     `[ -n "$pid" ] || { echo "fleet: no such job: ${id}" 1>&2; exit 1; }\n` +
     `is_owned "$pid" "$d/run" || { echo "fleet: refusing to kill pid $pid: it is not job ${id}" 1>&2; exit 1; }\n` +
@@ -416,7 +460,7 @@ export function killScript(host: Host, id: string): string {
     `  i=0; while [ "$i" -lt 8 ] && ${running}; do sleep 0.25; i=$((i+1)); done\n` +
     `fi\n` +
     `if ${running}; then echo "fleet: job process survived SIGKILL — not marking exited" 1>&2; exit 1; fi\n` +
-    `[ -f "$d/exit" ] || echo "$code" > "$d/exit"\n` +
+    `read_exit "$d" >/dev/null || publish_exit "$d" "$code" || exit 1\n` +
     `echo "killed $pid"`;
 }
 
@@ -449,9 +493,9 @@ export function waitPoll(host: Host, id: string, until?: string): string {
       WIN_OWNED_FN,
       `$dir="$env:USERPROFILE\\.fleet\\jobs\\${id}"`,
       `if (!(Test-Path $dir)) { 'MISSING'; exit 0 }`,
-      `if (Test-Path "$dir\\exit") { 'EXIT:' + (Get-Content "$dir\\exit" -Raw).Trim() }`,
+      `$code=Get-FleetJobExit $dir; if ($null -ne $code) { 'EXIT:' + $code }`,
       untilSrc,
-      `if (!(Test-Path "$dir\\exit")) { $jpid=(Get-Content "$dir\\pid" -EA SilentlyContinue | Select-Object -First 1); if ($jpid -and -not (Test-FleetJobProcess ([int]$jpid) "$dir\\run.ps1")) { 'DEAD' } }`,
+      `if ($null -eq (Get-FleetJobExit $dir)) { $jpid=(Get-Content "$dir\\pid" -EA SilentlyContinue | Select-Object -First 1); if ($jpid -and -not (Test-FleetJobProcess ([int]$jpid) "$dir\\run.ps1")) { 'DEAD' } }`,
     ].join("\n");
   }
   const untilSrc = until
@@ -462,9 +506,9 @@ export function waitPoll(host: Host, id: string, until?: string): string {
   // an inspection failure on every tick.
   return UNIX_OWNED_FN + `dir="$HOME/.fleet/jobs/${id}"\n` +
     `[ -d "$dir" ] || { echo MISSING; exit 0; }\n` +
-    `if [ -f "$dir/exit" ]; then echo "EXIT:$(cat "$dir/exit")"; fi\n` +
+    `if code="$(read_exit "$dir")"; then echo "EXIT:$code"; fi\n` +
     untilSrc +
-    `\nif [ ! -f "$dir/exit" ]; then pid="$(cat "$dir/pid" 2>/dev/null)"; if [ -n "$pid" ] && ! is_owned "$pid" "$dir/run"; then echo DEAD; fi; fi` +
+    `\nif ! read_exit "$dir" >/dev/null; then pid="$(cat "$dir/pid" 2>/dev/null)"; if [ -n "$pid" ] && ! is_owned "$pid" "$dir/run"; then echo DEAD; fi; fi` +
     `\nexit 0`;
 }
 
@@ -542,7 +586,7 @@ $n=0
 foreach ($d in (Get-ChildItem -Directory $base -EA SilentlyContinue)) {
   $p=$d.FullName
   $jpid=(Get-Content "$p\\pid" -EA SilentlyContinue | Select-Object -First 1)
-  if (Test-Path "$p\\exit") { }
+  if ($null -ne (Get-FleetJobExit $p)) { }
   elseif ($jpid -and (Test-FleetJobProcess ([int]$jpid) "$p\\run.ps1")) { continue }
   elseif ('${all ? "1" : "0"}' -ne '1') { continue }
   Remove-Item -Recurse -Force $p -EA SilentlyContinue; $n++
@@ -558,7 +602,7 @@ for d in "$base"/*/; do
   [ -d "$d" ] || continue
   d="\${d%/}"
   pid="$(cat "$d/pid" 2>/dev/null)"
-  if [ -f "$d/exit" ]; then :
+  if read_exit "$d" >/dev/null; then :
   elif is_owned "$pid" "$d/run"; then continue                       # running — never prune
   elif [ "${all ? "1" : "0"}" != "1" ]; then continue               # dead, but not --all
   fi

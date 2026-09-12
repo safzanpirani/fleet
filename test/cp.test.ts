@@ -1,5 +1,5 @@
 import { test, expect, describe } from "bun:test";
-import { parseRemoteSpec } from "../src/core.ts";
+import { parseRemoteSpec, pushFile } from "../src/core.ts";
 import type { FleetConfig, Host } from "../src/config.ts";
 
 const host = (name: string, os: Host["os"]): Host => ({ name, ssh: name, os });
@@ -46,4 +46,79 @@ describe("parseRemoteSpec (cp direction detection)", () => {
 
   test("dt: with no path colon is not a remote spec", () =>
     expect(parseRemoteSpec(cfg, "dt:spore-abc")).toBeNull());
+});
+
+describe("pushFile creates a trailing-slash destination", () => {
+  const ok = (h: string) => ({ host: h, ok: true, code: 0, stdout: "", stderr: "" });
+  const capture = () => {
+    const mkdirs: { host: string; cmd: string }[] = [];
+    const copies: string[] = [];
+    return {
+      mkdirs, copies,
+      deps: {
+        exec: async (h: Host, cmd: string) => { mkdirs.push({ host: h.name, cmd }); return ok(h.name); },
+        scp: async (h: Host, _l: string | string[], remote: string) => { copies.push(`${h.name}:${remote}`); return ok(h.name); },
+      } as any,
+    };
+  };
+
+  test("Windows never uses New-Item -LiteralPath, which does not exist on it", async () => {
+    // The bug: `New-Item` has no -LiteralPath parameter in any PowerShell
+    // version, so EVERY Windows trailing-slash destination failed with
+    // "A parameter cannot be found that matches parameter name 'LiteralPath'"
+    // — tilde and absolute paths alike, not just `~/dir/` as first reported.
+    const c = capture();
+    await pushFile(cfg, "/tmp/a.txt", "winbox", "~/out/", false, c.deps);
+    expect(c.mkdirs).toHaveLength(1);
+    expect(c.mkdirs[0]!.cmd).not.toContain("-LiteralPath");
+    expect(c.mkdirs[0]!.cmd).not.toContain("New-Item");
+  });
+
+  test("Windows resolves the path literally, so brackets are not globbed", async () => {
+    const c = capture();
+    await pushFile(cfg, "/tmp/a.txt", "winbox", "C:/Users/Admin/a[1]/", false, c.deps);
+    const cmd = c.mkdirs[0]!.cmd;
+    // -Path would treat [1] as a wildcard and match nothing; the session's
+    // unresolved-provider-path resolver handles ~ and relatives without globbing.
+    expect(cmd).toContain("GetUnresolvedProviderPathFromPSPath");
+    expect(cmd).toContain("System.IO.Directory]::CreateDirectory");
+    expect(cmd).toContain("a[1]/");
+  });
+
+  test("a single quote in the destination cannot break out of the literal", async () => {
+    const c = capture();
+    await pushFile(cfg, "/tmp/a.txt", "winbox", "C:/tmp/it's/", false, c.deps);
+    expect(c.mkdirs[0]!.cmd).toContain("it''s");
+  });
+
+  test("posix hosts still get mkdir -p through the quoting-proof assignment", async () => {
+    const c = capture();
+    await pushFile(cfg, "/tmp/a.txt", "web", "~/out/", false, c.deps);
+    expect(c.mkdirs[0]!.cmd).toContain("mkdir -p --");
+  });
+
+  test("no trailing slash means no directory is created", async () => {
+    const c = capture();
+    await pushFile(cfg, "/tmp/a.txt", "winbox", "C:/Users/Admin/a.txt", false, c.deps);
+    expect(c.mkdirs).toEqual([]);
+    expect(c.copies).toEqual(["winbox:C:/Users/Admin/a.txt"]);
+  });
+
+  test("a bare root is not treated as a directory to create", async () => {
+    const c = capture();
+    await pushFile(cfg, "/tmp/a.txt", "web", "/", false, c.deps);
+    expect(c.mkdirs).toEqual([]);
+  });
+
+  test("a failed mkdir names the directory and skips the copy", async () => {
+    const copies: string[] = [];
+    const [r] = await pushFile(cfg, "/tmp/a.txt", "winbox", "~/out/", false, {
+      exec: async (h: Host) => ({ host: h.name, ok: false, code: 1, stdout: "", stderr: "denied" }),
+      scp: async (h: Host, _l: unknown, remote: string) => { copies.push(remote); return ok(h.name); },
+    } as any);
+    expect(r!.ok).toBe(false);
+    expect(r!.stderr).toContain("could not create destination directory ~/out/");
+    expect(r!.stderr).toContain("denied");
+    expect(copies).toEqual([]);
+  });
 });

@@ -48,7 +48,8 @@ restart the host's `fleet-mcp` service):
 ```sh
 fleet deploy win-box                 # or any selector; --no-restart / --restart <svc>
 ```
-`fleet deploy` builds with `COPYFILE_DISABLE=1` (no AppleDouble), installs into the host's
+`fleet deploy` archives with `COPYFILE_DISABLE=1` and uses `--no-xattrs` on macOS
+to omit Apple metadata. It installs into the host's
 `deploy.dir` (default `~/fleet` | `%USERPROFILE%\fleet`), and restarts `deploy.service` →
 the host's `fleet-mcp` service by default.
 

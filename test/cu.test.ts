@@ -7,6 +7,9 @@ import {
 import type { CuSnapshot, CuWindowInfo } from "../src/core.ts";
 import type { FleetConfig, Host } from "../src/config.ts";
 import type { ExecResult } from "../src/ssh.ts";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const host = (name: string, os: Host["os"]): Host => ({ name, ssh: name, os });
 
@@ -198,6 +201,48 @@ describe("cua-driver 0.22 conveniences", () => {
   });
 });
 
+describe("cuInstall on a host that has never had cua", () => {
+  test("Linux writes the systemd unit before restarting it", async () => {
+    const cmds = new Map<string, string>();
+    await cuInstall(cfg, "lin", {
+      exec: async (target, cmd) => {
+        cmds.set(target.name, cmd);
+        return { host: target.name, ok: true, code: 0, stdout: "", stderr: "" };
+      },
+    });
+    const cmd = cmds.get("lin")!;
+
+    // cua-driver's own `autostart enable` is Windows-only, and nothing else in
+    // the install path creates this unit, so a first install used to end in
+    // "Unit cua-driver.service not found".
+    expect(cmd).toContain(".config/systemd/user/cua-driver.service");
+    expect(cmd).toContain("systemctl --user daemon-reload");
+    expect(cmd).toContain("systemctl --user enable cua-driver.service");
+    expect(cmd).toContain("systemctl --user restart cua-driver.service");
+
+    // Written only when absent, so a host with a customised unit keeps it.
+    expect(cmd).toContain('if [ ! -f "$unit" ]');
+
+    // The socket has to be the one the client dials, and the daemon drives the
+    // desktop rather than the SSH login's environment.
+    expect(cmd).toContain(".cache/cua-driver/cua-driver.sock");
+    expect(cmd).toContain("Environment=DISPLAY=:0");
+  });
+
+  test("the installer is invoked with a $0 placeholder", async () => {
+    const cmds = new Map<string, string>();
+    await cuInstall(cfg, "lin", {
+      exec: async (target, cmd) => {
+        cmds.set(target.name, cmd);
+        return { host: target.name, ok: true, code: 0, stdout: "", stderr: "" };
+      },
+    });
+    // `bash -c "$script" --flag` passes --flag as $0, where the script cannot
+    // see it. A placeholder keeps that trap from biting whoever adds a flag.
+    expect(cmds.get("lin")!).toContain('/bin/bash -c "$installer" cua-driver-install');
+  });
+});
+
 // ── targeting, blockers, coordinate space, verified effect ──────────────────
 
 const windowFixture = (over: Partial<CuWindowInfo> = {}): CuWindowInfo => ({
@@ -251,6 +296,15 @@ describe("target resolution", () => {
     const t = cuResolveTargetFrom(snap, "fleet");
     expect(t.pid).toBe(200);
     expect(t.matched).toBe("title");
+  });
+
+  test("exact and partial dialog titles select that window instead of its larger parent", () => {
+    const modal = windowFixture({ window_id: 9, title: "Save As", width: 420, height: 200, z_index: 22 });
+    const snap = snapshotFixture({ windows: [windowFixture(), modal] });
+    for (const query of ["Save As", "save as", "Save"])
+      expect(cuResolveTargetFrom(snap, query).window.window_id).toBe(9);
+    expect(cuResolveTargetFrom(snap, "Playnite").window.window_id).toBe(7);
+    expect(() => cuResolveTargetFrom(snap, "  ")).toThrow("required");
   });
 
   test("an unmatched query names what is on screen instead of failing blankly", () => {
@@ -359,6 +413,7 @@ describe("verified actions", () => {
     { before: "aa", after: "bb", settle: "bb", effect: "changed" },
     { before: "aa", after: "bb", settle: "cc", effect: "indeterminate" },
     { before: "", after: "", settle: undefined, effect: "indeterminate" },
+    { before: "aa", after: "bb", settle: undefined, effect: "indeterminate" },
   ])("before/after bitmap hashes report $effect", async (scenario) => {
     const r = await cuAct(cfgWin, "win", "Playnite", "click", { x: 1, y: 1 }, {}, {
       snapshot,
@@ -503,6 +558,67 @@ describe("act round trips", () => {
     "__FLEET_HASH__A|aa", "__FLEET_CAP__act|", "{}", "__FLEET_END__", "__FLEET_HASH__B|aa",
     ...(image ? ["__FLEET_IMG__C:\\Temp\\after.png"] : []),
   ].join("\n");
+
+  test.each([
+    { pid: 999 }, { window_id: 999 }, { scope: "desktop" },
+    { x: 99999, y: 0 }, { x: 1 }, { x: NaN, y: 0 }, { x: 0, y: Infinity },
+    { x: "1", y: 2 },
+  ])("generic action JSON cannot bypass target checks: %j", async (payload) => {
+    let actions = 0;
+    await expect(cuAct(cfgWin, "win", "Playnite", "click", payload, {}, {
+      snapshot,
+      exec: async () => { actions++; throw new Error("must not deliver input"); },
+    })).rejects.toThrow();
+    expect(actions).toBe(0);
+  });
+
+  test("requested after-images propagate missing-artifact and transfer failures", async () => {
+    for (const remoteExists of [false, true]) {
+      const result = await cuAct(cfgWin, "win", "Playnite", "click", {}, { imageOut: "after.png" }, {
+        snapshot,
+        exec: async (h) => ({ host: h.name, ok: true, code: 0, stderr: "", stdout: reply(remoteExists) }),
+        deliver: async (_h, _remote, path) => ({ path,
+          result: { host: "win", ok: false, code: 23, stdout: "", stderr: "transfer failed" } }),
+      });
+      expect(result.result.ok).toBe(false);
+      expect(result.result.code).toBe(remoteExists ? 23 : 1);
+      expect(result.localImage).toBeUndefined();
+    }
+  });
+
+  test("real Bash preserves driver errors and refuses input without a before-capture", async () => {
+    const root = await mkdtemp(join(tmpdir(), "fleet-cu-driver-"));
+    const driver = join(root, "cua-driver");
+    try {
+      await writeFile(driver, `#!${process.execPath}\n`
+        + `const payload = JSON.parse(await Bun.stdin.text());\n`
+        + `if (process.argv[2] === 'get_window_state') {\n`
+        + `  if (process.env.FAIL_CAPTURE === '1') process.exit(9);\n`
+        + `  await Bun.write(payload.screenshot_out_file, 'unchanged bitmap bytes');\n`
+        + `} else { console.log('action rejected'); process.exit(17); }\n`, { mode: 0o755 });
+      for (const failCapture of [false, true]) {
+        const result = await cuAct({ hosts: { lin: host("lin", "linux") } }, "lin", "Playnite", "click", {},
+          { settleMs: 0 }, {
+            snapshot,
+            exec: async (h, script) => {
+              const proc = Bun.spawn(["/bin/bash", "-s"], {
+                env: { ...process.env, FAIL_CAPTURE: failCapture ? "1" : "0", TMPDIR: root },
+                stdin: new TextEncoder().encode(script.replace(/^fcd=.*$/m, `fcd='${driver.replaceAll("'", "'\\''")}'`)),
+                stdout: "pipe", stderr: "pipe",
+              });
+              const [code, stdout, stderr] = await Promise.all([
+                proc.exited, new Response(proc.stdout).text(), new Response(proc.stderr).text(),
+              ]);
+              return { host: h.name, ok: code === 0, code, stdout, stderr };
+            },
+          });
+        expect(result.result.ok).toBe(false);
+        expect(result.result.code).toBe(failCapture ? 1 : 17);
+        expect(result.driverOutput).toBe(failCapture ? "" : "action rejected");
+        expect(result.effect).toBe(failCapture ? "indeterminate" : "no_change");
+      }
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
 
   test.each([
     { imageOut: undefined, keeps: false },

@@ -73,6 +73,7 @@ export interface ToolFingerprint {
   skillPath?: string;      // absolute path to SKILL.md on the controller
   sourceHash?: string;
   skillHash?: string;
+  compiled?: boolean;
 }
 export interface ToolManifest {
   tool: string;
@@ -83,6 +84,7 @@ export interface ToolManifest {
   skill?: string;          // hash of the SKILL.md that was pushed alongside
   sourceHash?: string;
   skillSkipped?: boolean;
+  compiled?: boolean;
 }
 export type ToolState = "current" | "stale" | "missing" | "unreachable";
 export interface ToolStatusRow {
@@ -255,12 +257,15 @@ async function fingerprintSource(spec: ReturnType<typeof resolveTool>, files: st
     version = ((await Bun.file(pkg).json()) as { version?: string }).version ?? "0.0.0";
   const sourceHash = await hashFiles(spec.root, files);
   const skillHash = skillPath ? await fileHash(skillPath) : undefined;
-  const hash = skillHash
+  const contentHash = skillHash
     ? new Bun.CryptoHasher("sha256").update(`fleet-tools-fingerprint-v3\0${sourceHash}\0${skillHash}`).digest("hex").slice(0, 12)
     : sourceHash;
+  const hash = spec.compile
+    ? new Bun.CryptoHasher("sha256").update(`fleet-tools-compiled-v1\0${contentHash}`).digest("hex").slice(0, 12)
+    : contentHash;
   return {
     name: spec.name, version, files: files.length, root: spec.root, skillPath,
-    hash, sourceHash, skillHash,
+    hash, sourceHash, skillHash, ...(spec.compile ? { compiled: true } : {}),
   };
 }
 
@@ -302,6 +307,7 @@ export async function readManifests(h: Host): Promise<{ manifests: ToolManifest[
 
 function verdict(local: ToolFingerprint, remote: ToolManifest | undefined): ToolState {
   if (!remote) return "missing";
+  if (Boolean(local.compiled) !== Boolean(remote.compiled)) return "stale";
   if (remote.sourceHash && local.sourceHash)
     return remote.sourceHash === local.sourceHash && (!local.skillHash || remote.skill === local.skillHash)
       ? "current" : "stale";
@@ -375,10 +381,11 @@ export interface ToolSyncResult {
 }
 
 export function installScript(
-  h: Host, spec: { name: string; entry?: string }, dir: string, manifest: ToolManifest, bin: string,
+  h: Host, spec: { name: string; entry?: string; compile?: boolean }, dir: string, manifest: ToolManifest, bin: string,
   archive = `${spec.name}-sync.tgz`,
 ): { cmd: string; shell: "bash" | "powershell" } {
   const entry = spec.entry ?? "src/cli.ts";
+  if (spec.compile && h.os === "windows") throw new Error(`tools.${spec.name}.compile supports Linux and macOS only`);
   // `dir` is a shell expression ($HOME/tg) until the host expands it, so the
   // manifest is written with a placeholder the remote shell substitutes — a
   // stored "$HOME/tg" would be useless to anyone reading the inventory later.
@@ -415,13 +422,28 @@ export function installScript(
     `tar -xzf "$HOME/${archive}" -C "$dir"`,
     `(cd "$dir" && "$bun" install >/dev/null 2>&1)`,
     `rm -f "$HOME/${archive}"`,
+    `launcher="$HOME/.local/bin/${bin}"`,
+    `[ ! -d "$launcher" ] || { echo "launcher path is a directory" >&2; exit 1; }`,
+    `candidate="$(mktemp "$HOME/.local/bin/.${bin}.XXXXXX")"`,
+    `trap 'rm -f "$candidate"' EXIT`,
     // Unquoted heredoc: $bun/$dir expand as the launcher is written, \$@ does not.
     // A symlink into src/cli.ts with a `#!/usr/bin/env bun` shebang would look
     // equivalent and isn't — ~/.bun/bin is absent from a non-interactive ssh
     // PATH, so every `fleet exec host '<tool> …'` dies with `env: 'bun': No such
     // file or directory`. Absolute bun path, always.
-    `cat > "$HOME/.local/bin/${bin}" <<LAUNCHER\n#!/bin/sh\nexec "$bun" "$dir/${entry}" "\\$@"\nLAUNCHER`,
-    `chmod 755 "$HOME/.local/bin/${bin}"`,
+    ...(spec.compile ? [
+      `(cd "$dir" && "$bun" build --compile "${entry}" --outfile "$candidate")`,
+      ...(h.os === "mac" ? [
+        `/usr/bin/codesign --force --sign - "$candidate"`,
+        `/usr/bin/codesign --verify --strict "$candidate"`,
+      ] : []),
+      `chmod 755 "$candidate"`,
+      `"$bun" -e 'const p = Bun.spawn([process.argv[1], "--help"], { stdin: "ignore", stdout: "ignore", stderr: "inherit", timeout: 10000, killSignal: "SIGKILL" }); process.exit(await p.exited);' "$candidate"`,
+    ] : [
+      `cat > "$candidate" <<LAUNCHER\n#!/bin/sh\nexec "$bun" "$dir/${entry}" "\\$@"\nLAUNCHER`,
+      `chmod 755 "$candidate"`,
+    ]),
+    `mv -f "$candidate" "$launcher"`,
     `sed "s|__DIR__|$dir|" > "${MANIFEST_DIR_POSIX}/${spec.name}.json" <<'MANIFEST'\n${json}\nMANIFEST`,
     `echo "installed ${spec.name} -> $dir"`,
   ].join("\n") };
@@ -523,6 +545,7 @@ async function installToolPayload(
   const manifest: ToolManifest = {
     tool: spec.name, version: fp.version, hash: !skillPushed && fp.skillPath ? `skill-skipped:${fp.sourceHash ?? fp.hash}` : fp.hash, dir,
     sourceHash: fp.sourceHash,
+    ...(spec.compile ? { compiled: true } : {}),
     syncedAt: new Date().toISOString().slice(0, 19) + "Z",
     ...(skillPushed ? { skill: fp.skillHash } : fp.skillPath ? { skillSkipped: true } : {}),
   };
@@ -546,6 +569,8 @@ export async function syncTool(
 ): Promise<ToolSyncResult[]> {
   const spec = resolveTool(cfg, name);
   const hosts = resolveHosts(cfg, sel);
+  if (spec.compile && hosts.some((host) => host.os === "windows"))
+    throw new Error(`tools.${name}.compile supports Linux and macOS only; no hosts were synced`);
   const stage = await mkdtemp(join(tmpdir(), "fleet-tool-sync-"));
   try {
     const source = join(stage, "source");
@@ -579,7 +604,8 @@ export async function syncTool(
     const fileList = join(stage, "files");
     await Bun.write(fileList, files.map((rel) => `./${rel}\0`).join(""));
     const tar = join(stage, "source.tgz");
-    const build = Bun.spawn(["tar", "czf", tar, "-C", source, "--null", "--no-recursion", "-T", fileList],
+    const build = Bun.spawn(["tar", "czf", tar, ...(process.platform === "darwin" ? ["--no-xattrs"] : []),
+      "-C", source, "--null", "--no-recursion", "-T", fileList],
       { env: { ...process.env, COPYFILE_DISABLE: "1" }, stdout: "ignore", stderr: "pipe" });
     const [code, stderr] = await Promise.all([build.exited, new Response(build.stderr).text()]);
     if (code !== 0) throw new Error(`tarball build failed for ${name}: ${stderr.trim()}`);

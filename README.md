@@ -123,6 +123,8 @@ Help works without configuration or network access: `fleet help exec`,
 `fleet jobs --help`, and `fleet help tools`. Fleet validates its own flags before
 contacting a host. Flags inside an opaque remote command remain command payload.
 Value flags support `--flag=value`; integer timeouts reject fractional values.
+`exec` and `spawn` accept `--` immediately after the selector. Everything after
+that separator belongs to the remote command, including flags such as `--json`.
 
 `fleet edit` treats replacement text literally, including `$&`. Omitting `--new`
 or passing `--new ""` deletes the match. A present `--new` without a value fails.
@@ -139,6 +141,10 @@ the task and temporary control files.
 `jobs list` aliases the bare listing command; `jobs tail --lines N` aliases `-n N`.
 Addressed commands accept both `host:id` and `host id`. Use `--json` for one JSON
 result; live `tail --follow` cannot combine with `--json`.
+
+Linux and macOS cancellation tracks descendant identities through TERM and KILL,
+including children that survive their runner. Exit records are published atomically.
+Empty or malformed records do not hide a live runner or permit pruning it.
 
 Wait timeouts and Ctrl-C stop observation without cancelling the job. Resume
 with the same reference. Unconfirmed launches retain their attempted ID and are
@@ -161,12 +167,10 @@ fleet jobs kill web:<id>             # kill the whole process tree (TERM, escala
 fleet jobs prune [<sel>] [--all]        # remove finished spools (--all also drops dead)
 ```
 
-`kill` sends SIGTERM to the process group, waits up to ~5s, escalates to SIGKILL
-if needed, and only marks the job `exited` (sentinel code 143/137) once the
-process is confirmed gone — a job that somehow survives is reported as an error
-rather than silently mislabelled, so `prune` can never delete the spool out from
-under a still-running job. (Windows uses `taskkill /T /F` + the same
-confirm-then-sentinel dance.)
+`kill` verifies the runner before signalling its process tree. It sends TERM,
+waits up to five seconds, then escalates against surviving tracked descendants.
+It publishes a sentinel exit code only after those processes are gone. Windows
+uses `taskkill /T /F` and confirms that the owned runner has stopped.
 
 `wait` is scriptable: it exits with the job's own code on completion, `0` on a
 `--until` match, `124` on timeout — so `fleet jobs wait web:<id> && deploy`
@@ -199,9 +203,9 @@ fleet cu all install            # the entire fleet
 Each selected host runs its OS's official current-release installer (`install.ps1`
 on Windows, `install.sh` elsewhere). Re-run `install` to update. Windows registers
 the autostart task and starts it with `autostart kick`; UAC elevation is required
-once for RunLevel=Highest. Linux restarts an existing `cua-driver.service` systemd
-user unit, preserving its display environment. Configure that unit before using
-this command on Linux.
+once for RunLevel=Highest. Linux creates and enables a missing systemd user unit
+with `DISPLAY=:0`, then restarts it. Existing units keep their display settings.
+Adjust the unit if your desktop uses another display.
 
 Fleet reports a result for each host and returns a non-zero exit if a download,
 installation, or daemon restart fails.
@@ -238,7 +242,10 @@ This exists because cua-driver's own `effect` field returns `"unverifiable"` for
 input that worked and input that silently did nothing, alike. Fleet hashes the
 window bitmap before and after the action instead, and takes a third capture when
 they differ so a window that repaints on its own (a clock, a spinner, video) is
-not reported as a false change. One ssh round trip.
+not reported as a false change. A failed settling capture reports `indeterminate`.
+Driver errors and missing requested images return failure. A title match selects
+that window, including dialogs. `act` JSON must omit `pid` and `window_id`; Fleet
+supplies them and validates `x,y`. Raw `click {JSON}` remains a driver passthrough.
 
 The immediate payoff: a background click that reports `no_change` tells you the
 target's input stack dropped it, and `--foreground` is the fix — a decision that
@@ -520,6 +527,11 @@ fast with the offending key named (a typo'd group member must error, not
 silently shrink a `reboot @group` fan-out). Group members are also re-checked at
 resolve time.
 
+A source checkout also accepts `fleet.config.example.json` when its main config
+is absent. Compiled binaries search beside the executable, then the user config
+and deployed source directories. Missing-config errors list usable locations.
+An explicit `FLEET_CONFIG` that does not exist fails without falling back.
+
 Override the config path with `FLEET_CONFIG=/path/to.json`. Keep a personal,
 git-ignored `fleet.config.local.json` if you don't want hosts in git.
 
@@ -562,6 +574,14 @@ are not automatically removed.
 
 HTTP MCP request bodies are limited to 16 MiB. Malformed JSON returns 400 and
 oversized bodies return 413. Authentication remains mandatory outside health.
+
+Set `"compile": true` in a tool registry entry to build a native Bun executable
+on Linux or macOS. Sync builds the configured entry on the target, signs and
+verifies macOS candidates, and runs `--help` with a ten-second timeout before
+replacing the launcher. Failed builds preserve the previous executable and
+manifest; source and skill files may already have changed. Bun remains required
+for later builds. Windows targets reject compiled mode before any host is synced.
+Changing the compilation mode makes the previous manifest stale.
 
 ## Development checks
 

@@ -41,14 +41,13 @@ export interface Machine {
 export interface Route {
   prefer: string[];                  // ordered host-entry names: preferred transport first
 }
-/** A CLI tool this fleet distributes to its boxes (`fleet tools`). The registry
- *  is deliberately about *shipping*, not about how the tool is built: a source
- *  root on the controller, an optional paired Agent Skill, and where it lands. */
+/** A CLI tool this fleet distributes to its boxes (`fleet tools`). */
 export interface ToolSpec {
   root: string;         // source dir on the controller (~ expanded), e.g. ~/Development/tg
   skill?: string;       // SKILL.md path, relative to root (default: skills/<name>/SKILL.md if it exists)
   bin?: string;         // launcher name on PATH (default: the tool name)
   entry?: string;       // entrypoint the launcher runs, relative to the install dir (default: src/cli.ts)
+  compile?: boolean;    // build a native Bun executable on Linux/macOS before replacing the launcher
   dir?: string;         // install dir on hosts (default: ~/<name> | %USERPROFILE%\<name>)
   hosts?: string;       // default selector for `fleet tools sync <name>` (default: none — must be explicit)
   exclude?: string[];   // portable glob exclusions on top of node_modules/.git/dist
@@ -199,40 +198,67 @@ export function validateConfig(cfg: FleetConfig, path: string): void {
   for (const [tn, rawTool] of Object.entries(optionalRecord(cfg.tools, "tools"))) {
     const tool = record(rawTool, `tools.${tn}`) as unknown as ToolSpec;
     knownKeys(tool as unknown as Record<string, unknown>,
-      ["root", "skill", "bin", "entry", "dir", "hosts", "exclude"], `tools.${tn}`);
+      ["root", "skill", "bin", "entry", "compile", "dir", "hosts", "exclude"], `tools.${tn}`);
     if (!tool.root || typeof tool.root !== "string") fail(`tools.${tn}: missing/invalid \`root\``);
     for (const key of ["skill", "bin", "entry", "dir", "hosts"] as const)
       stringIfPresent(tool[key], `tools.${tn}.${key}`);
+    if (tool.compile !== undefined && typeof tool.compile !== "boolean")
+      fail(`tools.${tn}.compile must be a boolean`);
     if (tool.exclude !== undefined
       && (!Array.isArray(tool.exclude) || tool.exclude.some((e) => typeof e !== "string" || !e)))
       fail(`tools.${tn}.exclude must be an array of non-empty strings`);
   }
 }
 
+/** Bun's embedded filesystem prefix. `import.meta.url` resolves inside it in a
+ *  `bun build --compile` binary, so ROOT becomes `/$bunfs` there — a path that
+ *  exists only inside the executable and can never be created by a user. */
+const BUNFS = "/$bunfs";
+
 /**
- * Where to read fleet.config.json from.
+ * Every place fleet looks for a config, in order. `FLEET_CONFIG` wins over all
+ * of them.
  *
  * When running from source, ROOT is the repo and the config sits next to it.
- * In a `bun build --compile` binary, `import.meta.url` resolves inside the
- * embedded virtual filesystem, so ROOT becomes `/$bunfs` and the config is
- * unreachable — hence the fallbacks below. FLEET_CONFIG always wins.
+ * In a compiled binary ROOT is inside `BUNFS` and unreachable — hence the
+ * fallbacks. Exported so a not-found error can say where it actually searched.
  */
-export async function resolveConfigPath(): Promise<string> {
-  if (process.env.FLEET_CONFIG) return process.env.FLEET_CONFIG;
-  const repoPath = join(ROOT, "fleet.config.json");
-  const candidates = [
-    repoPath,                                                   // source checkout
+export function configSearchPaths(): string[] {
+  if (process.env.FLEET_CONFIG) return [process.env.FLEET_CONFIG];
+  return [
+    join(ROOT, "fleet.config.json"),                            // source checkout
     join(ROOT, "fleet.config.example.json"),                    // safe public-clone fallback
     join(dirname(process.execPath), "fleet.config.json"),       // beside the binary
     join(homedir(), ".config", "fleet", "fleet.config.json"),   // XDG-ish
     join(homedir(), "fleet", "fleet.config.json"),              // deployed source tree
   ];
+}
+
+export async function resolveConfigPath(): Promise<string> {
+  const candidates = configSearchPaths();
   for (const c of candidates) if (await Bun.file(c).exists()) return c;
-  return repoPath; // keep the original not-found error message
+  return candidates[0]!; // not found — loadConfig turns this into a real message
+}
+
+/** What to tell someone who has no config. The bare ENOENT this replaces named
+ *  `/$bunfs/fleet.config.json` for a compiled binary: a path inside the
+ *  executable that the reader cannot inspect, create, or act on at all. */
+export function configNotFoundMessage(paths = configSearchPaths()): string {
+  if (process.env.FLEET_CONFIG)
+    return `FLEET_CONFIG points at ${paths[0]}, which does not exist`;
+  // A BUNFS path is not somewhere anyone can put a file, so offering it as a
+  // location would be worse than saying nothing.
+  const usable = paths.filter((p) => !p.startsWith(BUNFS));
+  return [
+    "no fleet config found — set FLEET_CONFIG=/path/to/fleet.config.json,"
+      + ` or create one at${usable.length > 1 ? " any of" : ""}:`,
+    ...usable.map((p) => `  ${p}`),
+  ].join("\n");
 }
 
 export async function loadConfig(): Promise<FleetConfig> {
   const path = await resolveConfigPath();
+  if (!await Bun.file(path).exists()) throw new Error(configNotFoundMessage());
   const raw = await Bun.file(path).json() as FleetConfig;
   validateConfig(raw, path);
   for (const [name, h] of Object.entries(raw.hosts)) h.name = name;

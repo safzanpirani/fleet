@@ -52,6 +52,41 @@ async function runCli(
 }
 
 describe("machine-readable CLI output", () => {
+  test("exec and spawn accept a separator after the selector and preserve remote flags", async () => {
+    const { root, bin, config } = fixture();
+    writeFileSync(config, JSON.stringify({ hosts: { local: { ssh: "local", os: "mac" } } }));
+    executable(join(bin, "ssh"), "#!/bin/sh\nexec /bin/bash -s\n");
+    try {
+      const result = await runCli(["exec", "--raw", "local", "--", "printf", "'%s\\n'", "--json"], config, bin);
+      expect(result).toEqual({ code: 0, stdout: "--json\n", stderr: "" });
+      const nested = await runCli(["exec", "--raw", "local", "--", "printf '%s\\n' --help --"], config, bin);
+      expect(nested).toEqual({ code: 0, stdout: "--help\n--\n", stderr: "" });
+      const spawned = await runCli(["spawn", "--json", "local", "--", "printf", "'%s\\n'", "--json"], config, bin, { HOME: root });
+      expect(spawned.code, spawned.stderr).toBe(0);
+      const [{ id }] = JSON.parse(spawned.stdout);
+      const waited = await runCli(["jobs", "wait", `local:${id}`, "--timeout", "5", "--json"], config, bin, { HOME: root });
+      expect(waited.code, waited.stderr).toBe(0);
+      expect(await Bun.file(join(root, ".fleet/jobs", id, "out")).text()).toBe("--json\n");
+      for (const command of ["exec", "spawn"]) {
+        const empty = await runCli([command, "local", "--"], config, bin);
+        expect(empty.code).toBe(1);
+        expect(empty.stderr).toContain("usage:");
+      }
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test("raw cu click JSON remains a driver passthrough", async () => {
+    const { root, bin, config } = fixture();
+    executable(join(bin, "ssh"), "#!/bin/sh\ncat\n");
+    try {
+      const args = '{"pid":42,"window_id":7,"x":12,"y":34}';
+      const result = await runCli(["cu", "local", "click", args], config, bin);
+      expect(result.code, result.stderr).toBe(0);
+      expect(result.stdout).toContain(args);
+      expect(result.stdout).not.toContain("list_apps");
+      expect(result.stdout).not.toContain("__FLEET_HASH__");
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
   test("help works without config and never starts SSH", async () => {
     const { root, bin } = fixture();
     try {
@@ -199,7 +234,7 @@ describe("machine-readable CLI output", () => {
       }
       expect(await Bun.file(marker).exists()).toBe(false);
     } finally { rmSync(root, { recursive: true, force: true }); }
-  });
+  }, 15_000);
 
   test("edit distinguishes missing replacement values and preserves literal replacement bytes", async () => {
     const { root, bin, config } = fixture();

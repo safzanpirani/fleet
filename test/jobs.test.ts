@@ -2,7 +2,7 @@ import { test, expect, describe, spyOn } from "bun:test";
 import { jobLog, jobTail, killScript, listJobs, pruneJobs, resolveJobRef, parseRows, newId, spawnJob, unixSpawnScript, waitJob, waitPoll } from "../src/jobs.ts";
 import * as ssh from "../src/ssh.ts";
 import type { FleetConfig, Host } from "../src/config.ts";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -215,9 +215,9 @@ describe("detached job lifecycle", () => {
     }
   });
 
-  test("macOS kill escalates against resistant descendants after their runner exits", async () => {
+  test.each(["mac", "linux"] as const)("%s kill escalates against resistant descendants after their runner exits", async (os) => {
     const fixtureHome = mkdtempSync(join(tmpdir(), "fleet-job-kill-tree-"));
-    const local = host("local", "mac");
+    const local = host("local", os);
     const dir = join(fixtureHome, ".fleet", "jobs", "resistant-job");
     const unrelated = Bun.spawn(["sleep", "30"], { stdout: "ignore", stderr: "ignore" });
     const pids: number[] = [];
@@ -228,7 +228,9 @@ describe("detached job lifecycle", () => {
       return state !== "" && !state.includes("Z");
     };
     try {
-      const launch = await runBash(unixSpawnScript(local, "resistant-job",
+      // nohup is available on both test platforms; exercise each kill branch
+      // against the same real descendant tree without requiring setsid on macOS.
+      const launch = await runBash(unixSpawnScript({ ...local, os: "mac" }, "resistant-job",
         'trap "" TERM\necho $$ > "$HOME/workload-pid"\nsleep 30 &\necho $! > "$HOME/leaf-pid"\nwait'), fixtureHome);
       expect(launch.code, launch.stderr).toBe(0);
       pids.push(Number(readFileSync(join(dir, "pid"), "utf8")));
@@ -249,6 +251,66 @@ describe("detached job lifecycle", () => {
       rmSync(fixtureHome, { recursive: true, force: true });
     }
   }, 15_000);
+
+  test("exit publication exposes only the complete code, even when rename is delayed", async () => {
+    const fixtureHome = mkdtempSync(join(tmpdir(), "fleet-job-exit-publish-"));
+    const local = host("local", "mac");
+    const dir = join(fixtureHome, ".fleet", "jobs", "publish-job");
+    try {
+      // Delay the final rename while the prepared record is already on disk.
+      const launch = await runBash(`mv() {
+        touch "$HOME/publishing"
+        for i in {1..300}; do [ -f "$HOME/release" ] && break; sleep 0.01; done
+        command mv "$@"
+      }
+      export -f mv
+      ` + unixSpawnScript(local, "publish-job", "exit 7"), fixtureHome);
+      expect(launch.code, launch.stderr).toBe(0);
+      for (let i = 0; i < 100 && !await Bun.file(join(fixtureHome, "publishing")).exists(); i++) await Bun.sleep(10);
+      expect(await Bun.file(join(fixtureHome, "publishing")).exists()).toBe(true);
+      expect(await Bun.file(join(dir, "exit")).exists()).toBe(false);
+      expect((await runBash(waitPoll(local, "publish-job"), fixtureHome)).stdout).toBe("");
+      writeFileSync(join(fixtureHome, "release"), "");
+      for (let i = 0; i < 100 && !await Bun.file(join(dir, "exit")).exists(); i++) await Bun.sleep(10);
+      expect(await Bun.file(join(dir, "exit")).text()).toBe("7\n");
+      expect(readdirSync(dir).filter((name) => name.startsWith(".exit."))).toEqual([]);
+    } finally {
+      writeFileSync(join(fixtureHome, "release"), "");
+      for (let i = 0; i < 100 && !await Bun.file(join(dir, "exit")).exists(); i++) await Bun.sleep(10);
+      rmSync(fixtureHome, { recursive: true, force: true });
+    }
+  });
+
+  test.each(["", "invalid"])("a malformed legacy exit record (%j) cannot hide or prune a live runner", async (record) => {
+    const fixtureHome = mkdtempSync(join(tmpdir(), "fleet-job-exit-invalid-"));
+    const local = host("local", "mac");
+    const fixtureConfig: FleetConfig = { hosts: { local } };
+    const dir = join(fixtureHome, ".fleet", "jobs", "invalid-exit");
+    const execute = spyOn(ssh, "exec").mockImplementation(async (h, script) => {
+      const r = await runBash(script, fixtureHome);
+      return { host: h.name, ok: r.code === 0, ...r };
+    });
+    try {
+      const launch = await runBash(unixSpawnScript(local, "invalid-exit", "echo ready; exec sleep 10"), fixtureHome);
+      expect(launch.code, launch.stderr).toBe(0);
+      for (let i = 0; i < 100 && !Bun.file(join(dir, "out")).size; i++) await Bun.sleep(10);
+      writeFileSync(join(dir, "exit"), record);
+      expect((await runBash(waitPoll(local, "invalid-exit"), fixtureHome)).stdout).toBe("");
+      expect(await listJobs(fixtureConfig, "local")).toMatchObject([{ status: "running", code: null }]);
+      expect(await pruneJobs(fixtureConfig, "local", true)).toEqual([{ host: "local", removed: 0 }]);
+      const unreadable = await runBash("pgrep() { return 2; }\n" + killScript(local, "invalid-exit"), fixtureHome);
+      expect(unreadable.code).toBe(1);
+      expect(unreadable.stderr).toContain("no signals sent");
+      expect(await listJobs(fixtureConfig, "local")).toMatchObject([{ status: "running" }]);
+      const killed = await runBash(killScript(local, "invalid-exit"), fixtureHome);
+      expect(killed.code, killed.stderr).toBe(0);
+      expect(readFileSync(join(dir, "exit"), "utf8").trim()).toMatch(/^\d+$/);
+    } finally {
+      execute.mockRestore();
+      await runBash(killScript(local, "invalid-exit"), fixtureHome);
+      rmSync(fixtureHome, { recursive: true, force: true });
+    }
+  });
 
   test("unconfirmed launches retain each attempted id and never retry", async () => {
     const attempts: string[] = [];

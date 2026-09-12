@@ -659,6 +659,36 @@ async function localScript(home: string, cmd: string): Promise<ssh.ExecResult> {
 }
 
 describe("tool installation transactions", () => {
+  test.skipIf(process.platform !== "darwin")("sync archives omit macOS extended attributes", async () => {
+    const root = makeTool();
+    const file = join(root, "src", "cli.ts");
+    const attribute = "fleet-test-xattr-do-not-ship";
+    const set = Bun.spawnSync(["xattr", "-w", "com.fleet.fixture", attribute, file]);
+    expect(set.exitCode, set.stderr.toString()).toBe(0);
+    let inspected = false;
+    const execute = spyOn(ssh, "exec").mockImplementation(async (h) =>
+      ({ host: h.name, ok: true, code: 0, stdout: "", stderr: "" }));
+    const transfer = spyOn(ssh, "scp").mockImplementation(async (h, source, destination) => {
+      if (destination.endsWith(".tgz")) {
+        const tar = Buffer.from(Bun.gunzipSync(new Uint8Array(await Bun.file(source as string).arrayBuffer()))).toString();
+        expect(tar).toContain("console.log('hi')");
+        expect(tar).not.toContain(attribute);
+        expect(tar).not.toContain("LIBARCHIVE.xattr.");
+        expect(tar).not.toContain("SCHILY.xattr.");
+        inspected = true;
+      }
+      return { host: h.name, ok: true, code: 0, stdout: "", stderr: "" };
+    });
+    try {
+      const [result] = await syncTool(cfgFor(root), "demo", "web", { skill: false });
+      expect(result?.ok, result?.error).toBe(true);
+      expect(inspected).toBe(true);
+    } finally {
+      execute.mockRestore(); transfer.mockRestore();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("Windows locks use exclusive create and close the owner stream", () => {
     const h = host("main", "windows");
     const acquire = toolSyncLockScript(h, "$env:USERPROFILE\\demo", "owner-one").cmd;

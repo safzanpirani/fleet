@@ -34,7 +34,7 @@ fleet exec win-box "nvidia-smi"
 | `fleet jobs log <host:id>` | Full captured output of a job. |
 | `fleet jobs tail <host:id> [-n N] [-f]` | Last N lines; `-f` streams live (foreground until Ctrl-C). |
 | `fleet jobs wait <host:id> [--until <regex>] [--timeout S]` | Block until the job exits (or its output matches `--until`). Scriptable exit code: job's own code on exit, `0` on match, `124` on timeout. |
-| `fleet jobs kill <host:id>` | TERM the whole job process-group. |
+| `fleet jobs kill <host:id>` | TERM the verified job process tree and escalate against surviving descendants. |
 | `fleet jobs prune [<sel>] [--all]` | Remove finished job spools (`--all` also drops dead ones; never touches running). |
 | `fleet cp <local> <sel>:<remote>` | Copy a file to host(s); fan-out across a group. |
 | `fleet edit <sel>:<path> --old S --new S` | Edit a remote file in place, reject ambiguous matches, and print the diff. |
@@ -74,7 +74,7 @@ Anywhere `<sel>` appears: a hostname, logical route, group, `all`, Daytona
 ## Critical rules
 
 - **Don't escape commands.** `fleet exec vps 'echo "a & b | c"'` round-trips verbatim.
-- **Put Fleet flags before the selector.** Fleet rejects misplaced `spawn` flags instead of sending them to the remote shell.
+- **Put Fleet flags before the selector.** Use `fleet exec web -- program --json` or the same separator with `spawn` to keep all following flags in the remote command.
 - **Command syntax is the target's native shell**: bash for Linux hosts, **PowerShell**
   for Windows hosts. So `fleet exec all "uptime"` works on Linux but fails on Windows
   (no native `uptime`). For cross-OS, pick portable commands or scope by group
@@ -131,8 +131,8 @@ and exposes computer-use tools. Same interactive-desktop requirement as `fleet s
 - **Install or update:** `fleet cu <selector> install` runs each host's official
   current-release installer. Windows registers the `cua-driver-serve` autostart task
   and runs `autostart kick`, with one-time UAC elevation for RunLevel=Highest.
-  Linux restarts the existing `cua-driver.service` systemd user unit, preserving its
-  display environment. Configure that unit before installing on Linux. Download,
+  Linux creates and enables `cua-driver.service` when absent, with `DISPLAY=:0`,
+  and preserves existing units. Adjust the unit for other displays. Download,
   installation, and service restart failures return a non-zero exit.
 - **Target by anything.** Every verb takes a pid, a process name (with or without
   `.exe`), an app display name, or a window title. One resolver serves all of them,
@@ -150,9 +150,11 @@ and exposes computer-use tools. Same interactive-desktop requirement as `fleet s
   - `fleet cu win-box act firefox <tool> '{…}'` for any other input tool
   - Flags: `--space window|screen`, `--button`, `--count`, `--foreground`,
     `--settle MS`, `--shot [--grid]` to pull the after-image.
-  Fleet hashes the window bitmap before and after, and takes a third capture when they
-  differ so an animating window is not reported as a false change. One ssh round trip.
-  Do not build your own click-then-screenshot loop; this is it.
+  Fleet hashes the target before and after input. A differing pair requires a
+  successful settling capture; failure reports `indeterminate`. Driver errors and
+  missing requested images return failure. A title match selects that window,
+  including dialogs. `act` JSON must omit `pid` and `window_id`; Fleet supplies
+  them and validates `x,y`.
 - **Traps that cost whole sessions.** The verbs above handle each one; they still bite
   raw passthrough:
   1. **Omitting `window_id` does not mean "the main window".** cua-driver targets the
@@ -207,8 +209,9 @@ and exposes computer-use tools. Same interactive-desktop requirement as `fleet s
 - An image is pulled back **only when `--out` is passed** (or via the `shot-window` verb);
   if a call errors, cua-driver's own message is surfaced (e.g. "Missing window_id — use
   list_windows"), not a misleading scp error.
-- `shot-window` resolves pid→window→capture in a **single remote round-trip** (~3s),
-  not five. Plain `cu` calls are ~1.3s each.
+- `shot-window` reads the desktop snapshot, captures the selected windows, then
+  transfers and cleans up images. Raw `click {JSON}` bypasses Fleet target
+  resolution, coordinate checks, and effect verification.
 - **`--grid` [--grid-step N]** overlays a labeled pixel-coordinate grid (default 100px) on
   any capture (`shot`, `cu --out`, `shot-window`) — read off x,y before a click, since cua
   coords are **window-local pixels**. On `shot-window` the image also carries a caption
@@ -303,3 +306,7 @@ For one-off work on the local machine, or hosts not in `fleet.config.json`, use 
 - Sync and deploy share a lock per installation directory and use unique archives. A timeout or disconnect retains the lock; inspect the operation before removing it or retrying.
 - Daytona defaults to five minutes and requires positive explicit timeouts. `--timeout 0` only disables SSH execution deadlines.
 - HTTP MCP limits request bodies to 16 MiB. Malformed JSON returns 400; oversized requests return 413.
+
+- Exit records are published atomically. Empty or malformed records do not hide a live runner or allow pruning it. Linux and macOS cancellation tracks surviving descendants through TERM and KILL.
+- Set `tools.<name>.compile` to `true` for native Bun executables on Linux/macOS. Sync builds, signs macOS candidates, and requires `--help` to succeed within ten seconds before replacing the launcher. Failed builds preserve the prior executable and manifest; source and skills may already be updated. Windows selections fail before syncing.
+- `FLEET_CONFIG` takes precedence and fails if its file is absent. Source checkouts retain the example-config fallback. Missing-config diagnostics omit Bun embedded filesystem paths.

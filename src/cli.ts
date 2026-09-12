@@ -231,6 +231,8 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
       const scriptPath = typeof flags["--script"] === "string" && flags["--script"] ? flags["--script"] : undefined;
       const interp = typeof flags["--interp"] === "string" && flags["--interp"] ? flags["--interp"] : undefined;
       const sel = pos.shift();
+      const separated = pos[0] === "--";
+      if (separated) pos.shift();
       const cmd = pos.join(" ");
       if (scriptPath) {
         if (!sel) die("usage: fleet exec --script <file|-> [--interp cmd] [--cwd dir] [--timeout S] [--wsl] [--raw] [--json] <sel>");
@@ -248,12 +250,12 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
       // AFTER <sel>, where it is treated as part of the command and shipped to
       // the remote shell verbatim — which fails far away from the real cause.
       // (`--shell wsl` is a common invention; the real flag is `--wsl`.)
-      const strayFlag = pos[0]?.startsWith("--") ? pos[0] : undefined;
+      const strayFlag = !separated && pos[0]?.startsWith("--") ? pos[0] : undefined;
       if (strayFlag === "--shell")
         die(`there is no --shell flag; use --wsl, and put it BEFORE the host: fleet exec --wsl ${sel} <cmd…>`);
       if (strayFlag && ["--json", "--wsl", "--raw", "--cwd", "--timeout", "--script", "--interp"].includes(strayFlag))
         die(`'${strayFlag}' must come BEFORE the host selector: fleet exec ${strayFlag} ${sel} <cmd…>`);
-      const trailing = trailingFleetFlag(pos, ["--json", "--wsl", "--raw"], ["--cwd", "--timeout", "--script", "--interp"]);
+      const trailing = separated ? undefined : trailingFleetFlag(pos, ["--json", "--wsl", "--raw"], ["--cwd", "--timeout", "--script", "--interp"]);
       if (trailing)
         die(`'${trailing}' must come BEFORE the host selector: fleet exec ${trailing} ${sel} <cmd…>  (quote the whole command if it really ends in ${trailing})`);
       // a bare machine name (dual-boot box) auto-routes to whichever boot is live
@@ -271,9 +273,11 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
       const cwd = typeof flags["--cwd"] === "string" && flags["--cwd"] ? flags["--cwd"] : undefined;
       const label = typeof flags["--label"] === "string" && flags["--label"] ? flags["--label"] : undefined;
       const sel = pos.shift();
+      const separated = pos[0] === "--";
+      if (separated) pos.shift();
       const cmd = pos.join(" ");
       if (!sel || !cmd) die("usage: fleet spawn [--cwd dir] [--label name] [--json] <sel> <cmd…>");
-      const misplaced = ["--cwd", "--label", "--json", "--name"].includes(pos[0] ?? "") ? pos[0]
+      const misplaced = separated ? undefined : ["--cwd", "--label", "--json", "--name"].includes(pos[0] ?? "") ? pos[0]
         : trailingFleetFlag(pos, ["--json"], ["--cwd", "--label", "--name"]);
       if (misplaced === "--name")
         die("there is no --name flag; use --label, and put it BEFORE the host: fleet spawn --label <name> " + sel + " <cmd…>");
@@ -781,7 +785,10 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
 
       // ── verified input: resolve → act → prove the pixels moved ─────────────
       const ACT_VERBS = ["click", "key", "type", "act"] as const;
-      if (ACT_VERBS.includes(verb as typeof ACT_VERBS[number])) {
+      // Preserve the driver's original `click {JSON}` passthrough alongside
+      // Fleet's `click TARGET X Y` convenience form.
+      const rawClick = verb === "click" && rest.length === 2 && /^\s*\{/.test(rest[1]!);
+      if (!rawClick && ACT_VERBS.includes(verb as typeof ACT_VERBS[number])) {
         const q = rest[1] ?? die(`usage: fleet cu <host> ${verb} <pid|process|app|title> …`);
         const shotPath = wantShot || out ? (out ?? `${autoName(q)}.${await preferredImageExt()}`) : undefined;
 

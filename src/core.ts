@@ -275,21 +275,31 @@ export async function runScript(
 // ── cp ────────────────────────────────────────────────────────────────────────
 export async function pushFile(
   cfg: FleetConfig, local: string | string[], sel: string, remote: string, recursive = false,
+  deps: { exec?: typeof exec; scp?: typeof scp } = {},
 ): Promise<ExecResult[]> {
   const hosts = resolveHosts(cfg, sel);
+  const run = deps.exec ?? exec;
+  const copy = deps.scp ?? scp;
   // scp needs the destination directory to exist. A trailing slash states the
   // intent unambiguously, so create it instead of failing with "No such file".
   const wantsDir = /[\\/]$/.test(remote) && remote.length > 1;
   return Promise.all(hosts.map(async (h) => {
     if (wantsDir && h.transport !== "daytona") {
+      // `New-Item` has no -LiteralPath in ANY PowerShell version, so this step
+      // used to fail on every Windows trailing-slash destination — tilde or
+      // absolute alike. Its -Path form exists but globs, so `[1]` in a path
+      // would miss. GetUnresolvedProviderPathFromPSPath resolves `~` and
+      // relative paths the way the rest of the session does, without globbing;
+      // CreateDirectory is literal, recursive, and idempotent.
       const mk = h.os === "windows"
-        ? `New-Item -ItemType Directory -Force -LiteralPath '${psEsc(remote)}' | Out-Null`
+        ? `[void][System.IO.Directory]::CreateDirectory(`
+          + `$ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath('${psEsc(remote)}'))`
         : `${bashPathAssignment("d", remote)}
 mkdir -p -- "$d"`;
-      const r = await exec(h, mk, "auto");
+      const r = await run(h, mk, "auto");
       if (!r.ok) return { ...r, stderr: `could not create destination directory ${remote}: ${r.stderr.trim() || "exit " + r.code}` };
     }
-    return scp(h, local, remote, recursive);
+    return copy(h, local, remote, recursive);
   }));
 }
 
@@ -643,7 +653,8 @@ export async function deployHosts(
   const tar = join(staging, "source.tgz");
   try {
     const build = Bun.spawn(
-      ["tar", "czf", tar, "-C", sourceRoot, "--exclude", "node_modules", "--exclude", ".git", "--exclude", "dist", "--exclude", ".scratch", "."],
+      ["tar", "czf", tar, ...(process.platform === "darwin" ? ["--no-xattrs"] : []), "-C", sourceRoot,
+        "--exclude", "node_modules", "--exclude", ".git", "--exclude", "dist", "--exclude", ".scratch", "."],
       { env: { ...process.env, COPYFILE_DISABLE: "1" }, stdout: "ignore", stderr: "pipe" });
     const [buildCode, buildError] = await Promise.all([
       build.exited,
@@ -1338,6 +1349,33 @@ function cuaBin(os: Host["os"]): { prelude: string; invoke: string } {
   };
 }
 
+/** The systemd user unit that runs the daemon on Linux.
+ *
+ *  cua-driver does not write this itself: its `autostart enable` is Windows-only
+ *  as of 0.26, and the Linux recipe lives in install-local.sh, which builds from
+ *  a repo checkout and is marked not-for-end-users. So a fresh Linux host has
+ *  the binary and no service, and `systemctl --user restart` on it fails with
+ *  "Unit cua-driver.service not found" — which is what this install used to do.
+ *
+ *  DISPLAY matters: the daemon drives the desktop, so it needs the graphical
+ *  session rather than the environment an SSH login happens to carry. */
+const CUA_LINUX_UNIT = [
+  "[Unit]",
+  "Description=cua-driver computer-use daemon",
+  "After=graphical-session.target",
+  "PartOf=graphical-session.target",
+  "",
+  "[Service]",
+  "Type=simple",
+  "Environment=DISPLAY=:0",
+  "ExecStart=%h/.local/bin/cua-driver serve --socket %h/.cache/cua-driver/cua-driver.sock",
+  "Restart=on-failure",
+  "RestartSec=2",
+  "",
+  "[Install]",
+  "WantedBy=graphical-session.target default.target",
+].join("\n");
+
 /** Install the current release, then restart the host's desktop daemon. */
 function cuInstallCmd(os: Host["os"]): { cmd: string; shell: Shell } {
   if (os === "windows") return {
@@ -1345,13 +1383,29 @@ function cuInstallCmd(os: Host["os"]): { cmd: string; shell: Shell } {
     cmd: `$ErrorActionPreference='Stop'; irm https://raw.githubusercontent.com/trycua/cua/main/libs/cua-driver/scripts/install.ps1 | iex; `
       + `& "$env:LOCALAPPDATA\\Programs\\Cua\\cua-driver\\bin\\cua-driver.exe" autostart kick`,
   };
+  // `bash -c "$installer" <flag>` would pass the flag as $0, not $1, so any
+  // argument has to come after an explicit $0 placeholder. Nothing needs one
+  // today; the placeholder is here so adding one later does not silently do
+  // nothing.
+  const runInstaller = `/bin/bash -c "$installer" cua-driver-install || exit $?`;
+  if (os !== "linux") return {
+    shell: "bash",
+    cmd: `installer=$(curl -fsSL https://raw.githubusercontent.com/trycua/cua/main/libs/cua-driver/scripts/install.sh) || exit $?\n`
+      + `${runInstaller}\n`
+      + `"$(command -v cua-driver || echo "$HOME/.local/bin/cua-driver")" autostart kick`,
+  };
   return {
     shell: "bash",
     cmd: `installer=$(curl -fsSL https://raw.githubusercontent.com/trycua/cua/main/libs/cua-driver/scripts/install.sh) || exit $?\n`
-      + `/bin/bash -c "$installer" || exit $?\n`
-      + (os === "linux"
-        ? `systemctl --user restart cua-driver.service`
-        : `"$(command -v cua-driver || echo "$HOME/.local/bin/cua-driver")" autostart kick`),
+      + `${runInstaller}\n`
+      + `unit="$HOME/.config/systemd/user/cua-driver.service"\n`
+      + `if [ ! -f "$unit" ]; then\n`
+      + `  mkdir -p "$(dirname "$unit")"\n`
+      + `  cat > "$unit" <<'CUA_UNIT'\n${CUA_LINUX_UNIT}\nCUA_UNIT\n`
+      + `  systemctl --user daemon-reload\n`
+      + `  systemctl --user enable cua-driver.service\n`
+      + `fi\n`
+      + `systemctl --user restart cua-driver.service`,
   };
 }
 
@@ -1865,6 +1919,7 @@ export function cuLooksModal(main: CuWindowInfo, w: CuWindowInfo): boolean {
  *  name, or a window title, exact-first then prefix then substring. */
 export function cuResolveTargetFrom(snap: CuSnapshot, query: string): CuTarget {
   const q = query.trim();
+  if (!q) throw new Error("an app, process, PID, or window title is required");
   const byPid = identitiesByPid(snap);
   const windowsFor = (pid: number) => snap.windows.filter((w) => w.pid === pid);
 
@@ -1905,7 +1960,12 @@ export function cuResolveTargetFrom(snap: CuSnapshot, query: string): CuTarget {
   }
 
   const mine = windowsFor(pid);
-  const window = mainWindowFor(mine);
+  const titleMatches = matched === "title"
+    ? mine.filter((w) => w.title.toLowerCase() === q.toLowerCase())
+    : [];
+  const window = mainWindowFor(matched === "title"
+    ? (titleMatches.length ? titleMatches : mine.filter((w) => w.title.toLowerCase().includes(q.toLowerCase())))
+    : mine);
   const name = byPid.get(pid)?.display ?? String(pid);
   if (!window) throw new Error(
     `${name} (pid ${pid}) has no top-level windows cua-driver can address`
@@ -1948,6 +2008,7 @@ export function cuBlockerNote(target: CuTarget): string | undefined {
 export function cuResolvePoint(
   target: CuTarget, x: number, y: number, space: "window" | "screen" = "window",
 ): { x: number; y: number } {
+  if (!Number.isFinite(x) || !Number.isFinite(y)) throw new Error("x and y must be finite numbers");
   const { capture, window: win } = target;
   const local = space === "screen"
     ? { x: (x - win.x) * (capture.width / Math.max(1, win.width)),
@@ -2254,13 +2315,24 @@ export async function cuAct(
   const { prelude, invoke } = cuaBin(host.os);
   const win = host.os === "windows";
   const settle = Math.max(0, Math.round(opts.settleMs ?? 400));
+  if (!Number.isFinite(settle)) throw new Error("settleMs must be finite");
+  if (!payload || typeof payload !== "object" || Array.isArray(payload))
+    throw new Error("action arguments must be a JSON object");
+  for (const key of ["pid", "window_id"])
+    if (Object.hasOwn(payload, key)) throw new Error(`${key} is supplied by Fleet; select the target by app, PID, or window title`);
+  if (payload.scope !== undefined && payload.scope !== "window")
+    throw new Error("verified actions require window scope");
 
-  // window_id is ALWAYS sent: omitted, cua-driver targets the pid's frontmost
-  // window, which is the modal when one is open.
+  let argumentPoint: { x: number; y: number } | undefined;
+  if (Object.hasOwn(payload, "x") || Object.hasOwn(payload, "y")) {
+    if (typeof payload.x !== "number" || typeof payload.y !== "number")
+      throw new Error("x and y must be given together as finite numbers");
+    argumentPoint = cuResolvePoint(target, payload.x, payload.y);
+  }
   const point = opts.point
     ? cuResolvePoint(target, opts.point.x, opts.point.y, opts.point.space ?? "window")
-    : undefined;
-  const full = { pid: target.pid, window_id: target.window.window_id, ...payload, ...point };
+    : argumentPoint;
+  const full = { ...payload, ...point, pid: target.pid, window_id: target.window.window_id };
   const actArgs = [tool, JSON.stringify(full)];
   const sleep = win ? `Start-Sleep -Milliseconds ${settle}` : `sleep ${(settle / 1000).toFixed(3)}`;
   const hashOf = (tag: string) => cuHashBlock(host.os, invoke, target.pid, target.window.window_id, tag);
@@ -2270,7 +2342,9 @@ export async function cuAct(
     `$ErrorActionPreference='Continue'`,
     prelude,
     hashOf("A"),
-    `$act = (${cuInvocation(actArgs, host.os, invoke)} 2>&1)`,
+    `if (-not $hA) { Write-Error 'could not capture target before input'; exit 1 }`,
+    `$act = @(${cuInvocation(actArgs, host.os, invoke)} 2>&1); $actSucceeded = $?; $actCode = $LASTEXITCODE`,
+    `if ($null -eq $actCode) { $actCode = 0 }; if (-not $actSucceeded -and $actCode -eq 0) { $actCode = 1 }`,
     `Write-Output '${CAP_SENTINEL}act|'`,
     `$act | Write-Output`,
     `Write-Output '${END_SENTINEL}'`,
@@ -2287,12 +2361,15 @@ export async function cuAct(
       : `Remove-Item -LiteralPath $keep -Force -EA SilentlyContinue`,
     `Remove-Item -LiteralPath $outA -Force -EA SilentlyContinue`,
     `if ($outC) { Remove-Item -LiteralPath $outB -Force -EA SilentlyContinue }`,
+    `exit $actCode`,
   ].join("\n") : [
     `_fleet_hash() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" 2>/dev/null | cut -d' ' -f1; else shasum -a 256 "$1" 2>/dev/null | cut -d' ' -f1; fi; }`,
     prelude,
     hashOf("A"),
+    `[ -n "$hA" ] || { echo 'could not capture target before input' >&2; exit 1; }`,
     `echo '${CAP_SENTINEL}act|'`,
     `${cuInvocation(actArgs, host.os, invoke)} 2>&1`,
+    `act_code=$?`,
     `echo '${END_SENTINEL}'`,
     sleep,
     hashOf("B"),
@@ -2305,6 +2382,7 @@ export async function cuAct(
     wantImage
       ? `if [ -s "$keep" ]; then echo "${IMG_SENTINEL}$keep"; fi`
       : `rm -f "$keep"`,
+    `exit "$act_code"`,
   ].join("\n");
 
   const raw = await run(host, script, win ? "powershell" : "bash");
@@ -2324,7 +2402,9 @@ export async function cuAct(
     reason = "a window capture failed, so the before/after comparison could not run";
   } else if (hA === hB) {
     effect = "no_change";
-  } else if (hC && hB !== hC) {
+  } else if (!hC) {
+    reason = "the settling capture failed, so the pixel change could not be verified";
+  } else if (hB !== hC) {
     reason = "the window is still repainting on its own (animation, video, a live clock)"
       + " — the pixels moved, but not provably because of this action";
   } else {
@@ -2342,10 +2422,12 @@ export async function cuAct(
     result: { ...raw, stdout: driverOutput },
   };
 
-  if (!remote || !opts.imageOut) return base;
+  if (!opts.imageOut) return base;
+  if (!remote) return { ...base, result: { ...base.result, ok: false, code: base.result.code || 1,
+    stderr: [base.result.stderr, "cua-driver produced no requested after-image"].filter(Boolean).join("\n") } };
   try {
     const { result: pull, path } = await (deps.deliver ?? deliverImage)(host, remote, opts.imageOut);
-    if (!pull.ok) return { ...base, result: { ...base.result, stderr:
+    if (!pull.ok) return { ...base, result: { ...base.result, ok: false, code: base.result.code || pull.code || 1, stderr:
       [base.result.stderr, `image pull failed: ${pull.stderr}`].filter(Boolean).join("\n") } };
     await validateImageArtifact(path);
     return { ...base, localImage: path };

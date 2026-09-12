@@ -1,5 +1,5 @@
 import { test, expect, describe } from "bun:test";
-import { resolveHosts, validateConfig } from "../src/config.ts";
+import { configNotFoundMessage, configSearchPaths, resolveHosts, validateConfig } from "../src/config.ts";
 import type { FleetConfig, Host } from "../src/config.ts";
 
 const host = (name: string, os: Host["os"], gpu = false): Host =>
@@ -196,8 +196,9 @@ describe("validateConfig", () => {
   test("unknown top-level, host, and nested fields fail instead of becoming no-ops", () => {
     expect(() => validateConfig({ ...base(), typo: true } as any, "t")).toThrow(/unknown field.*typo/);
     const badHost = base();
-    (badHost.hosts.vps as any).loadout = true;
-    expect(() => validateConfig(badHost, "t")).toThrow(/hosts\.vps.*loadout/);
+    // Use an obviously fake field name so the fixture cannot imply a feature.
+    (badHost.hosts.vps as any).notAHostField = true;
+    expect(() => validateConfig(badHost, "t")).toThrow(/hosts\.vps.*notAHostField/);
     const badService = base();
     badService.hosts.vps!.services = { web: { type: "systemd", name: "web", typo: 1 } as any };
     expect(() => validateConfig(badService, "t")).toThrow(/services\.web.*typo/);
@@ -232,5 +233,58 @@ describe("validateConfig", () => {
       hosts: { app: { name: "app", ssh: "app", os: "linux", services: {}, deploy: { service: "typo" } } },
     } as FleetConfig;
     expect(() => validateConfig(bad, "test.json")).toThrow(/deploy\.service: unknown service 'typo'/);
+  });
+});
+
+describe("finding a config", () => {
+  const withEnv = async <T>(value: string | undefined, fn: () => T | Promise<T>): Promise<T> => {
+    const had = Object.hasOwn(process.env, "FLEET_CONFIG");
+    const prev = process.env.FLEET_CONFIG;
+    if (value === undefined) delete process.env.FLEET_CONFIG;
+    else process.env.FLEET_CONFIG = value;
+    try { return await fn(); }
+    finally {
+      if (had) process.env.FLEET_CONFIG = prev;
+      else delete process.env.FLEET_CONFIG;
+    }
+  };
+
+  test("FLEET_CONFIG is the only candidate when it is set", async () => {
+    expect(await withEnv("/tmp/explicit.json", configSearchPaths)).toEqual(["/tmp/explicit.json"]);
+  });
+
+  test("without it, every fallback is searched in order", async () => {
+    const paths = await withEnv(undefined, configSearchPaths);
+    expect(paths.length).toBeGreaterThan(1);
+    expect(paths.every((p) => /fleet\.config(?:\.example)?\.json$/.test(p))).toBe(true);
+    expect(paths[1]).toBe(paths[0]!.replace("fleet.config.json", "fleet.config.example.json"));
+  });
+
+  test("an explicit FLEET_CONFIG that does not exist names itself", async () => {
+    expect(await withEnv("/nope/missing.json", () => configNotFoundMessage()))
+      .toBe("FLEET_CONFIG points at /nope/missing.json, which does not exist");
+  });
+
+  test("the not-found message lists real places and never a /$bunfs path", async () => {
+    // A compiled binary resolves its own root inside Bun's embedded filesystem,
+    // so the bare ENOENT this replaced told the reader to look at
+    // `/$bunfs/fleet.config.json` — a path inside the executable that cannot be
+    // inspected or created.
+    const message = await withEnv(undefined, () => configNotFoundMessage([
+      "/$bunfs/fleet.config.json",
+      "/opt/fleet/fleet.config.json",
+      "/home/u/.config/fleet/fleet.config.json",
+    ]));
+    expect(message).not.toContain("bunfs");
+    expect(message).toContain("FLEET_CONFIG=");
+    expect(message).toContain("/opt/fleet/fleet.config.json");
+    expect(message).toContain("/home/u/.config/fleet/fleet.config.json");
+  });
+
+  test("a single usable location does not say \"any of\"", async () => {
+    const message = await withEnv(undefined,
+      () => configNotFoundMessage(["/$bunfs/fleet.config.json", "/opt/fleet/fleet.config.json"]));
+    expect(message).not.toContain("any of");
+    expect(message).toContain("/opt/fleet/fleet.config.json");
   });
 });
