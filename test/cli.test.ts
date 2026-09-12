@@ -4,6 +4,7 @@ import type { FleetConfig } from "../src/config.ts";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
+import { cuaFixture } from "./helpers/cua-driver.ts";
 
 const cli = join(import.meta.dir, "../src/cli.ts");
 
@@ -52,6 +53,38 @@ async function runCli(
 }
 
 describe("machine-readable CLI output", () => {
+  test("named pointer and keyboard controls and file batches work through the CLI", async () => {
+    const fixture = await cuaFixture();
+    const env = { CUA_FIXTURE_ROOT: fixture.root, TMPDIR: fixture.root };
+    try {
+      const commands = [
+        ["drag", "Fixture", "120", "240", "300", "400", "--space", "screen", "--duration", "50"],
+        ["right-click", "Fixture", "10", "20"], ["double-click", "Fixture", "10", "20"],
+        ["scroll", "Fixture", "down", "2", "--by", "page"],
+        ["hotkey", "Fixture", "ctrl", "a"],
+      ];
+      for (const args of commands) {
+        const result = await runCli(["cu", "local", ...args, "--settle", "0", "--json"], fixture.config, fixture.bin, env);
+        expect(result.code, result.stderr).toBe(0);
+        expect(JSON.parse(result.stdout).result.ok).toBe(true);
+      }
+      const events = await fixture.read("events");
+      expect(events.map((e: any) => e.tool)).toEqual(["drag", "right_click", "double_click", "scroll", "hotkey"]);
+      expect(events[0].payload).toMatchObject({ from_x: 10, from_y: 20, to_x: 100, to_y: 100, duration_ms: 50 });
+      expect(events[3].payload).toMatchObject({ direction: "down", amount: 2, by: "page" });
+      expect(events[4].payload.keys).toEqual(["ctrl", "a"]);
+      const batchFile = join(fixture.root, "batch.json");
+      writeFileSync(batchFile, JSON.stringify([{ tool: "type_text", args: { text: "fixture text" } }, { tool: "press_key", args: { key: "Tab" } }]));
+      const batch = await runCli(["cu", "local", "batch", "Fixture", "--file", batchFile, "--settle", "0", "--json"], fixture.config, fixture.bin, env);
+      expect(batch.code, batch.stderr).toBe(0);
+      expect(JSON.parse(batch.stdout).actions.map((a: any) => a.status)).toEqual(["completed", "completed"]);
+      const raw = await runCli(["cu", "local", "drag", '{"pid":42,"window_id":7,"from_x":1,"from_y":2,"to_x":3,"to_y":4}'], fixture.config, fixture.bin, env);
+      expect(raw.code, raw.stderr).toBe(0);
+      expect(raw.stdout).toContain("reply drag");
+      expect((await fixture.read("events")).at(-1).payload.to_x).toBe(3);
+    } finally { await fixture.cleanup(); }
+  }, 15_000);
+
   test("exec and spawn accept a separator after the selector and preserve remote flags", async () => {
     const { root, bin, config } = fixture();
     writeFileSync(config, JSON.stringify({ hosts: { local: { ssh: "local", os: "mac" } } }));

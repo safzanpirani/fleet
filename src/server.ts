@@ -17,7 +17,7 @@ import {
   gpuRows, diskRows, hostStatus, runRecipe, captureScreenshot, overlayGrid, cuRun,
   cuInstall, cuTools, cuDescribe, cuRecordStart, cuRecordStop, cuRecordStatus,
   cuApps, cuShotWindow, browseHost, deployHosts, diagnose,
-  cuSnapshot, cuResolveTargetFrom, cuResolvePoint, cuAct, cuBlockerNote,
+  cuSnapshot, cuResolveTargetFrom, cuResolvePoint, cuAct, cuBatch, CU_BATCH_TOOLS, cuBlockerNote,
   cuGridCaption, cuElementSupport, compactCuOutput, briefDescribe,
   rebootHosts, firmwareRebootHosts, bootState, switchMachine, waitFor, routeSelector, svcStatus,
 } from "./core.ts";
@@ -940,11 +940,11 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       app: z.string().describe("PID, process name, app name, or window title."),
       tool: z.string().describe("cua-driver input tool: click, press_key, type_text, scroll, hotkey, …"),
       args: z.record(z.string(), z.any()).optional()
-        .describe("Tool arguments WITHOUT pid/window_id — Fleet supplies those."),
+        .describe("Tool arguments WITHOUT pid/window_id/target or from_zoom. Fleet supplies the target and checks x/y and drag endpoints."),
       x: z.number().optional().describe("Pixel X, validated and translated into window-local space."),
       y: z.number().optional().describe("Pixel Y, validated and translated into window-local space."),
       space: z.enum(["window", "screen"]).optional()
-        .describe("Frame for x/y. window (default) = pixels in the shot-window capture; screen = desktop."),
+        .describe("Frame for all coordinates, including args.from_x/from_y/to_x/to_y. window (default) = shot-window pixels; screen = desktop."),
       settleMs: z.number().int().min(0).max(10000).optional()
         .describe("Wait before the after-capture (default 400)."),
       screenshot: z.boolean().optional().describe("Return the after image."),
@@ -957,7 +957,7 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       if ((x === undefined) !== (y === undefined))
         return text("x and y must be given together", true);
       const r = await cuAct(cfg, target, app, tool, { ...(args ?? {}) }, {
-        settleMs, imageOut: local,
+        settleMs, imageOut: local, space,
         point: x !== undefined && y !== undefined ? { x, y, space: space ?? "window" } : undefined,
       });
       const note = cuBlockerNote(r.target);
@@ -980,6 +980,44 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     } catch (error) {
       return text(error instanceof Error ? error.message : String(error), true);
     }
+  });
+
+  server.registerTool("fleet_cu_batch", {
+    title: "Run ordered window input and capture the result",
+    description: "Run 1–100 ordered input actions on one exact window in a single remote execution after target discovery. "
+      + "All coordinates are checked before input. Stops at the first driver failure without retrying. "
+      + "Returns each step's completed/failed/not_run/unconfirmed status and the whole sequence's pixel effect. "
+      + "Take a fresh observation between batches that open dialogs, move windows, or change layout. "
+      + "A completed step confirms driver exit, not its application effect. Screenshot is returned by default. " + sel,
+    inputSchema: {
+      host: z.string().describe("One host or route."),
+      app: z.string().min(1).describe("PID, process name, app name, or exact window title shared by every action."),
+      actions: z.array(z.object({
+        tool: z.enum(CU_BATCH_TOOLS),
+        args: z.record(z.string(), z.any()).optional().describe("Raw tool arguments without pid/window_id/target or from_zoom."),
+        space: z.enum(["window", "screen"]).optional().describe("Override the batch coordinate space for this action."),
+        delayMs: z.number().int().min(0).max(10000).optional().describe("Delay after successful input; at most 60000 ms total."),
+      }).strict()).min(1).max(100),
+      space: z.enum(["window", "screen"]).optional(),
+      settleMs: z.number().int().min(0).max(10000).optional(),
+      screenshot: z.boolean().optional().describe("Return the final image (default true)."),
+      grid: z.boolean().optional().describe("Overlay the final image coordinate grid."),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
+  }, async ({ host, app, actions, space, settleMs, screenshot, grid }) => {
+    const run = async (local?: string) => {
+      const r = await cuBatch(cfg, await routeSelector(cfg, host), app, actions, { space, settleMs, imageOut: local });
+      const note = cuBlockerNote(r.target);
+      const { localImage, ...summary } = r;
+      const content: any[] = [{ type: "text", text: JSON.stringify({ ...summary, ...(note ? { warning: note } : {}) }) }];
+      if (localImage) {
+        if (grid) await overlayGrid(localImage, { caption: cuGridCaption(r.target), banner: note });
+        content.push({ type: "image", data: await consumeImage(localImage), mimeType: "image/png" });
+      }
+      return { content, isError: !r.result.ok };
+    };
+    try { return screenshot !== false || grid ? await withTempImage("fleet-cua-batch-", run) : await run(); }
+    catch (error) { return text(error instanceof Error ? error.message : String(error), true); }
   });
 
   server.registerTool("fleet_deploy", {

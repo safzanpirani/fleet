@@ -43,6 +43,7 @@ const MUTATING_TOOLS = [
   "fleet_cp",
   "fleet_cu",
   "fleet_cu_act",
+  "fleet_cu_batch",
   "fleet_cu_apps",
   "fleet_cu_screenshot_window",
   "fleet_cu_windows",
@@ -87,6 +88,30 @@ function toolByName(tools: Tool[], name: string): Tool {
 }
 
 describe("Fleet MCP parity", () => {
+  test("MCP batches forward ordered input and expose partial failure as an error", async () => {
+    const batch = spyOn(core, "cuBatch").mockImplementation(async (_cfg, host, app, actions, opts) => {
+      expect(host).toBe("local");
+      expect(app).toBe("Fixture");
+      expect(actions.map((action) => action.tool)).toEqual(["drag", "scroll"]);
+      expect(opts?.space).toBe("screen");
+      expect(opts?.imageOut).toBeUndefined();
+      return { host, target: { name: "Fixture", pid: 42, window: { window_id: 7 }, blockers: [], siblings: [] },
+        effect: "indeterminate", hashes: [], actions: [{ index: 0, status: "failed", code: 17 }, { index: 1, status: "not_run", code: null }],
+        result: { host, ok: false, code: 17, stdout: "", stderr: "driver refused" } } as any;
+    });
+    try {
+      await withClient(false, async (client) => {
+        const result = await client.callTool({ name: "fleet_cu_batch", arguments: {
+          host: "local", app: "Fixture", space: "screen", screenshot: false,
+          actions: [{ tool: "drag", args: { from_x: 1, from_y: 2, to_x: 3, to_y: 4 } }, { tool: "scroll", args: { direction: "down" } }],
+        } });
+        expect(result.isError).toBe(true);
+        expect(JSON.stringify(result.content)).toContain("not_run");
+        expect(batch.mock.calls).toHaveLength(1);
+      });
+    } finally { batch.mockRestore(); }
+  });
+
   test("service restart describes and executes every matching service host", async () => {
     const execute = spyOn(ssh, "exec").mockImplementation(async (host) => ({
       host: host.name, ok: true, code: 0, stdout: "restarted", stderr: "",

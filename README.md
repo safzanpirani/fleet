@@ -485,6 +485,36 @@ stdio server (`mcp.ts`) and the remote HTTP server (`http.ts`). All of them —
 plus the CLI (`cli.ts`) — are thin frontends over the `core.ts` action layer, so
 the quoting-proof shell construction lives in exactly one place.
 
+### Computer-use controls and batches
+
+`fleet cu` has named `click`, `right-click`, `double-click`, `drag`, `scroll`,
+`hotkey`, `key`, and `type` commands. Use `act <target> <tool> <JSON>` for other
+window input, or `<tool> <JSON>` for raw driver access. Drag endpoints and other
+coordinates are checked against the selected window. `--space screen` translates
+desktop coordinates; `--json` returns one structured result.
+
+```sh
+fleet cu web drag "Example App" 100 80 300 200 --duration 500
+fleet cu web scroll "Example App" down 2 --by page
+fleet cu web batch "Example App" '[{"tool":"click","args":{"x":100,"y":80}},{"tool":"type_text","args":{"text":"example"}}]' --shot --json
+```
+
+A batch targets one fixed window, executes ordered input on the host, and captures
+before/after the whole sequence. Use `--file actions.json` or `-` for stdin. Each
+entry has `tool`, optional `args`, optional coordinate `space`, and optional
+`delayMs`. It stops on the first driver error or structured refusal without retrying.
+Linux/macOS batches require `python3` on the target; Windows uses PowerShell.
+Per-step status is
+`completed`, `failed`, `not_run`, or `unconfirmed`; completion confirms driver exit,
+not an application effect. Inspect the desktop after unconfirmed input. Observe
+again between batches that open a dialog, move a window, or change the layout.
+
+Limits are 100 actions, 256 KiB JSON, ten seconds per explicit delay and sixty
+seconds total delay. The MCP tool `fleet_cu_batch` returns a final image by default.
+Run `fleet cu <host> tools` and `describe <tool>` for the installed raw inventory
+and schemas. The Fleet skill's Computer Use section catalogs every raw tool in
+the published platform registries, including platform-specific controls.
+
 ## Remote MCP endpoint (HTTP)
 For remote clients (e.g. Poke) the server also speaks **HTTP** — modern Streamable
 HTTP at `POST /mcp` and legacy SSE at `GET /sse` + `POST /messages`. It is meant

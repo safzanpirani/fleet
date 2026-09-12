@@ -2009,6 +2009,7 @@ export function cuResolvePoint(
   target: CuTarget, x: number, y: number, space: "window" | "screen" = "window",
 ): { x: number; y: number } {
   if (!Number.isFinite(x) || !Number.isFinite(y)) throw new Error("x and y must be finite numbers");
+  if (space !== "window" && space !== "screen") throw new Error("space must be window or screen");
   const { capture, window: win } = target;
   const local = space === "screen"
     ? { x: (x - win.x) * (capture.width / Math.max(1, win.width)),
@@ -2288,6 +2289,38 @@ function cuHashBlock(os: Host["os"], invoke: string, pid: number, windowId: numb
   ].join("\n");
 }
 
+export interface CuInputOptions {
+  settleMs?: number;
+  imageOut?: string;
+  space?: "window" | "screen";
+  point?: { x: number; y: number; space?: "window" | "screen" };
+}
+
+function cuInputPayload(target: CuTarget, payload: Record<string, unknown>, opts: CuInputOptions): Record<string, unknown> {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload))
+    throw new Error("action arguments must be a JSON object");
+  for (const key of ["pid", "window_id", "target"])
+    if (Object.hasOwn(payload, key)) throw new Error(`${key} is supplied by Fleet; select the target by app, PID, or window title`);
+  if (payload.scope !== undefined && payload.scope !== "window")
+    throw new Error("verified actions require window scope");
+  if (payload.from_zoom !== undefined && payload.from_zoom !== false)
+    throw new Error("verified actions use full-window coordinates; use raw cu for from_zoom");
+  if (opts.space !== undefined && opts.space !== "window" && opts.space !== "screen")
+    throw new Error("space must be window or screen");
+  const full = { ...payload };
+  for (const [xKey, yKey] of [["x", "y"], ["from_x", "from_y"], ["to_x", "to_y"]] as const) {
+    if (!Object.hasOwn(payload, xKey) && !Object.hasOwn(payload, yKey)) continue;
+    const x = payload[xKey], y = payload[yKey];
+    if (typeof x !== "number" || typeof y !== "number")
+      throw new Error(`${xKey} and ${yKey} must be given together as finite numbers`);
+    const point = cuResolvePoint(target, x, y, opts.space ?? "window");
+    full[xKey] = point.x;
+    full[yKey] = point.y;
+  }
+  if (opts.point) Object.assign(full, cuResolvePoint(target, opts.point.x, opts.point.y, opts.point.space ?? opts.space ?? "window"));
+  return { ...full, pid: target.pid, window_id: target.window.window_id };
+}
+
 /** Run one input action against an exact (pid, window_id) and report what the
  *  window's pixels did.
  *
@@ -2301,39 +2334,205 @@ function cuHashBlock(os: Host["os"], invoke: string, pid: number, windowId: numb
  *  `effect: "unverifiable"` forced. */
 export async function cuAct(
   cfg: FleetConfig, sel: string, query: string, tool: string, payload: Record<string, unknown>,
-  opts: {
-    settleMs?: number; imageOut?: string;
-    /** Validated and translated against the resolved target, so a caller never
-     *  has to resolve the window twice to convert one point. */
-    point?: { x: number; y: number; space?: "window" | "screen" };
-  } = {},
+  opts: CuInputOptions = {},
   deps: { exec?: typeof exec; deliver?: typeof deliverImage; snapshot?: typeof cuSnapshot } = {},
 ): Promise<CuActResult> {
   const host = resolveHosts(cfg, sel)[0]!;
-  const run = deps.exec ?? exec;
   const { target } = await cuResolveTarget(cfg, sel, query, { snapshot: deps.snapshot, exec: deps.exec });
+  const full = cuInputPayload(target, payload, opts);
+  return cuActOnTarget(host, target, tool, full, opts, deps);
+}
+
+export const CU_BATCH_TOOLS = [
+  "click", "right_click", "double_click", "drag", "scroll", "press_key", "hotkey", "type_text", "set_value", "invoke_menu",
+] as const;
+
+export interface CuBatchAction {
+  tool: typeof CU_BATCH_TOOLS[number];
+  args?: Record<string, unknown>;
+  space?: "window" | "screen";
+  delayMs?: number;
+}
+
+export interface CuBatchStep {
+  index: number;
+  tool: string;
+  payload: Record<string, unknown>;
+  status: "completed" | "failed" | "not_run" | "unconfirmed";
+  code: number | null;
+  driverOutput: string;
+}
+
+export interface CuBatchResult extends CuResult {
+  target: CuTarget;
+  effect: CuEffect;
+  reason?: string;
+  hashes: string[];
+  actions: CuBatchStep[];
+}
+
+function cuBatchReplyCheck(os: Host["os"]): string {
+  if (os === "windows") return [
+    "function Test-FleetInputRefusal($body) {",
+    "  try { $reply = $body | ConvertFrom-Json -ErrorAction Stop } catch { return $false }",
+    "  if ($reply.isError -eq $true -or $reply.status -in @('refused', 'error', 'failed') -or $reply.refusal -or $reply.error) { return $true }",
+    "  if ($reply.escalation.reason -in @('delivery_failed', 'background_unavailable')) { return $true }",
+    "  if ($reply.structuredContent -and (Test-FleetInputRefusal ($reply.structuredContent | ConvertTo-Json -Depth 100 -Compress))) { return $true }",
+    "  foreach ($part in $reply.content) { if ($part.type -eq 'text' -and (Test-FleetInputRefusal $part.text)) { return $true } }",
+    "  return $false",
+    "}",
+  ].join("\n");
+  const parser = [
+    "import json, sys",
+    "def refused(body):",
+    "    try: value = json.loads(body)",
+    "    except (ValueError, TypeError): return False",
+    "    if not isinstance(value, dict): return False",
+    "    if value.get('isError') is True or value.get('status') in ('refused', 'error', 'failed') or value.get('refusal') or value.get('error'): return True",
+    "    escalation = value.get('escalation')",
+    "    if isinstance(escalation, dict) and escalation.get('reason') in ('delivery_failed', 'background_unavailable'): return True",
+    "    if refused(json.dumps(value.get('structuredContent'))): return True",
+    "    return any(isinstance(part, dict) and part.get('type') == 'text' and refused(part.get('text')) for part in (value.get('content') or []))",
+    "with open(sys.argv[1]) as source: sys.exit(1 if refused(source.read()) else 0)",
+  ].join("\n");
+  return [
+    "command -v python3 >/dev/null 2>&1 || { echo 'batch input not started: python3 is required to inspect driver refusals' >&2; exit 1; }",
+    `_fleet_check_reply() { python3 -c ${shellQuote(parser, os)} "$1"; }`,
+  ].join("\n");
+}
+
+/** Execute an ordered input sequence on one resolved window, then observe it.
+ *  Every coordinate is checked before any input. No intermediate capture can
+ *  reset the driver's per-PID scale. A driver failure stops the sequence; lost
+ *  confirmation is reported without retrying any potentially delivered input. */
+export async function cuBatch(
+  cfg: FleetConfig, sel: string, query: string, actions: CuBatchAction[],
+  opts: Omit<CuInputOptions, "point"> = {},
+  deps: { exec?: typeof exec; deliver?: typeof deliverImage; snapshot?: typeof cuSnapshot } = {},
+): Promise<CuBatchResult> {
+  if (!Array.isArray(actions) || actions.length < 1 || actions.length > 100)
+    throw new Error("batch requires 1 to 100 actions");
+  if (opts.settleMs !== undefined && (!Number.isInteger(opts.settleMs) || opts.settleMs < 0 || opts.settleMs > 10000))
+    throw new Error("settleMs must be an integer from 0 to 10000");
+  let totalDelay = 0;
+  for (const [index, step] of actions.entries()) {
+    if (!step || typeof step !== "object" || Array.isArray(step)) throw new Error(`action ${index}: expected an object`);
+    for (const key of Object.keys(step))
+      if (!["tool", "args", "space", "delayMs"].includes(key)) throw new Error(`action ${index}: unknown field ${key}`);
+    if (!(CU_BATCH_TOOLS as readonly string[]).includes(step.tool))
+      throw new Error(`action ${index}: batch supports ${CU_BATCH_TOOLS.join(", ")}; use raw cu for other tools`);
+    if (step.space !== undefined && step.space !== "window" && step.space !== "screen")
+      throw new Error(`action ${index}: space must be window or screen`);
+    const delay = step.delayMs === undefined ? 0 : step.delayMs;
+    if (!Number.isInteger(delay) || delay < 0 || delay > 10000) throw new Error(`action ${index}: delayMs must be an integer from 0 to 10000`);
+    totalDelay += delay;
+  }
+  if (totalDelay > 60000) throw new Error("batch delays must total at most 60000 ms");
+  if (new TextEncoder().encode(JSON.stringify(actions)).length > 256 * 1024)
+    throw new Error("batch input exceeds 256 KiB");
+  const host = resolveHosts(cfg, sel)[0]!;
+  const { target } = await cuResolveTarget(cfg, sel, query, { snapshot: deps.snapshot, exec: deps.exec });
+  const prepared = actions.map((step, index) => {
+    try {
+      const args = cuInputPayload(target, step.args === undefined ? {} : step.args, { ...opts, space: step.space ?? opts.space });
+      if (step.tool === "drag" && ["from_x", "from_y", "to_x", "to_y"].some((key) => typeof args[key] !== "number"))
+        throw new Error("drag requires from_x, from_y, to_x, and to_y");
+      if (["click", "right_click", "double_click"].includes(step.tool)
+        && args.element_index === undefined && args.element_token === undefined && args.x === undefined)
+        throw new Error("click requires x/y or an accessibility element handle");
+      if (step.tool === "type_text" && typeof args.text !== "string") throw new Error("type_text requires text");
+      if (step.tool === "press_key" && (typeof args.key !== "string" || !args.key)) throw new Error("press_key requires key");
+      if (step.tool === "hotkey" && (!Array.isArray(args.keys) || args.keys.length < 2 || args.keys.some((key) => typeof key !== "string" || !key)))
+        throw new Error("hotkey requires at least two key names");
+      if (step.tool === "scroll" && !["up", "down", "left", "right"].includes(String(args.direction)))
+        throw new Error("scroll requires direction up, down, left, or right");
+      return args;
+    } catch (error) { throw new Error(`action ${index}: ${error instanceof Error ? error.message : String(error)}`); }
+  });
+  const { invoke } = cuaBin(host.os);
+  const win = host.os === "windows";
+  const marker = `__FLEET_STEP_${crypto.randomUUID().replaceAll("-", "")}__`;
+  const statements = actions.flatMap((step, index) => {
+    const invocation = cuInvocation([step.tool, JSON.stringify(prepared[index])], host.os, invoke);
+    const delay = step.delayMs ?? 0;
+    return win ? [
+      `Write-Output '${marker}${index}|start'`,
+      `$global:LASTEXITCODE = 0`,
+      `${invocation} 2>&1 | Tee-Object -Variable batchOutput`,
+      `$batchSucceeded = $?; $batchCode = $LASTEXITCODE`,
+      `if ($null -eq $batchCode) { $batchCode = 0 }; if (-not $batchSucceeded -and $batchCode -eq 0) { $batchCode = 1 }`,
+      `if ($batchCode -eq 0 -and (Test-FleetInputRefusal ($batchOutput -join "\n"))) { $batchCode = 1 }`,
+      `Write-Output ("\n${marker}${index}|exit|" + $batchCode)`,
+      `if ($batchCode -ne 0) { $global:LASTEXITCODE = $batchCode; return }`,
+      ...(delay ? [`Start-Sleep -Milliseconds ${delay}`] : []),
+    ] : [
+      `printf '%s\\n' '${marker}${index}|start'`,
+      `batch_reply=$(mktemp) || return 1`,
+      `trap 'rm -f "$batch_reply"' EXIT`,
+      `{ ${invocation}; } 2>&1 | tee "$batch_reply"`,
+      'batch_code=${PIPESTATUS[0]}',
+      `if [ "$batch_code" -eq 0 ]; then _fleet_check_reply "$batch_reply"; batch_code=$?; fi`,
+      `rm -f "$batch_reply"; trap - EXIT`,
+      `printf '\\n%s%s\\n' '${marker}${index}|exit|' "$batch_code"`,
+      `[ "$batch_code" -eq 0 ] || return "$batch_code"`,
+      ...(delay ? [`sleep ${(delay / 1000).toFixed(3)}`] : []),
+    ];
+  });
+  const input = win
+    ? { prelude: [cuBatchReplyCheck(host.os), "function Invoke-FleetInputBatch {", ...statements, "$global:LASTEXITCODE = 0", "}"].join("\n"), invoke: "Invoke-FleetInputBatch" }
+    : { prelude: [cuBatchReplyCheck(host.os), "_fleet_input_batch() {", ...statements, "return 0", "}"].join("\n"), invoke: "_fleet_input_batch" };
+  let observed: CuActResult;
+  try { observed = await cuActOnTarget(host, target, "batch", {}, opts, deps, input); }
+  catch (error) {
+    observed = { host: host.name, target, effect: "indeterminate", hashes: [], payload: {}, driverOutput: "",
+      result: { host: host.name, ok: false, code: 1, stdout: "", stderr: error instanceof Error ? error.message : String(error) } };
+  }
+  const steps: CuBatchStep[] = actions.map((step, index) => ({
+    index, tool: step.tool, payload: prepared[index]!, status: "unconfirmed", code: null, driverOutput: "",
+  }));
+  let current: CuBatchStep | undefined;
+  let stopped = /could not capture target before input|batch input not started:/.test(observed.result.stderr);
+  for (const line of observed.driverOutput.split("\n")) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith(marker)) {
+      const [index, event, code] = trimmed.slice(marker.length).split("|");
+      const step = steps[Number(index)];
+      if (!step) continue;
+      if (event === "start") current = step;
+      if (event === "exit" && /^-?\d+$/.test(code ?? "")) {
+        step.code = Number(code);
+        step.status = step.code === 0 ? "completed" : "failed";
+        if (step.code !== 0) stopped = true;
+        current = undefined;
+      }
+    } else if (current) current.driverOutput += line + "\n";
+  }
+  for (const step of steps) {
+    step.driverOutput = step.driverOutput.trim();
+    if (stopped && step.status === "unconfirmed" && step !== current) step.status = "not_run";
+  }
+  const confirmed = steps.every((step) => step.status === "completed");
+  const result = { ...observed.result, stdout: steps.map((step) => `${step.index}: ${step.tool} ${step.status}`).join("\n"), ok: observed.result.ok && confirmed,
+    code: observed.result.code || (confirmed ? 0 : 1) };
+  if (steps.some((step) => step.status === "unconfirmed"))
+    result.stderr = [result.stderr, "batch outcome is unconfirmed; inspect the window before issuing more input"].filter(Boolean).join("\n");
+  return { host: host.name, target, effect: observed.effect, reason: observed.reason,
+    hashes: observed.hashes, actions: steps, result, ...(observed.localImage ? { localImage: observed.localImage } : {}) };
+}
+
+async function cuActOnTarget(
+  host: Host, target: CuTarget, tool: string, full: Record<string, unknown>,
+  opts: CuInputOptions,
+  deps: { exec?: typeof exec; deliver?: typeof deliverImage },
+  input?: { prelude: string; invoke: string },
+): Promise<CuActResult> {
+  const run = deps.exec ?? exec;
   const { prelude, invoke } = cuaBin(host.os);
   const win = host.os === "windows";
   const settle = Math.max(0, Math.round(opts.settleMs ?? 400));
   if (!Number.isFinite(settle)) throw new Error("settleMs must be finite");
-  if (!payload || typeof payload !== "object" || Array.isArray(payload))
-    throw new Error("action arguments must be a JSON object");
-  for (const key of ["pid", "window_id"])
-    if (Object.hasOwn(payload, key)) throw new Error(`${key} is supplied by Fleet; select the target by app, PID, or window title`);
-  if (payload.scope !== undefined && payload.scope !== "window")
-    throw new Error("verified actions require window scope");
-
-  let argumentPoint: { x: number; y: number } | undefined;
-  if (Object.hasOwn(payload, "x") || Object.hasOwn(payload, "y")) {
-    if (typeof payload.x !== "number" || typeof payload.y !== "number")
-      throw new Error("x and y must be given together as finite numbers");
-    argumentPoint = cuResolvePoint(target, payload.x, payload.y);
-  }
-  const point = opts.point
-    ? cuResolvePoint(target, opts.point.x, opts.point.y, opts.point.space ?? "window")
-    : argumentPoint;
-  const full = { ...payload, ...point, pid: target.pid, window_id: target.window.window_id };
   const actArgs = [tool, JSON.stringify(full)];
+  const action = input?.invoke ?? cuInvocation(actArgs, host.os, invoke);
   const sleep = win ? `Start-Sleep -Milliseconds ${settle}` : `sleep ${(settle / 1000).toFixed(3)}`;
   const hashOf = (tag: string) => cuHashBlock(host.os, invoke, target.pid, target.window.window_id, tag);
   const wantImage = Boolean(opts.imageOut);
@@ -2341,12 +2540,14 @@ export async function cuAct(
   const script = win ? [
     `$ErrorActionPreference='Continue'`,
     prelude,
+    ...(input ? [input.prelude] : []),
     hashOf("A"),
     `if (-not $hA) { Write-Error 'could not capture target before input'; exit 1 }`,
-    `$act = @(${cuInvocation(actArgs, host.os, invoke)} 2>&1); $actSucceeded = $?; $actCode = $LASTEXITCODE`,
-    `if ($null -eq $actCode) { $actCode = 0 }; if (-not $actSucceeded -and $actCode -eq 0) { $actCode = 1 }`,
     `Write-Output '${CAP_SENTINEL}act|'`,
-    `$act | Write-Output`,
+    `$global:LASTEXITCODE = 0`,
+    `${action} 2>&1`,
+    `$actSucceeded = $?; $actCode = $LASTEXITCODE`,
+    `if ($null -eq $actCode) { $actCode = 0 }; if (-not $actSucceeded -and $actCode -eq 0) { $actCode = 1 }`,
     `Write-Output '${END_SENTINEL}'`,
     sleep,
     hashOf("B"),
@@ -2365,10 +2566,11 @@ export async function cuAct(
   ].join("\n") : [
     `_fleet_hash() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" 2>/dev/null | cut -d' ' -f1; else shasum -a 256 "$1" 2>/dev/null | cut -d' ' -f1; fi; }`,
     prelude,
+    ...(input ? [input.prelude] : []),
     hashOf("A"),
     `[ -n "$hA" ] || { echo 'could not capture target before input' >&2; exit 1; }`,
     `echo '${CAP_SENTINEL}act|'`,
-    `${cuInvocation(actArgs, host.os, invoke)} 2>&1`,
+    `${action} 2>&1`,
     `act_code=$?`,
     `echo '${END_SENTINEL}'`,
     sleep,
@@ -2431,6 +2633,9 @@ export async function cuAct(
       [base.result.stderr, `image pull failed: ${pull.stderr}`].filter(Boolean).join("\n") } };
     await validateImageArtifact(path);
     return { ...base, localImage: path };
+  } catch (error) {
+    return { ...base, result: { ...base.result, ok: false, code: base.result.code || 1,
+      stderr: [base.result.stderr, `image delivery failed: ${error instanceof Error ? error.message : String(error)}`].filter(Boolean).join("\n") } };
   } finally {
     const cleanup = rmCmd(host.os, remote);
     await run(host, cleanup.cmd, cleanup.shell).catch(() => {});

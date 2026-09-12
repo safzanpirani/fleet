@@ -195,10 +195,123 @@ and exposes computer-use tools. Same interactive-desktop requirement as `fleet s
   for screenshot-only previews and `max_dimension` for thumbnails. Pass these fields
   through raw JSON after checking `fleet cu <host> describe get_window_state`.
   `capture_mode` is deprecated and ignored; it does not skip accessibility work.
+
+### Complete raw computer-use command catalog
+
+Every tool below uses `fleet cu <host> <tool> '<JSON>'`. Fleet also accepts the
+explicit `fleet cu <host> call <tool> '<JSON>'` form to bypass named convenience
+verbs. Read `fleet cu <host> describe <tool>` for the installed argument schema;
+platforms differ, and the driver returns an error for unavailable operations.
+`fleet cu <host> tools` is the live inventory. This catalog was checked on
+2026-09-12 against the Windows 0.24.0 registry (57 tools) and the published
+[macOS](https://cua.ai/docs/reference/cua-driver/mcp-tools),
+[Linux](https://cua.ai/docs/reference/cua-driver/mcp-tools-linux), and
+[Windows](https://cua.ai/docs/reference/cua-driver/mcp-tools-windows) registries
+(61 distinct names across platforms). The final two rows are platform-specific.
+
+| Function | Raw commands |
+|---|---|
+| Desktop and window inspection | `list_apps`, `list_windows`, `get_accessibility_tree`, `get_window_state`, `get_desktop_state`, `get_screen_size`, `get_cursor_position`, `zoom` |
+| Pointer, keyboard, and editable values | `click`, `right_click`, `double_click`, `drag`, `scroll`, `press_key`, `hotkey`, `type_text`, `set_value`, `move_cursor` |
+| Applications and window management | `launch_app`, `kill_app`, `bring_to_front`, `set_window_frame`, `invoke_menu` |
+| Clipboard | `clipboard_read`, `clipboard_write` |
+| Browser discovery and navigation | `get_browser_state`, `browser_prepare`, `browser_navigate` |
+| Browser input, dialogs, and files | `browser_click`, `browser_type`, `browser_pointer`, `browser_dialog`, `browser_set_input_files`, `browser_download` |
+| Browser compatibility | `page` |
+| Post-action predicates | `verify_state` |
+| Recording and replay | `start_recording`, `stop_recording`, `get_recording_state`, `replay_trajectory`, `install_ffmpeg` |
+| Sessions | `start_session`, `get_session`, `list_sessions`, `end_session` |
+| Legacy sessions | `escalate_session`, `get_session_state` |
+| Agent cursor appearance and motion | `get_agent_cursor_state`, `set_agent_cursor_enabled`, `set_agent_cursor_motion`, `set_agent_cursor_theme` |
+| Configuration and diagnostics | `get_config`, `set_config`, `check_permissions`, `health_report`, `check_for_update` |
+| Windows diagnostics | `debug_window_info` |
+| Linux held-button and multi-pointer gestures | `mouse_button_down`, `mouse_drag`, `mouse_button_up`, `parallel_mouse_drag` |
+
+Raw calls retain the driver's semantics. In window scope, `move_cursor` moves the
+agent overlay; it does not establish a general hover guarantee. `set_window_frame`
+is the direct geometry command for moving/resizing windows. Linux's held-button
+commands expose lower-level drag control; finish a held gesture with
+`mouse_button_up`. Use `browser_pointer` for browser hover/scroll/drag.
+
+Accessibility calls require current `element_token` or `element_index` plus
+`snapshot_id`, as described by the installed tool. Observe again after a layout
+change; do not guess or reuse stale handles. Raw desktop input uses `scope:desktop`
+or the driver's explicit desktop `target`; named Fleet inputs keep one window.
+Cua does not currently expose Codex Sky's separate `paste`, `select_text`, or
+`perform_secondary_action` names. Clipboard writing, `set_value`, menu invocation,
+and supported click actions provide related operations with different contracts.
+
+Other raw CLI commands are available through `fleet cu <host> <command> …`:
+`--version`, `list-tools`, `describe`, `call`, `status`, `stop`, `serve`, `mcp`,
+`mcp-config`, `config`, `recording`, `autostart`, and the installed version's
+`permissions`, `telemetry`, `cursor-theme`, `skills`, `channel`, `check-update`,
+`update`, `doctor`, `diagnose`, `revoke`, `manifest`, and `dump-docs` commands.
+Use the installed command's help for its exact subcommands. `serve` and `mcp`
+are long-lived processes; Fleet's ordinary tool calls use an existing daemon.
+For Fleet-managed recording, use `record start|stop|status` so output persists
+across short-lived CLI invocations. Raw `recording render` converts an existing
+trajectory to video. See the [driver CLI reference](https://cua.ai/docs/reference/cua-driver/cli-reference).
+
+### Named controls and batches
+
+```sh
+fleet cu win-box right-click "Example App" 120 80
+fleet cu win-box double-click "Example App" 120 80
+fleet cu win-box drag "Example App" 120 80 400 240 --duration 500
+fleet cu win-box scroll "Example App" down 2 --by page
+fleet cu win-box hotkey "Example App" ctrl a
+fleet cu win-box batch "Example App" --file actions.json --shot --json
+```
+
+The drag endpoints and `x,y` are screenshot pixels in the full target window.
+`--space screen` converts desktop coordinates. `act` JSON must omit `pid`,
+`window_id`, `target`, and `from_zoom`; Fleet sets the target and validates every
+coordinate pair. Raw drag/scroll/hotkey/click JSON calls remain passthroughs.
+Named inputs support `--json`, `--settle MS`, `--shot`, and `--foreground`.
+Use background delivery first; select foreground only when the result calls for it.
+
+An `actions.json` file contains an ordered array:
+
+```json
+[
+  {"tool":"click","args":{"x":120,"y":80}},
+  {"tool":"type_text","args":{"text":"example text"}},
+  {"tool":"press_key","args":{"key":"Tab"},"delayMs":100},
+  {"tool":"scroll","args":{"direction":"down","amount":2,"by":"page"}}
+]
+```
+
+The array may also be one quoted argument, or stdin with `batch <target> -`.
+Batch tools: `click`, `right_click`, `double_click`, `drag`, `scroll`, `press_key`,
+`hotkey`, `type_text`, `set_value`, and `invoke_menu`. Other driver operations use
+raw calls. A batch shares one fixed window and one coordinate frame. Target
+resolution happens once, followed by one remote execution for the sequence and
+its before/after captures. Image transfer adds a copy and cleanup when requested.
+The MCP equivalent is `fleet_cu_batch`, which returns the final image by default.
+
+All coordinates are checked before any input. A nonzero driver exit, structured
+refusal, or delivery-failure escalation stops the batch. Linux and macOS batches
+require `python3` on the target to inspect JSON replies; Windows uses PowerShell.
+Each step reports `completed`, `failed`, `not_run`, or `unconfirmed` with
+its driver output. `completed` confirms the driver's exit, not the application's
+effect. The pixel verdict describes the whole batch; it cannot prove every step.
+A transport failure never triggers a replay. Inspect the desktop before issuing
+more input after `unconfirmed`. Use a new observation before actions that depend
+on a newly opened dialog, changed layout, or moved/resized window. Keep such
+transitions at the end of a batch, then re-resolve the next target.
+
+Limits: 100 actions, 256 KiB of input JSON, 10 seconds per `delayMs`, and 60 seconds
+of total explicit delay. Each step may override `space` with `window` or `screen`.
+Only batch completion is observed; do not batch steps that need model decisions
+between them. This provides the same act-several-times-then-observe workflow as
+Codex's native computer-use API, over Fleet's remote transport.
+
+### Raw examples and operational contracts
+
 - **Raw passthrough:** `fleet cu <host> <cua-driver args…>` for anything else:
   - `fleet cu win-box list-tools` — every tool + description (authoritative per version).
   - `fleet cu win-box get_screen_size` / `list_apps` / `list_windows '{"pid":3848}'`
-  - `fleet cu win-box get_window_state '{"pid":3848,"window_id":66756,"capture_mode":"vision"}' --out win.png`
+  - `fleet cu win-box get_window_state '{"pid":3848,"window_id":66756,"include_accessibility_tree":false}' --out win.png`
   - `fleet cu win-box click '{"pid":3848,"window_id":66756,"x":100,"y":200}'`
   - `fleet cu win-box type_text '{"text":"hello"}'` · `press_key` · `scroll` · `move_cursor`
   - `fleet cu win-box hotkey '{"pid":3848,"window_id":66756,"keys":["alt","f4"]}'` (close window)

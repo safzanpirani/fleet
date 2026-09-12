@@ -40,7 +40,7 @@ import {
   gpuRows, diskRows, fetchDashboard, hostStatus, runRecipe, captureScreenshot, rebootHosts,
   cuInstall, cuRun, cuTools, cuDescribe, cuRecordStart, cuRecordStop, cuRecordStatus,
   cuApps, cuShotWindow, browseHost, preferredImageExt, overlayGrid,
-  cuSnapshot, cuResolveTargetFrom, cuResolvePoint, cuAct, cuBlockerNote,
+  cuSnapshot, cuResolveTargetFrom, cuResolvePoint, cuAct, cuBatch, cuBlockerNote,
   cuGridCaption, cuElementSupport, compactCuOutput, briefDescribe,
   bootState, switchMachine, waitFor, routeSelector, deployHosts, diagnose, firmwareRebootHosts,
 } from "./core.ts";
@@ -783,12 +783,43 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
         return 0;
       }
 
+      if (verb === "batch") {
+        const json = pullFlag(rest, "--json");
+        const file = pullVal(rest, "--file");
+        const q = rest[1];
+        if (!q || (file ? rest.length !== 2 : rest.length !== 3))
+          die("usage: fleet cu <host> batch <target> <JSON-array|-> [--json] [--shot] | batch <target> --file FILE");
+        const source = file ? await Bun.file(file).text() : rest[2] === "-" ? await Bun.stdin.text() : rest[2]!;
+        let actions;
+        try { actions = JSON.parse(source); }
+        catch { die("batch needs a valid JSON array"); }
+        if (foreground && Array.isArray(actions)) actions = actions.map((step) => ({
+          ...step, args: { ...step.args, delivery_mode: "foreground" },
+        }));
+        const imageOut = wantShot || out ? (out ?? `${autoName(q)}.${await preferredImageExt()}`) : undefined;
+        const r = await cuBatch(cfg, target, q, actions, { settleMs: settle, imageOut, space });
+        const note = cuBlockerNote(r.target);
+        if (r.localImage) await applyGrid(r.localImage, gridOpts(r.target, note));
+        if (json) console.log(JSON.stringify(r));
+        else {
+          console.log(`${r.result.ok ? A.g("●") : A.r("✗")} ${A.b(r.target.name)} · batch effect: ${r.effect}`);
+          for (const step of r.actions) {
+            console.log(`  ${step.index + 1}. ${step.tool}: ${step.status}${step.code === null ? "" : ` (exit ${step.code})`}`);
+            if (step.driverOutput) console.log(step.driverOutput.split("\n").map((line) => "     " + line).join("\n"));
+          }
+          if (r.reason) console.log(A.d(r.reason));
+          if (r.result.stderr) console.error(r.result.stderr);
+          if (note) console.error(A.r(note));
+          if (r.localImage) { console.log(`after → ${r.localImage}`); openImg(r.localImage); }
+        }
+        return r.result.ok ? 0 : 1;
+      }
+
       // ── verified input: resolve → act → prove the pixels moved ─────────────
-      const ACT_VERBS = ["click", "key", "type", "act"] as const;
-      // Preserve the driver's original `click {JSON}` passthrough alongside
-      // Fleet's `click TARGET X Y` convenience form.
-      const rawClick = verb === "click" && rest.length === 2 && /^\s*\{/.test(rest[1]!);
-      if (!rawClick && ACT_VERBS.includes(verb as typeof ACT_VERBS[number])) {
+      const ACT_VERBS = ["click", "right-click", "double-click", "drag", "scroll", "hotkey", "key", "type", "act"] as const;
+      const rawInput = ["click", "drag", "scroll", "hotkey"].includes(verb ?? "") && /^\s*\{/.test(rest[1] ?? "");
+      if (!rawInput && ACT_VERBS.includes(verb as typeof ACT_VERBS[number])) {
+        const json = pullFlag(rest, "--json");
         const q = rest[1] ?? die(`usage: fleet cu <host> ${verb} <pid|process|app|title> …`);
         const shotPath = wantShot || out ? (out ?? `${autoName(q)}.${await preferredImageExt()}`) : undefined;
 
@@ -796,18 +827,41 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
         let payload: Record<string, unknown> = {};
         let point: { x: number; y: number; space: "window" | "screen" } | undefined;
         let summary = "";
-        if (verb === "click") {
+        if (["click", "right-click", "double-click"].includes(verb!)) {
           const [xs, ys] = [rest[2], rest[3]];
-          if (rest.length !== 4) die("usage: fleet cu <host> click <app> <x> <y> [--space window|screen]");
+          if (rest.length !== 4) die(`usage: fleet cu <host> ${verb} <app> <x> <y> [--space window|screen]`);
           const [x, y] = [Number(xs), Number(ys)];
           if (!Number.isFinite(x) || !Number.isFinite(y)) die(`click needs numeric x y (got '${xs} ${ys}')`);
           if (button && !["left", "right", "middle"].includes(button))
             die(`--button must be left, right, or middle (got '${button}')`);
+          if (clickCount > 3) die("--count must be 1, 2, or 3");
           point = { x, y, space };
-          payload = { count: clickCount, ...(button ? { button } : {}) };
-          summary = `click ${x},${y}`
-            + (space === "screen" ? A.d(" (screen)") : "")
-            + (clickCount > 1 ? ` x${clickCount}` : "");
+          tool = verb === "right-click" ? "right_click" : verb === "double-click" ? "double_click" : "click";
+          payload = tool === "click" ? { count: clickCount, ...(button ? { button } : {}) } : {};
+          summary = `${tool} ${x},${y}`;
+        } else if (verb === "drag") {
+          const duration = numVal(rest, "--duration", 500, 0);
+          if (duration > 10000) die("--duration must be at most 10000 ms");
+          if (rest.length !== 6) die("usage: fleet cu <host> drag <app> <from-x> <from-y> <to-x> <to-y> [--duration MS]");
+          const coords = rest.slice(2).map(Number);
+          if (coords.some((n) => !Number.isFinite(n))) die("drag needs four finite coordinates");
+          if (button && !["left", "right", "middle"].includes(button)) die("--button must be left, right, or middle");
+          payload = { from_x: coords[0], from_y: coords[1], to_x: coords[2], to_y: coords[3], duration_ms: duration,
+            ...(button ? { button } : {}) };
+          summary = `drag ${coords[0]},${coords[1]} → ${coords[2]},${coords[3]}`;
+        } else if (verb === "scroll") {
+          const by = pullVal(rest, "--by") ?? "line";
+          if (by !== "line" && by !== "page") die("--by must be line or page");
+          if (rest.length < 3 || rest.length > 4 || !["up", "down", "left", "right"].includes(rest[2]!))
+            die("usage: fleet cu <host> scroll <app> <up|down|left|right> [amount] [--by line|page]");
+          const amount = rest[3] === undefined ? 3 : Number(rest[3]);
+          if (!Number.isInteger(amount) || amount < 1 || amount > 50) die("scroll amount must be an integer from 1 to 50");
+          payload = { direction: rest[2], amount, by };
+          summary = `scroll ${rest[2]} ${amount} ${by}`;
+        } else if (verb === "hotkey") {
+          if (rest.length < 4) die("usage: fleet cu <host> hotkey <app> <modifier> <key> [key…]");
+          payload = { keys: rest.slice(2) };
+          summary = `hotkey ${rest.slice(2).join("+")}`;
         } else if (verb === "key") {
           if (rest.length !== 3) die("usage: fleet cu <host> key <app> <key>");
           tool = "press_key";
@@ -830,9 +884,14 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
         if (foreground) payload.delivery_mode = "foreground";
 
         const r = await cuAct(cfg, target, q, tool, payload,
-          { settleMs: settle, imageOut: shotPath, point });
+          { settleMs: settle, imageOut: shotPath, point, space });
+        if (json) {
+          if (r.localImage) await applyGrid(r.localImage, gridOpts(r.target, cuBlockerNote(r.target)));
+          console.log(JSON.stringify(r));
+          return r.result.ok ? 0 : 1;
+        }
         if (point && typeof r.payload.x === "number")
-          summary = `click ${r.payload.x},${r.payload.y}`
+          summary = `${tool} ${r.payload.x},${r.payload.y}`
             + (space === "screen" ? A.d(` (from screen ${point.x},${point.y})`) : "")
             + (clickCount > 1 ? ` x${clickCount}` : "");
         const badge = r.effect === "changed" ? A.g("● changed")
