@@ -35,6 +35,10 @@ const SSH_PERSIST = process.env.FLEET_SSH_PERSIST || "60s";
 let _muxDir: string | null = null;
 function controlOpts(): string[] {
   if (!SSH_MUX) return [];
+  // Windows OpenSSH has no unix-socket connection multiplexing. Handing it
+  // ControlMaster/ControlPath makes every ssh fail with "mux_client_request_session:
+  // read from master failed", which `fleet ls` reports as a dead host.
+  if (process.platform === "win32") return [];
   if (SSH_MUX_FROM_CONFIG) return [];   // honour ControlMaster/ControlPath from ~/.ssh/config
   if (_muxDir === null) {
     _muxDir = join(homedir(), ".fleet", "ssh");
