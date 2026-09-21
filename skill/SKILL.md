@@ -18,7 +18,7 @@ placeholder hosts from `fleet.config.example.json` (`web`, `gpu-box`, `win-box`,
 ## Quick start
 
 ```sh
-fleet ls                      # every host: reachability + configured services
+fleet ls                      # every host: reachability + configured services  (alias: fleet hosts)
 fleet status                  # live CPU/mem/disk/gpu table (from the dashboard)
 fleet exec win-box "nvidia-smi"
 ```
