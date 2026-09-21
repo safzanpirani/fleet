@@ -47,6 +47,7 @@ Prefer not to link the command globally? Run it with
 ## Usage
 ```sh
 fleet ls                            # reachability + services (◍ = ssh-down but health-URL ok)
+fleet hosts                         # alias for `fleet ls`
 fleet exec win-box "nvidia-smi"      # run on one host
 fleet exec windows-auto "hostname"  # resolve a logical route before dispatch
 fleet exec all "uptime"             # run on every host, in parallel
