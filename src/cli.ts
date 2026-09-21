@@ -122,7 +122,7 @@ function printRaw(r: ExecResult): void {
 }
 
 const SUBCOMMANDS = [
-  "ls", "dt", "exec", "spawn", "jobs", "cp", "edit", "restart", "reboot", "bios", "boot", "switch", "wait",
+  "ls", "hosts", "dt", "exec", "spawn", "jobs", "cp", "edit", "restart", "reboot", "bios", "boot", "switch", "wait",
   "gpu", "disk", "status", "top", "logs", "svc", "shot", "cu", "browse", "run", "deploy", "tools", "doctor", "completion", "ssh", "help",
 ];
 /** Emit a bash/zsh completion script with this config's hosts/groups/recipes/
@@ -183,9 +183,9 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
       console.log(helpText(["help", ...rest]));
       return 0;
 
-    case "ls": {
+    case "ls": case "hosts": {
       const { flags, rest: pos } = parseFlags(rest, ["--json"], []);
-      if (pos.length) die("usage: fleet ls [--json]");
+      if (pos.length) die(`usage: fleet ${command} [--json]`);
       const json = flags["--json"] === true;
       const row = (h: { up: boolean; httpUp?: boolean; name: string; os: string; ssh: string; services: string[] }) => {
         const dot = h.up ? A.g("●") : h.httpUp ? A.y("◍") : A.r("○");

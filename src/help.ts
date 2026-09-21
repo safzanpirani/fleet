@@ -1,6 +1,6 @@
 /** Static help must work without configuration, SSH, or a dashboard. */
 const usage: Record<string, string> = {
-  ls: "ls [--json]                         list host reachability and services",
+  ls: "ls [--json]                         list host reachability and services (alias: hosts)",
   dt: "dt [--json]                         list Daytona sandboxes",
   exec: "exec [--cwd DIR] [--timeout S] [--wsl] [--raw | --json] <sel> [--] <cmd…>\n  fleet exec --script <file|-> [--interp CMD] [--cwd DIR] [--timeout S] [--wsl] [--raw | --json] <sel>",
   spawn: "spawn [--cwd DIR] [--label NAME] [--json] <sel> [--] <cmd…>",
@@ -42,7 +42,7 @@ const detail: Record<string, string> = {
   edit: "Omitting --new or passing --new \"\" deletes the matched text. A present --new\nwithout a value is an error. Use --old=--flag for option-looking literal text.\nFleet requires one match unless --all is set, checks for concurrent modification,\nand prints changed lines. --dry-run does not write.",
 };
 
-const aliases: Record<string, string> = { service: "svc", screenshot: "shot", computer: "cu" };
+const aliases: Record<string, string> = { hosts: "ls", service: "svc", screenshot: "shot", computer: "cu" };
 const subcommands: Record<string, string[]> = {
   jobs: ["list", "log", "tail", "wait", "kill", "prune"],
   tools: ["list", "status", "sync", "stamp"],
