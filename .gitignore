@@ -5,3 +5,5 @@ bun.lockb
 fleet.config.json
 fleet.config.local.json
 dist/
+.scratch/
+fleet.config.json.bak-*

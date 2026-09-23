@@ -556,7 +556,7 @@ describe("act round trips", () => {
   const snapshot = async () => snapshotFixture();
   const reply = (image: boolean) => [
     "__FLEET_HASH__A|aa", "__FLEET_CAP__act|", "{}", "__FLEET_END__", "__FLEET_HASH__B|aa",
-    ...(image ? ["__FLEET_IMG__C:\\Temp\\after.png"] : []),
+    ...(image ? ["__FLEET_B64__after", Buffer.from("png bytes").toString("base64"), "__FLEET_B64END__"] : []),
   ].join("\n");
 
   test.each([
@@ -623,7 +623,7 @@ describe("act round trips", () => {
   test.each([
     { imageOut: undefined, keeps: false },
     { imageOut: "after.png", keeps: true },
-  ])("the after-image is cleaned up host-side unless it was asked for (%j)", async (scenario) => {
+  ])("the after-image comes back inline and is always deleted host-side (%j)", async (scenario) => {
     const scripts: string[] = [];
     await cuAct(cfgWin, "win", "Playnite", "click", {}, { imageOut: scenario.imageOut }, {
       snapshot,
@@ -633,10 +633,11 @@ describe("act round trips", () => {
         return { host: target.name, ok: true, code: 0, stdout: reply(scenario.keeps), stderr: "" };
       },
     });
-    // A verify-only click must not pay a second ssh round trip just to delete a
-    // temp PNG it never wanted.
-    expect(scripts[0]).toContain(scenario.keeps ? "__FLEET_IMG__" : "Remove-Item -LiteralPath $keep");
-    expect(scripts.length).toBe(scenario.keeps ? 2 : 1);
+    // The image rides back in the same stdout and the script deletes it, so
+    // neither case pays a second ssh round trip for a pull or a cleanup.
+    expect(scripts[0]).toContain(scenario.keeps ? "__FLEET_B64__after" : "Remove-Item -LiteralPath $keep");
+    expect(scripts[0]).toContain("Remove-Item -LiteralPath $keep");
+    expect(scripts.length).toBe(1);
   });
 });
 

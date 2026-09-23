@@ -197,6 +197,12 @@ const WIN_RUNNER = [
   `$PID | Set-Content -Encoding ascii "$dir\\pid"`,
   `$cwd = (Get-Content "$dir\\cwd" -Raw).Trim()`,
   `try { Set-Location -LiteralPath $cwd -ErrorAction Stop } catch { "fleet: cwd not found: $cwd" | Set-Content "$dir\\out"; Set-FleetJobExit $dir 127; exit }`,
+  // A hidden scheduled-task console is cp1252, so Python tools that print
+  // anything outside it (a ✓, an emoji) die with a misleading codec error.
+  // UTF-8 unless the job asked for something else.
+  `if (-not $env:PYTHONUTF8) { $env:PYTHONUTF8 = '1' }`,
+  `if (-not $env:PYTHONIOENCODING) { $env:PYTHONIOENCODING = 'utf-8' }`,
+  `try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } catch {}`,
   `$global:LASTEXITCODE = 0`,
   `try { & "$dir\\cmd.ps1" *> "$dir\\out" 2>&1; $code = $LASTEXITCODE } catch { $_ | Out-File -Append "$dir\\out"; $code = 1 }`,
   `if ($null -eq $code) { $code = 0 }`,

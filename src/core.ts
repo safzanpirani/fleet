@@ -5,14 +5,16 @@
  * stdio MCP process. Presentation (ANSI tables, plain text) lives in the
  * frontends; the quoting-proof shell construction lives once, here + `ssh.ts`.
  */
-import { resolveHosts, REPO_ROOT } from "./config.ts";
+import { resolveHosts, REPO_ROOT, lookupProxy, normalizeProxy, resolveProxy } from "./config.ts";
 import type { FleetConfig, Host, Service, ServiceType, Machine } from "./config.ts";
-import { exec, probe, scp, scpPull, sshDiagnose, bashEsc, bashPathAssignment, psEsc } from "./ssh.ts";
+import { connOpts, exec, probe, probeDetail, scp, scpPull, sshDiagnose, bashEsc, bashPathAssignment, psEsc } from "./ssh.ts";
+import { checkProxy, proxyCommandFor } from "./proxy.ts";
+import type { ProxyCheck } from "./proxy.ts";
 import type { ExecResult, Shell } from "./ssh.ts";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { createConnection } from "node:net";
-import { mkdir, mkdtemp, readdir, rename, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { installLockScript } from "./install-lock.ts";
 
@@ -145,6 +147,8 @@ export async function svcStatus(cfg: FleetConfig, sel: string, name: string): Pr
 export interface HostReport {
   name: string; os: string; ssh: string; gpu: boolean; up: boolean; services: string[];
   httpUp?: boolean;   // when ssh is down but a configured health URL answers: alive, just unreachable
+  proxy: string | null;   // resolved proxy name (redacted for inline URLs), or null
+  proxyDown?: boolean;    // the PROXY is unreachable — the host was never contacted
 }
 /** Probe an HTTP endpoint as a coarse liveness check. Any response (even 401/404)
  *  means something is listening → the box is alive; only a transport failure or a
@@ -162,10 +166,13 @@ export async function lsHosts(
   cfg: FleetConfig, onResult?: (r: HostReport) => void,
 ): Promise<HostReport[]> {
   return Promise.all(Object.values(cfg.hosts).map(async (h) => {
-    const up = await probe(h);
+    const result = await probeDetail(h);
+    const up = result.up;
     const httpUp = !up && h.health ? await probeHttp(h.health) : undefined;
     const rep: HostReport = {
       name: h.name, os: h.os, ssh: h.ssh, gpu: !!h.gpu, up, httpUp,
+      proxy: result.via ?? null,
+      proxyDown: result.down === "proxy" ? true : undefined,
       services: Object.keys(h.services ?? {}),
     };
     onResult?.(rep);
@@ -674,6 +681,9 @@ export interface Diagnosis {
   health?: string; httpUp?: boolean;
   reason?: string;       // the extracted failure signature when ssh is down
   hints: string[];       // actionable next steps
+  proxy?: string;        // resolved proxy name (redacted); absent when direct
+  proxyCommand?: string; // the exact ProxyCommand fleet hands ssh
+  proxyCheck?: ProxyCheck;   // endpoint reachability + the `verify` result
 }
 /** Map a verbose-ssh failure log to a human reason + actionable hints. */
 function classifySsh(stderr: string): { reason: string; hints: string[] } {
@@ -699,16 +709,71 @@ function classifySsh(stderr: string): { reason: string; hints: string[] } {
  *  health-URL cross-check so an alive-but-unreachable box is obvious. */
 export async function diagnose(cfg: FleetConfig, sel: string): Promise<Diagnosis> {
   const host = resolveHosts(cfg, await routeSelector(cfg, sel))[0]!;
-  const probe = await sshDiagnose(host);
-  const httpUp = host.health ? await probeHttp(host.health) : undefined;
+  const resolvedProxy = resolveProxy(host);
+  const [probe, httpUp, proxyCheck] = await Promise.all([
+    sshDiagnose(host),
+    host.health ? probeHttp(host.health) : Promise.resolve(undefined),
+    resolvedProxy ? checkProxy(resolvedProxy) : Promise.resolve(undefined),
+  ]);
   const base: Diagnosis = {
     host: host.name, os: host.os, ssh: host.ssh, services: Object.keys(host.services ?? {}),
     sshUp: probe.ok, ms: probe.ms, health: host.health, httpUp, hints: [],
+    proxy: resolvedProxy?.name, proxyCommand: proxyCommandFor(host), proxyCheck,
   };
   if (probe.ok) return base;
   const { reason, hints } = classifySsh(probe.stderr);
+  // Attribution first: a dead proxy is not a dead host, and saying otherwise
+  // sends you power-cycling a machine that was never contacted.
+  if (proxyCheck && !proxyCheck.reachable)
+    return { ...base, reason: `proxy ${proxyCheck.name} (${proxyCheck.endpoint}) is unreachable — the host was never contacted`,
+      hints: [`check the proxy endpoint itself, then retry`,
+        `FLEET_NO_PROXY=1 fleet doctor ${host.name}   # test the direct route`] };
   if (httpUp) hints.unshift("health URL answers → the box is ALIVE; this is an ssh/route problem, not a dead host");
+  if (resolvedProxy) hints.push(`the route goes through proxy ${resolvedProxy.name} — compare with FLEET_NO_PROXY=1`);
   return { ...base, reason, hints };
+}
+
+// ── proxies ──────────────────────────────────────────────────────────────────
+export interface ProxyRow {
+  name: string; type: string; endpoint: string; dns: string;
+  auth: boolean;              // credentials configured (never the credentials themselves)
+  isDefault: boolean;
+  hosts: string[];            // hosts routed through it, defaultProxy included
+}
+/** Every configured proxy and what rides on it. No secret ever appears here. */
+export function proxyRows(cfg: FleetConfig): ProxyRow[] {
+  return Object.entries(cfg.proxies ?? {}).map(([name, spec]) => {
+    const n = normalizeProxy(spec);
+    return {
+      name, type: n.type, endpoint: `${n.host}:${n.port}`, dns: n.dns,
+      auth: !!(spec.user || spec.passwordEnv || spec.passwordFile),
+      isDefault: cfg.defaultProxy === name,
+      hosts: Object.values(cfg.hosts)
+        .filter((h) => h.transport !== "daytona" && (h.proxy ?? cfg.defaultProxy) === name)
+        .map((h) => h.name),
+    };
+  });
+}
+/** Probe (and, where `verify` is set, prove) proxies — all of them, or the named ones. */
+export async function proxyChecks(cfg: FleetConfig, names?: string[]): Promise<ProxyCheck[]> {
+  const wanted = names?.length ? names : Object.keys(cfg.proxies ?? {});
+  return Promise.all(wanted.map((n) => checkProxy(lookupProxy(n, cfg))));
+}
+
+/** Close the ssh control master for each selected host.
+ *
+ *  Changing a host's proxy does NOT re-route a live master: the old socket keeps
+ *  serving the old path until ControlPersist expires. This is the escape hatch —
+ *  and the first thing to run when `fleet ls` disagrees with `ssh -o ControlPath=none`. */
+export async function dropMasters(cfg: FleetConfig, sel: string): Promise<{ host: string; dropped: boolean; detail: string }[]> {
+  const hosts = resolveHosts(cfg, sel).filter((h) => h.transport !== "daytona");
+  return Promise.all(hosts.map(async (h) => {
+    const proc = Bun.spawn(["ssh", ...connOpts(h), "-O", "exit", h.ssh], { stdout: "pipe", stderr: "pipe" });
+    const [err, code] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+    const detail = err.trim();
+    // "No such file or directory"/"not found" just means there was no master.
+    return { host: h.name, dropped: code === 0, detail: code === 0 ? "master closed" : (detail || "no live master") };
+  }));
 }
 
 // ── boot-state awareness (dual-boot machines) ─────────────────────────────────
@@ -1349,6 +1414,162 @@ function cuaBin(os: Host["os"]): { prelude: string; invoke: string } {
   };
 }
 
+/** Windows prelude that multiplexes every driver call in one remote script over
+ *  a single `cua-driver mcp` process.
+ *
+ *  Each `cua-driver <tool>` process on Windows pays ~600-900 ms to reach the
+ *  daemon from the ssh session, even for `get_config`. One `mcp` process pays
+ *  that once and answers every later call in milliseconds, so a verified click
+ *  (capture, act, capture, capture) costs one connection instead of four.
+ *  `--socket` names the daemon's pipe explicitly: without it, `mcp` refuses to
+ *  run from ssh's Session 0.
+ *
+ *  `Invoke-FleetCua <tool> <json>` writes the raw JSON-RPC reply and sets
+ *  $LASTEXITCODE (1 on isError). When the session cannot start (a driver older
+ *  than 0.28), it runs the per-call CLI instead. A session that dies mid-script
+ *  is NOT retried through the CLI: the lost call may already have delivered
+ *  input, and replaying it would deliver it twice. */
+export function cuWinSession(): string {
+  return [
+    `$script:fcuP = $null; $script:fcuId = 0; $script:fcuUtf8 = New-Object System.Text.UTF8Encoding($false)`,
+    `function Write-FleetCuaLine([string]$line) { $b = $script:fcuUtf8.GetBytes($line + [char]10); $script:fcuP.StandardInput.BaseStream.Write($b, 0, $b.Length); $script:fcuP.StandardInput.BaseStream.Flush() }`,
+    `function Send-FleetCua([string]$method, [string]$params) {`,
+    `  $script:fcuId++; $id = $script:fcuId`,
+    `  try { Write-FleetCuaLine ('{"jsonrpc":"2.0","id":' + $id + ',"method":"' + $method + '","params":' + $params + '}') } catch { return $null }`,
+    `  while ($true) {`,
+    `    $line = $script:fcuP.StandardOutput.ReadLine()`,
+    `    if ($null -eq $line) { return $null }`,
+    `    if ($line -match ('^\\s*\\{"jsonrpc":"2\\.0","id":' + $id + '[,}]')) { return $line }`,
+    `  }`,
+    `}`,
+    `function Start-FleetCua {`,
+    `  try {`,
+    `    $psi = New-Object System.Diagnostics.ProcessStartInfo`,
+    `    $psi.FileName = $fcd; $psi.Arguments = 'mcp --socket \\\\.\\pipe\\cua-driver'`,
+    `    $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true`,
+    `    $psi.RedirectStandardInput = $true; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true`,
+    `    $psi.StandardOutputEncoding = $script:fcuUtf8`,
+    `    $script:fcuP = [System.Diagnostics.Process]::Start($psi)`,
+    `    $null = $script:fcuP.StandardError.ReadToEndAsync()`,
+    `    $init = Send-FleetCua 'initialize' '{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"fleet","version":"1"}}'`,
+    `    if (-not $init -or $init -notmatch '"result"') { throw 'cua-driver mcp did not initialize' }`,
+    `    Write-FleetCuaLine '{"jsonrpc":"2.0","method":"notifications/initialized"}'`,
+    `  } catch {`,
+    `    if ($script:fcuP) { try { $script:fcuP.Kill() } catch {} }`,
+    `    $script:fcuP = $null`,
+    `  }`,
+    `  $script:fcuCli = -not $script:fcuP`,
+    `}`,
+    `function Stop-FleetCua { if ($script:fcuP) { try { $script:fcuP.StandardInput.Close(); $null = $script:fcuP.WaitForExit(2000) } catch {}; try { if (-not $script:fcuP.HasExited) { $script:fcuP.Kill() } } catch {}; $script:fcuP = $null } }`,
+    `function Invoke-FleetCua([string]$tool, [string]$json) {`,
+    `  if ($script:fcuCli) {`,
+    `    $global:LASTEXITCODE = 0`,
+    `    $out = @($json | & $fcd $tool 2>&1); $ok = $?; $code = $LASTEXITCODE`,
+    `    $out | Write-Output`,
+    `    if ($null -eq $code) { $code = 0 }; if (-not $ok -and $code -eq 0) { $code = 1 }`,
+    `    $global:LASTEXITCODE = $code; return`,
+    `  }`,
+    `  if (-not $script:fcuP) { Write-Output 'cua-driver session closed before this call; it was not sent'; $global:LASTEXITCODE = 1; return }`,
+    `  $reply = Send-FleetCua 'tools/call' ('{"name":"' + $tool + '","arguments":' + $json + '}')`,
+    `  if ($null -eq $reply) { $script:fcuP = $null; Write-Output 'cua-driver session closed during this call; its outcome is unknown'; $global:LASTEXITCODE = 1; return }`,
+    `  Write-Output $reply`,
+    `  $global:LASTEXITCODE = if ($reply -match '^\\s*\\{"jsonrpc":"2\\.0","id":\\d+,"error"' -or $reply -match '(?<!\\\\)"isError":\\s*true') { 1 } else { 0 }`,
+    `}`,
+    `Start-FleetCua`,
+  ].join("\n");
+}
+
+/** A PowerShell expression that evaluates to one JSON argument string. With
+ *  `outVar`, the capture path lands in `screenshot_out_file` at run time, so
+ *  $env:TEMP-style paths expand remotely and never have to be guessed here. */
+function psJsonExpr(json: string, outVar = ""): string {
+  if (!outVar) return `'${json.replace(/'/g, "''")}'`;
+  const prefix = json.trim().replace(/\}\s*$/, "");
+  const comma = prefix.trimEnd().endsWith("{") ? "" : ",";
+  const pre = `'${(prefix + comma).replace(/'/g, "''")}"screenshot_out_file":"'`;
+  return `(${pre} + ($${outVar} -replace '\\\\','\\\\') + '"}')`;
+}
+
+/** One driver call inside a `cuWinSession` script. */
+function cuWinCall(tool: string, json: string, outVar = ""): string {
+  return `Invoke-FleetCua '${tool.replace(/'/g, "''")}' ${psJsonExpr(json, outVar)}`;
+}
+
+/** Normalize one driver reply to what the per-call CLI prints: a JSON-RPC
+ *  envelope from a `cuWinSession` becomes its structured payload (pretty JSON)
+ *  or its text, and anything else passes through unchanged. Every parser below
+ *  reads this form, so a session and the CLI fallback look identical to it. */
+export function cuReplyText(body: string): string {
+  const trimmed = body.trim();
+  if (!trimmed.startsWith('{"jsonrpc"')) return body;
+  let envelope: any;
+  try { envelope = JSON.parse(trimmed); } catch { return body; }
+  if (envelope?.error) return String(envelope.error.message ?? JSON.stringify(envelope.error));
+  const result = envelope?.result ?? {};
+  if (result.structuredContent && typeof result.structuredContent === "object")
+    return JSON.stringify(result.structuredContent, null, 2);
+  const text = (Array.isArray(result.content) ? result.content : [])
+    .filter((part: any) => part?.type === "text" && typeof part.text === "string")
+    .map((part: any) => part.text as string)
+    .join("\n");
+  return text.replace(/^✅\s*/, "");
+}
+
+// Inline image transfer: a capture's bytes ride back base64-encoded in the same
+// ssh stdout, instead of costing an scp pull plus a cleanup exec per image.
+const B64_SENTINEL = "__FLEET_B64__";
+const B64_END = "__FLEET_B64END__";
+
+/** Remote lines that print one capture file base64-encoded under `tag`, then
+ *  delete it. Nothing is printed when the file is missing or empty, so a failed
+ *  capture reads as "no image", never as an empty one. */
+function emitImage(os: Host["os"], pathVar: string, tag: string): string {
+  if (os === "windows") return [
+    `if ($${pathVar} -and (Test-Path -LiteralPath $${pathVar}) -and (Get-Item -LiteralPath $${pathVar}).Length -gt 0) {`,
+    `  $b64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes($${pathVar}))`,
+    `  Write-Output '${B64_SENTINEL}${tag}'`,
+    `  for ($i = 0; $i -lt $b64.Length; $i += 65536) { Write-Output $b64.Substring($i, [Math]::Min(65536, $b64.Length - $i)) }`,
+    `  Write-Output '${B64_END}'`,
+    `}`,
+    `if ($${pathVar}) { Remove-Item -LiteralPath $${pathVar} -Force -EA SilentlyContinue }`,
+  ].join("\n");
+  return [
+    `if [ -s "$${pathVar}" ]; then echo '${B64_SENTINEL}${tag}'; base64 < "$${pathVar}"; echo '${B64_END}'; fi`,
+    `rm -f "$${pathVar}"`,
+  ].join("\n");
+}
+
+/** Every inline image in an exec's stdout, by tag, plus the stdout without them. */
+export function takeInlineImages(stdout: string): { images: Map<string, Uint8Array>; rest: string } {
+  const images = new Map<string, Uint8Array>();
+  const kept: string[] = [];
+  let tag: string | undefined;
+  let chunks: string[] = [];
+  for (const line of stdout.split("\n")) {
+    const trimmed = line.trim();
+    if (tag === undefined && trimmed.startsWith(B64_SENTINEL)) {
+      tag = trimmed.slice(B64_SENTINEL.length);
+      chunks = [];
+    } else if (tag !== undefined && trimmed === B64_END) {
+      images.set(tag, Uint8Array.from(Buffer.from(chunks.join(""), "base64")));
+      tag = undefined;
+    } else if (tag !== undefined) {
+      chunks.push(trimmed);
+    } else {
+      kept.push(line);
+    }
+  }
+  return { images, rest: kept.join("\n") };
+}
+
+/** A `deliverImage` pull that writes bytes already in hand. */
+function inlinePull(host: Host, bytes: Uint8Array): typeof scpPull {
+  return async (_host, _remote, local) => {
+    await writeFile(local, bytes);
+    return { host: host.name, ok: true, code: 0, stdout: "", stderr: "" };
+  };
+}
+
 /** The systemd user unit that runs the daemon on Linux.
  *
  *  cua-driver does not write this itself: its `autostart enable` is Windows-only
@@ -1427,8 +1648,6 @@ export async function cuInstall(
 export interface CuInstallAction { host: string; os: Host["os"]; result: ExecResult; }
 export interface CuResult { host: string; result: ExecResult; localImage?: string; }
 
-const IMG_SENTINEL = "__FLEET_IMG__";
-
 /** Build the piped/quoted `<bin> <args>` invocation for one cua-driver call.
  *  A JSON positional arg is piped via stdin (Windows PowerShell 5.1 strips the
  *  quotes around field names on native-command args; piping preserves them). */
@@ -1476,49 +1695,43 @@ export async function cuRun(
     return { host: host.name, result };
   }
 
-  // Image call: run cua with --screenshot-out-file, echo its own output, then a
-  // sentinel line with the path IFF the file was actually written.
+  // Image call: run cua with screenshot_out_file, echo its own output, then the
+  // image itself inline IFF the file was actually written. One round trip: no
+  // scp pull and no cleanup exec afterwards.
   const cmd = win
     ? [prelude,
        `$out = Join-Path $env:TEMP ('cua_' + [guid]::NewGuid().ToString('N') + '.png')`,
-       `$driverOutput = @(${cuInvocation(args, host.os, invoke, "out")} 2>&1); $driverSucceeded = $?; $driverCode = $LASTEXITCODE`,
-       `$driverOutput | Write-Output`,
-       `if ((Test-Path -LiteralPath $out) -and (Get-Item -LiteralPath $out).Length -gt 0) { Write-Output ('${IMG_SENTINEL}' + $out) }`,
+       // Uncaptured on purpose: capturing a cua-driver call's output on
+       // Windows adds ~600 ms. It prints straight to ssh's stdout instead.
+       `$global:LASTEXITCODE = 0`,
+       `${cuInvocation(args, host.os, invoke, "out")}; $driverSucceeded = $?; $driverCode = $LASTEXITCODE`,
+       emitImage(host.os, "out", "image"),
        `if (-not $driverSucceeded) { if ($null -ne $driverCode -and $driverCode -ne 0) { exit $driverCode }; exit 1 }`,
        `if ($null -ne $driverCode -and $driverCode -ne 0) { exit $driverCode }`].join("\n")
     : [prelude,
        `out="${"${TMPDIR:-/tmp}"}/cua_shot_$$_$RANDOM.png"; rm -f "$out"`,
        `${cuInvocation(args, host.os, invoke, "out")} 2>&1`,
        `driver_code=$?`,
-       `if [ -s "$out" ]; then echo "${IMG_SENTINEL}$out"; fi`,
+       emitImage(host.os, "out", "image"),
        `exit "$driver_code"`].join("\n");
   const raw = await runExec(host, cmd, shell);
-
-  // split the sentinel out of the displayed output
-  const lines = raw.stdout.split("\n");
-  const imgLine = lines.find((l) => l.trim().startsWith(IMG_SENTINEL));
-  const result: ExecResult = {
-    ...raw,
-    stdout: lines.filter((l) => !l.trim().startsWith(IMG_SENTINEL)).join("\n").trimEnd(),
-  };
-  if (!imgLine) return { host: host.name, result: {
+  const { images, rest } = takeInlineImages(raw.stdout);
+  const result: ExecResult = { ...raw, stdout: rest.trimEnd() };
+  const bytes = images.get("image");
+  if (!bytes) return { host: host.name, result: {
     ...result, ok: false, code: result.code || 1,
     stderr: [result.stderr, "cua-driver produced no requested image"].filter(Boolean).join("\n"),
   } };
 
-  const remote = imgLine.trim().slice(IMG_SENTINEL.length);
   try {
     if (!result.ok) return { host: host.name, result };
-    const { result: pull, path } = await deliverImage(host, remote, imageOut);
+    const { result: pull, path } = await deliverImage(host, "inline", imageOut, { pull: inlinePull(host, bytes) });
     if (!pull.ok) return { host: host.name,
       result: { ...result, ok: false, code: pull.code || 1, stderr: `${result.stderr}\nimage pull failed: ${pull.stderr}`.trim() } };
     return { host: host.name, result, localImage: path };
   } catch (error) {
     return { host: host.name, result: { ...result, ok: false, code: 1,
       stderr: error instanceof Error ? error.message : String(error) } };
-  } finally {
-    const cleanup = rmCmd(host.os, remote);
-    await runExec(host, cleanup.cmd, cleanup.shell).catch(() => {});
   }
 }
 
@@ -1841,6 +2054,9 @@ export async function cuSnapshot(
   const win = host.os === "windows";
   const { prelude, invoke } = cuaBin(host.os);
   const mark = win ? `Write-Output '${SEP_SENTINEL}'` : `echo '${SEP_SENTINEL}'`;
+  // Direct calls, deliberately: their output goes straight to ssh's stdout. On
+  // Windows, capturing or redirecting a cua-driver call's output costs ~600 ms
+  // more per call; left uncaptured, each of these costs tens of milliseconds.
   const cmd = [prelude, `${invoke} list_apps`, mark, `${invoke} list_windows`, mark, `${invoke} get_config`]
     .join("\n");
   const result = await (deps.exec ?? exec)(host, cmd, win ? "powershell" : "bash");
@@ -2053,18 +2269,20 @@ export interface CuCapture {
  *  `include_accessibility_tree:false` skips the UIA walk entirely — the capture
  *  is ~2x faster and the reply is a few hundred bytes instead of a tree. */
 function cuCaptureBlock(os: Host["os"], invoke: string, pid: number, windowId: number, idx: number): string {
-  const args = ["get_window_state", JSON.stringify({ pid, window_id: windowId, include_accessibility_tree: false })];
+  const json = JSON.stringify({ pid, window_id: windowId, include_accessibility_tree: false });
   if (os === "windows") return [
     `$out = Join-Path $env:TEMP ('fleet_cu_' + [guid]::NewGuid().ToString('N') + '.png')`,
     `Write-Output ('${CAP_SENTINEL}${windowId}|' + $out)`,
-    `${cuInvocation(args, os, invoke, "out")} 2>&1 | Write-Output`,
+    `${cuWinCall("get_window_state", json, "out")} 2>&1 | Write-Output`,
     `Write-Output '${END_SENTINEL}'`,
+    emitImage(os, "out", String(windowId)),
   ].join("\n");
   return [
     `out="\${TMPDIR:-/tmp}/fleet_cu_$$_${idx}.png"; rm -f "$out"`,
     `echo '${CAP_SENTINEL}${windowId}|'"$out"`,
-    `${cuInvocation(args, os, invoke, "out")} 2>&1`,
+    `${cuInvocation(["get_window_state", json], os, invoke, "out")} 2>&1`,
     `echo '${END_SENTINEL}'`,
+    emitImage(os, "out", String(windowId)),
   ].join("\n");
 }
 
@@ -2097,7 +2315,7 @@ function captureFromBlock(
   let width = fallback.width, height = fallback.height;
   let bounds = { x: win.x, y: win.y, width: win.width, height: win.height };
   try {
-    const json = extractJson(body);
+    const json = extractJson(cuReplyText(body));
     if (Number(json?.screenshot_width) > 0) width = Number(json.screenshot_width);
     if (Number(json?.screenshot_height) > 0) height = Number(json.screenshot_height);
     const b = json?.window_bounds;
@@ -2141,13 +2359,18 @@ export async function cuShotWindow(
 
   const wantComposite = opts.composite !== false && target.blockers.length > 0;
   const order = [...(wantComposite ? target.blockers.slice(0, 4) : []), target.window];
+  const win = host.os === "windows";
   const script = [
-    host.os === "windows" ? `$ErrorActionPreference='Continue'` : `set +e`,
+    win ? `$ErrorActionPreference='Continue'` : `set +e`,
     prelude,
+    ...(win ? [cuWinSession()] : []),
     ...order.map((w, i) => cuCaptureBlock(host.os, invoke, target.pid, w.window_id, i)),
+    ...(win ? [`Stop-FleetCua`] : []),
   ].join("\n");
 
-  const raw = await run(host, script, host.os === "windows" ? "powershell" : "bash");
+  const executed = await run(host, script, win ? "powershell" : "bash");
+  const { images, rest } = takeInlineImages(executed.stdout);
+  const raw = { ...executed, stdout: rest };
   const blocks = parseCaptureBlocks(raw.stdout);
   const byId = new Map(blocks.map((b) => [b.windowId, b]));
   const mainBlock = byId.get(target.window.window_id);
@@ -2161,7 +2384,8 @@ export async function cuShotWindow(
     host: host.name, target, app, window, composited: [],
     result: { ...raw, ok: false, code: raw.code || 1, stderr: [raw.stderr, stderr].filter(Boolean).join("\n") },
   });
-  if (!mainBlock) return fail(
+  const mainBytes = images.get(String(target.window.window_id));
+  if (!mainBlock || !mainBytes) return fail(
     `cua-driver produced no requested window image for ${target.name} w${target.window.window_id}`
     + (raw.stdout.trim() ? `\n${raw.stdout.trim()}` : ""));
 
@@ -2172,13 +2396,15 @@ export async function cuShotWindow(
   target.capture = { ...target.capture, width: main.width, height: main.height };
   const extras = order.slice(0, -1).flatMap((w) => {
     const b = byId.get(w.window_id);
-    return b ? [captureFromBlock(w, b.remotePath, b.body, cuCaptureSize(w, 0))] : [];
+    return b && images.has(String(w.window_id)) ? [captureFromBlock(w, b.remotePath, b.body, cuCaptureSize(w, 0))] : [];
   });
-  const remotePaths = [main, ...extras].map((c) => c.remotePath);
 
+  // The script already deleted every remote capture after printing it, so
+  // delivery below is local-only: no scp pull and no cleanup round trip.
+  const deliver = deps.deliver ?? deliverImage;
   const warning = cuBlockerNote(target);
   try {
-    const { result: pull, path } = await (deps.deliver ?? deliverImage)(host, main.remotePath, imageOut);
+    const { result: pull, path } = await deliver(host, main.remotePath, imageOut, { pull: inlinePull(host, mainBytes) });
     if (!pull.ok) return fail(`image pull failed: ${pull.stderr || `scp exit ${pull.code}`}`);
     await validateImageArtifact(path);
     main.localPath = path;
@@ -2186,7 +2412,8 @@ export async function cuShotWindow(
     const composited: CuWindowInfo[] = [];
     for (const extra of extras) {
       const staged = `${path}.blocker-${extra.window.window_id}.png`;
-      const got = await (deps.deliver ?? deliverImage)(host, extra.remotePath, staged);
+      const got = await deliver(host, extra.remotePath, staged,
+        { pull: inlinePull(host, images.get(String(extra.window.window_id))!) });
       if (!got.result.ok) continue;
       extra.localPath = got.path;
       if (await (deps.composite ?? compositeWindows)(path, main, extra)) composited.push(extra.window);
@@ -2199,11 +2426,6 @@ export async function cuShotWindow(
     };
   } catch (error) {
     return fail(error instanceof Error ? error.message : String(error));
-  } finally {
-    for (const remote of remotePaths) {
-      const cleanup = rmCmd(host.os, remote);
-      await run(host, cleanup.cmd, cleanup.shell).catch(() => {});
-    }
   }
 }
 
@@ -2269,15 +2491,20 @@ export interface CuActResult extends CuResult {
   reason?: string;
   /** cua-driver's own reply to the action call, verbatim. */
   driverOutput: string;
+  /** The control the action addressed, when it was addressed by label. */
+  element?: CuElement;
+  /** Why the driver says the input was refused or not delivered. */
+  refusal?: string;
   hashes: string[];
   payload: Record<string, unknown>;
 }
 
 function cuHashBlock(os: Host["os"], invoke: string, pid: number, windowId: number, tag: string): string {
-  const args = ["get_window_state", JSON.stringify({ pid, window_id: windowId, include_accessibility_tree: false })];
+  const json = JSON.stringify({ pid, window_id: windowId, include_accessibility_tree: false });
+  const args = ["get_window_state", json];
   if (os === "windows") return [
     `$out${tag} = Join-Path $env:TEMP ('fleet_cu_' + [guid]::NewGuid().ToString('N') + '.png')`,
-    `$null = (${cuInvocation(args, os, invoke, `out${tag}`)} 2>&1)`,
+    `$null = (${cuWinCall("get_window_state", json, `out${tag}`)} 2>&1)`,
     `$h${tag} = if (Test-Path -LiteralPath $out${tag}) { (Get-FileHash -LiteralPath $out${tag} -Algorithm SHA256).Hash } else { '' }`,
     `Write-Output ('${HASH_SENTINEL}${tag}|' + $h${tag})`,
   ].join("\n");
@@ -2294,6 +2521,8 @@ export interface CuInputOptions {
   imageOut?: string;
   space?: "window" | "screen";
   point?: { x: number; y: number; space?: "window" | "screen" };
+  /** Address a control by accessibility instead of by pixel. */
+  element?: CuElementLocator;
 }
 
 function cuInputPayload(target: CuTarget, payload: Record<string, unknown>, opts: CuInputOptions): Record<string, unknown> {
@@ -2335,12 +2564,25 @@ function cuInputPayload(target: CuTarget, payload: Record<string, unknown>, opts
 export async function cuAct(
   cfg: FleetConfig, sel: string, query: string, tool: string, payload: Record<string, unknown>,
   opts: CuInputOptions = {},
-  deps: { exec?: typeof exec; deliver?: typeof deliverImage; snapshot?: typeof cuSnapshot } = {},
+  deps: { exec?: typeof exec; deliver?: typeof deliverImage; snapshot?: typeof cuSnapshot; elements?: typeof cuElements } = {},
 ): Promise<CuActResult> {
   const host = resolveHosts(cfg, sel)[0]!;
   const { target } = await cuResolveTarget(cfg, sel, query, { snapshot: deps.snapshot, exec: deps.exec });
+  let element: CuElement | undefined;
+  if (opts.element) {
+    if (opts.point || ["x", "y", "element_index", "element_token"].some((key) => Object.hasOwn(payload ?? {}, key)))
+      throw new Error("address the control by element or by x,y — not both");
+    // A token needs no lookup; a label costs one tree read, projected host-side.
+    element = opts.element.token && !opts.element.label && !opts.element.role
+      ? { index: -1, token: opts.element.token, role: "", label: "", actions: [] }
+      : cuPickElement((await (deps.elements ?? cuElements)(cfg, sel, query,
+        { filter: opts.element.label }, { target })).elements, opts.element);
+    if (!element.token) throw new Error(`element #${element.index} has no element_token; update cua-driver`);
+    payload = { ...payload, element_token: element.token };
+  }
   const full = cuInputPayload(target, payload, opts);
-  return cuActOnTarget(host, target, tool, full, opts, deps);
+  const result = await cuActOnTarget(host, target, tool, full, opts, deps);
+  return element && element.index >= 0 ? { ...result, element } : result;
 }
 
 export const CU_BATCH_TOOLS = [
@@ -2375,6 +2617,8 @@ function cuBatchReplyCheck(os: Host["os"]): string {
   if (os === "windows") return [
     "function Test-FleetInputRefusal($body) {",
     "  try { $reply = $body | ConvertFrom-Json -ErrorAction Stop } catch { return $false }",
+    "  if ($reply.jsonrpc -and $reply.error) { return $true }",
+    "  if ($reply.jsonrpc -and $reply.result) { $reply = $reply.result }",
     "  if ($reply.isError -eq $true -or $reply.status -in @('refused', 'error', 'failed') -or $reply.refusal -or $reply.error) { return $true }",
     "  if ($reply.escalation.reason -in @('delivery_failed', 'background_unavailable')) { return $true }",
     "  if ($reply.structuredContent -and (Test-FleetInputRefusal ($reply.structuredContent | ConvertTo-Json -Depth 100 -Compress))) { return $true }",
@@ -2453,7 +2697,8 @@ export async function cuBatch(
   const win = host.os === "windows";
   const marker = `__FLEET_STEP_${crypto.randomUUID().replaceAll("-", "")}__`;
   const statements = actions.flatMap((step, index) => {
-    const invocation = cuInvocation([step.tool, JSON.stringify(prepared[index])], host.os, invoke);
+    const json = JSON.stringify(prepared[index]);
+    const invocation = win ? cuWinCall(step.tool, json) : cuInvocation([step.tool, json], host.os, invoke);
     const delay = step.delayMs ?? 0;
     return win ? [
       `Write-Output '${marker}${index}|start'`,
@@ -2508,7 +2753,7 @@ export async function cuBatch(
     } else if (current) current.driverOutput += line + "\n";
   }
   for (const step of steps) {
-    step.driverOutput = step.driverOutput.trim();
+    step.driverOutput = cuReplyText(step.driverOutput.trim()).trim();
     if (stopped && step.status === "unconfirmed" && step !== current) step.status = "not_run";
   }
   const confirmed = steps.every((step) => step.status === "completed");
@@ -2531,8 +2776,8 @@ async function cuActOnTarget(
   const win = host.os === "windows";
   const settle = Math.max(0, Math.round(opts.settleMs ?? 400));
   if (!Number.isFinite(settle)) throw new Error("settleMs must be finite");
-  const actArgs = [tool, JSON.stringify(full)];
-  const action = input?.invoke ?? cuInvocation(actArgs, host.os, invoke);
+  const actJson = JSON.stringify(full);
+  const action = input?.invoke ?? (win ? cuWinCall(tool, actJson) : cuInvocation([tool, actJson], host.os, invoke));
   const sleep = win ? `Start-Sleep -Milliseconds ${settle}` : `sleep ${(settle / 1000).toFixed(3)}`;
   const hashOf = (tag: string) => cuHashBlock(host.os, invoke, target.pid, target.window.window_id, tag);
   const wantImage = Boolean(opts.imageOut);
@@ -2540,6 +2785,7 @@ async function cuActOnTarget(
   const script = win ? [
     `$ErrorActionPreference='Continue'`,
     prelude,
+    cuWinSession(),
     ...(input ? [input.prelude] : []),
     hashOf("A"),
     `if (-not $hA) { Write-Error 'could not capture target before input'; exit 1 }`,
@@ -2554,11 +2800,12 @@ async function cuActOnTarget(
     `if ($hA -ne $hB) { ${sleep}`,
     hashOf("C"),
     `}`,
+    `Stop-FleetCua`,
     `$keep = if ($outC) { $outC } else { $outB }`,
-    // Hand the after-image back only when it was asked for; otherwise delete it
-    // here, so the common verify-only call does not pay a round trip to clean up.
+    // Hand the after-image back inline only when it was asked for; either way
+    // the file is deleted here, so no call pays a round trip to clean up.
     wantImage
-      ? `if ((Test-Path -LiteralPath $keep) -and (Get-Item -LiteralPath $keep).Length -gt 0) { Write-Output ('${IMG_SENTINEL}' + $keep) }`
+      ? emitImage(host.os, "keep", "after")
       : `Remove-Item -LiteralPath $keep -Force -EA SilentlyContinue`,
     `Remove-Item -LiteralPath $outA -Force -EA SilentlyContinue`,
     `if ($outC) { Remove-Item -LiteralPath $outB -Force -EA SilentlyContinue }`,
@@ -2582,12 +2829,14 @@ async function cuActOnTarget(
     `fi`,
     `rm -f "$outA"`,
     wantImage
-      ? `if [ -s "$keep" ]; then echo "${IMG_SENTINEL}$keep"; fi`
+      ? emitImage(host.os, "keep", "after")
       : `rm -f "$keep"`,
     `exit "$act_code"`,
   ].join("\n");
 
-  const raw = await run(host, script, win ? "powershell" : "bash");
+  const executed = await run(host, script, win ? "powershell" : "bash");
+  const { images, rest } = takeInlineImages(executed.stdout);
+  const raw = { ...executed, stdout: rest };
   const hash = (tag: string) => {
     const line = raw.stdout.split("\n").find((l) => l.trim().startsWith(`${HASH_SENTINEL}${tag}|`));
     return line ? line.trim().slice(HASH_SENTINEL.length + tag.length + 1) : "";
@@ -2596,7 +2845,9 @@ async function cuActOnTarget(
   // The action's own reply is framed by the same sentinels as a capture block,
   // with an empty path where a capture would name its PNG.
   const blocks = parseCaptureBlocks(raw.stdout);
-  const driverOutput = (blocks.find((b) => !b.remotePath) ?? blocks[0])?.body.trim() ?? "";
+  const body = (blocks.find((b) => !b.remotePath) ?? blocks[0])?.body.trim() ?? "";
+  // A batch frames each step's reply itself and unwraps them per step.
+  const driverOutput = input ? body : cuReplyText(body).trim();
 
   let effect: CuEffect = "indeterminate";
   let reason: string | undefined;
@@ -2613,22 +2864,27 @@ async function cuActOnTarget(
     effect = "changed";
   }
 
-  const imgLine = wantImage
-    ? raw.stdout.split("\n").find((l) => l.trim().startsWith(IMG_SENTINEL))
-    : undefined;
-  const remote = imgLine ? imgLine.trim().slice(IMG_SENTINEL.length) : undefined;
+  // An exit code of 0 is not delivery: the driver reports a background input
+  // the app dropped as `escalation: delivery_failed` in an otherwise normal
+  // reply. Batch already stops on that; a single action fails on it too.
+  const refusal = input ? undefined : cuReplyRefusal(driverOutput);
   const base: CuActResult = {
     host: host.name, target, effect, reason, driverOutput,
+    ...(refusal ? { refusal } : {}),
     hashes: [hA, hB, hC].filter(Boolean),
     payload: full,
-    result: { ...raw, stdout: driverOutput },
+    result: refusal && raw.ok
+      ? { ...raw, stdout: driverOutput, ok: false, code: 1, stderr: [raw.stderr, refusal].filter(Boolean).join("\n") }
+      : { ...raw, stdout: driverOutput },
   };
 
   if (!opts.imageOut) return base;
-  if (!remote) return { ...base, result: { ...base.result, ok: false, code: base.result.code || 1,
+  const bytes = images.get("after");
+  if (!bytes) return { ...base, result: { ...base.result, ok: false, code: base.result.code || 1,
     stderr: [base.result.stderr, "cua-driver produced no requested after-image"].filter(Boolean).join("\n") } };
   try {
-    const { result: pull, path } = await (deps.deliver ?? deliverImage)(host, remote, opts.imageOut);
+    const { result: pull, path } = await (deps.deliver ?? deliverImage)(host, "inline", opts.imageOut,
+      { pull: inlinePull(host, bytes) });
     if (!pull.ok) return { ...base, result: { ...base.result, ok: false, code: base.result.code || pull.code || 1, stderr:
       [base.result.stderr, `image pull failed: ${pull.stderr}`].filter(Boolean).join("\n") } };
     await validateImageArtifact(path);
@@ -2636,9 +2892,6 @@ async function cuActOnTarget(
   } catch (error) {
     return { ...base, result: { ...base.result, ok: false, code: base.result.code || 1,
       stderr: [base.result.stderr, `image delivery failed: ${error instanceof Error ? error.message : String(error)}`].filter(Boolean).join("\n") } };
-  } finally {
-    const cleanup = rmCmd(host.os, remote);
-    await run(host, cleanup.cmd, cleanup.shell).catch(() => {});
   }
 }
 
@@ -2749,6 +3002,210 @@ export async function cuElementSupport(
       ? `element_index: available for ${where} (${elements}+ elements) — prefer it over pixels.`
       : `element_index: UNAVAILABLE for ${where} (UIA tree empty). Use pixel x,y; `
         + `element_index and element_token cannot resolve on this window.`,
+  };
+}
+
+// ── element-first control: address controls by name, verify by state ───────
+// Pixels are the fallback, not the interface. `get_window_state` without a
+// screenshot returns the window's accessibility tree with one opaque
+// `element_token` per actionable control, and every input tool accepts that
+// token in place of x,y. The daemon keeps its element cache across separate
+// CLI processes, so a token read in one Fleet call still resolves in the next
+// (and survives the screenshot-only captures a verified action takes).
+
+export interface CuElement {
+  index: number;
+  /** Opaque per-snapshot handle; pass it back as `element_token`. */
+  token?: string;
+  role: string;
+  label: string;
+  value?: string | null;
+  enabled?: boolean;
+  selected?: boolean;
+  /** Accessibility patterns the control exposes: invoke, set_value, expand, … */
+  actions: string[];
+  /** Desktop-space bounds, as the driver reports them. */
+  frame?: { x: number; y: number; w: number; h: number };
+  /** Frame center in window-local screenshot pixels: the pixel fallback for a
+   *  control whose accessibility action the app ignores. */
+  center?: { x: number; y: number };
+  depth?: number;
+}
+
+export interface CuElements extends CuResult {
+  target: CuTarget;
+  snapshotId?: string;
+  /** Elements in the whole snapshot, before any filter projection. */
+  total: number;
+  elements: CuElement[];
+  /** False when the accessibility walk found nothing to address. */
+  available: boolean;
+}
+
+/** `get_window_state` structured output → typed elements. Pure. */
+export function parseCuElements(stdout: string, target: CuTarget): Omit<CuElements, "host" | "result"> {
+  let json: any;
+  try { json = extractJson(stdout); } catch { return { target, total: 0, elements: [], available: false }; }
+  const rows: any[] = Array.isArray(json?.elements) ? json.elements : [];
+  const win = target.window;
+  const elements = rows.flatMap((row): CuElement[] => {
+    const index = Number(row?.element_index);
+    if (!Number.isInteger(index)) return [];
+    const f = row.frame && typeof row.frame === "object" ? row.frame : undefined;
+    const frame = f && [f.x, f.y, f.w, f.h].every((v) => Number.isFinite(Number(v)))
+      ? { x: Number(f.x), y: Number(f.y), w: Number(f.w), h: Number(f.h) } : undefined;
+    let center: CuElement["center"];
+    if (frame && frame.w > 0 && frame.h > 0) {
+      const cx = frame.x + frame.w / 2, cy = frame.y + frame.h / 2;
+      // Only a frame that sits inside the window is trusted as desktop space.
+      if (cx >= win.x && cy >= win.y && cx < win.x + win.width && cy < win.y + win.height) {
+        try { center = cuResolvePoint(target, cx, cy, "screen"); } catch { center = undefined; }
+      }
+    }
+    return [{
+      index,
+      token: typeof row.element_token === "string" ? row.element_token : undefined,
+      role: String(row.role ?? ""),
+      label: String(row.label ?? ""),
+      value: row.value === undefined ? undefined : row.value === null ? null : String(row.value),
+      enabled: typeof row.enabled === "boolean" ? row.enabled : undefined,
+      selected: typeof row.selected === "boolean" ? row.selected : undefined,
+      actions: Array.isArray(row.actions) ? row.actions.map(String) : [],
+      frame, center,
+      depth: Number.isFinite(Number(row.depth)) ? Number(row.depth) : undefined,
+    }];
+  });
+  const total = Number(json?.total_element_count ?? json?.element_count ?? elements.length) || 0;
+  return {
+    target, elements, total,
+    snapshotId: typeof json?.snapshot_id === "string" ? json.snapshot_id : undefined,
+    available: total > 0 && json?.degraded !== true,
+  };
+}
+
+/** Read a window's addressable controls without taking a screenshot.
+ *  `filter` is the driver's own case-insensitive projection, so a large tree
+ *  is narrowed host-side instead of shipped whole. */
+export async function cuElements(
+  cfg: FleetConfig, sel: string, query: string,
+  opts: { filter?: string; maxElements?: number; maxDepth?: number } = {},
+  deps: { run?: typeof cuRun; snapshot?: typeof cuSnapshot; target?: CuTarget } = {},
+): Promise<CuElements> {
+  const target = deps.target ?? (await cuResolveTarget(cfg, sel, query, { snapshot: deps.snapshot })).target;
+  const args: Record<string, unknown> = {
+    pid: target.pid, window_id: target.window.window_id, include_screenshot: false,
+  };
+  if (opts.filter) args.query = opts.filter;
+  if (opts.maxElements !== undefined) args.max_elements = opts.maxElements;
+  if (opts.maxDepth !== undefined) args.max_depth = opts.maxDepth;
+  const response = await (deps.run ?? cuRun)(cfg, sel, ["get_window_state", JSON.stringify(args)]);
+  if (!response.result.ok) return { ...response, target, total: 0, elements: [], available: false };
+  return { ...response, ...parseCuElements(response.result.stdout, target) };
+}
+
+/** How a caller names one control: its token, or its label (plus role / nth
+ *  to break a tie). */
+export interface CuElementLocator { token?: string; label?: string; role?: string; nth?: number }
+
+/** Pick exactly one element, or explain why not. Exact label beats substring;
+ *  an ambiguous match lists the candidates with their tokens instead of
+ *  guessing, because the wrong "OK" button is worse than none. Pure. */
+export function cuPickElement(elements: CuElement[], loc: CuElementLocator): CuElement {
+  if (loc.token) {
+    const hit = elements.find((e) => e.token === loc.token);
+    if (hit) return hit;
+    throw new Error(`no element with token ${loc.token} in this snapshot; list them with: fleet cu <host> elements <target>`);
+  }
+  const label = loc.label?.trim().toLowerCase();
+  const role = loc.role?.trim().toLowerCase();
+  if (!label && !role) throw new Error("an element needs a token, a label, or a role");
+  const byRole = role ? elements.filter((e) => e.role.toLowerCase() === role) : elements;
+  const exact = label === undefined ? byRole : byRole.filter((e) => e.label.trim().toLowerCase() === label);
+  const pool = exact.length ? exact
+    : label === undefined ? [] : byRole.filter((e) => e.label.toLowerCase().includes(label));
+  const describe = (e: CuElement) => `${e.token ?? `#${e.index}`} ${e.role} "${e.label}"`
+    + (e.enabled === false ? " (disabled)" : "");
+  const what = [role && `role ${loc.role}`, label !== undefined && `label "${loc.label}"`].filter(Boolean).join(" and ");
+  if (!pool.length) {
+    const near = elements.slice(0, 12).map(describe).join("\n  ");
+    throw new Error(`no element with ${what}` + (near ? `; some that exist:\n  ${near}` : ""));
+  }
+  if (loc.nth !== undefined) {
+    if (!Number.isInteger(loc.nth) || loc.nth < 1 || loc.nth > pool.length)
+      throw new Error(`--nth must be from 1 to ${pool.length} for ${what}`);
+    return pool[loc.nth - 1]!;
+  }
+  if (pool.length === 1) return pool[0]!;
+  throw new Error(`${pool.length} elements match ${what}; pass --role, --nth N, or --element TOKEN:\n  `
+    + pool.slice(0, 12).map(describe).join("\n  "));
+}
+
+/** A driver reply that says the input was refused or never delivered, even
+ *  though the process exited 0 — `escalation.reason: delivery_failed` is how a
+ *  background key press that the app ignored reports itself. */
+export function cuReplyRefusal(text: string): string | undefined {
+  let reply: any;
+  try { reply = extractJson(text); } catch { return undefined; }
+  if (!reply || typeof reply !== "object" || Array.isArray(reply)) return undefined;
+  if (reply.isError === true) return "the driver returned an error";
+  if (["refused", "error", "failed"].includes(reply.status)) return `the driver reported status ${reply.status}`;
+  if (reply.refusal) return `the driver refused the input: ${typeof reply.refusal === "string" ? reply.refusal : JSON.stringify(reply.refusal)}`;
+  const reason = reply.escalation?.reason;
+  if (reason === "delivery_failed" || reason === "background_unavailable")
+    return `the driver could not deliver this input in the background (${reason}); retry with --foreground`;
+  return undefined;
+}
+
+export type CuVerifyStatus = "satisfied" | "unsatisfied" | "unknown";
+export interface CuVerifyResult extends CuResult {
+  target: CuTarget;
+  status: CuVerifyStatus;
+  predicates: { index: number; status: CuVerifyStatus; reason?: string; observed?: unknown }[];
+  elapsedMs?: number;
+}
+
+/** Check a window's state with `verify_state` — deterministic predicates over
+ *  its accessibility tree and bounds, with no screenshot to interpret. Only
+ *  `satisfied` is success; `unknown` never implies it. */
+export async function cuVerify(
+  cfg: FleetConfig, sel: string, query: string, expect: unknown[],
+  opts: { timeoutMs?: number; stableSamples?: number } = {},
+  deps: { run?: typeof cuRun; snapshot?: typeof cuSnapshot } = {},
+): Promise<CuVerifyResult> {
+  if (!Array.isArray(expect) || expect.length < 1 || expect.length > 8)
+    throw new Error("verify takes 1 to 8 predicates");
+  if (opts.timeoutMs !== undefined && (!Number.isInteger(opts.timeoutMs) || opts.timeoutMs < 0 || opts.timeoutMs > 10000))
+    throw new Error("timeout must be an integer from 0 to 10000 ms");
+  if (opts.stableSamples !== undefined && (!Number.isInteger(opts.stableSamples) || opts.stableSamples < 1 || opts.stableSamples > 5))
+    throw new Error("stable samples must be an integer from 1 to 5");
+  const { target } = await cuResolveTarget(cfg, sel, query, { snapshot: deps.snapshot });
+  const args: Record<string, unknown> = { pid: target.pid, window_id: target.window.window_id, expect };
+  if (opts.timeoutMs !== undefined) args.timeout_ms = opts.timeoutMs;
+  if (opts.stableSamples !== undefined) args.stable_samples = opts.stableSamples;
+  const response = await (deps.run ?? cuRun)(cfg, sel, ["verify_state", JSON.stringify(args)]);
+  const fail = (why: string): CuVerifyResult => ({ ...response, target, status: "unknown", predicates: [],
+    result: { ...response.result, ok: false, code: response.result.code || 1,
+      stderr: [response.result.stderr, why].filter(Boolean).join("\n") } });
+  if (!response.result.ok) return fail("verify_state failed");
+  let json: any;
+  try { json = extractJson(response.result.stdout); } catch { return fail(response.result.stdout.trim() || "verify_state returned no JSON"); }
+  const known = (s: unknown): CuVerifyStatus => s === "satisfied" || s === "unsatisfied" ? s : "unknown";
+  if (json?.status === undefined) return fail(response.result.stdout.trim());
+  const status = known(json.status);
+  const predicates = (Array.isArray(json.predicates) ? json.predicates : []).map((p: any, i: number) => {
+    let observed: unknown = p?.observed_json;
+    if (typeof observed === "string") { try { observed = JSON.parse(observed); } catch { /* keep the raw text */ } }
+    return {
+      index: Number.isInteger(p?.index) ? p.index : i,
+      status: known(p?.status),
+      ...(p?.unknown_reason ? { reason: String(p.unknown_reason) } : {}),
+      ...(observed !== undefined && observed !== null ? { observed } : {}),
+    };
+  });
+  return {
+    ...response, target, status, predicates,
+    elapsedMs: Number.isFinite(Number(json.elapsed_ms)) ? Number(json.elapsed_ms) : undefined,
+    result: { ...response.result, ok: status === "satisfied", code: status === "satisfied" ? 0 : 1 },
   };
 }
 

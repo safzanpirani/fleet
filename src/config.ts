@@ -24,7 +24,29 @@ export interface Host {
   health?: string;    // HTTP URL probed as a liveness fallback when ssh is down (ls/doctor)
   cdp?: string;       // Chrome DevTools Protocol endpoint used by `fleet browse`
   deploy?: DeployTarget;   // where `fleet deploy` ships the fleet source on this host
+  proxy?: string;     // `proxies` entry name, or an inline URL (socks5h://user:pass@host:1080)
 }
+/** How `fleet doctor` proves a proxy actually changes the egress IP. */
+export interface ProxyVerify {
+  url: string;        // http(s) URL fetched THROUGH the proxy
+  expect?: string;    // the exit IP the response body must contain
+}
+/** A proxy every transport to a host is routed through. Credentials never live
+ *  in the ssh command line: the `ProxyCommand` carries only the proxy NAME and
+ *  `fleet __proxy-connect` reads the secret from passwordEnv/passwordFile. */
+export interface ProxySpec {
+  type?: ProxyType;   // default socks5
+  host: string;
+  port: number;
+  user?: string;
+  passwordEnv?: string;   // env var holding the password
+  passwordFile?: string;  // ~-expanded file holding the password (first line)
+  password?: string;      // inline-URL only; never a config field (validation rejects it)
+  dns?: "local" | "remote";  // default remote — the proxy resolves the target, no local leak
+  verify?: ProxyVerify;
+}
+export type ProxyType = "socks5" | "socks5h" | "http";
+
 export interface DeployTarget {
   dir?: string;       // install dir (default: ~/fleet | %USERPROFILE%\fleet)
   bun?: string;       // bun binary path (default: bun on PATH, else ~/.bun/bin/bun)
@@ -60,6 +82,8 @@ export interface FleetConfig {
   groups?: Record<string, string[]>;     // custom named groups
   recipes?: Record<string, string[]>;    // saved playbooks (fleet subcommand strings)
   tools?: Record<string, ToolSpec>;      // CLI tools this fleet ships to its boxes
+  proxies?: Record<string, ProxySpec>;   // named proxies hosts can be routed through
+  defaultProxy?: string;                 // applies to every host with no `proxy` of its own
   dashboard?: string;
 }
 
@@ -71,9 +95,108 @@ const OSES = new Set<string>(["linux", "windows", "mac"]);
 const SVC_TYPES = new Set<string>(["systemd", "systemd-user", "nssm", "winservice", "schtask"]);
 const WIN_SHELLS = new Set<string>(["pwsh", "powershell"]);
 const TRANSPORTS = new Set<string>(["ssh", "daytona"]);
+const PROXY_TYPES = new Set<string>(["socks5", "socks5h", "http"]);
+const PROXY_DNS = new Set<string>(["local", "remote"]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+
+// ── proxies ──────────────────────────────────────────────────────────────────
+// A host with a `proxy` is reachable ONLY through that proxy: every transport
+// (exec, spawn, cp, edit, interactive ssh, probe, doctor) gets the same
+// `-o ProxyCommand=…`. Resolution is deliberately overridable at three levels so
+// a wedged proxy never locks you out of your own fleet.
+
+/** A proxy plus the label it is reported under. `name` is a `proxies` key, or
+ *  the redacted URL for an inline spec. */
+export interface ResolvedProxy {
+  name: string;   // display label: the `proxies` key, or the REDACTED inline URL
+  ref: string;    // the literal reference to hand a child process (name or URL)
+  spec: ProxySpec;
+}
+
+/** Hide `user:pass@` in anything that may reach a log, an error, or --json. */
+export function redactProxy(text: string): string {
+  return text.replace(/(\b[a-z0-9+.-]+:\/\/)([^/@\s]*:)[^/@\s]*@/gi, "$1$2***@");
+}
+
+/** Parse the convenience inline form, e.g. `socks5h://user:pass@host:1080`.
+ *  Documented as convenience only — the password lands in fleet.config.json. */
+export function parseProxyUrl(url: string): ProxySpec {
+  let u: URL;
+  try { u = new URL(url); } catch { throw new Error(`not a valid proxy URL: ${redactProxy(url)}`); }
+  const scheme = u.protocol.replace(/:$/, "").toLowerCase();
+  if (!PROXY_TYPES.has(scheme))
+    throw new Error(`proxy URL scheme must be one of ${[...PROXY_TYPES].join("|")} (got '${scheme}')`);
+  if (!u.hostname) throw new Error(`proxy URL has no host: ${redactProxy(url)}`);
+  const port = u.port ? Number(u.port) : (scheme === "http" ? 8080 : 1080);
+  if (!Number.isInteger(port) || port < 1 || port > 65535)
+    throw new Error(`proxy URL port must be 1-65535 (got '${u.port}')`);
+  const spec: ProxySpec = { type: scheme as ProxyType, host: u.hostname, port };
+  if (u.username) spec.user = decodeURIComponent(u.username);
+  if (u.password) spec.password = decodeURIComponent(u.password);
+  // `#passwordEnv=NAME` is how fleet hands an inline URL's password to its own
+  // ProxyCommand without writing it into argv (see proxyOpts).
+  const fromEnv = /^#passwordEnv=([A-Z0-9_]+)$/.exec(u.hash)?.[1];
+  if (fromEnv && !u.password) spec.passwordEnv = fromEnv;
+  return spec;
+}
+
+/** `socks5h` is shorthand for socks5 + remote DNS; normalise it away so the
+ *  transport only ever sees `socks5` | `http` plus an explicit `dns`. */
+export function normalizeProxy(spec: ProxySpec): Required<Pick<ProxySpec, "type" | "dns">> & ProxySpec {
+  const socks5h = spec.type === "socks5h";
+  return {
+    ...spec,
+    type: socks5h ? "socks5" : (spec.type ?? "socks5"),
+    dns: spec.dns ?? "remote",
+  };
+}
+
+/** Stable identity of a route — what makes two proxies "the same connection" for
+ *  ControlPath purposes. Credentials are excluded deliberately: they change the
+ *  auth, not the path, and must never reach a socket name. */
+export function proxyIdentity(spec: ProxySpec): string {
+  const n = normalizeProxy(spec);
+  return `${n.type}://${n.user ?? ""}@${n.host}:${n.port}/${n.dns}`;
+}
+
+/** The config the running process resolves proxies against. Set once by
+ *  `loadConfig`, so the transport layer can stay a pure `Host`-in function. */
+let _activeConfig: FleetConfig | null = null;
+export function setActiveConfig(cfg: FleetConfig | null): void { _activeConfig = cfg; }
+export function activeConfig(): FleetConfig | null { return _activeConfig; }
+
+/** Look up a proxy reference (a `proxies` key or an inline URL). */
+export function lookupProxy(ref: string, cfg: FleetConfig | null = _activeConfig): ResolvedProxy {
+  if (ref.includes("://")) return { name: redactProxy(ref), ref, spec: parseProxyUrl(ref) };
+  const spec = cfg?.proxies?.[ref];
+  if (!spec) throw new Error(`unknown proxy '${ref}' (have: ${Object.keys(cfg?.proxies ?? {}).join(", ") || "none"})`);
+  return { name: ref, ref, spec };
+}
+
+/**
+ * Which proxy (if any) a connection to `host` goes through. First match wins:
+ *   1. FLEET_PROXY_OVERRIDE — set by `--proxy` (beats the kill switch on purpose)
+ *   2. FLEET_NO_PROXY=1     — global kill switch, also set by `--no-proxy`
+ *   3. FLEET_PROXY          — env default
+ *   4. hosts.<h>.proxy
+ *   5. defaultProxy
+ *   6. none — exactly today's behaviour
+ */
+export function resolveProxy(
+  host: Pick<Host, "proxy" | "transport">,
+  cfg: FleetConfig | null = _activeConfig,
+  env: Record<string, string | undefined> = process.env,
+): ResolvedProxy | null {
+  if (host.transport === "daytona") return null;   // HTTP transport; §5 says warn-and-ignore
+  const override = env.FLEET_PROXY_OVERRIDE;
+  if (override) return lookupProxy(override, cfg);
+  if (env.FLEET_NO_PROXY === "1") return null;
+  const ref = env.FLEET_PROXY || host.proxy || cfg?.defaultProxy;
+  return ref ? lookupProxy(ref, cfg) : null;
 }
 
 /** Structural validation — fails fast at load with a precise message instead of
@@ -108,15 +231,54 @@ export function validateConfig(cfg: FleetConfig, path: string): void {
   };
 
   const root = record(cfg, "`config`");
-  knownKeys(root, ["$comment", "hosts", "machines", "routes", "groups", "recipes", "tools", "dashboard"], "`config`");
+  knownKeys(root, ["$comment", "hosts", "machines", "routes", "groups", "recipes", "tools", "proxies", "defaultProxy", "dashboard"], "`config`");
   stringIfPresent(root["$comment"], "`config`.$comment");
   if (!isRecord(cfg.hosts) || !Object.keys(cfg.hosts).length)
     fail("`hosts` must be a non-empty object");
   httpUrlIfPresent(cfg.dashboard, "dashboard");
+  for (const [pn, rawProxy] of Object.entries(optionalRecord(cfg.proxies, "proxies"))) {
+    const px = record(rawProxy, `proxies.${pn}`) as unknown as ProxySpec;
+    knownKeys(px as unknown as Record<string, unknown>,
+      ["type", "host", "port", "user", "passwordEnv", "passwordFile", "dns", "verify"], `proxies.${pn}`);
+    if (px.type !== undefined && !PROXY_TYPES.has(px.type))
+      fail(`proxies.${pn}: type must be one of ${[...PROXY_TYPES].join("|")} (got '${px.type}')`);
+    if (!px.host || typeof px.host !== "string") fail(`proxies.${pn}: missing/invalid \`host\``);
+    if (!Number.isInteger(px.port) || px.port < 1 || px.port > 65535)
+      fail(`proxies.${pn}.port must be an integer 1-65535 (got '${px.port}')`);
+    stringIfPresent(px.user, `proxies.${pn}.user`);
+    stringIfPresent(px.passwordEnv, `proxies.${pn}.passwordEnv`);
+    stringIfPresent(px.passwordFile, `proxies.${pn}.passwordFile`);
+    if (px.passwordEnv && px.passwordFile)
+      fail(`proxies.${pn}: set at most one of passwordEnv / passwordFile`);
+    if (px.dns !== undefined && !PROXY_DNS.has(px.dns))
+      fail(`proxies.${pn}.dns must be one of ${[...PROXY_DNS].join("|")} (got '${px.dns}')`);
+    if (px.verify !== undefined) {
+      const v = record(px.verify, `proxies.${pn}.verify`) as unknown as ProxyVerify;
+      knownKeys(v as unknown as Record<string, unknown>, ["url", "expect"], `proxies.${pn}.verify`);
+      if (!v.url) fail(`proxies.${pn}.verify: missing \`url\``);
+      httpUrlIfPresent(v.url, `proxies.${pn}.verify.url`);
+      stringIfPresent(v.expect, `proxies.${pn}.verify.expect`);
+    }
+  }
+  const proxyNames = Object.keys(cfg.proxies ?? {});
+  /** A bare word must name a `proxies` entry; anything with a scheme is an inline URL. */
+  const checkProxyRef = (ref: unknown, at: string): void => {
+    stringIfPresent(ref, at);
+    if (ref === undefined) return;
+    const value = ref as string;
+    if (value.includes("://")) {
+      try { parseProxyUrl(value); }
+      catch (e) { fail(`${at}: ${redactProxy((e as Error).message)}`); }
+      return;
+    }
+    if (!proxyNames.includes(value))
+      fail(`${at} references unknown proxy '${value}' (have: ${proxyNames.join(", ") || "none"})`);
+  };
+  checkProxyRef(cfg.defaultProxy, "defaultProxy");
   for (const [name, rawHost] of Object.entries(cfg.hosts)) {
     const h = record(rawHost, `hosts.${name}`) as unknown as Host;
     knownKeys(h as unknown as Record<string, unknown>,
-      ["name", "ssh", "os", "transport", "gpu", "wsl", "winShell", "python", "services", "health", "cdp", "deploy"],
+      ["name", "ssh", "os", "transport", "gpu", "wsl", "winShell", "python", "services", "health", "cdp", "deploy", "proxy"],
       `hosts.${name}`);
     if (!h.ssh || typeof h.ssh !== "string") fail(`hosts.${name}: missing/invalid \`ssh\``);
     if (h.ssh.startsWith("-")) fail(`hosts.${name}.ssh must not begin with '-' (ssh would parse it as an option)`);
@@ -128,6 +290,7 @@ export function validateConfig(cfg: FleetConfig, path: string): void {
     stringIfPresent(h.python, `hosts.${name}.python`);
     httpUrlIfPresent(h.health, `hosts.${name}.health`);
     httpUrlIfPresent(h.cdp, `hosts.${name}.cdp`);
+    checkProxyRef(h.proxy, `hosts.${name}.proxy`);
     if (h.winShell && !WIN_SHELLS.has(h.winShell))
       fail(`hosts.${name}: winShell must be one of ${[...WIN_SHELLS].join("|")} (got '${h.winShell}')`);
     if (h.winShell && h.os !== "windows")
@@ -262,6 +425,7 @@ export async function loadConfig(): Promise<FleetConfig> {
   const raw = await Bun.file(path).json() as FleetConfig;
   validateConfig(raw, path);
   for (const [name, h] of Object.entries(raw.hosts)) h.name = name;
+  setActiveConfig(raw);
   return raw;
 }
 

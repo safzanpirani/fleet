@@ -329,8 +329,13 @@ describe("machine-readable CLI output", () => {
         + '{"windows":[{"window_id":7,"pid":1,"title":"Demo","app_name":"demo.exe",'
         + '"bounds":{"x":0,"y":0,"width":800,"height":600},"is_on_screen":true,'
         + '"minimized":false,"z_index":3}]}\\n__FLEET_SEP__\\n{"max_image_dimension":1568}\\n';
+      // Windows programs travel base64-encoded inside fleet's wrapper; the stub
+      // decodes them the way pwsh does before deciding what to answer.
       executable(join(bin, "ssh"),
-        "#!/bin/sh\nscript=$(cat)\ncase \"$script\" in\n"
+        "#!/bin/sh\nraw=$(cat)\n"
+        + "b64=$(printf '%s' \"$raw\" | sed -n \"s/.*FromBase64String('\\([^']*\\)').*/\\1/p\" | head -n 1)\n"
+        + "script=$(printf '%s' \"$b64\" | base64 -d 2>/dev/null)\n"
+        + "case \"$script\" in\n"
         + `  *list_apps*) printf '${snapshot}' ;;\n`
         + "  *) printf 'driver completed without output\\n' ;;\nesac\n");
       const copied = join(root, "scp-called");

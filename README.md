@@ -500,6 +500,20 @@ fleet cu web scroll "Example App" down 2 --by page
 fleet cu web batch "Example App" '[{"tool":"click","args":{"x":100,"y":80}},{"tool":"type_text","args":{"text":"example"}}]' --shot --json
 ```
 
+Address controls by accessibility instead of pixels when the window exposes them.
+`elements` lists each control's token, role, label, value, and actions without taking a
+screenshot. The input commands accept `--label TEXT [--role R] [--nth N]` or
+`--element TOKEN` in place of coordinates, and an ambiguous label is refused with the
+candidates listed. `verify` checks state with cua-driver's `verify_state`.
+
+```sh
+fleet cu web elements "Example App" save --role Button
+fleet cu web click "Example App" --label Save --role Button
+fleet cu web set "Example App" "example" --label Search
+fleet cu web menu "Example App" File "Save As..."
+fleet cu web verify "Example App" --label Saved
+```
+
 A batch targets one fixed window, executes ordered input on the host, and captures
 before/after the whole sequence. Use `--file actions.json` or `-` for stdin. Each
 entry has `tool`, optional `args`, optional coordinate `space`, and optional
@@ -563,6 +577,70 @@ is absent. Compiled binaries search beside the executable, then the user config
 and deployed source directories. Missing-config errors list usable locations.
 An explicit `FLEET_CONFIG` that does not exist fails without falling back.
 
+### Proxies
+
+A host with a `proxy` is reachable **only** through that proxy. Every transport
+carries the same route: `exec`, `spawn`/`jobs`, `cp`, `edit`, `restart`,
+`reboot`, `tools sync`, `deploy`, `ls`/`wait` probes, `doctor`, and interactive
+`fleet ssh`.
+
+```jsonc
+{
+  "proxies": {
+    "vpn-exit": {
+      "type": "socks5",              // socks5 | socks5h | http
+      "host": "192.0.2.10",
+      "port": 1080,
+      "user": "optional",
+      "passwordEnv": "VPN_PROXY_PW", // or "passwordFile": "~/.fleet/proxies/vpn.pw"
+      "dns": "remote",               // remote (default) — the PROXY resolves the target
+      "verify": { "url": "https://api.ipify.org", "expect": "198.51.100.7" }
+    }
+  },
+  "defaultProxy": "vpn-exit",        // optional; covers hosts with no `proxy` of their own
+  "hosts": {
+    "box": { "ssh": "box", "os": "linux", "proxy": "vpn-exit" }
+  }
+}
+```
+
+`"proxy"` takes a `proxies` key or an inline URL
+(`"socks5h://user:pass@host:1080"`). The inline form is a convenience only — the
+password then lives in `fleet.config.json`.
+
+Resolution, first match wins: `--proxy NAME|URL` → `FLEET_NO_PROXY=1` →
+`FLEET_PROXY` → `hosts.<h>.proxy` → `defaultProxy` → direct.
+
+```sh
+fleet proxy                  # configured proxies and what routes through each
+fleet proxy check            # probe each endpoint; run its `verify` fetch through it
+fleet proxy drop <sel>       # close ssh control masters after changing a route
+fleet doctor <host>          # resolved proxy, the exact ProxyCommand, the verify result
+fleet exec --no-proxy <host> 'echo $SSH_CLIENT'   # compare against the direct route
+```
+
+Fleet does **not** shell out to `nc`/`ncat`/`socat`: it speaks SOCKS5 itself via a
+hidden `fleet __proxy-connect <name> %h %p` that ssh runs as its `ProxyCommand`.
+That keeps the dependency set empty, makes remote DNS a deliberate choice rather
+than an implementation accident, and keeps credentials out of the process table —
+only the proxy *name* reaches ssh's argv; the secret is read in-process from
+`passwordEnv`/`passwordFile`. A failed connection names the leg that broke
+(proxy unreachable, auth rejected, DNS, destination refused) instead of blaming
+the host.
+
+Two things to know:
+
+- Fleet's explicit `-o ProxyCommand=…` **overrides** any `ProxyCommand` in
+  `~/.ssh/config` for that host. Delete hand-written blocks for hosts that now
+  carry `"proxy"` in fleet config, or raw `ssh` and `fleet` will disagree.
+- Changing a host's proxy does not re-route a **live** control master; it keeps
+  the old path until `ControlPersist` expires. Run `fleet proxy drop <host>`
+  (or `ssh -O exit <host>`) after a route change. Fleet mixes the route into the
+  control-socket name, so a proxied and a direct host that share a `HostName` no
+  longer collide — but a master created before the route changed is still stale.
+
+Daytona (`dt:`) hosts speak HTTP, not ssh; a proxy configured for one is ignored.
+
 Override the config path with `FLEET_CONFIG=/path/to.json`. Keep a personal,
 git-ignored `fleet.config.local.json` if you don't want hosts in git.
 
@@ -572,8 +650,12 @@ git-ignored `fleet.config.local.json` if you don't want hosts in git.
 | `FLEET_CONFIG` | alternate config path |
 | `FLEET_SOURCE_ROOT` | source checkout for deployment from a compiled binary |
 | `FLEET_EXEC_TIMEOUT` | default wall-clock cap in seconds; per-call timeout wins. Unset/0 disables the SSH cap; Daytona retains its five-minute default |
-| `FLEET_PROBE_TIMEOUT_MS` | reachability-probe cap (default 4000) |
+| `FLEET_DONE_GRACE_MS` | after a remote script reports it finished, how long to wait for its output to drain before returning (default 1500). Stops a remote child that keeps stdout open from hanging the call |
+| `FLEET_PROBE_TIMEOUT_MS` | reachability-probe cap (default 4000; a proxied host gets +2000 unless this is set) |
+| `FLEET_PROXY` | default proxy (name or URL) for every host with no `proxy` of its own |
+| `FLEET_NO_PROXY` | `1` routes every connection directly — the kill switch for a wedged proxy. `--proxy` still wins |
 | `FLEET_WIN_SHELL` | force `pwsh` or `powershell` on every Windows host (overrides per-host `winShell`) |
+| `NO_COLOR` / `FORCE_COLOR` | output is uncoloured unless stdout is a terminal; `NO_COLOR` always disables colour, `FORCE_COLOR=1` forces it |
 | `FLEET_NO_SSH_MUX` | `1` disables SSH connection multiplexing. By default fleet reuses one master connection per host (`ControlMaster=auto`, `ControlPersist=60s`, sockets under `~/.fleet/ssh/`) so fan-outs and poll loops don't re-handshake; a wedged socket is fixed by this flag or `rm ~/.fleet/ssh/cm-*` |
 
 ## Why

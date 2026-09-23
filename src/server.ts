@@ -18,7 +18,7 @@ import {
   cuInstall, cuTools, cuDescribe, cuRecordStart, cuRecordStop, cuRecordStatus,
   cuApps, cuShotWindow, browseHost, deployHosts, diagnose,
   cuSnapshot, cuResolveTargetFrom, cuResolvePoint, cuAct, cuBatch, CU_BATCH_TOOLS, cuBlockerNote,
-  cuGridCaption, cuElementSupport, compactCuOutput, briefDescribe,
+  cuGridCaption, cuElementSupport, compactCuOutput, briefDescribe, cuElements, cuVerify,
   rebootHosts, firmwareRebootHosts, bootState, switchMachine, waitFor, routeSelector, svcStatus,
 } from "./core.ts";
 import {
@@ -934,7 +934,11 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       + "window that repaints on its own. window_id is always sent explicitly — omitted, cua-driver "
       + "targets the process's FRONTMOST window, which is the modal dialog when one is open, and "
       + "window-local coordinates then land somewhere unrelated. Pixel coordinates are validated "
-      + "against the window and refused when they fall outside it. " + sel,
+      + "against the window and refused when they fall outside it. PREFER `element` over x/y: it "
+      + "addresses a control by accessibility (token from fleet_cu_elements, or its label), works "
+      + "on a background window, and an ambiguous label is refused with the candidates listed. "
+      + "A reply saying the input was not delivered fails the call; retry with "
+      + "args.delivery_mode \"foreground\". " + sel,
     inputSchema: {
       host: z.string().describe("Host name or selector (first matched host is used)."),
       app: z.string().describe("PID, process name, app name, or window title."),
@@ -943,6 +947,12 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
         .describe("Tool arguments WITHOUT pid/window_id/target or from_zoom. Fleet supplies the target and checks x/y and drag endpoints."),
       x: z.number().optional().describe("Pixel X, validated and translated into window-local space."),
       y: z.number().optional().describe("Pixel Y, validated and translated into window-local space."),
+      element: z.object({
+        token: z.string().optional().describe("element_token from fleet_cu_elements (no lookup needed)."),
+        label: z.string().optional().describe("Control label: exact match first, then substring, case-insensitive."),
+        role: z.string().optional().describe("Control role to narrow a label match: Button, Edit, MenuItem, CheckBox, …"),
+        nth: z.number().int().min(1).optional().describe("1-based pick among several matches."),
+      }).strict().optional().describe("Address a control by accessibility instead of x/y."),
       space: z.enum(["window", "screen"]).optional()
         .describe("Frame for all coordinates, including args.from_x/from_y/to_x/to_y. window (default) = shot-window pixels; screen = desktop."),
       settleMs: z.number().int().min(0).max(10000).optional()
@@ -951,19 +961,20 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       grid: z.boolean().optional().describe("Overlay the coordinate grid on the after image."),
     },
     annotations: { openWorldHint: true },
-  }, async ({ host, app, tool, args, x, y, space, settleMs, screenshot, grid }) => {
+  }, async ({ host, app, tool, args, x, y, element, space, settleMs, screenshot, grid }) => {
     const target = await routeSelector(cfg, host);
     const run = async (local?: string) => {
       if ((x === undefined) !== (y === undefined))
         return text("x and y must be given together", true);
       const r = await cuAct(cfg, target, app, tool, { ...(args ?? {}) }, {
-        settleMs, imageOut: local, space,
+        settleMs, imageOut: local, space, element,
         point: x !== undefined && y !== undefined ? { x, y, space: space ?? "window" } : undefined,
       });
       const note = cuBlockerNote(r.target);
       const lines = [
         `effect: ${r.effect}${r.reason ? ` — ${r.reason}` : ""}`,
-        `${r.target.name} · pid ${r.target.pid} · window_id ${r.target.window.window_id} · ${tool}`,
+        `${r.target.name} · pid ${r.target.pid} · window_id ${r.target.window.window_id} · ${tool}`
+        + (r.element ? ` → ${r.element.role} ${JSON.stringify(r.element.label)} (${r.element.token})` : ""),
         ...(note ? [note] : []),
         ...(r.driverOutput ? ["", r.driverOutput] : []),
         ...(r.result.stderr ? ["", r.result.stderr] : []),
@@ -980,6 +991,61 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     } catch (error) {
       return text(error instanceof Error ? error.message : String(error), true);
     }
+  });
+
+  server.registerTool("fleet_cu_elements", {
+    title: "List a window's addressable controls",
+    description: "Read one window's accessibility tree WITHOUT a screenshot: each control's element_token, "
+      + "role, label, value, enabled/selected state, available actions (invoke, set_value, toggle, expand, …), "
+      + "and its center in window-local pixels as a fallback. Pass a token or label to fleet_cu_act `element` "
+      + "instead of reading coordinates off an image. filter is applied host-side, so a large tree is not shipped "
+      + "whole. available:false means the walk found nothing and the window needs pixels. " + sel,
+    inputSchema: {
+      host: z.string().describe("Host name or selector (first matched host is used)."),
+      app: z.string().describe("PID, process name, app name, or window title."),
+      filter: z.string().optional().describe("Case-insensitive substring over labels and values; ancestors are kept."),
+      role: z.string().optional().describe("Keep only this role: Button, Edit, MenuItem, CheckBox, ListItem, …"),
+      maxElements: z.number().int().min(1).max(5000).optional().describe("Cap on nodes walked (driver default 5000)."),
+    },
+    annotations: { readOnlyHint: true, openWorldHint: true },
+  }, async ({ host, app, filter, role, maxElements }) => {
+    try {
+      const r = await cuElements(cfg, await routeSelector(cfg, host), app, { filter, maxElements });
+      if (!r.result.ok) return text(r.result.stderr || r.result.stdout || "get_window_state failed", true);
+      const elements = role ? r.elements.filter((e) => e.role.toLowerCase() === role.toLowerCase()) : r.elements;
+      return text(JSON.stringify({
+        target: { name: r.target.name, pid: r.target.pid, window_id: r.target.window.window_id, title: r.target.window.title },
+        snapshotId: r.snapshotId, total: r.total, available: r.available,
+        elements: elements.map(({ frame: _frame, ...e }) => e),
+        ...(r.available ? {} : { note: "no accessibility elements here: use fleet_cu_screenshot_window and pixel x/y" }),
+      }));
+    } catch (error) { return text(error instanceof Error ? error.message : String(error), true); }
+  });
+
+  server.registerTool("fleet_cu_verify", {
+    title: "Verify a window's state without a screenshot",
+    description: "Check 1-8 predicates against one exact window with cua-driver verify_state and return satisfied, "
+      + "unsatisfied, or unknown. Only satisfied is success; unknown never implies it. Predicates: "
+      + "{element:{selector:{label_contains?,role?},exists:true,value_equals?,enabled?,selected?}} or "
+      + "{window:{exists?,bounds?:{x,y,width,height,tolerance_px?}}}. Waits up to timeoutMs for the state "
+      + "to hold for stableSamples consecutive reads. " + sel,
+    inputSchema: {
+      host: z.string().describe("Host name or selector (first matched host is used)."),
+      app: z.string().describe("PID, process name, app name, or window title."),
+      expect: z.array(z.record(z.string(), z.any())).min(1).max(8).describe("Predicates, combined with AND."),
+      timeoutMs: z.number().int().min(0).max(10000).optional().describe("Bounded wait (driver default 5000; 0 = one sample)."),
+      stableSamples: z.number().int().min(1).max(5).optional().describe("Consecutive satisfied samples required (default 2)."),
+    },
+    annotations: { readOnlyHint: true, openWorldHint: true },
+  }, async ({ host, app, expect, timeoutMs, stableSamples }) => {
+    try {
+      const r = await cuVerify(cfg, await routeSelector(cfg, host), app, expect, { timeoutMs, stableSamples });
+      return { content: [{ type: "text" as const, text: JSON.stringify({
+        status: r.status, predicates: r.predicates, elapsedMs: r.elapsedMs,
+        target: { name: r.target.name, pid: r.target.pid, window_id: r.target.window.window_id },
+        ...(r.result.stderr ? { stderr: r.result.stderr } : {}),
+      }) }], isError: r.status === "unknown" && !r.predicates.length };
+    } catch (error) { return text(error instanceof Error ? error.message : String(error), true); }
   });
 
   server.registerTool("fleet_cu_batch", {

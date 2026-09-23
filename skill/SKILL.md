@@ -42,6 +42,8 @@ fleet exec win-box "nvidia-smi"
 | `fleet cu <host> <args…> [--out f.png]` | Computer-use via [cua-driver](https://github.com/trycua/cua): `install`, or pass a tool + JSON (`click`, `type_text`, `get_window_state`…). |
 | `fleet cu <host> click\|key\|type\|act <target> …` | Verified input: resolves the target, sends an explicit `window_id`, reports `changed` / `no_change` / `indeterminate`. |
 | `fleet cu <host> windows [target]` · `shot-window <target>` | List windows (blockers flagged) or capture one, with owned popups composited in. |
+| `fleet cu <host> elements <target> [filter]` · `verify <target> …` | List a window's controls with tokens (no screenshot), or check its state with `verify_state`. |
+| `fleet cu <host> click\|set\|type <target> --label TEXT` · `menu <target> <item…>` | Act on a control by label or `--element TOKEN` instead of x,y; invoke a native menu path. |
 | `fleet restart <host> <service>` | Restart a **configured** service (see config). |
 | `fleet bios <sel> [--yes]` | Reboot Windows UEFI/systemd Linux hosts into firmware setup. |
 | `fleet logs <host> <service> [-n N]` | Recent logs / status for a service. |
@@ -50,6 +52,7 @@ fleet exec win-box "nvidia-smi"
 | `fleet status [host] [--json]` | Live stats pulled from the dashboard API. |
 | `fleet top <host>` | Live terminal btop for one host (interactive; runs until Ctrl-C). |
 | `fleet run <recipe>` | Run a saved playbook from config (stops on first failure). |
+| `fleet proxy [list]` · `check [name…]` · `drop <sel>` | Configured proxies and what routes through each; probe each endpoint and re-run its `verify` fetch through it; close ssh control masters after a route change. `--proxy NAME\|URL` / `--no-proxy` override the route on any command (before the selector). |
 | `fleet tools status [tool] [sel]` | Report stale CLI and skill installations. Use `tools sync` to ship source, a launcher, and paired skills. |
 | `fleet ssh <host>` | Interactive shell. |
 
@@ -121,6 +124,21 @@ harness-backgrounded SSH session open for it.
   → `fleet jobs tail gpu-box:<id> -f` or `fleet jobs wait gpu-box:<id> --until '<rx>'` →
   `fleet jobs prune` when done. MCP exposes bounded job waits and inspection; live tailing stays CLI-only.
 
+## Exec behavior you can rely on
+
+- **Exit codes are real on Windows.** A PowerShell program stops at its first terminating
+  error (`throw`, a cmdlet under `-ErrorAction Stop`) and exits 1; a failing native command
+  as the last statement reports its own code (`cmd /c exit 3` → 3). `exit N` above 1 still
+  reports 1: pwsh `-Command -` collapses it and the code cannot be observed.
+- **Unicode survives both ways** on Windows: the program is shipped base64-encoded and
+  output is UTF-8. Detached Windows jobs get `PYTHONUTF8=1`, so Python tools that print
+  ✓ or emoji no longer die with a cp1252 codec error.
+- **A remote command that runs ssh/scp itself, or leaves `cmd &` behind, no longer hangs**
+  `fleet exec`. The script reports its own completion; fleet waits `FLEET_DONE_GRACE_MS`
+  (default 1500) for output to drain, then returns with the reported exit code.
+- **Output is plain text when piped** (no ANSI); `FORCE_COLOR=1` restores colour, and
+  `| head` no longer crashes fleet with a stack trace.
+
 ## Computer use (`fleet cu`)
 
 `fleet cu <host> …` drives a host's desktop through **cua-driver** (trycua/cua) — a
@@ -137,6 +155,31 @@ and exposes computer-use tools. Same interactive-desktop requirement as `fleet s
 - **Target by anything.** Every verb takes a pid, a process name (with or without
   `.exe`), an app display name, or a window title. One resolver serves all of them,
   and it reports which identity matched.
+- **Controls before pixels.** Read a window's controls, act on them by name, and check the
+  result by state. None of it needs a screenshot, and it works on a background window:
+  - `fleet cu win-box elements charmap [filter] [--role Button] [--json]` lists each
+    control's `element_token`, role, label, value, actions (`invoke`, `set_value`,
+    `toggle`, `expand`…), and its center in window-local pixels as a fallback.
+  - `fleet cu win-box click charmap --label "Advanced view"` · `set charmap "text" --label
+    "Characters to copy"` · `type <target> "text" --label Search` · `key`/`scroll`/`hotkey`/`act`
+    take the same `--label TEXT [--role R] [--nth N]` or `--element TOKEN` in place of x,y.
+    An exact label beats a substring. An ambiguous label is refused with every candidate's
+    token listed.
+  - `fleet cu win-box menu notepad File "Save As..."` invokes a native menu path through
+    accessibility. It never falls back to pixels.
+  - `fleet cu win-box verify charmap --label "Search for"` or `verify <target>
+    '[{"element":{"selector":{"role":"Edit"},"exists":true,"value_equals":"x"}}]'` runs
+    `verify_state`: `satisfied` exits 0, while `unsatisfied` and `unknown` exit 1. Prefer it
+    over the pixel `effect` whenever the outcome shows up in the tree: a blinking caret
+    makes the pixel check report `indeterminate`.
+  - MCP: `fleet_cu_elements`, `fleet_cu_verify`, and `fleet_cu_act` with
+    `element: {token | label, role?, nth?}`.
+  - A token from one call stays valid in the next (the daemon keeps the cache) until a
+    new tree read of that window replaces it.
+  - A reply with `escalation.reason: delivery_failed` means the app dropped the
+    background input. Fleet fails the action; retry with `--foreground` (it takes focus).
+    Windows 11 Notepad and Electron apps ignore background input; classic Win32 controls
+    (Character Map, most dialogs) accept it.
 - **Convenience verbs** (resolve the pid/window_id loop for you):
   - `fleet cu <host> apps [name]` — compact `pid  name` table (optional name filter).
   - `fleet cu <host> windows [target]` — every top-level window, or one process's
@@ -191,10 +234,28 @@ and exposes computer-use tools. Same interactive-desktop requirement as `fleet s
   tool's own "prefer element_index" advice does not apply:
   `fleet cu <host> describe click --brief --for <target>` probes the real window and says
   which addressing mode actually works.
-- **cua-driver 0.24:** `get_window_state` accepts `include_accessibility_tree:false`
-  for screenshot-only previews and `max_dimension` for thumbnails. Pass these fields
-  through raw JSON after checking `fleet cu <host> describe get_window_state`.
-  `capture_mode` is deprecated and ignored; it does not skip accessibility work.
+- **cua-driver 0.28:** `get_window_state` accepts `include_screenshot:false` for a
+  tree-only read, `query` for a host-side projection, `include_accessibility_tree:false`
+  for screenshot-only previews, and `max_dimension` for thumbnails. `capture_mode` is
+  deprecated and ignored. `verify_state`, `invoke_menu`, `set_window_frame`, and `zoom`
+  are new since 0.24.
+- **Latency.** On Windows, a `cua-driver` CLI call whose output PowerShell captures or
+  redirects costs ~600 ms more than one printing straight to ssh. Fleet leaves plain calls
+  uncaptured and runs captures, actions, and batches through one
+  `cua-driver mcp --socket \\.\pipe\cua-driver` session per script: it starts in ~180 ms,
+  and each call inside it costs milliseconds. Images return base64-encoded in the same
+  stdout, so a capture costs one round trip. Measured on a Windows host: a verified click
+  went from ~4.6 s to ~2.9 s, and `shot-window` on a window with owned popups from ~10 s
+  to ~3.8 s.
+- **Driver traps worth knowing before raw calls:**
+  - `move_cursor` with `scope:"desktop"` moves the user's REAL mouse pointer. Only
+    `scope:"window"` (with `pid` and `window_id`) moves the agent overlay cursor.
+  - The agent overlay moves only toward a screen point; accessibility input has none.
+    Its default motion makes short glides loop; straight lines need `arc_size:0`,
+    `arc_flow:0`, `turn_radius:0`, `spring:1`, `start_handle:0`, `end_handle:0`.
+  - `set_window_frame` refuses a maximized window; restore it first.
+  - Foreground input lands on whatever window is on top at that point. `bring_to_front`
+    the target first; maximizing through accessibility does not raise a window.
 
 ### Complete raw computer-use command catalog
 
@@ -392,11 +453,39 @@ the service env). `FLEET_MCP_READONLY=1` is the kill-switch (drops exec/cp/resta
 The host it runs on is the SSH origin for the whole fleet. Build/run details are in
 `DEPLOY.md`; `fleet restart <host> fleet-mcp` bounces it.
 
+## Proxied hosts (`proxy` / `fleet proxy`)
+
+Some hosts must never see the controller's own IP. Give the host a `proxy` and **every**
+transport is routed through it: `exec`, `spawn`/`jobs`, `cp`, `edit`, `restart`, `reboot`,
+`deploy`, `tools sync`, the `ls`/`wait` probes, `doctor`, and interactive `fleet ssh`.
+
+```sh
+fleet proxy                    # what is configured, and which hosts ride each proxy
+fleet proxy check              # is the endpoint alive; does `verify` still see the right exit IP
+fleet proxy drop <sel>         # close the ssh control master after changing a route
+fleet exec --proxy other <sel> 'echo $SSH_CLIENT'
+fleet exec --no-proxy <sel> 'echo $SSH_CLIENT'      # the direct route, for comparison
+```
+
+Config lives under a top-level `proxies` map plus `"proxy": "<name>"` on a host (or
+`defaultProxy` for a fleet-wide default). Resolution, first match wins: `--proxy` →
+`FLEET_NO_PROXY=1` → `FLEET_PROXY` → `hosts.<h>.proxy` → `defaultProxy` → direct.
+
+- **Verify by the source IP the remote sees**, not by "the command worked":
+  `fleet exec <host> 'echo $SSH_CLIENT'` must report the proxy's exit IP.
+- **After changing a host's proxy, run `fleet proxy drop <host>`.** A live control master
+  keeps the old route until `ControlPersist` expires.
+- **A dead proxy is not a dead host.** `fleet ls` shows `proxy down` and `fleet doctor`
+  says which leg failed.
+- **Never put credentials in the command line.** Use `passwordEnv` or `passwordFile`
+  (chmod 600).
+- **Daytona (`dt:`) hosts are HTTP, not ssh**, so a proxy configured for one is ignored.
+
 ## Config & extending
 
 Hosts, logical routes, groups, and recipes live in `fleet.config.json` (override path
 with `FLEET_CONFIG`; copy `fleet.config.example.json` to start). A host has `ssh`, `os`,
-optional `gpu`, `wsl`, `winShell`, and a `services` map; each service `type`
+optional `gpu`, `wsl`, `winShell`, `proxy`, and a `services` map; each service `type`
 (`systemd` / `systemd-user` / `winservice` / `schtask`) decides how restart/logs run.
 A route has an ordered `prefer` list of same-OS host entries.
 

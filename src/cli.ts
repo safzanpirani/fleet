@@ -29,6 +29,7 @@ import { loadConfig, resolveHosts } from "./config.ts";
 import type { FleetConfig } from "./config.ts";
 import { helpText } from "./help.ts";
 import { sshInteractive } from "./ssh.ts";
+import { proxyConnectMain } from "./proxy.ts";
 import type { ExecResult } from "./ssh.ts";
 import {
   spawnJob, listJobs, jobLog, jobTail, jobFollow, killJob, waitJob, pruneJobs,
@@ -40,9 +41,10 @@ import {
   gpuRows, diskRows, fetchDashboard, hostStatus, runRecipe, captureScreenshot, rebootHosts,
   cuInstall, cuRun, cuTools, cuDescribe, cuRecordStart, cuRecordStop, cuRecordStatus,
   cuApps, cuShotWindow, browseHost, preferredImageExt, overlayGrid,
-  cuSnapshot, cuResolveTargetFrom, cuResolvePoint, cuAct, cuBatch, cuBlockerNote,
+  cuSnapshot, cuResolveTargetFrom, cuResolvePoint, cuAct, cuBatch, cuBlockerNote, cuElements, cuVerify,
   cuGridCaption, cuElementSupport, compactCuOutput, briefDescribe,
   bootState, switchMachine, waitFor, routeSelector, deployHosts, diagnose, firmwareRebootHosts,
+  proxyRows, proxyChecks, dropMasters,
 } from "./core.ts";
 import {
   fingerprint,
@@ -54,13 +56,29 @@ import {
   toolSyncParallelism,
   stampSkill,
 } from "./tools.ts";
-import type { ServiceAction, CuTarget, GridOptions } from "./core.ts";
+import type { ServiceAction, CuTarget, GridOptions, CuElementLocator } from "./core.ts";
 
+/** Colour only for a person at a terminal. Output piped to an agent or a file
+ *  is data, and escape codes inside it are noise every reader has to strip.
+ *  NO_COLOR always wins; FORCE_COLOR restores colour for a pipe. */
+export function useColor(env: NodeJS.ProcessEnv = process.env, tty = Boolean(process.stdout.isTTY)): boolean {
+  if (env.NO_COLOR) return false;
+  if (env.FORCE_COLOR && env.FORCE_COLOR !== "0") return true;
+  return tty;
+}
+const COLOR = useColor();
+const paint = (code: string) => (s: string) => (COLOR ? `\x1b[${code}m${s}\x1b[0m` : s);
 const A = {
-  g: (s: string) => `\x1b[32m${s}\x1b[0m`, r: (s: string) => `\x1b[31m${s}\x1b[0m`,
-  y: (s: string) => `\x1b[33m${s}\x1b[0m`, d: (s: string) => `\x1b[90m${s}\x1b[0m`,
-  c: (s: string) => `\x1b[36m${s}\x1b[0m`, b: (s: string) => `\x1b[1m${s}\x1b[0m`,
+  g: paint("32"), r: paint("31"), y: paint("33"), d: paint("90"), c: paint("36"), b: paint("1"),
 };
+
+// A reader that stops early (`fleet ls | head -1`) closes the pipe. That is a
+// normal way to consume output, not a failure worth a Bun stack trace.
+for (const stream of [process.stdout, process.stderr])
+  stream.on("error", (error: NodeJS.ErrnoException) => {
+    if (error.code === "EPIPE") process.exit(0);
+    throw error;
+  });
 function die(m: string): never { console.error(A.r("✗ " + m)); process.exit(1); }
 /** Pull a numeric flag value, failing LOUDLY on garbage instead of letting a
  *  NaN leak into a remote command (`tail -n NaN`) or a 0ms poll loop. */
@@ -123,7 +141,7 @@ function printRaw(r: ExecResult): void {
 
 const SUBCOMMANDS = [
   "ls", "hosts", "dt", "exec", "spawn", "jobs", "cp", "edit", "restart", "reboot", "bios", "boot", "switch", "wait",
-  "gpu", "disk", "status", "top", "logs", "svc", "shot", "cu", "browse", "run", "deploy", "tools", "doctor", "completion", "ssh", "help",
+  "gpu", "disk", "status", "top", "logs", "svc", "shot", "cu", "browse", "run", "deploy", "tools", "proxy", "doctor", "completion", "ssh", "help",
 ];
 /** Emit a bash/zsh completion script with this config's hosts/groups/recipes/
  *  services baked in. Source it: `eval "$(fleet completion zsh)"`. */
@@ -148,7 +166,7 @@ _fleet() {
   case $words[2] in
     run) compadd -- "\${recipes[@]}";;
     ${svcCmds.split(" ").join("|")}) compadd -- "\${sels[@]}" "\${svcs[@]}";;
-    boot|switch|wait|exec|spawn|cp|edit|reboot|bios|top|shot|cu|ssh|doctor|status|deploy) compadd -- "\${sels[@]}";;
+    boot|switch|wait|exec|spawn|cp|edit|reboot|bios|top|shot|cu|ssh|doctor|status|deploy|proxy) compadd -- "\${sels[@]}";;
   esac
 }
 compdef _fleet fleet`;
@@ -171,13 +189,46 @@ _fleet() {
   case "\${COMP_WORDS[1]}" in
     run) _fleet_matches "$cur" "\${recipes[@]}";;
     ${svcCmds.split(" ").join("|")}) _fleet_matches "$cur" "\${sels[@]}" "\${svcs[@]}";;
-    boot|switch|wait|exec|spawn|cp|edit|reboot|bios|top|shot|cu|ssh|doctor|status|deploy) _fleet_matches "$cur" "\${sels[@]}";;
+    boot|switch|wait|exec|spawn|cp|edit|reboot|bios|top|shot|cu|ssh|doctor|status|deploy|proxy) _fleet_matches "$cur" "\${sels[@]}";;
   esac
 }
 complete -F _fleet fleet`;
 }
 
-async function dispatch(command: string | undefined, rest: string[], cfg: FleetConfig): Promise<number> {
+/**
+ * Pull `--proxy NAME|URL` / `--no-proxy` out of the LEADING flag run — the same
+ * position every other fleet flag takes — and publish the choice through the
+ * environment, which is also how it reaches `fleet __proxy-connect`.
+ *
+ * `--proxy` uses its own variable rather than FLEET_PROXY so it still wins when
+ * FLEET_NO_PROXY=1 is exported in the shell.
+ */
+export function applyProxyFlags(rest: string[], env: Record<string, string | undefined> = process.env): string[] {
+  const out: string[] = [];
+  let explicit: string | undefined;
+  let off = false;
+  for (let i = 0; i < rest.length; i++) {
+    const token = rest[i]!;
+    if (!token.startsWith("-")) { out.push(...rest.slice(i)); break; }
+    if (token === "--") { out.push(...rest.slice(i)); break; }
+    const eq = token.startsWith("--") ? token.indexOf("=") : -1;
+    const name = eq > 0 ? token.slice(0, eq) : token;
+    if (name === "--no-proxy") { off = true; continue; }
+    if (name === "--proxy") {
+      const value = eq > 0 ? token.slice(eq + 1) : rest[++i];
+      if (!value || value.startsWith("--")) die("--proxy needs a proxy name or URL (or use --no-proxy)");
+      explicit = value; continue;
+    }
+    out.push(token);
+  }
+  if (explicit && off) die("--proxy and --no-proxy cannot be combined");
+  if (explicit) { env.FLEET_PROXY_OVERRIDE = explicit; delete env.FLEET_NO_PROXY; }
+  if (off) { env.FLEET_NO_PROXY = "1"; delete env.FLEET_PROXY_OVERRIDE; delete env.FLEET_PROXY; }
+  return out;
+}
+
+async function dispatch(command: string | undefined, rest0: string[], cfg: FleetConfig): Promise<number> {
+  let rest = applyProxyFlags(rest0);
   switch (command) {
     case undefined: case "help": case "-h": case "--help":
       console.log(helpText(["help", ...rest]));
@@ -187,10 +238,16 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
       const { flags, rest: pos } = parseFlags(rest, ["--json"], []);
       if (pos.length) die(`usage: fleet ${command} [--json]`);
       const json = flags["--json"] === true;
-      const row = (h: { up: boolean; httpUp?: boolean; name: string; os: string; ssh: string; services: string[] }) => {
-        const dot = h.up ? A.g("●") : h.httpUp ? A.y("◍") : A.r("○");
-        const note = !h.up && h.httpUp ? A.y("ssh-down · http ok  ") : "";
-        return `${dot} ${A.b(h.name.padEnd(10))} ${A.d(h.os.padEnd(8))} ${A.d(h.ssh.padEnd(16))} ${note}${A.d(h.services.join(", "))}`;
+      const anyProxy = Object.values(cfg.hosts).some((h) => h.proxy) || !!cfg.defaultProxy
+        || !!process.env.FLEET_PROXY || !!process.env.FLEET_PROXY_OVERRIDE;
+      const row = (h: { up: boolean; httpUp?: boolean; name: string; os: string; ssh: string; services: string[]; proxy: string | null; proxyDown?: boolean }) => {
+        const dot = h.up ? A.g("●") : h.proxyDown ? A.y("◌") : h.httpUp ? A.y("◍") : A.r("○");
+        // "proxy down" and "host down" are different facts. Conflating them sends
+        // someone to power-cycle a box that was never contacted.
+        const note = h.proxyDown ? A.y(`proxy down          `)
+          : !h.up && h.httpUp ? A.y("ssh-down · http ok  ") : "";
+        const via = anyProxy ? A.d((h.proxy ?? "-").padEnd(16)) + " " : "";
+        return `${dot} ${A.b(h.name.padEnd(10))} ${A.d(h.os.padEnd(8))} ${A.d(h.ssh.padEnd(16))} ${via}${note}${A.d(h.services.join(", "))}`;
       };
       if (json) { console.log(JSON.stringify(await lsHosts(cfg), null, 2)); return 0; }
       // stream each host as it resolves (fastest first) — don't block on the slowest/dead host
@@ -633,6 +690,10 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
       const foreground = pullFlag(rest, "--foreground");
       const wantShot = pullFlag(rest, "--shot");
       const out = pullVal(rest, "--out");
+      const elementToken = pullVal(rest, "--element");
+      const elementLabel = pullVal(rest, "--label");
+      const elementRole = pullVal(rest, "--role");
+      const elementNth = pullVal(rest, "--nth");
       const sel = rest.shift();
       if (!sel) die("usage: fleet cu <host> <cua-driver args…> [--out f.png] [--grid]  |  fleet cu <sel> install");
       const target = await routeSelector(cfg, sel);
@@ -759,6 +820,71 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
         if (note) console.error(A.r(`▲ ${note}`));
         return 0;
       }
+      if (verb === "elements") {
+        const json = pullFlag(rest, "--json");
+        const max = pullVal(rest, "--max");
+        const q = rest[1];
+        if (!q || rest.length > 3) die("usage: fleet cu <host> elements <target> [filter] [--role R] [--max N] [--json]");
+        if (max !== undefined && (!/^\d+$/.test(max) || Number(max) < 1)) die(`--max must be a positive integer (got '${max}')`);
+        const r = await cuElements(cfg, target, q, { filter: rest[2] ?? elementLabel, maxElements: max ? Number(max) : undefined });
+        if (!r.result.ok) { printResult(r.result); return 1; }
+        const shown = elementRole ? r.elements.filter((e) => e.role.toLowerCase() === elementRole.toLowerCase()) : r.elements;
+        if (json) { console.log(JSON.stringify({ ...r, elements: shown })); return r.available ? 0 : 1; }
+        const w = r.target.window;
+        console.log(A.d(`${r.target.name} · pid ${r.target.pid} · w${w.window_id} · ${w.title || "(untitled)"}`
+          + (r.snapshotId ? ` · snapshot ${r.snapshotId}` : "") + ` · ${shown.length} of ${r.total} element(s)`));
+        if (!r.available) {
+          console.error(A.y("▲ the accessibility walk found nothing here — address this window with pixels (shot-window --grid)"));
+          return 1;
+        }
+        for (const e of shown) {
+          const indent = "  ".repeat(Math.min(6, Math.max(0, (e.depth ?? 0))));
+          console.log(`${A.d((e.token ?? `#${e.index}`).padEnd(13))} ${indent}${A.b(e.role)} ${JSON.stringify(e.label)}`
+            + (e.value !== undefined && e.value !== null && e.value !== e.label ? A.d(` = ${JSON.stringify(e.value.slice(0, 60))}`) : "")
+            + (e.actions.length ? A.g(` [${e.actions.join(",")}]`) : "")
+            + (e.enabled === false ? A.y(" disabled") : "")
+            + (e.selected ? A.g(" selected") : "")
+            + (e.center ? A.d(` @${e.center.x},${e.center.y}`) : ""));
+        }
+        return 0;
+      }
+      if (verb === "verify") {
+        const json = pullFlag(rest, "--json");
+        const value = pullVal(rest, "--value");
+        const timeout = pullVal(rest, "--timeout");
+        const samples = pullVal(rest, "--samples");
+        const q = rest[1];
+        const usage = "usage: fleet cu <host> verify <target> <JSON-predicates> | verify <target> --label L [--role R] [--value V] [--timeout MS] [--samples N] [--json]";
+        if (!q || rest.length > 3) die(usage);
+        let predicates: unknown[];
+        if (rest[2] !== undefined) {
+          if (elementLabel !== undefined || elementRole !== undefined || value !== undefined)
+            die("pass predicates as JSON or as --label/--role/--value, not both");
+          try { const parsed = JSON.parse(rest[2]!); predicates = Array.isArray(parsed) ? parsed : [parsed]; }
+          catch { die("verify needs a JSON predicate or array of predicates"); }
+        } else {
+          if (elementLabel === undefined && elementRole === undefined) die(usage);
+          const selector: Record<string, string> = {};
+          if (elementLabel !== undefined) selector.label_contains = elementLabel;
+          if (elementRole !== undefined) selector.role = elementRole;
+          predicates = [{ element: { selector, exists: true, ...(value !== undefined ? { value_equals: value } : {}) } }];
+        }
+        const int = (v: string | undefined, name: string) => {
+          if (v === undefined) return undefined;
+          if (!/^\d+$/.test(v)) die(`${name} must be a non-negative integer (got '${v}')`);
+          return Number(v);
+        };
+        const r = await cuVerify(cfg, target, q, predicates!, { timeoutMs: int(timeout, "--timeout"), stableSamples: int(samples, "--samples") });
+        if (json) { console.log(JSON.stringify(r)); return r.result.ok ? 0 : 1; }
+        const badge = r.status === "satisfied" ? A.g("● satisfied") : r.status === "unsatisfied" ? A.r("✗ unsatisfied") : A.y("? unknown");
+        console.log(`${badge} ${A.b(r.target.name)} ${A.d(`pid ${r.target.pid} w${r.target.window.window_id}`)}`
+          + (r.elapsedMs !== undefined ? A.d(` · ${r.elapsedMs} ms`) : ""));
+        for (const p of r.predicates)
+          console.log(`  ${p.index}: ${p.status}${p.reason ? A.d(` (${p.reason})`) : ""}`
+            + (p.observed !== undefined ? A.d(` observed ${JSON.stringify(p.observed)}`) : ""));
+        if (r.result.stderr) console.error(A.d(r.result.stderr));
+        return r.result.ok ? 0 : 1;
+      }
       if (verb === "shot-window" || verb === "win") {
         const q = rest[1] ?? die("usage: fleet cu <host> shot-window <pid|process|app|title> [--out f.png]");
         if (rest.length > 2) die("usage: fleet cu <host> shot-window <pid|process|app|title> [--out f.png]");
@@ -816,9 +942,17 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
       }
 
       // ── verified input: resolve → act → prove the pixels moved ─────────────
-      const ACT_VERBS = ["click", "right-click", "double-click", "drag", "scroll", "hotkey", "key", "type", "act"] as const;
+      const ACT_VERBS = ["click", "right-click", "double-click", "drag", "scroll", "hotkey", "key", "type", "set", "menu", "act"] as const;
       const rawInput = ["click", "drag", "scroll", "hotkey"].includes(verb ?? "") && /^\s*\{/.test(rest[1] ?? "");
-      if (!rawInput && ACT_VERBS.includes(verb as typeof ACT_VERBS[number])) {
+      const isAct = !rawInput && ACT_VERBS.includes(verb as typeof ACT_VERBS[number]);
+      const locating = [elementToken, elementLabel, elementRole, elementNth].some((v) => v !== undefined);
+      if (locating && (!isAct || verb === "drag" || verb === "menu"))
+        die("--element/--label/--role/--nth address a control for click, right-click, double-click, type, set, key, hotkey, scroll, and act; list them with: fleet cu <host> elements <target>");
+      if (elementNth !== undefined && (!/^\d+$/.test(elementNth) || Number(elementNth) < 1)) die(`--nth must be a positive integer (got '${elementNth}')`);
+      const element: CuElementLocator | undefined = locating
+        ? { token: elementToken, label: elementLabel, role: elementRole, nth: elementNth === undefined ? undefined : Number(elementNth) }
+        : undefined;
+      if (isAct) {
         const json = pullFlag(rest, "--json");
         const q = rest[1] ?? die(`usage: fleet cu <host> ${verb} <pid|process|app|title> …`);
         const shotPath = wantShot || out ? (out ?? `${autoName(q)}.${await preferredImageExt()}`) : undefined;
@@ -828,17 +962,22 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
         let point: { x: number; y: number; space: "window" | "screen" } | undefined;
         let summary = "";
         if (["click", "right-click", "double-click"].includes(verb!)) {
-          const [xs, ys] = [rest[2], rest[3]];
-          if (rest.length !== 4) die(`usage: fleet cu <host> ${verb} <app> <x> <y> [--space window|screen]`);
-          const [x, y] = [Number(xs), Number(ys)];
-          if (!Number.isFinite(x) || !Number.isFinite(y)) die(`click needs numeric x y (got '${xs} ${ys}')`);
           if (button && !["left", "right", "middle"].includes(button))
             die(`--button must be left, right, or middle (got '${button}')`);
           if (clickCount > 3) die("--count must be 1, 2, or 3");
-          point = { x, y, space };
           tool = verb === "right-click" ? "right_click" : verb === "double-click" ? "double_click" : "click";
           payload = tool === "click" ? { count: clickCount, ...(button ? { button } : {}) } : {};
-          summary = `${tool} ${x},${y}`;
+          if (element) {
+            if (rest.length !== 2) die(`usage: fleet cu <host> ${verb} <app> --label TEXT [--role R] [--nth N] | --element TOKEN`);
+            summary = tool;
+          } else {
+            const [xs, ys] = [rest[2], rest[3]];
+            if (rest.length !== 4) die(`usage: fleet cu <host> ${verb} <app> <x> <y> [--space window|screen]  |  ${verb} <app> --label TEXT`);
+            const [x, y] = [Number(xs), Number(ys)];
+            if (!Number.isFinite(x) || !Number.isFinite(y)) die(`click needs numeric x y (got '${xs} ${ys}')`);
+            point = { x, y, space };
+            summary = `${tool} ${x},${y}`;
+          }
         } else if (verb === "drag") {
           const duration = numVal(rest, "--duration", 500, 0);
           if (duration > 10000) die("--duration must be at most 10000 ms");
@@ -872,6 +1011,16 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
           tool = "type_text";
           payload = { text: rest[2] };
           summary = `type_text ${JSON.stringify(rest[2]!.slice(0, 40))}`;
+        } else if (verb === "set") {
+          if (rest.length !== 3 || !element) die("usage: fleet cu <host> set <app> <value> --label TEXT [--role R] [--nth N] | --element TOKEN");
+          tool = "set_value";
+          payload = { value: rest[2] };
+          summary = `set_value ${JSON.stringify(rest[2]!.slice(0, 40))}`;
+        } else if (verb === "menu") {
+          if (rest.length < 3) die("usage: fleet cu <host> menu <app> <item> [item…]   e.g. menu notepad File \"Save As...\"");
+          tool = "invoke_menu";
+          payload = { path: rest.slice(2) };
+          summary = `invoke_menu ${rest.slice(2).join(" › ")}`;
         } else {
           if (rest.length < 3 || rest.length > 4) die("usage: fleet cu <host> act <app> <tool> [JSON]");
           tool = rest[2]!;
@@ -884,7 +1033,7 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
         if (foreground) payload.delivery_mode = "foreground";
 
         const r = await cuAct(cfg, target, q, tool, payload,
-          { settleMs: settle, imageOut: shotPath, point, space });
+          { settleMs: settle, imageOut: shotPath, point, space, element });
         if (json) {
           if (r.localImage) await applyGrid(r.localImage, gridOpts(r.target, cuBlockerNote(r.target)));
           console.log(JSON.stringify(r));
@@ -894,6 +1043,9 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
           summary = `${tool} ${r.payload.x},${r.payload.y}`
             + (space === "screen" ? A.d(` (from screen ${point.x},${point.y})`) : "")
             + (clickCount > 1 ? ` x${clickCount}` : "");
+        if (element)
+          summary += r.element ? ` → ${r.element.role} ${JSON.stringify(r.element.label)} ${A.d(r.element.token ?? "")}`
+            : ` → ${A.d(String(r.payload.element_token))}`;
         const badge = r.effect === "changed" ? A.g("● changed")
           : r.effect === "no_change" ? A.y("○ no_change") : A.d("? indeterminate");
         console.log(`${badge} ${A.b(r.target.name)} ${A.d(`pid ${r.target.pid} w${r.target.window.window_id}`)} `
@@ -1001,7 +1153,12 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
     case "run": {
       const { rest: pos } = parseFlags(rest, [], []);
       const [name] = pos;
-      if (!name || pos.length !== 1) die("usage: fleet run <recipe>");
+      if (!name || pos.length !== 1) {
+        // `fleet run <host> <script>` is the commonest wrong guess: say where it lives.
+        const looksLikeScript = pos.some((p) => /\.(sh|bash|py|ps1|js|ts|rb|pl)$/i.test(p) || p.includes("/"));
+        die("usage: fleet run <recipe>" + (looksLikeScript
+          ? "\n  run executes a named recipe. To run a local script on a host: fleet exec --script <file> <host>" : ""));
+      }
       const steps = cfg.recipes?.[name!];
       if (!steps) die(`unknown recipe '${name}' (have: ${Object.keys(cfg.recipes ?? {}).join(", ") || "none"})`);
       console.log(A.c(`▶ recipe ${name} (${steps!.length} steps)`));
@@ -1170,6 +1327,46 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
       return 0;
     }
 
+    case "__proxy-connect":
+      // ssh's ProxyCommand child. stdout IS the tunnel — nothing may be printed
+      // to it, ever. Diagnostics go to stderr and the exit code names the leg.
+      return await proxyConnectMain(rest);
+
+    case "proxy": {
+      const [sub = "list", ...subRest] = rest;
+      if (sub === "drop") {
+        const { rest: pos } = parseFlags(subRest, [], []);
+        const [sel] = pos;
+        if (!sel || pos.length !== 1) die("usage: fleet proxy drop <sel>");
+        const dropped = await dropMasters(cfg, await routeSelector(cfg, sel));
+        for (const d of dropped) console.log(`${d.dropped ? A.g("●") : A.d("○")} ${A.b(d.host.padEnd(10))} ${A.d(d.detail)}`);
+        return 0;
+      }
+      const { flags, rest: pos } = parseFlags(subRest, ["--json"], []);
+      const json = flags["--json"] === true;
+      if (sub === "check") {
+        for (const name of pos) if (!cfg.proxies?.[name] && !name.includes("://"))
+          die(`unknown proxy: ${name} (have: ${Object.keys(cfg.proxies ?? {}).join(", ") || "none"})`);
+        const checks = await proxyChecks(cfg, pos);
+        if (json) { console.log(JSON.stringify(checks, null, 2)); return checks.every((c) => c.reachable && (c.verify?.ok ?? true)) ? 0 : 1; }
+        if (!checks.length) { console.log(A.d("no proxies configured")); return 0; }
+        for (const c of checks) {
+          console.log(`${c.reachable ? A.g("●") : A.r("○")} ${A.b(c.name.padEnd(18))} ${A.d(c.endpoint.padEnd(24))} ${c.reachable ? A.d("reachable") : A.r("unreachable")}`);
+          if (c.verify) console.log(`    ${c.verify.ok ? A.g("✓") : A.r("✗")} ${A.d(c.verify.url)} → ${c.verify.observed ?? A.r(c.verify.error ?? "no response")}`
+            + (c.verify.expect ? A.d(` (expect ${c.verify.expect})`) : ""));
+        }
+        return checks.every((c) => c.reachable && (c.verify?.ok ?? true)) ? 0 : 1;
+      }
+      if (sub !== "list" || pos.length) die("usage: fleet proxy [list] [--json] | check [name…] [--json] | drop <sel>");
+      const rows = proxyRows(cfg);
+      if (json) { console.log(JSON.stringify(rows, null, 2)); return 0; }
+      if (!rows.length) { console.log(A.d("no proxies configured — add a `proxies` entry to fleet.config.json")); return 0; }
+      for (const r of rows)
+        console.log(`${A.b(r.name.padEnd(18))} ${A.d(`${r.type}/${r.dns}`.padEnd(14))} ${A.d(r.endpoint.padEnd(24))}`
+          + `${r.auth ? A.y("auth ") : A.d("     ")}${r.isDefault ? A.c("default ") : ""}${A.d(r.hosts.join(", ") || "no hosts")}`);
+      return 0;
+    }
+
     case "doctor": {
       const { flags, rest: pos } = parseFlags(rest, ["--json"], []);
       const json = flags["--json"] === true;
@@ -1179,6 +1376,14 @@ async function dispatch(command: string | undefined, rest: string[], cfg: FleetC
       if (json) { console.log(JSON.stringify(d, null, 2)); return d.sshUp ? 0 : 1; }
       const head = d.sshUp ? A.g(`● ${d.host} reachable`) : A.r(`○ ${d.host} unreachable`);
       console.log(`${head} ${A.d(`· ${d.os} · ssh ${d.ssh} · ${d.ms}ms`)}`);
+      if (d.proxy) {
+        const c = d.proxyCheck;
+        const dot = c?.reachable ? A.g("●") : A.r("○");
+        console.log(`  ${dot} proxy ${A.b(d.proxy)} ${A.d(c ? c.endpoint : "")} ${c?.reachable ? A.d("reachable") : A.r("unreachable")}`);
+        if (c?.verify) console.log(`    ${c.verify.ok ? A.g("✓") : A.r("✗")} ${A.d(c.verify.url)} → ${c.verify.observed ?? A.r(c.verify.error ?? "no response")}`
+          + (c.verify.expect ? A.d(` (expect ${c.verify.expect})`) : ""));
+        if (d.proxyCommand) console.log(`    ${A.d("ProxyCommand: " + d.proxyCommand)}`);
+      }
       if (d.health) console.log(`  ${d.httpUp ? A.g("● health ok") : A.r("○ health down")} ${A.d(d.health)}`);
       if (d.services.length) console.log(`  ${A.d("services: " + d.services.join(", "))}`);
       if (!d.sshUp) {
