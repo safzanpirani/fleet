@@ -1,4 +1,6 @@
 import { expect, test } from "bun:test";
+import { mkdirSync } from "node:fs";
+import { dirname } from "node:path";
 import { sessionLoopScript, trySessionExec, winSessionEnabled, winSessionSocket } from "../src/winsession.ts";
 import type { Host } from "../src/config.ts";
 
@@ -38,6 +40,8 @@ test("each host route gets its own socket", () => {
 
 test("a lost reply after the broker accepted a request cannot trigger one-shot replay", async () => {
   const host = { ...win, ssh: `fake-${crypto.randomUUID()}` };
+  // The real broker creates ~/.fleet before listening; a fresh CI home has none.
+  mkdirSync(dirname(winSessionSocket(host)), { recursive: true, mode: 0o700 });
   const server = Bun.listen<{ received: boolean }>({
     unix: winSessionSocket(host),
     socket: {
