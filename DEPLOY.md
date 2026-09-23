@@ -1,8 +1,8 @@
-# Deploying the remote endpoint (`fleet.example.com`) on win-box
+# Deploying the remote endpoint (`<your-fleet-host>`) on win-box
 
 The HTTP MCP server (`src/http.ts`) runs on **win-box** as an nssm service `FleetMCP`
 on `127.0.0.1:8787`, exposed publicly through win-box's existing Cloudflare tunnel at
-`https://fleet.example.com`. win-box is the SSH origin for the whole fleet.
+`https://<your-fleet-host>`. win-box is the SSH origin for the whole fleet.
 
 ## Example Windows service setup
 
@@ -35,12 +35,12 @@ The token lives **only** in the service env: `nssm get FleetMCP AppEnvironmentEx
 Add to `C:\Users\ExampleUser\.cloudflared\config.yml` **above** the `http_status:404` catch-all
 (match the 2-space list indent of the other rules):
 ```yaml
-  - hostname: fleet.example.com
+  - hostname: <your-fleet-host>
     service: http://localhost:8787
 ```
 Then `cloudflared tunnel ingress validate`, restart **both** supervisors (nssm `cloudflared`
 service **and** the `Cloudflare Tunnel` scheduled task), and ensure the DNS route exists
-(`cloudflared tunnel route dns <tunnel-id> fleet.example.com`).
+(`cloudflared tunnel route dns <tunnel-id> <your-fleet-host>`).
 
 ## Redeploy after a code change
 One command does the whole dance (build tarball → ship → extract → `bun install` →
@@ -64,7 +64,7 @@ fleet restart win-box fleet-mcp     # = nssm restart FleetMCP
 </details>
 
 ## Operate
-- **Health:** `curl https://fleet.example.com/health`
+- **Health:** `curl https://<your-fleet-host>/health`
 - **Kill-switch (read-only):** set `FLEET_MCP_READONLY=1` in the nssm env (re-set the full
   `AppEnvironmentExtra`) and `fleet restart win-box fleet-mcp` — drops exec/cp/restart/run.
 - **Logs:** `C:\Users\ExampleUser\fleet\mcp-http.log`.

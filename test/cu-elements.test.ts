@@ -1,6 +1,6 @@
 import { beforeAll, describe, expect, test } from "bun:test";
 import {
-  cuAct, cuElements, cuPickElement, cuReplyRefusal, cuReplyText, cuResolveTargetFrom, cuVerify,
+  cuAct, cuElements, cuPickElement, cuReplyRefusal, cuRun, sameRole, cuReplyText, cuResolveTargetFrom, cuVerify,
   parseCuElements, takeInlineImages,
 } from "../src/core.ts";
 import type { CuElement, CuSnapshot } from "../src/core.ts";
@@ -64,6 +64,32 @@ describe("session replies", () => {
     expect(cuReplyRefusal('{"status":"refused","refusal":{"code":"menu_path_unavailable"}}')).toContain("refused");
     expect(cuReplyRefusal('{"effect":"unverifiable","route":"accessibility"}')).toBeUndefined();
     expect(cuReplyRefusal("plain text")).toBeUndefined();
+  });
+
+  test("roles match across Windows and macOS naming", () => {
+    expect(sameRole("AXButton", "Button")).toBe(true);
+    expect(sameRole("Button", "AXButton")).toBe(true);
+    expect(sameRole("Axis", "is")).toBe(false);
+    expect(sameRole("Edit", "Button")).toBe(false);
+  });
+
+  test("a bare lookup-failure code is a refusal; data that merely has a code field is not", () => {
+    expect(cuReplyRefusal('{"code":"window_id_not_found","pid":1,"suggestion":"call list_windows"}'))
+      .toContain("window_id_not_found");
+    expect(cuReplyRefusal('{"code":"snapshot_id_required"}')).toContain("snapshot_id_required");
+    expect(cuReplyRefusal('{"code":"en_US","name":"locale"}')).toBeUndefined();
+    expect(cuReplyRefusal('{"windows":[],"code":"ok"}')).toBeUndefined();
+  });
+
+  test("raw cu calls exit 1 when the driver refused with exit 0", async () => {
+    const cfg: FleetConfig = { hosts: { box: { name: "box", ssh: "box", os: "linux" } } };
+    const reply = (stdout: string) => async () => ({ host: "box", ok: true, code: 0, stdout, stderr: "" });
+    const refused = await cuRun(cfg, "box", ["set_value", "{}"], undefined,
+      { exec: reply('{"status":"refused","refusal":{"code":"snapshot_id_required"}}') });
+    expect(refused.result).toMatchObject({ ok: false, code: 1 });
+    expect(refused.result.stderr).toContain("fleet: the driver reported status refused");
+    const fine = await cuRun(cfg, "box", ["list_windows"], undefined, { exec: reply('{"windows":[]}') });
+    expect(fine.result.ok).toBe(true);
   });
 });
 

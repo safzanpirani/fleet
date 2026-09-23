@@ -25,7 +25,10 @@
  * This is the ANSI presentation frontend; all real work lives in `core.ts`
  * (shared with the MCP server in `mcp.ts`).
  */
+import { readFile } from "node:fs/promises";
 import { loadConfig, resolveHosts } from "./config.ts";
+import { runWinSessionBroker } from "./winsession.ts";
+import { focusElements } from "./focus.ts";
 import type { FleetConfig } from "./config.ts";
 import { helpText } from "./help.ts";
 import { sshInteractive } from "./ssh.ts";
@@ -41,7 +44,7 @@ import {
   gpuRows, diskRows, fetchDashboard, hostStatus, runRecipe, captureScreenshot, rebootHosts,
   cuInstall, cuRun, cuTools, cuDescribe, cuRecordStart, cuRecordStop, cuRecordStatus,
   cuApps, cuShotWindow, browseHost, preferredImageExt, overlayGrid,
-  cuSnapshot, cuResolveTargetFrom, cuResolvePoint, cuAct, cuBatch, cuBlockerNote, cuElements, cuVerify,
+  cuSnapshot, cuResolveTargetFrom, cuResolvePoint, cuAct, cuBatch, cuBlockerNote, cuElements, cuOpen, sameRole, cuVerify,
   cuGridCaption, cuElementSupport, compactCuOutput, briefDescribe,
   bootState, switchMachine, waitFor, routeSelector, deployHosts, diagnose, firmwareRebootHosts,
   proxyRows, proxyChecks, dropMasters,
@@ -505,7 +508,7 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
         const src = flags[flag] as string | undefined;
         if (src === undefined) return flags[inline] as string | undefined;
         if (flags[inline] !== undefined) die(`fleet edit: pass ${inline} or ${flag}, not both`);
-        return src === "-" ? await Bun.stdin.text() : await Bun.file(src).text();
+        return src === "-" ? await Bun.stdin.text() : await readFile(src, "utf8");
       };
       if (flags["--old-file"] === "-" && flags["--new-file"] === "-") die("fleet edit: only one of --old-file/--new-file can read stdin");
       const old = await fromFile("--old-file", "--old");
@@ -837,16 +840,41 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
         if (note) console.error(A.r(`▲ ${note}`));
         return 0;
       }
+      if (verb === "open") {
+        // fleet cu <host> open <app> [url] | open browser <url> | open <url>
+        const json = pullFlag(rest, "--json");
+        const wait = pullVal(rest, "--wait");
+        const [, first, second] = rest;
+        if (!first || rest.length > 3) die("usage: fleet cu <host> open <app> [url] | open <url> [--wait MS] [--json]");
+        const looksUrl = (v: string) => /^[a-z][a-z0-9+.-]*:\/\//i.test(v);
+        const [app, url] = second !== undefined ? [first, second] : looksUrl(first!) ? [undefined, first] : [first, undefined];
+        if (wait !== undefined && !/^\d+$/.test(wait)) die(`--wait must be milliseconds (got '${wait}')`);
+        const r = await cuOpen(cfg, target, app, url, { waitMs: wait ? Number(wait) : undefined });
+        if (json) { console.log(JSON.stringify(r)); return r.result.ok ? 0 : 1; }
+        if (!r.result.ok) { printResult(r.result); return 1; }
+        if (!r.window) { console.log(`${A.y("●")} opened ${r.what}; no window appeared yet (fleet cu ${target} windows lists them)`); return 0; }
+        const w = r.window;
+        console.log(`${A.g("●")} opened ${r.what}: ${A.b(w.title || "(untitled)")} ${A.d(`pid ${w.pid} · w${w.window_id} · ${w.width}x${w.height}@${w.x},${w.y}`)}`);
+        console.log(A.d(`address it as: fleet cu ${target} elements ${JSON.stringify(r.targetName)}`));
+        return 0;
+      }
       if (verb === "elements") {
         const json = pullFlag(rest, "--json");
         const max = pullVal(rest, "--max");
+        const task = pullVal(rest, "--task");
         const q = rest[1];
-        if (!q || rest.length > 3) die("usage: fleet cu <host> elements <target> [filter] [--role R] [--max N] [--json]");
+        if (!q || rest.length > 3) die("usage: fleet cu <host> elements <target> [filter] [--role R] [--max N] [--task TEXT] [--json]");
         if (max !== undefined && (!/^\d+$/.test(max) || Number(max) < 1)) die(`--max must be a positive integer (got '${max}')`);
         const r = await cuElements(cfg, target, q, { filter: rest[2] ?? elementLabel, maxElements: max ? Number(max) : undefined });
         if (!r.result.ok) { printResult(r.result); return 1; }
-        const shown = elementRole ? r.elements.filter((e) => e.role.toLowerCase() === elementRole.toLowerCase()) : r.elements;
-        if (json) { console.log(JSON.stringify({ ...r, elements: shown })); return r.available ? 0 : 1; }
+        let shown = elementRole ? r.elements.filter((e) => sameRole(e.role, elementRole)) : r.elements;
+        let focusNote: string | undefined;
+        let hiddenCount = 0;
+        if (task && r.available) {
+          const f = await focusElements(shown, task, `${r.target.name} · ${r.target.window.title || "(untitled)"}`);
+          shown = f.elements; focusNote = f.note; hiddenCount = f.hidden.length;
+        }
+        if (json) { console.log(JSON.stringify({ ...r, elements: shown, ...(task ? { hidden: hiddenCount, focus: focusNote } : {}) })); return r.available ? 0 : 1; }
         const w = r.target.window;
         console.log(A.d(`${r.target.name} · pid ${r.target.pid} · w${w.window_id} · ${w.title || "(untitled)"}`
           + (r.snapshotId ? ` · snapshot ${r.snapshotId}` : "") + ` · ${shown.length} of ${r.total} element(s)`));
@@ -863,6 +891,7 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
             + (e.selected ? A.g(" selected") : "")
             + (e.center ? A.d(` @${e.center.x},${e.center.y}`) : ""));
         }
+        if (focusNote) console.log(A.d(`(${focusNote})`));
         return 0;
       }
       if (verb === "verify") {
@@ -932,7 +961,7 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
         const q = rest[1];
         if (!q || (file ? rest.length !== 2 : rest.length !== 3))
           die("usage: fleet cu <host> batch <target> <JSON-array|-> [--json] [--shot] | batch <target> --file FILE");
-        const source = file ? await Bun.file(file).text() : rest[2] === "-" ? await Bun.stdin.text() : rest[2]!;
+        const source = file ? await readFile(file, "utf8") : rest[2] === "-" ? await Bun.stdin.text() : rest[2]!;
         let actions;
         try { actions = JSON.parse(source); }
         catch { die("batch needs a valid JSON array"); }
@@ -1342,6 +1371,15 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       if (pos.length > 1 || (shell !== "bash" && shell !== "zsh")) die("usage: fleet completion [bash|zsh]");
       console.log(completionScript(cfg, shell));
       return 0;
+    }
+
+    case "__win-session": {
+      // The kept-open PowerShell broker that exec starts for a Windows host.
+      const [name] = rest;
+      const host = name ? cfg.hosts[name] : undefined;
+      if (!host) return 2;
+      if (!await runWinSessionBroker(host)) return 0;
+      return await new Promise<number>(() => {});   // serves until idle
     }
 
     case "__proxy-connect":

@@ -33,6 +33,15 @@ describe("completion marker", () => {
     proc.kill();
   });
 
+  test("a command that reads stdin cannot swallow the rest of a bash program", async () => {
+    const m = doneMarker();
+    const script = withDoneMarker("echo before\ncat\necho after", "bash", m);
+    const proc = Bun.spawn(["/bin/bash", "-s"], { stdin: new TextEncoder().encode(script + "\n"), stdout: "pipe", stderr: "pipe" });
+    const [out, err] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+    expect(out).toBe("before\nafter\n");
+    expect(takeDoneMarker(err, m).code).toBe(0);
+  });
+
   test("the PowerShell wrapper ships the program base64-encoded and dot-sources it", () => {
     const m = doneMarker();
     const wrapped = withDoneMarker("Write-Output 'héllo ✓'", "powershell", m);

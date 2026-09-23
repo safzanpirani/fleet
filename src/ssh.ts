@@ -14,6 +14,7 @@ import type { Host } from "./config.ts";
 import { proxyControlKey, proxyOpts, proxyReachableCached } from "./proxy.ts";
 import { resolveProxy } from "./config.ts";
 import { dtExec, dtProbe, dtPush, dtPull } from "./daytona.ts";
+import { trySessionExec, winSessionEnabled } from "./winsession.ts";
 import { homedir, tmpdir } from "node:os";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -135,8 +136,14 @@ export function doneMarker(): string {
  *  statement failed. `exit N` bypasses the catch and cannot be observed; the
  *  marker then says `?` and exec keeps the process's own code. */
 export function withDoneMarker(script: string, shell: Shell, marker: string): string {
+  // bash -s reads the program from stdin, so a command in it that reads stdin
+  // (cua-driver, ssh, ffmpeg) swallowed every line after itself. bash parses
+  // the subshell whole before running it, so the body gets an empty stdin and
+  // the program stays intact. The subshell also keeps the body's `set -e` out
+  // of the login shell: with errexit still on, Ubuntu's ~/.bash_logout fails at
+  // `clear_console` and replaced the script's exit code with 1.
   if (shell !== "powershell")
-    return `trap 'fleet_rc=$?; printf "\n%s%s\n" "${marker}" "$fleet_rc" 1>&2' EXIT\n${script}`;
+    return `trap 'fleet_rc=$?; printf "\n%s%s\n" "${marker}" "$fleet_rc" 1>&2' EXIT\n(\n${script}\n) </dev/null`;
   // The program travels base64-encoded: pwsh decodes a stdin program in the
   // console's legacy codepage, so any non-ASCII character in it arrived
   // garbled. Run from a scriptblock, its line numbers are also the caller's.
@@ -329,6 +336,15 @@ export async function exec(
   // The cwd change goes INSIDE the wrapper, so a missing directory is a
   // reported failure rather than a statement PowerShell steps past.
   const located = opts.cwd ? (reportShell === "powershell" ? withCwdPwsh : withCwdBash)(command, opts.cwd) : command;
+  if (resolved === "powershell" && winBin === "pwsh" && winSessionEnabled(host)) {
+    const s = await trySessionExec(host, located, remainingMs);
+    if (s) {
+      const err = stripClixml(s.stderr.trimEnd());
+      if (s.timedOut) return { host: host.name, ok: false, code: 124, stdout: s.stdout,
+        stderr: (err + `\nfleet: command timed out after ${Math.round(timeoutMs / 1000)}s`).trim() };
+      return { host: host.name, ok: s.code === 0, code: s.code, stdout: s.stdout, stderr: err.trim() };
+    }
+  }
   const { args, stdin } = buildArgs(host, withDoneMarker(located, reportShell, marker), resolved, winBin);
 
   const proc = Bun.spawn(args, {

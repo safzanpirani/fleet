@@ -11,10 +11,10 @@ import { connOpts, exec, probe, probeDetail, scp, scpPull, sshDiagnose, bashEsc,
 import { checkProxy, proxyCommandFor } from "./proxy.ts";
 import type { ProxyCheck } from "./proxy.ts";
 import type { ExecResult, Shell, TransferOptions } from "./ssh.ts";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { createConnection } from "node:net";
-import { mkdir, mkdtemp, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { installLockScript } from "./install-lock.ts";
 
@@ -164,11 +164,22 @@ export async function probeHttp(url: string, timeoutMs = 4000): Promise<boolean>
  *  ssh *route* to a live box reads differently from a box that's actually off. */
 export async function lsHosts(
   cfg: FleetConfig, onResult?: (r: HostReport) => void,
+  opts: { statePath?: string; probe?: typeof probeDetail; http?: typeof probeHttp } = {},
 ): Promise<HostReport[]> {
-  return Promise.all(Object.values(cfg.hosts).map(async (h) => {
-    const result = await probeDetail(h);
+  // Every reachable host answers in well under a second, so the full probe cap
+  // is only ever spent on dead ones. A host that was down on the last `ls`
+  // gets a short cap; a host that answered keeps the full one, so a slow link
+  // to a live box is never cut short.
+  const statePath = opts.statePath ?? join(homedir(), ".fleet", "ls-state.json");
+  const known = await readLsState(statePath);
+  const shortCap = process.env.FLEET_PROBE_TIMEOUT_MS === undefined ? LS_KNOWN_DOWN_CAP_MS : undefined;
+  const reports = await Promise.all(Object.values(cfg.hosts).map(async (h) => {
+    const cap = known[h.name] === false && !resolveProxy(h) ? shortCap : undefined;
+    // The health URL is checked alongside ssh, not after it times out.
+    const http = h.health ? (opts.http ?? probeHttp)(h.health) : undefined;
+    const result = await (opts.probe ?? probeDetail)(h, cap);
     const up = result.up;
-    const httpUp = !up && h.health ? await probeHttp(h.health) : undefined;
+    const httpUp = !up && http ? await http : undefined;
     const rep: HostReport = {
       name: h.name, os: h.os, ssh: h.ssh, gpu: !!h.gpu, up, httpUp,
       proxy: result.via ?? null,
@@ -178,6 +189,28 @@ export async function lsHosts(
     onResult?.(rep);
     return rep;
   }));
+  await writeLsState(statePath, Object.fromEntries(reports.map((r) => [r.name, r.up])));
+  return reports;
+}
+
+export const LS_KNOWN_DOWN_CAP_MS = 1500;
+
+async function readLsState(path: string): Promise<Record<string, boolean>> {
+  try {
+    // node:fs, not Bun.file: on Windows (Bun 1.4.2) Bun.file(missing).text()
+    // never settles and holds no handle, so the CLI exited 0 mid-command.
+    const data = JSON.parse(await readFile(path, "utf8"));
+    return data && typeof data === "object" ? data : {};
+  } catch { return {}; }
+}
+
+async function writeLsState(path: string, state: Record<string, boolean>): Promise<void> {
+  try {
+    await mkdir(dirname(path), { recursive: true });
+    const tmp = `${path}.${process.pid}.tmp`;
+    await writeFile(tmp, JSON.stringify(state));
+    await rename(tmp, path);
+  } catch { /* a hint cache; ls is still correct without it */ }
 }
 
 // ── exec ──────────────────────────────────────────────────────────────────────
@@ -1711,6 +1744,10 @@ export async function cuRun(
 
   if (!imageOut) {
     const result = await runExec(host, `${prelude}\n${cuInvocation(args, host.os, invoke)}`, shell);
+    // cua-driver's CLI exits 0 even when it refused or failed; its reply says so.
+    const refusal = result.ok ? cuReplyRefusal(result.stdout) : undefined;
+    if (refusal) return { host: host.name, result: { ...result, ok: false, code: 1,
+      stderr: [result.stderr, `fleet: ${refusal}`].filter(Boolean).join("\n") } };
     return { host: host.name, result };
   }
 
@@ -1751,6 +1788,51 @@ export async function cuRun(
   } catch (error) {
     return { host: host.name, result: { ...result, ok: false, code: 1,
       stderr: error instanceof Error ? error.message : String(error) } };
+  }
+}
+
+export interface CuOpenResult extends CuResult {
+  /** What was opened, for the report line. */
+  what: string;
+  /** The window to address next, when one appeared in time. */
+  window?: CuWindowInfo;
+  /** The name to pass as TARGET to later commands. */
+  targetName?: string;
+}
+
+/** Start an app, or open a URL in one (or in the default browser), then name
+ *  the window to address next: a window that appeared, else the launched
+ *  process's largest window, since a running browser opens a tab in place. */
+export async function cuOpen(
+  cfg: FleetConfig, sel: string, app: string | undefined, url: string | undefined,
+  opts: { waitMs?: number } = {},
+  deps: { run?: typeof cuRun; snapshot?: typeof cuSnapshot; sleep?: (ms: number) => Promise<void> } = {},
+): Promise<CuOpenResult> {
+  const run = deps.run ?? cuRun;
+  const snapshot = deps.snapshot ?? cuSnapshot;
+  const browser = !app || /^(browser|default|default browser)$/i.test(app.trim());
+  if (browser && !url) throw new Error("open needs an app, a URL, or both");
+  const args: Record<string, unknown> = url
+    ? (browser ? { urls: [url] } : { name: app, additional_arguments: [url] })
+    : { name: app };
+  const what = url ? `${url}${browser ? "" : ` in ${app}`}` : app!;
+  const before = new Set((await snapshot(cfg, sel)).windows.map((w) => w.window_id));
+  const launched = await run(cfg, sel, ["launch_app", JSON.stringify(args)]);
+  if (!launched.result.ok) return { ...launched, what };
+  let pid: number | undefined;
+  try { pid = Number(extractJson(launched.result.stdout)?.pid) || undefined; } catch { /* no pid in the reply */ }
+  const deadline = Date.now() + (opts.waitMs ?? 6000);
+  let snap: CuSnapshot | undefined;
+  for (;;) {
+    snap = await snapshot(cfg, sel);
+    const usable = snap.windows.filter((w) => w.on_screen && !w.minimized && w.width > 1 && w.height > 1
+      && !/^cua-driver/i.test(w.app_name ?? ""));
+    const fresh = usable.filter((w) => !before.has(w.window_id));
+    const own = pid ? usable.filter((w) => w.pid === pid) : [];
+    const window = [...(fresh.length ? fresh : own)].sort((a, b) => b.width * b.height - a.width * a.height)[0];
+    if (window) return { ...launched, what, window, targetName: window.title || String(window.pid) };
+    if (Date.now() > deadline) return { ...launched, what };
+    await (deps.sleep ?? Bun.sleep)(250);
   }
 }
 
@@ -3122,6 +3204,13 @@ export async function cuElements(
   return { ...response, ...parseCuElements(response.result.stdout, target) };
 }
 
+/** Roles match without case or macOS's `AX` prefix, so `--role Button` finds
+ *  Windows' `Button` and macOS's `AXButton` alike. */
+export function sameRole(a: string, b: string): boolean {
+  const norm = (r: string) => r.trim().replace(/^AX(?=[A-Z])/, "").toLowerCase();
+  return norm(a) === norm(b);
+}
+
 /** How a caller names one control: its token, or its label (plus role / nth
  *  to break a tie). */
 export interface CuElementLocator { token?: string; label?: string; role?: string; nth?: number }
@@ -3138,7 +3227,7 @@ export function cuPickElement(elements: CuElement[], loc: CuElementLocator): CuE
   const label = loc.label?.trim().toLowerCase();
   const role = loc.role?.trim().toLowerCase();
   if (!label && !role) throw new Error("an element needs a token, a label, or a role");
-  const byRole = role ? elements.filter((e) => e.role.toLowerCase() === role) : elements;
+  const byRole = role ? elements.filter((e) => sameRole(e.role, role)) : elements;
   const exact = label === undefined ? byRole : byRole.filter((e) => e.label.trim().toLowerCase() === label);
   const pool = exact.length ? exact
     : label === undefined ? [] : byRole.filter((e) => e.label.toLowerCase().includes(label));
@@ -3172,6 +3261,10 @@ export function cuReplyRefusal(text: string): string | undefined {
   const reason = reply.escalation?.reason;
   if (reason === "delivery_failed" || reason === "background_unavailable")
     return `the driver could not deliver this input in the background (${reason}); retry with --foreground`;
+  // Lookup failures come back as a bare `{code, suggestion, …}` object.
+  if (typeof reply.code === "string" && /^[a-z]+(_[a-z]+)+$/.test(reply.code)
+      && (reply.suggestion !== undefined || /_(not_found|required|invalid|denied|failed|unavailable)$/.test(reply.code)))
+    return `the driver reported ${reply.code}`;
   return undefined;
 }
 

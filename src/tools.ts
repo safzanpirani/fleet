@@ -19,7 +19,7 @@
  */
 import { join, basename, dirname, relative } from "node:path";
 import { homedir, tmpdir } from "node:os";
-import { copyFile, chmod, lstat, mkdir, mkdtemp, readlink, readdir, rm, stat, symlink } from "node:fs/promises";
+import { copyFile, chmod, lstat, mkdir, mkdtemp, readFile, readlink, readdir, rm, stat, symlink } from "node:fs/promises";
 import type { Dirent } from "node:fs";
 import type { FleetConfig, Host, ToolSpec } from "./config.ts";
 import { resolveHosts } from "./config.ts";
@@ -664,7 +664,7 @@ export function toolSyncParallelism(toolCount: number, requested?: string): numb
  *  carries its own provenance wherever it ends up. Idempotent: re-stamping the
  *  same version rewrites nothing. Returns true when the file changed. */
 export async function stampSkill(path: string, version: string, date: string): Promise<boolean> {
-  const src = await Bun.file(path).text();
+  const src = await readFile(path, "utf8");
   const m = /^---\n([\s\S]*?)\n---\n/.exec(src);
   if (!m) throw new Error(`${basename(path)} has no YAML frontmatter to stamp`);
   let fm = m[1]!;

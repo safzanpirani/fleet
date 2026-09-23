@@ -12,13 +12,14 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { FleetConfig } from "./config.ts";
 import type { ExecResult } from "./ssh.ts";
+import { focusElements } from "./focus.ts";
 import {
   lsHosts, runExec, runScript, readScriptSource, editRemoteFile, pushFile, pullFile, restartService, serviceLogs,
   gpuRows, diskRows, hostStatus, runRecipe, captureScreenshot, overlayGrid, cuRun,
   cuInstall, cuTools, cuDescribe, cuRecordStart, cuRecordStop, cuRecordStatus,
   cuApps, cuShotWindow, browseHost, deployHosts, diagnose,
   cuSnapshot, cuResolveTargetFrom, cuResolvePoint, cuAct, cuBatch, CU_BATCH_TOOLS, cuBlockerNote,
-  cuGridCaption, cuElementSupport, compactCuOutput, briefDescribe, cuElements, cuVerify,
+  cuGridCaption, cuElementSupport, compactCuOutput, briefDescribe, cuElements, cuOpen, cuVerify, sameRole,
   rebootHosts, firmwareRebootHosts, bootState, switchMachine, waitFor, routeSelector, svcStatus,
 } from "./core.ts";
 import {
@@ -1010,19 +1011,49 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       filter: z.string().optional().describe("Case-insensitive substring over labels and values; ancestors are kept."),
       role: z.string().optional().describe("Keep only this role: Button, Edit, MenuItem, CheckBox, ListItem, …"),
       maxElements: z.number().int().min(1).max(5000).optional().describe("Cap on nodes walked (driver default 5000)."),
+      task: z.string().optional().describe("What you are about to do. Controls a judge is confident the task does not need are hidden (needs TYPESAFE_API_KEY on the fleet side; fails open). Cuts a 300-row window to the handful that matter."),
     },
     annotations: { readOnlyHint: true, openWorldHint: true },
-  }, async ({ host, app, filter, role, maxElements }) => {
+  }, async ({ host, app, filter, role, maxElements, task }) => {
     try {
       const r = await cuElements(cfg, await routeSelector(cfg, host), app, { filter, maxElements });
       if (!r.result.ok) return text(r.result.stderr || r.result.stdout || "get_window_state failed", true);
-      const elements = role ? r.elements.filter((e) => e.role.toLowerCase() === role.toLowerCase()) : r.elements;
+      let elements = role ? r.elements.filter((e) => sameRole(e.role, role)) : r.elements;
+      let focus: string | undefined;
+      if (task && r.available) {
+        const f = await focusElements(elements, task, `${r.target.name} · ${r.target.window.title || "(untitled)"}`);
+        elements = f.elements; focus = f.note;
+      }
       return text(JSON.stringify({
         target: { name: r.target.name, pid: r.target.pid, window_id: r.target.window.window_id, title: r.target.window.title },
         snapshotId: r.snapshotId, total: r.total, available: r.available,
+        ...(focus ? { focus } : {}),
         elements: elements.map(({ frame: _frame, ...e }) => e),
         ...(r.available ? {} : { note: "no accessibility elements here: use fleet_cu_screenshot_window and pixel x/y" }),
       }));
+    } catch (error) { return text(error instanceof Error ? error.message : String(error), true); }
+  });
+
+  server.registerTool("fleet_cu_open", {
+    title: "Open an app or a URL on a host's desktop",
+    description: "Start an app by name, open a URL in a named app, or open a URL in the default browser, then "
+      + "return the window to address next (a new window, else the launched process's largest one). Pass its "
+      + "title as `app` to fleet_cu_elements / fleet_cu_act. " + sel,
+    inputSchema: {
+      host: z.string().describe("Host name or selector (first matched host is used)."),
+      app: z.string().optional().describe("App to launch (\"Google Chrome\", \"explorer\", \"notepad\"). Omit to use the default browser for `url`."),
+      url: z.string().optional().describe("URL (or path/argument) to open in the app, or in the default browser."),
+      waitMs: z.number().int().min(0).max(30000).optional().describe("How long to wait for a window (default 6000)."),
+    },
+    annotations: { openWorldHint: true },
+  }, async ({ host, app, url, waitMs }) => {
+    try {
+      const r = await cuOpen(cfg, await routeSelector(cfg, host), app, url, { waitMs });
+      if (!r.result.ok) return text(r.result.stderr || r.result.stdout || "launch_app failed", true);
+      if (!r.window) return text(`opened ${r.what}; no window appeared yet (fleet_cu_windows lists them)`);
+      const w = r.window;
+      return text(JSON.stringify({ opened: r.what, window: { title: w.title, pid: w.pid, window_id: w.window_id,
+        x: w.x, y: w.y, width: w.width, height: w.height }, app: r.targetName }));
     } catch (error) { return text(error instanceof Error ? error.message : String(error), true); }
   });
 

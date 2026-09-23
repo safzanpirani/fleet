@@ -1,6 +1,6 @@
 ---
 name: fleet
-description: Run commands, launch detached background jobs, restart services, push files, screenshot desktops, and read live status across a fleet of machines (Linux, Windows, and Mac boxes) over SSH with zero quoting pain, via the `fleet` CLI or its MCP server. Use when the user wants to exec/run something on one or many of their boxes, spawn a long-running job that outlives the SSH session (and tail/wait/kill it), restart or tail logs for a service, copy a file to host(s), screenshot a remote machine, check fleet/host/GPU status or the status dashboard, register/use the fleet MCP server, or mentions fleet, @linux/@windows/@gpu, or "all my machines / servers".
+description: Run commands, launch detached background jobs, restart services, push files, screenshot desktops, and read live status across a fleet of machines (Linux, Windows, and Mac boxes) over SSH with zero quoting pain, via the `fleet` CLI or its MCP server. Use when the user wants to exec/run something on one or many of their boxes, spawn a long-running job that outlives the SSH session (and tail/wait/kill it), restart or tail logs for a service, copy a file to host(s), screenshot a remote machine, check fleet/host/GPU status or the status dashboard, register/use the fleet MCP server (Claude Code, Factory Droid, Codex), drive a remote desktop with `fleet cu`, or mentions fleet, @linux/@windows/@gpu, or "all my machines / servers".
 ---
 
 # fleet
@@ -128,14 +128,24 @@ harness-backgrounded SSH session open for it.
 
 - **Exit codes are real on Windows.** A PowerShell program stops at its first terminating
   error (`throw`, a cmdlet under `-ErrorAction Stop`) and exits 1; a failing native command
-  as the last statement reports its own code (`cmd /c exit 3` → 3). `exit N` above 1 still
-  reports 1: pwsh `-Command -` collapses it and the code cannot be observed.
+  as the last statement reports its own code (`cmd /c exit 3` → 3). `exit N` above 1
+  reports N through the kept-open session (below); only the one-shot fallback collapses it to 1.
 - **Unicode survives both ways** on Windows: the program is shipped base64-encoded and
   output is UTF-8. Detached Windows jobs get `PYTHONUTF8=1`, so Python tools that print
   ✓ or emoji no longer die with a cp1252 codec error.
 - **A remote command that runs ssh/scp itself, or leaves `cmd &` behind, no longer hangs**
   `fleet exec`. The script reports its own completion; fleet waits `FLEET_DONE_GRACE_MS`
   (default 1500) for output to drain, then returns with the reported exit code.
+- **Windows exec reuses a kept-open pwsh.** After the first call to a Windows host, a
+  background `fleet __win-session` process keeps one pwsh open over its own ssh
+  connection, and later calls take ~50-250 ms instead of ~0.6 s. Each call runs in a
+  child scope from the home directory, with environment variables restored after;
+  `$global:` state and imported modules carry over. Each program runs as a script file,
+  so `exit 7` reports 7 exactly (one-shot pwsh reports 1). A busy or unresponsive
+  session falls back to a one-shot pwsh, a timeout restarts it, and it closes after 10 idle minutes
+  (`FLEET_WIN_SESSION_IDLE_S`). `FLEET_WIN_SESSION=0` turns it off.
+- **Commands that read stdin get an empty one.** Scripts arrive over stdin, so a
+  command that reads stdin used to swallow the rest of the script. Now it sees EOF.
 - **Output is plain text when piped** (no ANSI); `FORCE_COLOR=1` restores colour, and
   `| head` no longer crashes fleet with a stack trace.
 
@@ -172,8 +182,20 @@ and exposes computer-use tools. Same interactive-desktop requirement as `fleet s
     `verify_state`: `satisfied` exits 0, while `unsatisfied` and `unknown` exit 1. Prefer it
     over the pixel `effect` whenever the outcome shows up in the tree: a blinking caret
     makes the pixel check report `indeterminate`.
-  - MCP: `fleet_cu_elements`, `fleet_cu_verify`, and `fleet_cu_act` with
+  - `fleet cu win-box open explorer 'C:\Windows'`, `open notepad`, or `open https://bun.sh`
+    (default browser) launches through `launch_app` and prints the window to address next.
+    MCP: `fleet_cu_open`.
+  - `fleet cu win-box elements "<title>" --task "open the Fonts folder"` hides the controls a
+    TypeSafe Jev judge is confident the task does not need: Explorer at `C:\Windows` went
+    from 295 rows to 18 with Fonts kept, in ~1.6 s. It needs `TYPESAFE_API_KEY` (or a JSON
+    file with `apiKey` named by `FLEET_JEV_CONFIG`), runs only past 30 rows, and fails open.
+    Each use is a paid Jev call. MCP: `fleet_cu_elements` `task`.
+  - MCP: `fleet_cu_elements`, `fleet_cu_open`, `fleet_cu_verify`, and `fleet_cu_act` with
     `element: {token | label, role?, nth?}`.
+  - cua-driver's CLI exits 0 even when it refuses. Raw `fleet cu <host> <tool> <json>`
+    exits 1 with `fleet: the driver reported …` when the reply is a refusal, `isError`, a
+    failed delivery, or a lookup code such as `window_id_not_found`. A plain-text error
+    (Windows prints some that way) still exits 0, so read the reply.
   - A token from one call stays valid in the next (the daemon keeps the cache) until a
     new tree read of that window replaces it.
   - A reply with `escalation.reason: delivery_failed` means the app dropped the

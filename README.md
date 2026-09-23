@@ -21,7 +21,7 @@ fleet status                     # the whole fleet at a glance
 - Long-running jobs survive SSH disconnects and remain easy to inspect.
 - The same operations are available to people through the CLI and agents through MCP.
 
-Driving fleet from Claude Code, Codex, or another agent? Start with
+Driving fleet from Claude Code, Factory Droid, Codex, or another agent? Start with
 **[Agent setup](#agent-setup)**.
 
 ## Quick start
@@ -68,7 +68,7 @@ fleet restart @linux cloudflared   # restart a configured service (fans out acro
 fleet bios windows-auto --yes      # reboot directly into UEFI/BIOS firmware setup
 fleet svc cloudflared              # up/down of one service on every host that has it
 fleet deploy gpu-box              # ship fleet source -> host, bun install, restart fleet-mcp
-fleet status                        # live CPU/mem/disk/gpu from dash.example.com
+fleet status                        # live CPU/mem/disk/gpu from your status dashboard
 fleet disk                          # live free space on every mounted volume
 fleet status vps                    # one host
 fleet logs web cloudflared -n 50
@@ -227,11 +227,16 @@ Every verb takes the same kind of target: a pid, a process name (with or without
 `.exe`), an app display name, or a window title.
 
 ```sh
+fleet cu web open firefox https://bun.sh   # launch an app and print its new window
 fleet cu web apps                       # pid + name table (optional name filter)
 fleet cu web windows                    # every top-level window on the desktop
 fleet cu web windows firefox            # one process's windows, blockers flagged
 fleet cu web shot-window firefox --grid --out w.png
 ```
+
+`open` takes an app, an app plus a URL or path, or a bare URL for the default
+browser. It waits (`--wait MS`) for a new top-level window and prints the title to
+pass to every later verb. MCP: `fleet_cu_open`.
 
 ### Input you can trust
 
@@ -295,9 +300,12 @@ fleet cu web click '{"pid":3848,"window_id":66756,"x":100,"y":200}'
 - **JSON args are piped over stdin**, not passed as argv — Windows PowerShell 5.1
   strips the quotes around JSON field names on native-command args, and piping
   preserves them.
+- **Refusals fail.** cua-driver's own CLI exits 0 even when it refuses. Fleet exits
+  1 when a reply is a refusal, an `isError`, a failed delivery, or a lookup error such
+  as `window_id_not_found`, so an agent's shell sees the failure without parsing it.
 - An image comes back only when you pass `--out` (or use `shot-window`).
 - Exposed to agents as `fleet_cu` (raw), `fleet_cu_act` (verified input),
-  `fleet_cu_windows`, `fleet_cu_screenshot_window` and `fleet_cu_describe`;
+  `fleet_cu_windows`, `fleet_cu_open`, `fleet_cu_screenshot_window` and `fleet_cu_describe`;
   `args: ["install"]` fans out over a selector there too.
 
 ## Agent setup
@@ -365,8 +373,13 @@ targets one agent, and `npx skills update fleet` pulls later changes. Prefer to
 do it by hand? Copy the folder in:
 
 ```sh
-cp -R ~/fleet/skill ~/.claude/skills/fleet
+cp -R ~/fleet/skill ~/.claude/skills/fleet      # Claude Code
+cp -R ~/fleet/skill ~/.factory/skills/fleet     # Factory Droid
 ```
+
+[Factory Droid](https://factory.com) also discovers skills under
+`~/.agents/skills/`, so a copy there serves Droid and other agents that read
+that path.
 
 **Install it wherever the `fleet` CLI is reachable.** The skill is only useful to
 an agent that can actually run `fleet` — so put it in every context you drive the
@@ -396,8 +409,16 @@ bun run src/mcp.ts            # or: bun run mcp   (FLEET_CONFIG honoured)
 ```sh
 claude mcp add fleet -- bun run ~/fleet/src/mcp.ts
 ```
+**Factory Droid**
+```sh
+droid mcp add fleet "bun run $HOME/fleet/src/mcp.ts"
+```
+Droid writes the entry to `~/.factory/mcp.json` ([docs](https://docs.factory.ai/harness/mcp)),
+and `/mcp` in a Droid session shows the server and its tools. A project can share
+it through `.factory/mcp.json` instead.
+
 **Any client that reads an MCP config** (`.mcp.json`, `claude_desktop_config.json`,
-Cursor, Windsurf, Zed, …):
+`~/.factory/mcp.json`, Cursor, Windsurf, Zed, …):
 ```json
 {
   "mcpServers": {
@@ -423,7 +444,7 @@ Restart the client, then ask it to list tools; you should see 20 named `fleet_*`
 
 A cloud agent, a phone client, or a teammate's session can't spawn a local stdio
 process. For those, run the [HTTP endpoint](#remote-mcp-endpoint-http) instead
-and register `https://fleet.example.com/mcp` with the token as the API key. The
+and register `https://<your-fleet-host>/mcp` with the token as the API key. The
 token is a root credential for every machine in the config — treat it that way,
 and start read-only:
 
@@ -501,9 +522,9 @@ coordinates are checked against the selected window. `--space screen` translates
 desktop coordinates; `--json` returns one structured result.
 
 ```sh
-fleet cu web drag "Example App" 100 80 300 200 --duration 500
-fleet cu web scroll "Example App" down 2 --by page
-fleet cu web batch "Example App" '[{"tool":"click","args":{"x":100,"y":80}},{"tool":"type_text","args":{"text":"example"}}]' --shot --json
+fleet cu win-box drag mspaint 100 80 300 200 --duration 500
+fleet cu win-box scroll notepad down 2 --by page
+fleet cu win-box batch notepad '[{"tool":"click","args":{"x":100,"y":80}},{"tool":"type_text","args":{"text":"hello"}}]' --shot --json
 ```
 
 Address controls by accessibility instead of pixels when the window exposes them.
@@ -513,12 +534,20 @@ screenshot. The input commands accept `--label TEXT [--role R] [--nth N]` or
 candidates listed. `verify` checks state with cua-driver's `verify_state`.
 
 ```sh
-fleet cu web elements "Example App" save --role Button
-fleet cu web click "Example App" --label Save --role Button
-fleet cu web set "Example App" "example" --label Search
-fleet cu web menu "Example App" File "Save As..."
-fleet cu web verify "Example App" --label Saved
+fleet cu win-box elements notepad save --role Button
+fleet cu win-box elements "<window title>" --task "open the Fonts folder"   # hide rows the task does not need
+fleet cu win-box click notepad --label Save --role Button
+fleet cu win-box set charmap "hello" --label "Search for"
+fleet cu win-box menu notepad File "Save As..."
+fleet cu win-box verify notepad --label Saved
 ```
+
+A big window can list hundreds of controls, and every row costs the agent
+context. `--task TEXT` sends each row to TypeSafe's Jev relevance judge and hides
+only the rows it is confident the task does not need: an Explorer window at
+`C:\Windows` went from 295 rows to 18 with the Fonts folder kept. It runs only past
+30 rows, needs `TYPESAFE_API_KEY`, and lists every row when the key is missing or
+the call fails. Each use is a paid API call.
 
 A batch targets one fixed window, executes ordered input on the host, and captures
 before/after the whole sequence. Use `--file actions.json` or `-` for stdin. Each
@@ -539,7 +568,7 @@ the published platform registries, including platform-specific controls.
 ## Remote MCP endpoint (HTTP)
 For remote clients (e.g. Poke) the server also speaks **HTTP** — modern Streamable
 HTTP at `POST /mcp` and legacy SSE at `GET /sse` + `POST /messages`. It is meant
-to sit behind a Cloudflare tunnel at `https://fleet.example.com`.
+to sit behind a Cloudflare tunnel on a hostname you control.
 
 ```sh
 FLEET_MCP_TOKEN=<long-random> bun run src/http.ts     # or: bun run serve
@@ -554,8 +583,9 @@ FLEET_MCP_TOKEN=<long-random> bun run src/http.ts     # or: bun run serve
   `ls`/`status`/`svc`/`gpu`/`logs`/`jobs`/`job_log`/`boot` are exposed.
 - **Binding:** defaults to `127.0.0.1:8787` (`FLEET_MCP_HOST` / `FLEET_MCP_PORT`) —
   only the local cloudflared should reach it; the token is the public gate.
-- Register in an MCP client with URL `https://fleet.example.com/mcp` and the
-  token as the API key. Smoke-test locally with `bun run scripts/smoke-http.ts`
+- Register in an MCP client with URL `https://<your-fleet-host>/mcp` and the
+  token as the API key. For Factory Droid:
+  `droid mcp add fleet https://<your-fleet-host>/mcp --type http --header "Authorization: Bearer $FLEET_MCP_TOKEN"`. Smoke-test locally with `bun run scripts/smoke-http.ts`
   (and `FLEET_MCP_READONLY=1 bun run scripts/smoke-http.ts` for the kill-switch).
 
 ## Config — `fleet.config.json`
@@ -662,6 +692,9 @@ git-ignored `fleet.config.local.json` if you don't want hosts in git.
 | `FLEET_NO_PROXY` | `1` routes every connection directly — the kill switch for a wedged proxy. `--proxy` still wins |
 | `FLEET_WIN_SHELL` | force `pwsh` or `powershell` on every Windows host (overrides per-host `winShell`) |
 | `NO_COLOR` / `FORCE_COLOR` | output is uncoloured unless stdout is a terminal; `NO_COLOR` always disables colour, `FORCE_COLOR=1` forces it |
+| `FLEET_WIN_SESSION` | `0` turns off the kept-open PowerShell session that makes repeat Windows execs take ~50-250 ms instead of ~0.6 s |
+| `FLEET_WIN_SESSION_IDLE_S` | idle seconds before that session closes (default 600) |
+| `TYPESAFE_API_KEY` | enables `fleet cu … elements --task` (paid call; fails open). `FLEET_JEV_CONFIG` may name a JSON file with `apiKey` instead |
 | `FLEET_NO_SSH_MUX` | `1` disables SSH connection multiplexing. By default fleet reuses one master connection per host (`ControlMaster=auto`, `ControlPersist=60s`, sockets under `~/.fleet/ssh/`) so fan-outs and poll loops don't re-handshake; a wedged socket is fixed by this flag or `rm ~/.fleet/ssh/cm-*` |
 
 ## Why
