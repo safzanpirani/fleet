@@ -227,6 +227,18 @@ describe("hard deadlines and deploy source", () => {
     await expect(waitFor(cfg, "typo", { timeoutMs: 100 })).rejects.toThrow("unknown host");
   });
 
+  test("--sudo ships the whole write through sudo -n and refuses Windows shells", async () => {
+    let sent = "";
+    await writeRemoteFile({ name: "box", ssh: "box", os: "linux" }, "/etc/x", "new", null, "auto", {
+      sudo: true,
+      exec: async (host, command) => { sent = command; return { host: host.name, ok: true, code: 0, stdout: "", stderr: "" }; },
+    });
+    const b64 = /^printf %s '([^']+)' \| base64 -d \| sudo -n bash$/.exec(sent)![1]!;
+    expect(Buffer.from(b64, "base64").toString("utf8")).toContain(`mv -- "$tmp" "$p"`);
+    await expect(writeRemoteFile({ name: "win", ssh: "win", os: "windows" }, "C:/x", "new", null, "auto", { sudo: true }))
+      .rejects.toThrow("--sudo needs a POSIX shell");
+  });
+
   test("remote writes refuse to replace POSIX symlinks", async () => {
     const root = mkdtempSync(join(tmpdir(), "fleet-edit-symlink-"));
     const target = join(root, "target");

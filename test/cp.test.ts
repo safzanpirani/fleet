@@ -1,5 +1,6 @@
 import { test, expect, describe } from "bun:test";
 import { parseRemoteSpec, pushFile } from "../src/core.ts";
+import { rsyncRemotePath } from "../src/ssh.ts";
 import type { FleetConfig, Host } from "../src/config.ts";
 
 const host = (name: string, os: Host["os"]): Host => ({ name, ssh: name, os });
@@ -120,5 +121,29 @@ describe("pushFile creates a trailing-slash destination", () => {
     expect(r!.stderr).toContain("could not create destination directory ~/out/");
     expect(r!.stderr).toContain("denied");
     expect(copies).toEqual([]);
+  });
+});
+
+describe("cp --resume", () => {
+  test("remote rsync paths drop ~/ and quote only for openrsync's shell parsing", () => {
+    expect(rsyncRemotePath("~/a b/it's", "gnu")).toBe("a b/it's");
+    expect(rsyncRemotePath("~/a b/it's", "openrsync")).toBe(`'a b/it'\\''s'`);
+    expect(rsyncRemotePath("~", "gnu")).toBe(".");
+    expect(rsyncRemotePath("/srv/x", "openrsync")).toBe("'/srv/x'");
+  });
+
+  test("pushFile hands resume to the copier and skips the Windows mkdir it will refuse", async () => {
+    const seen: unknown[] = [];
+    const mkdirs: string[] = [];
+    const deps = {
+      exec: async (h: Host) => { mkdirs.push(h.name); return { host: h.name, ok: true, code: 0, stdout: "", stderr: "" }; },
+      scp: async (h: Host, _l: string | string[], _r: string, _rec: boolean, opts: unknown) => {
+        seen.push(opts); return { host: h.name, ok: true, code: 0, stdout: "", stderr: "" };
+      },
+      resume: true,
+    } as any;
+    await pushFile(cfg, "/tmp/a", "web,winbox", "~/out/", false, deps);
+    expect(seen).toEqual([{ resume: true, progress: undefined }, { resume: true, progress: undefined }]);
+    expect(mkdirs).toEqual(["web"]);
   });
 });

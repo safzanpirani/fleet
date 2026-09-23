@@ -557,3 +557,23 @@ describe("detached job lifecycle", () => {
     }
   });
 });
+
+describe("spawn --wsl", () => {
+  test("the bash program travels base64-encoded, so its redirects stay bash's", async () => {
+    const { wslJobCommand } = await import("../src/jobs.ts");
+    const cmd = wslJobCommand("echo hi > /home/u/x.log | cat", "Ubuntu", "~/work dir");
+    expect(cmd).toStartWith("& wsl.exe -d 'Ubuntu' -- bash -c 'printf %s ");
+    expect(cmd).not.toContain("/home/u/x.log");
+    const b64 = /printf %s (\S+) \|/.exec(cmd)![1]!;
+    const body = Buffer.from(b64, "base64").toString("utf8");
+    expect(body).toContain(`cd -- "$HOME"/'work dir' || {`);
+    expect(body.endsWith("echo hi > /home/u/x.log | cat")).toBe(true);
+    expect(cmd.endsWith("exit $LASTEXITCODE")).toBe(true);
+  });
+
+  test("--wsl refuses hosts that are not Windows", async () => {
+    const { spawnJob } = await import("../src/jobs.ts");
+    await expect(spawnJob({ hosts: { l: { name: "l", ssh: "l", os: "linux" } } } as any, "l", "true", { wsl: true },
+      { exec: async () => { throw new Error("must not run"); } })).rejects.toThrow("--wsl needs Windows hosts");
+  });
+});

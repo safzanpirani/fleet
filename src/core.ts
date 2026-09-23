@@ -10,7 +10,7 @@ import type { FleetConfig, Host, Service, ServiceType, Machine } from "./config.
 import { connOpts, exec, probe, probeDetail, scp, scpPull, sshDiagnose, bashEsc, bashPathAssignment, psEsc } from "./ssh.ts";
 import { checkProxy, proxyCommandFor } from "./proxy.ts";
 import type { ProxyCheck } from "./proxy.ts";
-import type { ExecResult, Shell } from "./ssh.ts";
+import type { ExecResult, Shell, TransferOptions } from "./ssh.ts";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { createConnection } from "node:net";
@@ -282,7 +282,7 @@ export async function runScript(
 // ── cp ────────────────────────────────────────────────────────────────────────
 export async function pushFile(
   cfg: FleetConfig, local: string | string[], sel: string, remote: string, recursive = false,
-  deps: { exec?: typeof exec; scp?: typeof scp } = {},
+  deps: { exec?: typeof exec; scp?: typeof scp } & TransferOptions = {},
 ): Promise<ExecResult[]> {
   const hosts = resolveHosts(cfg, sel);
   const run = deps.exec ?? exec;
@@ -291,7 +291,9 @@ export async function pushFile(
   // intent unambiguously, so create it instead of failing with "No such file".
   const wantsDir = /[\\/]$/.test(remote) && remote.length > 1;
   return Promise.all(hosts.map(async (h) => {
-    if (wantsDir && h.transport !== "daytona") {
+    // rsync refuses Windows before touching the host, so skip the mkdir too.
+    const refused = deps.resume && h.os === "windows";
+    if (wantsDir && h.transport !== "daytona" && !refused) {
       // `New-Item` has no -LiteralPath in ANY PowerShell version, so this step
       // used to fail on every Windows trailing-slash destination — tilde or
       // absolute alike. Its -Path form exists but globs, so `[1]` in a path
@@ -306,17 +308,18 @@ mkdir -p -- "$d"`;
       const r = await run(h, mk, "auto");
       if (!r.ok) return { ...r, stderr: `could not create destination directory ${remote}: ${r.stderr.trim() || "exit " + r.code}` };
     }
-    return copy(h, local, remote, recursive);
+    return copy(h, local, remote, recursive, { resume: deps.resume, progress: deps.progress });
   }));
 }
 
 /** Pull host:remote → local. Single-host only (one local destination). */
 export async function pullFile(
   cfg: FleetConfig, sel: string, remote: string | string[], local: string, recursive = false,
+  opts: TransferOptions = {},
 ): Promise<ExecResult> {
   const hosts = resolveHosts(cfg, sel);
   if (hosts.length !== 1) throw new Error(`pull needs exactly one source host (got ${hosts.length} from '${sel}')`);
-  return scpPull(hosts[0]!, remote, local, recursive);
+  return scpPull(hosts[0]!, remote, local, recursive, opts);
 }
 
 // ── edit ──────────────────────────────────────────────────────────────────────
@@ -327,17 +330,32 @@ export async function pullFile(
 // concurrent remote change. This does neither: read bytes, replace exactly,
 // write back only if the file is still byte-identical to what we read.
 
+/** Run a POSIX script as root without a password prompt. The script travels
+ *  base64-encoded, so nothing in it needs quoting for sudo's argv. */
+export function asRoot(script: string): string {
+  return `printf %s '${Buffer.from(script, "utf8").toString("base64")}' | base64 -d | sudo -n bash`;
+}
+
+function refuseWindowsSudo(host: Host, win: boolean, sudo?: boolean): void {
+  if (win && sudo) throw new Error(`${host.name}: --sudo needs a POSIX shell (Linux, mac, or --wsl)`);
+}
+
 /** Read a remote file and return its bytes as UTF-8 text. */
-export async function readRemoteFile(host: Host, path: string, shell: Shell = "auto"): Promise<{ text: string; b64: string }> {
+export async function readRemoteFile(
+  host: Host, path: string, shell: Shell = "auto", opts: { sudo?: boolean } = {},
+): Promise<{ text: string; b64: string }> {
   const win = host.os === "windows" && shell !== "wsl" && shell !== "bash";
-  const cmd = win
-    ? `[Convert]::ToBase64String([IO.File]::ReadAllBytes('${psEsc(path)}'))`
-    : `${bashPathAssignment("p", path)}
-[ -e "$p" ] || { echo "no such file" 1>&2; exit 2; }
+  refuseWindowsSudo(host, win, opts.sudo);
+  const posix = `${bashPathAssignment("p", path)}
+d=$(dirname -- "$p")
+[ -e "$p" ] || { if [ -d "$d" ] && [ ! -x "$d" ]; then echo "permission denied (cannot enter $d); pass --sudo" 1>&2; else echo "no such file" 1>&2; fi; exit 2; }
 [ -f "$p" ] || { echo "not a regular file" 1>&2; exit 2; }
-[ -r "$p" ] || { echo "permission denied (owned by $(ls -ld -- "$p" 2>/dev/null | awk '{print $3}'); use exec --script with sudo)" 1>&2; exit 2; }
+[ -r "$p" ] || { echo "permission denied (owned by $(ls -ld -- "$p" 2>/dev/null | awk '{print $3}'); pass --sudo)" 1>&2; exit 2; }
 set -o pipefail
 base64 < "$p" | tr -d '\\n'`;
+  const cmd = win
+    ? `[Convert]::ToBase64String([IO.File]::ReadAllBytes('${psEsc(path)}'))`
+    : opts.sudo ? asRoot(posix) : posix;
   const r = await exec(host, cmd, shell);
   if (!r.ok) throw new Error(`${host.name}: cannot read ${path}: ${r.stderr.trim() || "exit " + r.code}`);
   const b64 = r.stdout.replace(/\s/g, "");
@@ -356,9 +374,10 @@ base64 < "$p" | tr -d '\\n'`;
  *  being silently overwritten. */
 export async function writeRemoteFile(
   host: Host, path: string, text: string, expectB64: string | null, shell: Shell = "auto",
-  deps: { exec?: typeof exec } = {},
+  deps: { exec?: typeof exec; sudo?: boolean } = {},
 ): Promise<ExecResult> {
   const win = host.os === "windows" && shell !== "wsl" && shell !== "bash";
+  refuseWindowsSudo(host, win, deps.sudo);
   const next = Buffer.from(text, "utf8").toString("base64");
   const expectHash = expectB64 === null ? null
     : createHash("sha256").update(Buffer.from(expectB64, "base64")).digest("hex");
@@ -388,7 +407,7 @@ export async function writeRemoteFile(
         `mv -- "$tmp" "$p"`,
         `trap - EXIT HUP INT TERM`,
       ].join("\n");
-  return (deps.exec ?? exec)(host, cmd, shell);
+  return (deps.exec ?? exec)(host, deps.sudo && !win ? asRoot(cmd) : cmd, shell);
 }
 
 export interface EditResult {
@@ -461,7 +480,7 @@ export function diffLines(before: string, after: string, ctx = 2): string {
  *  a silent no-op is the exact failure mode this command exists to prevent. */
 export async function editRemoteFile(
   cfg: FleetConfig, sel: string, path: string, oldStr: string, newStr: string,
-  opts: { wsl?: boolean; all?: boolean; dryRun?: boolean } = {},
+  opts: { wsl?: boolean; all?: boolean; dryRun?: boolean; sudo?: boolean } = {},
 ): Promise<EditResult[]> {
   if (!oldStr) throw new Error("fleet edit: --old cannot be empty");
   const hosts = resolveHosts(cfg, sel);
@@ -469,7 +488,7 @@ export async function editRemoteFile(
   return Promise.all(hosts.map(async (h): Promise<EditResult> => {
     const base = { host: h.name, path, replacements: 0, diff: "" };
     try {
-      const { text, b64 } = await readRemoteFile(h, path, shell);
+      const { text, b64 } = await readRemoteFile(h, path, shell, { sudo: opts.sudo });
       const n = text.split(oldStr).length - 1;
       if (n === 0) return { ...base, ok: false, error: `--old not found in ${path}` };
       if (n > 1 && !opts.all)
@@ -479,7 +498,7 @@ export async function editRemoteFile(
       // contain credentials, so show only the lines that will change.
       const diff = diffLines(text, next, 0);
       if (opts.dryRun) return { ...base, ok: true, replacements: n, diff };
-      const w = await writeRemoteFile(h, path, next, b64, shell);
+      const w = await writeRemoteFile(h, path, next, b64, shell, { sudo: opts.sudo });
       if (!w.ok) return { ...base, ok: false, error: w.stderr.trim() || `write failed (exit ${w.code})` };
       return { ...base, ok: true, replacements: n, diff };
     } catch (e) {

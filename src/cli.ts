@@ -325,22 +325,23 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
     }
 
     case "spawn": {
-      const { flags, rest: pos } = parseLeadingFlags(rest, ["--json"], ["--cwd", "--label"]);
+      const { flags, rest: pos } = parseLeadingFlags(rest, ["--json", "--wsl"], ["--cwd", "--label"]);
       const json = flags["--json"] === true;
+      const wsl = flags["--wsl"] === true;
       const cwd = typeof flags["--cwd"] === "string" && flags["--cwd"] ? flags["--cwd"] : undefined;
       const label = typeof flags["--label"] === "string" && flags["--label"] ? flags["--label"] : undefined;
       const sel = pos.shift();
       const separated = pos[0] === "--";
       if (separated) pos.shift();
       const cmd = pos.join(" ");
-      if (!sel || !cmd) die("usage: fleet spawn [--cwd dir] [--label name] [--json] <sel> <cmd…>");
-      const misplaced = separated ? undefined : ["--cwd", "--label", "--json", "--name"].includes(pos[0] ?? "") ? pos[0]
-        : trailingFleetFlag(pos, ["--json"], ["--cwd", "--label", "--name"]);
+      if (!sel || !cmd) die("usage: fleet spawn [--wsl] [--cwd dir] [--label name] [--json] <sel> <cmd…>");
+      const misplaced = separated ? undefined : ["--cwd", "--label", "--json", "--wsl", "--name"].includes(pos[0] ?? "") ? pos[0]
+        : trailingFleetFlag(pos, ["--json", "--wsl"], ["--cwd", "--label", "--name"]);
       if (misplaced === "--name")
         die("there is no --name flag; use --label, and put it BEFORE the host: fleet spawn --label <name> " + sel + " <cmd…>");
       if (misplaced)
         die("'" + misplaced + "' must come BEFORE the host selector: fleet spawn " + misplaced + " <value> " + sel + " <cmd…>  (quote the whole command if it really ends in " + misplaced + ")");
-      const results = await spawnJob(cfg, await routeSelector(cfg, sel!), cmd, { cwd, label });
+      const results = await spawnJob(cfg, await routeSelector(cfg, sel!), cmd, { cwd, label, wsl });
       if (json) { console.log(JSON.stringify(results, null, 2)); return results.some((r) => !r.ok) ? 1 : 0; }
       for (const r of results) {
         if (r.ok) console.log(`${A.g("●")} ${A.b(r.host)} ${A.d("job")} ${A.c(r.id!)} ${A.d("· pid " + r.pid)}  ${A.d("fleet jobs tail " + r.host + ":" + r.id)}`);
@@ -447,11 +448,12 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
     }
 
     case "cp": {
-      const parsed = parseFlags(rest, ["--json", "-r", "--recursive"], []);
+      const parsed = parseFlags(rest, ["--json", "-r", "--recursive", "--resume"], []);
       rest = parsed.rest;
       const json = parsed.flags["--json"] === true;
       const recursive = parsed.flags["-r"] === true || parsed.flags["--recursive"] === true;
-      const usage = "usage: fleet cp [-r] <local...> <sel>:<remote-dir>   |   fleet cp [-r] <sel>:<remote...> <local-dir>";
+      const resume = parsed.flags["--resume"] === true;
+      const usage = "usage: fleet cp [-r] [--resume] <local...> <sel>:<remote-dir>   |   fleet cp [-r] [--resume] <sel>:<remote...> <local-dir>";
       // Everything but the last token is a source; the last token is the destination.
       // With >1 source the destination must be a directory (scp enforces that).
       const dest = rest[rest.length - 1];
@@ -461,7 +463,10 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       const srcSpecs = srcs.map((s) => parseRemoteSpec(cfg, s));
       if (push) {
         if (srcSpecs.some(Boolean)) die("remote → remote copy is not supported (pull to a local file first)");
-        const results = await pushFile(cfg, srcs, await routeSelector(cfg, push.sel), push.path, recursive);
+        const sel = await routeSelector(cfg, push.sel);
+        // One meter per terminal: parallel copies to several hosts would overwrite each other's line.
+        const progress = !json && !!process.stdout.isTTY && resolveHosts(cfg, sel).length === 1;
+        const results = await pushFile(cfg, srcs, sel, push.path, recursive, { resume, progress });
         if (json) console.log(JSON.stringify(results, null, 2));
         else for (const r of results)
           console.log(`${r.ok ? A.g("●") : A.r("●")} ${A.b(r.host)} ${A.d(srcs.join(" ") + " → " + push.path)}${r.stderr ? "\n  " + A.d(r.stderr) : ""}`);
@@ -473,7 +478,8 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
         // race two hosts into the same directory with no way to tell them apart.
         if (new Set(specs.map((s) => s.sel)).size > 1)
           die(`fleet cp pulls from one host at a time (got ${[...new Set(specs.map((s) => s.sel))].join(", ")})`);
-        const r = await pullFile(cfg, await routeSelector(cfg, specs[0]!.sel), specs.map((s) => s.path), dest!, recursive);
+        const r = await pullFile(cfg, await routeSelector(cfg, specs[0]!.sel), specs.map((s) => s.path), dest!, recursive,
+          { resume, progress: !json && !!process.stdout.isTTY });
         if (json) console.log(JSON.stringify(r, null, 2));
         else console.log(`${r.ok ? A.g("●") : A.r("●")} ${A.b(r.host)} ${A.d(specs.map((s) => s.path).join(" ") + " → " + dest)}${r.stderr ? "\n  " + A.d(r.stderr) : ""}`);
         return r.ok ? 0 : 1;
@@ -486,20 +492,31 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       // Unlike exec there is no free-form remote command here, so flags are safe
       // to accept anywhere — `fleet edit host:/path --old X --new Y` reads best.
       const { flags, rest: pos } = parseFlags(rest,
-        ["--json", "--wsl", "--all", "--dry-run"], ["--old", "--new"], false, ["--new"]);
+        ["--json", "--wsl", "--all", "--dry-run", "--sudo"],
+        ["--old", "--new", "--old-file", "--new-file"], false, ["--new"]);
       const json = flags["--json"] === true;
       const wsl = flags["--wsl"] === true;
       const all = flags["--all"] === true;
       const dryRun = flags["--dry-run"] === true;
-      const old = flags["--old"] as string | undefined;
-      const neu = (flags["--new"] as string | undefined) ?? "";
+      const sudo = flags["--sudo"] === true;
+      // Multi-line text is easiest from a file or stdin: the shell never gets a
+      // chance to keep `\n` literal. Fleet never unescapes --old/--new itself.
+      const fromFile = async (flag: "--old-file" | "--new-file", inline: "--old" | "--new") => {
+        const src = flags[flag] as string | undefined;
+        if (src === undefined) return flags[inline] as string | undefined;
+        if (flags[inline] !== undefined) die(`fleet edit: pass ${inline} or ${flag}, not both`);
+        return src === "-" ? await Bun.stdin.text() : await Bun.file(src).text();
+      };
+      if (flags["--old-file"] === "-" && flags["--new-file"] === "-") die("fleet edit: only one of --old-file/--new-file can read stdin");
+      const old = await fromFile("--old-file", "--old");
+      const neu = (await fromFile("--new-file", "--new")) ?? "";
       const [target] = pos;
       if (!target || old === undefined || pos.length !== 1)
-        die("usage: fleet edit [--all] [--dry-run] [--wsl] [--json] <sel>:<path> --old <str> --new <str>");
+        die("usage: fleet edit [--all] [--dry-run] [--sudo] [--wsl] [--json] <sel>:<path> --old <str>|--old-file <file|-> [--new <str>|--new-file <file|->]");
       const spec = parseRemoteSpec(cfg, target!);
       if (!spec) die(`fleet edit needs a <sel>:<path> target (got '${target}')`);
       const results = await editRemoteFile(
-        cfg, await routeSelector(cfg, spec!.sel), spec!.path, old!, neu, { wsl, all, dryRun });
+        cfg, await routeSelector(cfg, spec!.sel), spec!.path, old!, neu, { wsl, all, dryRun, sudo });
       if (json) { console.log(JSON.stringify(results, null, 2)); return results.some((r) => !r.ok) ? 1 : 0; }
       for (const r of results) {
         if (!r.ok) { console.log(`${A.r("●")} ${A.b(r.host)} ${A.d(r.path)}  ${A.y(r.error ?? "edit failed")}`); continue; }

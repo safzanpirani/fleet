@@ -497,11 +497,12 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       all: z.boolean().optional().describe("Replace every occurrence instead of failing on multiple."),
       dryRun: z.boolean().optional().describe("Show the diff without writing anything."),
       wsl: z.boolean().optional().describe("Edit inside WSL on a Windows host."),
+      sudo: z.boolean().optional().describe("Read and write as root via passwordless sudo (POSIX only)."),
     },
     annotations: { openWorldHint: true },
-  }, async ({ selector, path, old, new: neu, all, dryRun, wsl }) => {
+  }, async ({ selector, path, old, new: neu, all, dryRun, wsl, sudo }) => {
     const results = await editRemoteFile(
-      cfg, await routeSelector(cfg, selector), path, old, neu ?? "", { all, dryRun, wsl });
+      cfg, await routeSelector(cfg, selector), path, old, neu ?? "", { all, dryRun, wsl, sudo });
     const out = results.map((r) => {
       if (!r.ok) return `✗ ${r.host} ${r.path} · ${r.error ?? "edit failed"}`;
       const what = `${r.replacements} replacement${r.replacements === 1 ? "" : "s"}`
@@ -562,10 +563,11 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       selector: z.string().describe("Destination host selector."),
       remote: z.string().describe("Remote destination path."),
       recursive: z.boolean().optional().describe("Recursively copy a directory."),
+      resume: z.boolean().optional().describe("Copy with rsync --partial; repeat the call after an interruption to continue. POSIX hosts only."),
     },
     annotations: { openWorldHint: true },
-  }, async ({ local, selector, remote, recursive }) => {
-    const results = await pushFile(cfg, local, await routeSelector(cfg, selector), remote, recursive);
+  }, async ({ local, selector, remote, recursive, resume }) => {
+    const results = await pushFile(cfg, local, await routeSelector(cfg, selector), remote, recursive, { resume });
     const from = Array.isArray(local) ? local.join(" ") : local;
     const out = results.map((r) =>
       `${r.ok ? "✓" : "✗"} ${r.host} · ${from} → ${remote}${r.stderr ? "\n" + indent(r.stderr) : ""}`,
@@ -584,10 +586,11 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
         .describe("Remote source path, or an array of paths (local must be a directory)."),
       local: z.string().describe("Destination path on the MCP server/controller."),
       recursive: z.boolean().optional().describe("Recursively copy a directory."),
+      resume: z.boolean().optional().describe("Copy with rsync --partial; repeat the call after an interruption to continue. POSIX hosts only."),
     },
     annotations: { openWorldHint: true },
-  }, async ({ selector, remote, local, recursive }) => {
-    const r = await pullFile(cfg, await routeSelector(cfg, selector), remote, local, recursive);
+  }, async ({ selector, remote, local, recursive, resume }) => {
+    const r = await pullFile(cfg, await routeSelector(cfg, selector), remote, local, recursive, { resume });
     const from = Array.isArray(remote) ? remote.join(" ") : remote;
     return text(
       `${r.ok ? "✓" : "✗"} ${r.host} · ${from} → ${local}${r.stderr ? "\n" + indent(r.stderr) : ""}`,
@@ -623,10 +626,11 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       command: z.string().describe("Command to run, verbatim. Quotes/pipes/$ round-trip as-is."),
       cwd: z.string().optional().describe("Working directory to run in (fails fast if missing)."),
       label: z.string().optional().describe("Optional human-readable label prefixed onto the job id."),
+      wsl: z.boolean().optional().describe("Windows hosts only: run the command in bash inside WSL, so its redirects and paths are Linux ones."),
     },
     annotations: { openWorldHint: true },
-  }, async ({ selector, command, cwd, label }) => {
-    const results = await spawnJob(cfg, await routeSelector(cfg, selector), command, { cwd, label });
+  }, async ({ selector, command, cwd, label, wsl }) => {
+    const results = await spawnJob(cfg, await routeSelector(cfg, selector), command, { cwd, label, wsl });
     const out = results.map((r) => r.ok
       ? `● ${r.host} job ${r.id} · pid ${r.pid}  (track: fleet_jobs / fleet_job_log ${r.host}:${r.id})`
       : `✗ ${r.host}:${r.id} · ${r.error ?? "spawn failed"}; inspect fleet_job_log before retrying`).join("\n");

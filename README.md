@@ -55,6 +55,7 @@ fleet exec --wsl win-box "uname -a"  # run inside WSL on a windows box
 fleet dt                            # list Daytona sandboxes (DAYTONA_API_KEY)
 fleet exec --cwd /srv/app web "./build.sh"   # run in a dir; fails fast if missing
 fleet exec --timeout 60 vps "slow-thing"        # wall-clock cap; a hung command exits 124
+# a timeout returns within a second and keeps the output printed so far
 fleet spawn --cwd /srv/app web "./train.sh"  # detached job that outlives ssh -> job id
 fleet jobs                          # every detached job across the fleet
 fleet jobs tail web:mqtn19-9px -f # stream a job's output live
@@ -62,6 +63,7 @@ fleet jobs wait web:mqtn19-9px --until 'Recovered.*1/1'   # block until match (o
 fleet jobs kill web:mqtn19-9px   # signal the whole job process-group
 fleet jobs prune                    # GC finished job spools
 fleet cp -r ./dist web:~/dist    # copy a dir (recursive); pull with  cp web:~/f.log ./
+fleet cp --resume big.tar web:~/   # rsync --partial: rerun after a drop to continue
 fleet restart @linux cloudflared   # restart a configured service (fans out across the selector)
 fleet bios windows-auto --yes      # reboot directly into UEFI/BIOS firmware setup
 fleet svc cloudflared              # up/down of one service on every host that has it
@@ -130,7 +132,10 @@ that separator belongs to the remote command, including flags such as `--json`.
 `fleet edit` treats replacement text literally, including `$&`. Omitting `--new`
 or passing `--new ""` deletes the match. A present `--new` without a value fails.
 Use `--old=--flag` for option-looking text. Edit diffs omit unchanged context and
-return a content-free summary when line alignment exceeds its work limit.
+return a content-free summary when line alignment exceeds its work limit. Fleet never turns the two
+characters `\n` into a newline. Pass multi-line text with `--old-file` or
+`--new-file`, which read a local file or `-` for stdin. `--sudo` edits a
+root-owned file through passwordless `sudo -n` on POSIX hosts.
 
 Screenshot commands require a local PNG/WebP artifact before reporting success.
 Transfers use temporary files and preserve existing output on failure. Windows
@@ -160,6 +165,7 @@ quoting-proof `exec`. Jobs are addressed as `host:id`.
 
 ```sh
 fleet spawn --cwd /srv/app --label train web "long-running-thing"  # -> host:id, detaches
+fleet spawn --wsl win-box "python3 job.py > /tmp/job.log"   # Windows host: runs inside WSL
 fleet jobs                              # list (running ● / exited ○ / dead ✗) across the fleet
 fleet jobs log  web:<id>             # full output
 fleet jobs tail web:<id> -n 40 -f    # last N lines, optionally follow live

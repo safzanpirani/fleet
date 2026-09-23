@@ -14,8 +14,8 @@ import type { Host } from "./config.ts";
 import { proxyControlKey, proxyOpts, proxyReachableCached } from "./proxy.ts";
 import { resolveProxy } from "./config.ts";
 import { dtExec, dtProbe, dtPush, dtPull } from "./daytona.ts";
-import { homedir } from "node:os";
-import { mkdirSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 // ── SSH connection multiplexing + proxying ───────────────────────────────────
@@ -92,6 +92,28 @@ export interface ExecOptions {
 // Every script now reports its own completion: one line on stderr carrying a
 // per-call nonce and the exit status. Seeing it, exec waits a short grace for
 // output to drain, then stops waiting. The line is removed from stderr.
+
+/** After fleet stops a call, how long to let already-sent output drain. */
+const STOP_DRAIN_MS = 500;
+
+/** Read a stream to a string incrementally; `cancel` abandons it early. */
+function drain(stream: ReadableStream<Uint8Array>, onText?: (text: string) => void) {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let text = "";
+  const done = (async () => {
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        text += decoder.decode(value, { stream: true });
+        onText?.(text);
+      }
+      text += decoder.decode();
+    } catch { /* cancelled */ }
+  })();
+  return { done, text: () => text, cancel: () => { reader.cancel().catch(() => {}); } };
+}
 
 /** Milliseconds to wait for the pipes to close after the completion marker. */
 const DONE_GRACE_MS = Math.max(0, Number(process.env.FLEET_DONE_GRACE_MS ?? 1500) || 0);
@@ -314,25 +336,35 @@ export async function exec(
     stdout: "pipe",
     stderr: "pipe",
   });
+  // Both streams are read incrementally. An ssh multiplexing client hands its
+  // stdio to the control master, so killing the client does not close these
+  // pipes: they stay open until the REMOTE command ends. Once fleet stops a
+  // call (timeout, or the completion marker's grace), it returns what it has
+  // after a short drain instead of waiting for that end-of-output.
+  const out = drain(proc.stdout);
+  const errStream = drain(proc.stderr, (text) => {
+    if (!graceTimer && text.includes(marker))
+      graceTimer = setTimeout(() => stop("released"), DONE_GRACE_MS);
+  });
   let timedOut = false;
-  const timer = timeoutMs > 0
-    ? setTimeout(() => { timedOut = true; proc.kill("SIGKILL"); }, remainingMs)
-    : null;
-  // Read stderr as it arrives so the completion marker is seen before the
-  // pipes close; a lingering remote child can keep them open indefinitely.
-  let rawErr = "";
   let released = false;
   let graceTimer: ReturnType<typeof setTimeout> | undefined;
-  const readErr = (async () => {
-    const decoder = new TextDecoder();
-    for await (const chunk of proc.stderr as unknown as AsyncIterable<Uint8Array>) {
-      rawErr += decoder.decode(chunk, { stream: true });
-      if (!graceTimer && rawErr.includes(marker))
-        graceTimer = setTimeout(() => { released = true; proc.kill("SIGTERM"); }, DONE_GRACE_MS);
-    }
-    rawErr += decoder.decode();
-  })();
-  const [stdout, , exited] = await Promise.all([new Response(proc.stdout).text(), readErr, proc.exited]);
+  let onStop: () => void = () => {};
+  const stopped = new Promise<void>((resolve) => { onStop = resolve; });
+  function stop(why: "timeout" | "released") {
+    if (why === "timeout") timedOut = true; else released = true;
+    proc.kill(why === "timeout" ? "SIGKILL" : "SIGTERM");
+    setTimeout(onStop, STOP_DRAIN_MS);
+  }
+  const timer = timeoutMs > 0 ? setTimeout(() => stop("timeout"), remainingMs) : null;
+  const finished = await Promise.race([
+    Promise.all([out.done, errStream.done, proc.exited]).then(() => true),
+    stopped.then(() => false),
+  ]);
+  if (!finished) { out.cancel(); errStream.cancel(); }
+  const exited = finished ? await proc.exited : (proc.exitCode ?? 1);
+  const stdout = out.text();
+  const rawErr = errStream.text();
   if (timer) clearTimeout(timer);
   if (graceTimer) clearTimeout(graceTimer);
   const done = takeDoneMarker(rawErr, marker);
@@ -479,15 +511,66 @@ export function sshInteractive(host: Host): Promise<number> {
   return proc.exited;
 }
 
-async function runScp(host: Host, argv: string[]): Promise<ExecResult> {
-  const proc = Bun.spawn(["scp", ...connOpts(host), "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", ...argv],
-    { stdout: "pipe", stderr: "pipe" });
+export interface TransferOptions {
+  /** Copy with rsync --partial so a rerun continues an interrupted file and skips finished ones. */
+  resume?: boolean;
+  /** Let the copier draw its progress meter on this terminal. */
+  progress?: boolean;
+}
+
+async function runCopier(host: Host, argv: string[], progress?: boolean): Promise<ExecResult> {
+  // scp and rsync draw their meters on stdout, and only when it is a terminal.
+  const proc = Bun.spawn(argv, { stdout: progress ? "inherit" : "pipe", stderr: "pipe" });
   const [stdout, stderr, code] = await Promise.all([
-    new Response(proc.stdout).text(),
+    proc.stdout ? new Response(proc.stdout).text() : "",
     new Response(proc.stderr).text(),
     proc.exited,
   ]);
   return { host: host.name, ok: code === 0, code, stdout: stdout.trimEnd(), stderr: stderr.trimEnd() };
+}
+
+function runScp(host: Host, argv: string[], progress?: boolean): Promise<ExecResult> {
+  return runCopier(host,
+    ["scp", ...connOpts(host), "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", ...argv], progress);
+}
+
+let rsyncFlavor: "gnu" | "openrsync" | undefined;
+/** GNU rsync takes `-s` and ships paths inside its protocol; macOS openrsync has
+ *  no `-s`, so the remote login shell parses them and they need quoting. */
+function localRsyncFlavor(): "gnu" | "openrsync" {
+  if (!rsyncFlavor) {
+    const r = Bun.spawnSync(["rsync", "--version"], { stdout: "pipe", stderr: "pipe" });
+    rsyncFlavor = /openrsync/i.test(r.stdout.toString() + r.stderr.toString()) ? "openrsync" : "gnu";
+  }
+  return rsyncFlavor;
+}
+
+/** A remote rsync path. The server starts in the home directory, so a leading
+ *  `~/` becomes a relative path instead of relying on tilde expansion. */
+export function rsyncRemotePath(path: string, flavor: "gnu" | "openrsync"): string {
+  const rel = path === "~" ? "." : path.startsWith("~/") ? path.slice(2) || "." : path;
+  return flavor === "gnu" ? rel : `'${rel.replaceAll("'", `'\\''`)}'`;
+}
+
+/** rsync over fleet's ssh options. `--partial` keeps an interrupted file, and the
+ *  next run uses it as the delta basis; `-t` lets a rerun skip finished files.
+ *  The ssh options go through a throwaway wrapper script, because rsync's `-e`
+ *  splitting cannot carry a quoted ProxyCommand. */
+async function runRsync(host: Host, argv: string[], recursive: boolean, progress?: boolean): Promise<ExecResult> {
+  if (host.transport === "daytona" || host.os === "windows")
+    return { host: host.name, ok: false, code: 2, stdout: "",
+      stderr: `--resume needs rsync on both ends; ${host.name} is ${host.transport === "daytona" ? "a sandbox" : "Windows"}. Copy without --resume.` };
+  const dir = mkdtempSync(join(tmpdir(), "fleet-rsync-"));
+  const wrapper = join(dir, "ssh");
+  const quote = (a: string) => `'${a.replaceAll("'", `'\\''`)}'`;
+  writeFileSync(wrapper, `#!/bin/sh\nexec ssh ${[...connOpts(host), "-o", "BatchMode=yes", "-o", "ConnectTimeout=15"].map(quote).join(" ")} "$@"\n`, { mode: 0o700 });
+  try {
+    return await runCopier(host, ["rsync", "-t", "--partial", ...(recursive ? ["-r"] : []),
+      ...(localRsyncFlavor() === "gnu" ? ["-s"] : []),
+      ...(progress ? ["--progress"] : []), "-e", wrapper, ...argv], progress);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 /** Win32 OpenSSH/SFTP accepts forward-slash remote paths. Native backslashes
@@ -512,7 +595,7 @@ function mergeScpResults(host: Host, rs: ExecResult[]): ExecResult {
  *  `recursive` (scp -r) copies a directory tree. With more than one source,
  *  `remote` must be an existing directory — scp itself enforces that. */
 export async function scp(
-  host: Host, local: string | string[], remote: string, recursive = false,
+  host: Host, local: string | string[], remote: string, recursive = false, opts: TransferOptions = {},
 ): Promise<ExecResult> {
   const locals = Array.isArray(local) ? local : [local];
   if (!locals.length) throw new Error("scp needs at least one source path");
@@ -524,14 +607,15 @@ export async function scp(
     return mergeScpResults(host, await Promise.all(
       locals.map((l) => dtPush(host, l, joinRemote(remote, l)))));
   }
-  return runScp(host, [...(recursive ? ["-r"] : []), ...locals, `${host.ssh}:${scpRemotePath(host, remote)}`]);
+  if (opts.resume) return runRsync(host, [...locals, `${host.ssh}:${rsyncRemotePath(remote, localRsyncFlavor())}`], recursive, opts.progress);
+  return runScp(host, [...(recursive ? ["-r"] : []), ...locals, `${host.ssh}:${scpRemotePath(host, remote)}`], opts.progress);
 }
 
 /** scp host:remote → local (pull). Mirror of `scp`, for retrieving file(s)/dir(s)
  *  the remote produced (e.g. a screenshot). Remote path passed through verbatim.
  *  With more than one source, `local` must be an existing directory. */
 export async function scpPull(
-  host: Host, remote: string | string[], local: string, recursive = false,
+  host: Host, remote: string | string[], local: string, recursive = false, opts: TransferOptions = {},
 ): Promise<ExecResult> {
   const remotes = Array.isArray(remote) ? remote : [remote];
   if (!remotes.length) throw new Error("scp needs at least one source path");
@@ -542,7 +626,8 @@ export async function scpPull(
     return mergeScpResults(host, await Promise.all(
       remotes.map((r) => dtPull(host, r, joinRemote(local, r)))));
   }
-  return runScp(host, [...(recursive ? ["-r"] : []), ...remotes.map((r) => `${host.ssh}:${scpRemotePath(host, r)}`), local]);
+  if (opts.resume) return runRsync(host, [...remotes.map((r) => `${host.ssh}:${rsyncRemotePath(r, localRsyncFlavor())}`), local], recursive, opts.progress);
+  return runScp(host, [...(recursive ? ["-r"] : []), ...remotes.map((r) => `${host.ssh}:${scpRemotePath(host, r)}`), local], opts.progress);
 }
 
 /** `dir` + the basename of `src` — how scp names each file when the destination

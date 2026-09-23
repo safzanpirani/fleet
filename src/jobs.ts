@@ -244,15 +244,33 @@ function windowsSpawnScript(id: string, cmd: string, cwd?: string): string {
 }
 
 /** Launch a detached job on each host the selector resolves to. */
+/** A Windows job's command that runs inside WSL. The bash program travels
+ *  base64-encoded, so its redirects, pipes and quotes are bash's, never
+ *  PowerShell's: `> /home/u/x.log` writes inside Linux instead of creating
+ *  `C:\home\u\x.log`. The cwd change happens in bash, where Linux paths mean
+ *  what they say. The job's exit code is bash's. */
+export function wslJobCommand(cmd: string, distro: string, cwd?: string): string {
+  const body = cwd
+    ? `cd -- ${cwd === "~" ? '"$HOME"' : cwd.startsWith("~/") ? `"$HOME"/'${cwd.slice(2).replace(/'/g, "'\\''")}'` : `'${cwd.replace(/'/g, "'\\''")}'`} || { echo "fleet: cwd not found: ${cwd.replace(/["$`\\]/g, "")}" 1>&2; exit 127; }\n${cmd}`
+    : cmd;
+  return `& wsl.exe -d '${distro.replace(/'/g, "''")}' -- bash -c 'printf %s ${b64(body)} | base64 -d | bash -ls'\nexit $LASTEXITCODE`;
+}
+
 export async function spawnJob(
-  cfg: FleetConfig, sel: string, cmd: string, opts: { cwd?: string; label?: string } = {},
+  cfg: FleetConfig, sel: string, cmd: string, opts: { cwd?: string; label?: string; wsl?: boolean } = {},
   dependencies: { exec?: typeof exec; newId?: typeof newId } = {},
 ): Promise<SpawnResult[]> {
   const hosts = resolveHosts(cfg, sel);
+  if (opts.wsl) {
+    const bad = hosts.filter((h) => h.os !== "windows").map((h) => h.name);
+    if (bad.length) throw new Error(`--wsl needs Windows hosts; ${bad.join(", ")} ${bad.length === 1 ? "is" : "are"} not`);
+  }
   return Promise.all(hosts.map(async (h): Promise<SpawnResult> => {
     const id = (dependencies.newId ?? newId)(opts.label);
     const script = h.os === "windows"
-      ? windowsSpawnScript(id, cmd, opts.cwd)
+      ? (opts.wsl
+        ? windowsSpawnScript(id, wslJobCommand(cmd, h.wsl ?? "Ubuntu", opts.cwd))
+        : windowsSpawnScript(id, cmd, opts.cwd))
       : unixSpawnScript(h, id, cmd, opts.cwd);
     try {
       const r = await (dependencies.exec ?? exec)(h, script, shellFor(h));
