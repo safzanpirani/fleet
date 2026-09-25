@@ -2187,7 +2187,9 @@ const displayName = (s: string) => s.replace(/\.(exe|app)$/i, "").trim();
 function identitiesByPid(snap: CuSnapshot): Map<number, { names: string[]; display: string; active: boolean }> {
   const byPid = new Map<number, { names: string[]; display: string; active: boolean }>();
   const add = (pid: number, name: string | undefined, display?: string, active?: boolean) => {
-    if (!Number.isFinite(pid)) return;
+    // Windows lists installed apps that are not running with pid 0. They have
+    // no window to address, and keyed together they would shadow a live title.
+    if (!Number.isFinite(pid) || pid <= 0) return;
     const entry = byPid.get(pid) ?? { names: [], display: display ?? name ?? String(pid), active: false };
     if (name) {
       for (const variant of [name, stripExe(name)]) {
@@ -3303,17 +3305,29 @@ export async function cuVerify(
   try { json = extractJson(response.result.stdout); } catch { return fail(response.result.stdout.trim() || "verify_state returned no JSON"); }
   const known = (s: unknown): CuVerifyStatus => s === "satisfied" || s === "unsatisfied" ? s : "unknown";
   if (json?.status === undefined) return fail(response.result.stdout.trim());
-  const status = known(json.status);
+  let status = known(json.status);
   const predicates = (Array.isArray(json.predicates) ? json.predicates : []).map((p: any, i: number) => {
-    let observed: unknown = p?.observed_json;
+    let observed: any = p?.observed_json;
     if (typeof observed === "string") { try { observed = JSON.parse(observed); } catch { /* keep the raw text */ } }
+    const index = Number.isInteger(p?.index) ? p.index : i;
+    let pStatus = known(p?.status);
+    let reason = p?.unknown_reason ? String(p.unknown_reason) : undefined;
+    // UIA pads values ("69104 " in Calculator, "Ω\r" in Character Map) and the
+    // driver compares value_equals exactly. Padding is never what a caller means.
+    const want = (expect[index] as any)?.element?.value_equals;
+    if (pStatus === "unsatisfied" && typeof want === "string" && typeof observed?.value === "string"
+      && observed.value !== want && observed.value.trim() === want.trim()) {
+      pStatus = "satisfied";
+      reason = "value matched after trimming whitespace";
+    }
     return {
-      index: Number.isInteger(p?.index) ? p.index : i,
-      status: known(p?.status),
-      ...(p?.unknown_reason ? { reason: String(p.unknown_reason) } : {}),
+      index, status: pStatus,
+      ...(reason ? { reason } : {}),
       ...(observed !== undefined && observed !== null ? { observed } : {}),
     };
   });
+  if (status === "unsatisfied" && predicates.length === expect.length && predicates.every((p: { status: CuVerifyStatus }) => p.status === "satisfied"))
+    status = "satisfied";
   return {
     ...response, target, status, predicates,
     elapsedMs: Number.isFinite(Number(json.elapsed_ms)) ? Number(json.elapsed_ms) : undefined,

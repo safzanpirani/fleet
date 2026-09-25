@@ -289,6 +289,18 @@ describe("verify", () => {
     expect(r.predicates[0]!.reason).toBe("unsupported_predicate");
   });
 
+  test("a value that differs only by UIA padding satisfies --value", async () => {
+    const pred = (value: string) => [{ element: { selector: { label_contains: "Result" }, exists: true, value_equals: value } }];
+    const reply = JSON.stringify({ status: "unsatisfied", predicates: [
+      { index: 0, status: "unsatisfied", observed_json: '{"label":"Result","value":"69104 "}' }] });
+    const r = await cuVerify(cfg, "win", "Character Map", pred("69104"), {}, { snapshot, run: run(reply) });
+    expect(r.status).toBe("satisfied");
+    expect(r.result.ok).toBe(true);
+    expect(r.predicates[0]!.reason).toContain("trimming");
+    const wrong = await cuVerify(cfg, "win", "Character Map", pred("69105"), {}, { snapshot, run: run(reply) });
+    expect(wrong.status).toBe("unsatisfied");
+  });
+
   test("bad bounds are refused before any host call", async () => {
     await expect(cuVerify(cfg, "win", "x", [], {}, { snapshot })).rejects.toThrow("1 to 8");
     await expect(cuVerify(cfg, "win", "x", [{}], { timeoutMs: 20000 }, { snapshot })).rejects.toThrow("timeout");

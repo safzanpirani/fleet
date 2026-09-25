@@ -298,6 +298,20 @@ describe("target resolution", () => {
     expect(t.matched).toBe("title");
   });
 
+  test("installed apps that are not running (pid 0) cannot shadow a live window title", () => {
+    // Windows list_apps reports every installed app, the ones not running with
+    // pid 0. Keyed by pid they merged into one entry, so "Settings" matched it by
+    // name and failed as "Search (pid 0) has no top-level windows".
+    const snap = snapshotFixture({
+      apps: [{ name: "Search", pid: 0 }, { name: "Settings", pid: 0 }, { name: "ApplicationFrameHost", pid: 300 }],
+      windows: [windowFixture({ pid: 300, window_id: 30, app_name: "ApplicationFrameHost.exe", title: "Settings" })],
+    });
+    const t = cuResolveTargetFrom(snap, "Settings");
+    expect(t.pid).toBe(300);
+    expect(t.window.window_id).toBe(30);
+    expect(() => cuResolveTargetFrom(snap, "Search")).toThrow(/no app, process, or window title matching "Search"/);
+  });
+
   test("exact and partial dialog titles select that window instead of its larger parent", () => {
     const modal = windowFixture({ window_id: 9, title: "Save As", width: 420, height: 200, z_index: 22 });
     const snap = snapshotFixture({ windows: [windowFixture(), modal] });

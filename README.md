@@ -740,3 +740,9 @@ Changing the compilation mode makes the previous manifest stale.
 Run `bun run check` for TypeScript and the full test suite. `bun run build:local`
 builds a native candidate, verifies its macOS code signature where applicable,
 and runs help without configuration before replacing `dist/fleet-local`.
+
+`bun run scripts/cu-daily.ts <windows-host>` drives a live desktop through the
+real CLI with everyday tasks (Calculator arithmetic, a new folder in Explorer, a
+character from Character Map, the device name from Settings), checks each result
+through the app's own state or the file system, and closes what it opened.
+`--paid` adds the `elements --task` case, which calls the TypeSafe API.

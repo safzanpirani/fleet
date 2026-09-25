@@ -143,7 +143,10 @@ harness-backgrounded SSH session open for it.
   `$global:` state and imported modules carry over. Each program runs as a script file,
   so `exit 7` reports 7 exactly (one-shot pwsh reports 1). A busy or unresponsive
   session falls back to a one-shot pwsh, a timeout restarts it, and it closes after 10 idle minutes
-  (`FLEET_WIN_SESSION_IDLE_S`). `FLEET_WIN_SESSION=0` turns it off.
+  (`FLEET_WIN_SESSION_IDLE_S`). `FLEET_WIN_SESSION=0` turns it off. A call whose
+  PowerShell output never arrived fails with "the Windows session lost this program's
+  PowerShell output" and restarts the session; the program already ran, so rerun it only
+  if it is safe to run twice.
 - **Commands that read stdin get an empty one.** Scripts arrive over stdin, so a
   command that reads stdin used to swallow the rest of the script. Now it sees EOF.
 - **Output is plain text when piped** (no ANSI); `FORCE_COLOR=1` restores colour, and
@@ -182,6 +185,9 @@ and exposes computer-use tools. Same interactive-desktop requirement as `fleet s
     `verify_state`: `satisfied` exits 0, while `unsatisfied` and `unknown` exit 1. Prefer it
     over the pixel `effect` whenever the outcome shows up in the tree: a blinking caret
     makes the pixel check report `indeterminate`.
+    `--value` ignores surrounding whitespace, since UIA pads values (`"69104 "` in
+    Calculator, `"Ω\r"` in Character Map); a match found only after trimming still waits
+    out the driver's ~5 s poll first.
   - `fleet cu win-box open explorer 'C:\Windows'`, `open notepad`, or `open https://bun.sh`
     (default browser) launches through `launch_app` and prints the window to address next.
     MCP: `fleet_cu_open`.
@@ -211,6 +217,7 @@ and exposes computer-use tools. Same interactive-desktop requirement as `fleet s
 - **Verified input** — `click`, `key`, `type`, and generic `act` resolve the target,
   send an explicit `window_id`, and report what the window's pixels **actually did**:
   - `fleet cu win-box click firefox 166 447` → `● changed` / `○ no_change` / `? indeterminate`
+  - A refused or undelivered action prints `✗ refused (<effect>)` and exits 1.
   - `fleet cu win-box key firefox escape` · `fleet cu win-box type firefox "hello"`
   - `fleet cu win-box act firefox <tool> '{…}'` for any other input tool
   - Flags: `--space window|screen`, `--button`, `--count`, `--foreground`,

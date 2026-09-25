@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
-import { sessionLoopScript, trySessionExec, winSessionEnabled, winSessionSocket } from "../src/winsession.ts";
+import { sessionLoopScript, takePipeProbe, trySessionExec, winSessionEnabled, winSessionSocket } from "../src/winsession.ts";
 import type { Host } from "../src/config.ts";
 
 const win: Host = { name: "w", ssh: "w", os: "windows" };
@@ -62,4 +62,15 @@ test("a lost reply after the broker accepted a request cannot trigger one-shot r
   } finally {
     server.stop(true);
   }
+});
+
+test("the pipeline probe is stripped exactly, and its absence is reported", () => {
+  const end = "__FLEET_END_abc__";
+  expect(sessionLoopScript()).toContain("'__FLEET_PIPE__' + $__fsEnd");
+  expect(takePipeProbe(`a\r\nb\r\n__FLEET_PIPE__${end}\r\n`, end)).toEqual({ stdout: "a\r\nb\r\n", probed: true });
+  expect(takePipeProbe(`__FLEET_PIPE__${end}\r\n`, end)).toEqual({ stdout: "", probed: true });
+  // Output that only reached stdout through [Console] or a native child, with
+  // the pipeline broken: no probe, so the call must not pass as a success.
+  expect(takePipeProbe("x\r\n", end).probed).toBe(false);
+  expect(takePipeProbe(`echo __FLEET_PIPE__${end}\r\n`, end).probed).toBe(false);
 });

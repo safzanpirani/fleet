@@ -26,6 +26,15 @@ import type { Host } from "./config.ts";
 import { fleetReinvocation, proxyOpts } from "./proxy.ts";
 
 const READY = "__FLEET_SESSION_READY__";
+const PIPE_PROBE = "__FLEET_PIPE__";
+
+/** Remove the pipeline probe the session prints before its end marker. Its
+ *  absence means the program's pipeline output never reached stdout. */
+export function takePipeProbe(stdout: string, end: string): { stdout: string; probed: boolean } {
+  const at = stdout.lastIndexOf(PIPE_PROBE + end);
+  if (at < 0 || (at > 0 && stdout[at - 1] !== "\n")) return { stdout, probed: false };
+  return { stdout: stdout.slice(0, at), probed: true };
+}
 const IDLE_MS = Math.max(10_000, Number(process.env.FLEET_WIN_SESSION_IDLE_S ?? 600) * 1000 || 600_000);
 
 /** The pwsh program the session runs. Each request is the end marker on its
@@ -73,6 +82,9 @@ while ($null -ne ($__fsLine = $__fsReader.ReadLine())) {
     [Console]::Error.WriteLine(($_ | Out-String).TrimEnd())
     $script:__fsCode = 1
   }
+  # Sent the way program output travels (the pipeline), unlike the end markers.
+  # Its absence means the session lost this call's output.
+  '${PIPE_PROBE}' + $__fsEnd
   foreach ($__fsVar in @(Get-Variable -Scope Global)) {
     if ($__fsVar.Name -notlike '__fs*' -and -not $__fsGlobals.ContainsKey($__fsVar.Name)) { Remove-Variable -Name $__fsVar.Name -Scope Global -EA SilentlyContinue }
   }
@@ -386,11 +398,18 @@ class Session {
       this.kill();
       return { stdout: this.out, stderr: this.err, code: typeof code === "number" ? code : 1, ended: true };
     }
-    return {
-      stdout: this.out.slice(0, mo.index),
-      // Errors name the session's temp file; the caller only knows "its script".
-      stderr: this.err.slice(0, me.index).replace(/[A-Za-z]:\\[^\r\n:]*?fleet-session-\d+\.ps1/g, "script"),
-      code: Number(mo[1]),
-    };
+    // Errors name the session's temp file; the caller only knows "its script".
+    const stderr = this.err.slice(0, me.index).replace(/[A-Za-z]:\\[^\r\n:]*?fleet-session-\d+\.ps1/g, "script");
+    const { stdout, probed } = takePipeProbe(this.out.slice(0, mo.index), end);
+    if (!probed) {
+      // Seen once on a long-lived session: every later call returned empty
+      // stdout with exit 0. Fail this call and start a fresh session; the
+      // program already ran, so it is never replayed.
+      this.kill();
+      return { stdout, code: Number(mo[1]) || 1,
+        stderr: [stderr, "fleet: the Windows session lost this program's PowerShell output; "
+          + "the session was restarted, so run the command again if you need its output"].filter(Boolean).join("\n") };
+    }
+    return { stdout, stderr, code: Number(mo[1]) };
   }
 }

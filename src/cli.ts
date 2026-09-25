@@ -1092,7 +1092,9 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
         if (element)
           summary += r.element ? ` → ${r.element.role} ${JSON.stringify(r.element.label)} ${A.d(r.element.token ?? "")}`
             : ` → ${A.d(String(r.payload.element_token))}`;
-        const badge = r.effect === "changed" ? A.g("● changed")
+        // A refusal exits 1, so it leads the line; the pixel effect alone read as a soft pass.
+        const badge = r.refusal ? A.r(`✗ refused (${r.effect})`)
+          : r.effect === "changed" ? A.g("● changed")
           : r.effect === "no_change" ? A.y("○ no_change") : A.d("? indeterminate");
         console.log(`${badge} ${A.b(r.target.name)} ${A.d(`pid ${r.target.pid} w${r.target.window.window_id}`)} `
           + `${A.d("·")} ${summary}`);
