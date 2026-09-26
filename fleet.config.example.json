@@ -41,6 +41,11 @@
     "laptop": {
       "ssh": "laptop",
       "os": "mac"
+    },
+    "phone": {
+      "ssh": "phone",
+      "os": "linux",
+      "android": { "serial": "127.0.0.1:5555" }
     }
   },
   "routes": {

@@ -252,11 +252,36 @@ export function interpreterFor(ext: string, os: string): string | null {
 export function buildScriptCommand(source: string, interp: string | null, os: string, shell: Shell): string {
   if (!interp) return source;                       // native to the target shell
   const b64 = Buffer.from(source, "utf8").toString("base64");
+  const psTarget = os === "windows" && shell !== "wsl" && shell !== "bash";
+  // `pwsh -` reads stdin as an interactive session and echoes every line back,
+  // secrets included, and `-Command -` runs it line by line. PowerShell gets a
+  // private temp .ps1 and -File instead, removed whatever the script does.
+  if (isPowerShell(interp)) {
+    const run = `${interp} -NoProfile -NonInteractive -File`;
+    if (psTarget) return [
+      `$fleetPs = Join-Path $env:TEMP ('fleet_' + [guid]::NewGuid().ToString('N') + '.ps1')`,
+      `[IO.File]::WriteAllText($fleetPs, [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${b64}')), (New-Object Text.UTF8Encoding $true))`,
+      `try { & ${run} $fleetPs; $fleetPsCode = $LASTEXITCODE } finally { Remove-Item -LiteralPath $fleetPs -Force -EA SilentlyContinue }`,
+      `exit $fleetPsCode`,
+    ].join("\n");
+    return [
+      `fleet_ps_dir="$(mktemp -d)" || exit 1`,
+      `trap 'rm -rf "$fleet_ps_dir"' EXIT`,
+      `printf %s '${b64}' | base64 -d > "$fleet_ps_dir/script.ps1"`,
+      `${run} "$fleet_ps_dir/script.ps1"`,
+    ].join("\n");
+  }
   // PowerShell target: decode in-process, pipe the text to the interpreter's stdin
-  if (os === "windows" && shell !== "wsl" && shell !== "bash")
+  if (psTarget)
     return `[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${b64}')) | & ${interp} -`;
   // bash target (linux/mac/wsl): decode with base64(1), pipe to stdin
   return `printf %s '${b64}' | base64 -d | ${interp} -`;
+}
+
+/** True when an --interp command runs PowerShell (`pwsh`, `powershell.exe`, a full path). */
+function isPowerShell(interp: string): boolean {
+  const bin = interp.trim().split(/\s+/, 1)[0]!.replace(/^["']|["']$/g, "");
+  return /^(pwsh|powershell)(\.exe)?$/i.test(bin.split(/[\\/]/).pop()!);
 }
 
 export interface ScriptSource { source: string; ext: string; label: string }
@@ -1575,7 +1600,7 @@ const B64_END = "__FLEET_B64END__";
 /** Remote lines that print one capture file base64-encoded under `tag`, then
  *  delete it. Nothing is printed when the file is missing or empty, so a failed
  *  capture reads as "no image", never as an empty one. */
-function emitImage(os: Host["os"], pathVar: string, tag: string): string {
+export function emitImage(os: Host["os"], pathVar: string, tag: string): string {
   if (os === "windows") return [
     `if ($${pathVar} -and (Test-Path -LiteralPath $${pathVar}) -and (Get-Item -LiteralPath $${pathVar}).Length -gt 0) {`,
     `  $b64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes($${pathVar}))`,
@@ -2094,7 +2119,7 @@ export interface CuTarget {
   name: string;
   /** Which identity matched the caller's query — reported so a surprising
    *  resolution is visible instead of silent. */
-  matched: "pid" | "process" | "app" | "title";
+  matched: "pid" | "window" | "process" | "app" | "title";
   window: CuWindowInfo;
   /** Other on-screen, non-minimized windows owned by the same pid. */
   siblings: CuWindowInfo[];
@@ -2234,8 +2259,9 @@ export function cuLooksModal(main: CuWindowInfo, w: CuWindowInfo): boolean {
 }
 
 /** Resolve a fuzzy query against a snapshot. Pure — no host access.
- *  Accepts a pid, a process image name (with or without `.exe`), an app display
- *  name, or a window title, exact-first then prefix then substring. */
+ *  Accepts a pid, a window_id (bare or as `w123`), a process image name (with
+ *  or without `.exe`), an app display name, or a window title, exact-first then
+ *  prefix then substring. */
 export function cuResolveTargetFrom(snap: CuSnapshot, query: string): CuTarget {
   const q = query.trim();
   if (!q) throw new Error("an app, process, PID, or window title is required");
@@ -2244,9 +2270,21 @@ export function cuResolveTargetFrom(snap: CuSnapshot, query: string): CuTarget {
 
   let pid: number | undefined;
   let matched: CuTarget["matched"] = "pid";
+  let byId: CuWindowInfo | undefined;
 
-  if (/^\d+$/.test(q)) {
-    pid = Number(q);
+  // `windows` lists window_id first and every result line prints `w<id>`, so a
+  // number copied from either is as likely a window as a pid. A live pid wins;
+  // a number that owns no window but names one targets that window.
+  const idForm = /^w(\d+)$/i.exec(q);
+  if (idForm || /^\d+$/.test(q)) {
+    const n = Number(idForm ? idForm[1] : q);
+    const win = snap.windows.find((w) => w.window_id === n);
+    if (!idForm && windowsFor(n).length) pid = n;
+    else if (win) { byId = win; pid = win.pid; matched = "window"; }
+    else if (idForm) throw new Error(
+      `no window w${n} on screen — window ids change when a window is recreated; `
+      + `re-read them with: fleet cu <host> windows`);
+    else pid = n;
   } else {
     const needle = q.toLowerCase();
     const bare = stripExe(q);
@@ -2282,13 +2320,15 @@ export function cuResolveTargetFrom(snap: CuSnapshot, query: string): CuTarget {
   const titleMatches = matched === "title"
     ? mine.filter((w) => w.title.toLowerCase() === q.toLowerCase())
     : [];
-  const window = mainWindowFor(matched === "title"
+  const window = byId ?? mainWindowFor(matched === "title"
     ? (titleMatches.length ? titleMatches : mine.filter((w) => w.title.toLowerCase().includes(q.toLowerCase())))
     : mine);
   const name = byPid.get(pid)?.display ?? String(pid);
   if (!window) throw new Error(
     `${name} (pid ${pid}) has no top-level windows cua-driver can address`
-    + ` — it may be running without a desktop window, or in another session`);
+    + (matched === "pid"
+      ? ` and no window has id ${pid} — pass a pid, a window_id from \`fleet cu <host> windows\`, or an app name`
+      : ` — it may be running without a desktop window, or in another session`));
 
   const siblings = mine.filter((w) =>
     w.window_id !== window.window_id && w.on_screen && !w.minimized && w.width > 1 && w.height > 1);
@@ -2598,6 +2638,9 @@ export interface CuActResult extends CuResult {
   element?: CuElement;
   /** Why the driver says the input was refused or not delivered. */
   refusal?: string;
+  /** The addressed control's value read back after set_value / type_text, when
+   *  the pixels alone could not confirm the input. */
+  valueAfter?: string | null;
   hashes: string[];
   payload: Record<string, unknown>;
 }
@@ -2684,8 +2727,87 @@ export async function cuAct(
     payload = { ...payload, element_token: element.token };
   }
   const full = cuInputPayload(target, payload, opts);
-  const result = await cuActOnTarget(host, target, tool, full, opts, deps);
-  return element && element.index >= 0 ? { ...result, element } : result;
+  let result = await cuActOnTarget(host, target, tool, full, opts, deps);
+  result = await cuConfirmClosed(cfg, sel, result, deps);
+  if (!element || element.index < 0) return result;
+  return cuConfirmByValue(cfg, sel, query, tool, payload, { ...result, element }, opts.element!, deps.elements);
+}
+
+/** A window captured before the input but not after it has usually closed: a
+ *  Close button, an OK on a dialog, Alt+F4. One window listing tells that apart
+ *  from a failed capture, and only this case pays for it. */
+async function cuConfirmClosed(
+  cfg: FleetConfig, sel: string, r: CuActResult, deps: { exec?: typeof exec; snapshot?: typeof cuSnapshot },
+): Promise<CuActResult> {
+  if (r.effect !== "indeterminate" || r.hashes.length !== 1 || r.refusal || !r.result.ok) return r;
+  try {
+    const snap = await (deps.snapshot ?? cuSnapshot)(cfg, sel, { exec: deps.exec });
+    if (!snap.result.ok || snap.windows.some((w) => w.window_id === r.target.window.window_id)) return r;
+  } catch { return r; }
+  return { ...r, effect: "changed", reason: `the window closed (w${r.target.window.window_id} is no longer listed)` };
+}
+
+/** Text input into a control is checked by the control's value when the pixels
+ *  cannot settle it: a field with a blinking caret or a live clock nearby reads
+ *  `indeterminate`, and cua-driver's synthetic-events route reports
+ *  `delivery_failed` for type_text whose every character arrived. The value
+ *  must differ from the one read before the input and hold the text, so a
+ *  field that already said it proves nothing. One extra tree read, only when
+ *  the pixels did not already say `changed` or the driver refused. */
+async function cuConfirmByValue(
+  cfg: FleetConfig, sel: string, query: string, tool: string, payload: Record<string, unknown>,
+  r: CuActResult, loc: CuElementLocator, elements: typeof cuElements = cuElements,
+): Promise<CuActResult> {
+  const text = tool === "set_value" ? payload.value : tool === "type_text" ? payload.text : undefined;
+  const toggle = tool === "click" && r.element?.actions.includes("toggle") && typeof r.element.selected === "boolean";
+  if (!r.element) return r;
+  if (toggle) return cuConfirmToggle(cfg, sel, query, r, loc, elements);
+  if (typeof text !== "string" || !text.trim() || (r.effect === "changed" && !r.refusal)) return r;
+  let after: CuElement;
+  try {
+    after = cuPickElement((await elements(cfg, sel, query, { filter: loc.label }, { target: r.target })).elements,
+      { label: loc.label, role: loc.role, nth: loc.nth });
+  } catch { return r; }
+  const was = String(r.element.value ?? "").trim();
+  const now = String(after.value ?? "").trim();
+  const want = text.trim();
+  const arrived = now !== was && (tool === "set_value" ? now === want : now.includes(want));
+  if (!arrived) return { ...r, valueAfter: after.value ?? null };
+  const note = `the control now reads ${JSON.stringify(now.length > 80 ? now.slice(0, 77) + "..." : now)}`
+    + (r.refusal ? ` although cua-driver said ${r.refusal}` : "") + " — confirmed by value, not pixels";
+  const { refusal, ...rest } = r;
+  let result = r.result;
+  if (refusal && !result.ok) {
+    // cuActOnTarget appends the refusal as the last stderr line when the exec
+    // itself succeeded; only then is the refusal the sole reason for failure.
+    const lines = result.stderr.split("\n");
+    if (lines[lines.length - 1] === refusal)
+      result = { ...result, ok: true, code: 0, stderr: lines.slice(0, -1).join("\n") };
+    else return { ...r, valueAfter: after.value ?? null };
+  }
+  return { ...rest, effect: "changed", reason: note, valueAfter: after.value ?? null, result };
+}
+
+/** A click on a checkbox or toggle button is judged by its toggle state, read
+ *  back, because a caret blinking elsewhere in the window makes the pixels
+ *  report `changed` for a click that toggled nothing. */
+async function cuConfirmToggle(
+  cfg: FleetConfig, sel: string, query: string,
+  r: CuActResult, loc: CuElementLocator, elements: typeof cuElements,
+): Promise<CuActResult> {
+  let after: CuElement;
+  try {
+    after = cuPickElement((await elements(cfg, sel, query, { filter: loc.label }, { target: r.target })).elements,
+      { label: loc.label, role: loc.role, nth: loc.nth });
+  } catch { return r; }
+  if (typeof after.selected !== "boolean") return r;
+  const label = JSON.stringify(r.element!.label);
+  if (after.selected !== r.element!.selected) return { ...r, effect: "changed",
+    reason: `${label} is now ${after.selected ? "on" : "off"} — confirmed by toggle state, not pixels` };
+  if (r.refusal) return r;
+  return { ...r, effect: "no_change",
+    reason: `${label} is still ${after.selected ? "on" : "off"}`
+      + (r.effect === "changed" ? " although the window's pixels moved" : "") };
 }
 
 export const CU_BATCH_TOOLS = [
@@ -3086,17 +3208,22 @@ export async function cuElementSupport(
   deps: { run?: typeof cuRun; snapshot?: typeof cuSnapshot } = {},
 ): Promise<{ target: CuTarget; elements: number; available: boolean; note: string }> {
   const { target } = await cuResolveTarget(cfg, sel, query, { snapshot: deps.snapshot });
-  const { result } = await (deps.run ?? cuRun)(cfg, sel, ["get_window_state", JSON.stringify({
-    pid: target.pid, window_id: target.window.window_id, include_screenshot: false, max_elements: 40,
-  })]);
-  let elements = 0;
-  let degraded = false;
-  try {
-    const json = extractJson(result.stdout);
-    elements = Number(json?.total_element_count ?? json?.element_count
-      ?? (Array.isArray(json?.elements) ? json.elements.length : 0)) || 0;
-    degraded = json?.degraded === true;
-  } catch { /* leave it at zero — treated as unavailable below */ }
+  const probe = async (cap?: number) => {
+    const { result } = await (deps.run ?? cuRun)(cfg, sel, ["get_window_state", JSON.stringify({
+      pid: target.pid, window_id: target.window.window_id, include_screenshot: false,
+      ...(cap ? { max_elements: cap } : {}),
+    })]);
+    try {
+      const json = extractJson(result.stdout);
+      const count = Number(json?.total_element_count ?? json?.element_count
+        ?? (Array.isArray(json?.elements) ? json.elements.length : 0)) || 0;
+      return { elements: count, degraded: json?.degraded === true };
+    } catch { return { elements: 0, degraded: false }; }   // treated as unavailable below
+  };
+  // The cap counts every node walked, containers included, so a deep window can
+  // exhaust 40 before its first control. Only an uncapped walk proves "none".
+  let { elements, degraded } = await probe(40);
+  if (!elements || degraded) ({ elements, degraded } = await probe());
   const available = elements > 0 && !degraded;
   const where = `${target.name} w${target.window.window_id}`;
   return {
@@ -3143,6 +3270,10 @@ export interface CuElements extends CuResult {
   elements: CuElement[];
   /** False when the accessibility walk found nothing to address. */
   available: boolean;
+  /** Set when `maxElements` stopped the walk before it reached any control.
+   *  cua-driver counts every node it walks, containers included, so a small
+   *  cap returns nothing from a window whose controls are all addressable. */
+  bounded?: boolean;
 }
 
 /** `get_window_state` structured output → typed elements. Pure. */
@@ -3203,7 +3334,8 @@ export async function cuElements(
   if (opts.maxDepth !== undefined) args.max_depth = opts.maxDepth;
   const response = await (deps.run ?? cuRun)(cfg, sel, ["get_window_state", JSON.stringify(args)]);
   if (!response.result.ok) return { ...response, target, total: 0, elements: [], available: false };
-  return { ...response, ...parseCuElements(response.result.stdout, target) };
+  const parsed = parseCuElements(response.result.stdout, target);
+  return { ...response, ...parsed, ...(!parsed.available && opts.maxElements !== undefined ? { bounded: true } : {}) };
 }
 
 /** Roles match without case or macOS's `AX` prefix, so `--role Button` finds

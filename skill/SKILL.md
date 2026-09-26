@@ -286,6 +286,40 @@ and exposes computer-use tools. Same interactive-desktop requirement as `fleet s
   - Foreground input lands on whatever window is on top at that point. `bring_to_front`
     the target first; maximizing through accessibility does not raise a window.
 
+### Android phones
+
+A host with an `"android"` block is a phone reached over SSH into Termux. Termux's own
+adb client drives the phone's adbd on `127.0.0.1:5555`. The verbs differ from the
+desktop ones; `fleet help cu` lists them.
+
+- **Read the screen without an image.** `fleet cu <phone> elements [filter] [--role R]`
+  lists each element's role, label (text, content-desc, an empty field's hint, or a
+  tappable row's children), id, actions, state, and center in device pixels (~1 s).
+  Take `shot` only when the tree is empty or layout matters; it reports its scale.
+- **Act by label.** `tap|long-press|type|scroll <phone> <TARGET> --label TEXT`, where
+  TARGET is the package that must hold focus or `any`. Input is refused before delivery
+  when another package has focus, the screen is off, or the phone is locked. Never try
+  to unlock it: ask the user.
+- **Read the effect line.** `changed` / `no_change` / `indeterminate` come from frame
+  hashes on the phone. Animated screens and blinking cursors give `indeterminate`;
+  confirm with `wait --focus PKG` or `wait --label TEXT`.
+- **Several inputs:** `batch <TARGET> '[{"action":"tap","label":"Search"},{"action":"sleep","ms":800},{"action":"type","text":"wifi"}]'`
+  runs in one round trip and stops at the first failure. Labels resolve against the
+  screen before the batch starts; split the batch where a new page opens.
+- **Other verbs:** `open PACKAGE|URL [--in PACKAGE]`, `apps [filter]`,
+  `key TARGET back|home|enter|…`, `swipe`, `state`, `doctor`. `type` sends printable
+  ASCII only.
+- **Run `release` when done.** The UI helper holds an accessibility connection until
+  it idles out after 2 minutes; some apps react to one.
+- **After a reboot** every call says adbd is not listening. Ask the user to turn on
+  Wireless debugging (it needs Wi-Fi), then run `fleet cu <phone> bootstrap`.
+- **Slow links:** over a relayed mobile connection prefer `elements` and
+  `shot --width 400`; a full screenshot can take 15–25 s.
+- **It is a person's phone.** Check `state` first. Send messages, post, pay, or change
+  settings only when asked, and verify each step by label: confirm the chat header
+  before typing, the field's read-back and the Send button before sending, and the new
+  message row afterwards.
+
 ### Complete raw computer-use command catalog
 
 Every tool below uses `fleet cu <host> <tool> '<JSON>'`. Fleet also accepts the

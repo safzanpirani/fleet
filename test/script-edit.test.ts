@@ -54,6 +54,21 @@ describe("buildScriptCommand", () => {
     expect(cmd).toContain("| & python -");
   });
 
+  test("PowerShell interpreters get a temp .ps1 and -File, never stdin", () => {
+    // `pwsh -` echoed every line of a piped script, a secret included.
+    const src = "$secret = 'hunter2'\nWrite-Output ok\n";
+    for (const [interp, os] of [["pwsh", "windows"], ["powershell.exe", "windows"], ["C:\\pw\\pwsh.exe", "windows"], ["pwsh", "linux"]] as const) {
+      const cmd = buildScriptCommand(src, interp, os, "auto");
+      expect(cmd).toContain(`${interp} -NoProfile -NonInteractive -File`);
+      expect(cmd).not.toMatch(/\| *&? *\S*pwsh\S* -$/m);
+      expect(cmd).not.toContain("hunter2");
+      const b64 = cmd.match(/'([A-Za-z0-9+/=]{20,})'/)![1]!;
+      expect(Buffer.from(b64, "base64").toString("utf8")).toBe(src);
+    }
+    expect(buildScriptCommand(src, "pwsh", "windows", "auto")).toContain("finally { Remove-Item");
+    expect(buildScriptCommand(src, "pwsh", "linux", "auto")).toContain(`trap 'rm -rf "$fleet_ps_dir"' EXIT`);
+  });
+
   test("a wsl target uses the bash form even though the host is windows", () => {
     const cmd = buildScriptCommand("x=1\n", "python3", "linux", "wsl");
     expect(cmd).toContain("base64 -d | python3 -");

@@ -1,5 +1,8 @@
 import { test, expect, describe } from "bun:test";
-import { configNotFoundMessage, configSearchPaths, resolveHosts, validateConfig } from "../src/config.ts";
+import { configNotFoundMessage, configSearchPaths, resolveHosts, staleBinaryHint, validateConfig } from "../src/config.ts";
+import { mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { FleetConfig, Host } from "../src/config.ts";
 
 const host = (name: string, os: Host["os"], gpu = false): Host =>
@@ -286,5 +289,41 @@ describe("finding a config", () => {
       () => configNotFoundMessage(["/$bunfs/fleet.config.json", "/opt/fleet/fleet.config.json"]));
     expect(message).not.toContain("any of");
     expect(message).toContain("/opt/fleet/fleet.config.json");
+  });
+});
+
+describe("staleBinaryHint", () => {
+  const setup = () => {
+    const root = mkdtempSync(join(tmpdir(), "fleet-stale-"));
+    const checkout = join(root, "checkout");
+    mkdirSync(join(checkout, "src"), { recursive: true });
+    writeFileSync(join(checkout, "src", "config.ts"), `const keys = ["ssh", "os", "android"];`);
+    writeFileSync(join(checkout, "fleet.config.json"), "{}");
+    symlinkSync(join(checkout, "fleet.config.json"), join(root, "fleet.config.json"));
+    return { root, checkout, installed: join(root, "fleet.config.json") };
+  };
+  const message = "invalid config x: hosts.phone: unknown field 'android'";
+
+  test("names the checkout when its source accepts the field", async () => {
+    const { root, checkout, installed } = setup();
+    try {
+      expect(await staleBinaryHint(message, installed, "/$bunfs")).toBe(
+        `this fleet is older than the source at ${realpathSync(checkout)}, which accepts 'android'; rebuild it there with: bun run build:local`);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  test("stays quiet when the checkout is the running source", async () => {
+    const { root, checkout, installed } = setup();
+    try { expect(await staleBinaryHint(message, installed, checkout)).toBeUndefined(); }
+    finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  test("stays quiet when the checkout does not know the field either", async () => {
+    const { root, installed } = setup();
+    try { expect(await staleBinaryHint("invalid config x: hosts.a: unknown field 'typo'", installed, "/$bunfs")).toBeUndefined(); }
+    finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  test("ignores errors that are not about unknown fields", async () => {
+    const { root, installed } = setup();
+    try { expect(await staleBinaryHint("invalid config x: hosts.a: missing/invalid `ssh`", installed, "/$bunfs")).toBeUndefined(); }
+    finally { rmSync(root, { recursive: true, force: true }); }
   });
 });

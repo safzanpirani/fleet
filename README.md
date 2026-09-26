@@ -77,6 +77,7 @@ fleet shot web --grid          # overlay a labeled pixel-coordinate grid (--grid
 fleet cu @windows install      # install cua-driver across a selector (computer use)
 fleet cu web get_screen_size   # drive a desktop: click/type/read window state
 fleet cu web ... --grid        # same grid overlay on the cua capture, for click targeting
+fleet cu phone elements        # an Android phone's screen as a UI tree, no screenshot
 fleet doctor web               # diagnose why a host is unreachable (ssh -vv + health)
 fleet completion zsh                # shell completion:  eval "$(fleet completion zsh)"
 fleet ssh web                  # drop into an interactive shell
@@ -308,6 +309,64 @@ fleet cu web click '{"pid":3848,"window_id":66756,"x":100,"y":200}'
   `fleet_cu_windows`, `fleet_cu_open`, `fleet_cu_screenshot_window` and `fleet_cu_describe`;
   `args: ["install"]` fans out over a selector there too.
 
+### Android phones
+
+A host with an `android` block is a phone reached over SSH into
+[Termux](https://termux.dev). Termux's own adb client drives the phone's adbd on
+`127.0.0.1`, so adb traffic never crosses the network: screenshots are encoded on
+the phone and the before/after checks hash frames there.
+
+```json
+"phone": { "ssh": "phone", "os": "linux", "android": { "serial": "127.0.0.1:5555" } }
+```
+
+One-time setup on the phone: install Termux with `sshd`, then
+`pkg install android-tools libwebp nmap`. Turn on Developer options → Wireless
+debugging, and run `fleet cu phone bootstrap`: Termux finds the wireless-debugging
+port on localhost and runs `adb tcpip 5555`. Its key must be trusted there once
+(`bootstrap PAIR-PORT PAIR-CODE` pairs it). Wireless debugging needs Wi-Fi and
+switches off without it; with USB debugging also on, adbd keeps running and port
+5555 keeps working on mobile data, which makes the phone reachable over Tailscale
+anywhere. After a reboot, turn Wireless debugging on and run `bootstrap` again.
+
+```sh
+fleet cu phone doctor                          # every link from SSH to the input system
+fleet cu phone elements [filter] [--role R]    # UI tree: role, label, id, actions, center
+fleet cu phone tap settings --label Bluetooth  # TARGET is the package that must hold focus
+fleet cu phone type any "hello" --label search # ASCII; the field is read back
+fleet cu phone batch any '[{"action":"key","key":"back"},{"action":"key","key":"home"}]'
+fleet cu phone wait --label "Wi-Fi" --timeout 8000
+fleet cu phone open https://example.com --in com.android.chrome
+fleet cu phone shot --width 400                # WebP encoded on the phone
+fleet cu phone release                         # stop the UI helper now
+```
+
+The desktop contracts carry over:
+
+- **Explicit target.** Every input names the package that must hold focus (a word
+  in it matches) or `any`. Input is refused before delivery when another package
+  holds focus, the screen is off, or the phone is locked; fleet never unlocks it.
+- **Labels, not pixels.** `elements` reads the accessibility tree; a label resolves
+  to one element or is refused with the candidates. A caption inside a tappable
+  row reports the row it reaches. A label action reuses the tree the last
+  `elements` read, and the phone first checks the element's rows still look the
+  same, sending nothing if they do not.
+- **Effect from pixels.** `changed` / `no_change` / `indeterminate` come from frame
+  hashes taken on the phone with the status bar cut off (its clock and network meter
+  change on their own), polled until two frames agree. Typing reads the focused
+  field back.
+- **Batches** run up to 50 steps in one round trip, re-check focus before every
+  step, and stop at the first failure.
+- **A fast UI tree.** A 4 KB helper (`android/uiserver`, a dex run by adb's shell
+  through `app_process`, nothing installed as an app) holds one UiAutomation
+  connection and serves the tree in ~0.1 s, against ~2.5 s for `uiautomator dump`.
+  It leaves other accessibility services running, answers only a token that only
+  adb's shell can read, and exits after 2 idle minutes.
+
+Measured on a test phone: over Wi-Fi, `elements` takes ~1 s and an input ~2–3 s.
+Over Tailscale's relay on mobile data (~10–15 KB/s) replies are gzipped: `elements`
+~1.7 s, an input ~2 s, and a screenshot 8 s at 400 px wide.
+
 ## Agent setup
 
 Fleet is built to be driven by a coding agent as much as by a human. For most
@@ -500,7 +559,7 @@ All prefixed `fleet_`, grouped by access:
 | Group | Tools |
 |---|---|
 | **Read-only** — carry `readOnlyHint`, always registered | `ls` · `logs` · `svc` · `gpu` · `disk` · `status` · `jobs` · `job_log` · `boot` |
-| **Mutating** — dropped by the read-only kill-switch | `exec` · `cp` · `restart` · `spawn` · `job_kill` · `reboot` · `bios` · `switch` · `screenshot` · `cu` · `run` |
+| **Mutating** — dropped by the read-only kill-switch | `exec` · `cp` · `restart` · `spawn` · `job_kill` · `reboot` · `bios` · `switch` · `screenshot` · `cu` · `run` · `android_*` (state, elements, screenshot, act, batch, wait, open, apps, bootstrap, release) |
 | **Not exposed** | `top` / `ssh` (need a live TTY) · job `tail -f` / `wait` (would block) |
 
 - `screenshot` counts as **mutating** — capturing runs commands on the host (on Windows it registers a one-shot scheduled task).

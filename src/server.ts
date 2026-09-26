@@ -27,6 +27,11 @@ import {
 } from "./jobs.ts";
 import { listSandboxes } from "./daytona.ts";
 import { toolsStatus } from "./tools.ts";
+import {
+  androidDoctor, androidElementsOf, androidShot, androidAct, androidOpen, androidApps, androidBootstrap,
+  androidBatch, androidWait, androidRelease,
+} from "./android.ts";
+import type { AndroidAction, AndroidBatchStep } from "./android.ts";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -408,7 +413,7 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       tool: z.string().min(1).describe("Exact cua-driver tool name."),
       brief: z.boolean().optional().describe("Trim to name, summary, and field list."),
       forApp: z.string().optional()
-        .describe("PID, process name, app name, or window title to check element support against."),
+        .describe("PID, window_id (w123), process name, app name, or window title to check element support against."),
     },
     annotations: { readOnlyHint: true, openWorldHint: true },
   }, async ({ host, tool, brief, forApp }) => {
@@ -836,7 +841,7 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
 
   server.registerTool("fleet_cu_windows", {
     title: "List desktop windows",
-    description: "List top-level windows. With app, resolve it by PID, process name, app name, "
+    description: "List top-level windows. With app, resolve it by PID, window_id, process name, app name, "
       + "or window title and show only that process's windows — marking the one Fleet targets "
       + "and any window sitting ABOVE it. A window above the target is usually a modal dialog, "
       + "and it silently swallows every click and keystroke aimed at the window underneath. "
@@ -844,7 +849,7 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     inputSchema: {
       host: z.string().describe("Host name or selector (first matched host is used)."),
       app: z.string().optional()
-        .describe("PID, process name (Playnite.DesktopApp[.exe]), app name, or window title."),
+        .describe("PID, window_id (w123), process name (Playnite.DesktopApp[.exe]), app name, or window title."),
     },
     annotations: { openWorldHint: true },
   }, async ({ host, app }) => {
@@ -878,7 +883,7 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
 
   server.registerTool("fleet_cu_screenshot_window", {
     title: "Screenshot an application window",
-    description: "Resolve an application by PID, process name, app name, or window title, capture "
+    description: "Resolve an application by PID, window_id, process name, app name, or window title, capture "
       + "the window, and return the image. Owned popups and modal dialogs the process has open "
       + "ARE COMPOSITED onto the capture and named in the reply — a capture of the window alone "
       + "looks completely normal while a modal underneath it eats every click. With grid, the "
@@ -887,7 +892,7 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       + "would actually land, without clicking. " + sel,
     inputSchema: {
       host: z.string().describe("Host name or selector (first matched host is used)."),
-      app: z.string().describe("PID, process name (Playnite.DesktopApp[.exe]), app name, or window title."),
+      app: z.string().describe("PID, window_id (w123), process name (Playnite.DesktopApp[.exe]), app name, or window title."),
       grid: z.boolean().optional().describe("Overlay a labeled coordinate grid on the returned image."),
       gridStep: z.number().int().positive().max(1000).optional().describe("Grid spacing in pixels (default 100)."),
       probe: z.object({ x: z.number(), y: z.number() }).optional()
@@ -946,7 +951,7 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       + "args.delivery_mode \"foreground\". " + sel,
     inputSchema: {
       host: z.string().describe("Host name or selector (first matched host is used)."),
-      app: z.string().describe("PID, process name, app name, or window title."),
+      app: z.string().describe("PID, window_id (w123), process name, app name, or window title."),
       tool: z.string().describe("cua-driver input tool: click, press_key, type_text, scroll, hotkey, …"),
       args: z.record(z.string(), z.any()).optional()
         .describe("Tool arguments WITHOUT pid/window_id/target or from_zoom. Fleet supplies the target and checks x/y and drag endpoints."),
@@ -1007,10 +1012,10 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       + "whole. available:false means the walk found nothing and the window needs pixels. " + sel,
     inputSchema: {
       host: z.string().describe("Host name or selector (first matched host is used)."),
-      app: z.string().describe("PID, process name, app name, or window title."),
+      app: z.string().describe("PID, window_id (w123), process name, app name, or window title."),
       filter: z.string().optional().describe("Case-insensitive substring over labels and values; ancestors are kept."),
       role: z.string().optional().describe("Keep only this role: Button, Edit, MenuItem, CheckBox, ListItem, …"),
-      maxElements: z.number().int().min(1).max(5000).optional().describe("Cap on nodes walked (driver default 5000)."),
+      maxElements: z.number().int().min(1).max(5000).optional().describe("Cap on nodes walked, containers included (driver default 5000); a small cap can return no controls at all."),
       task: z.string().optional().describe("What you are about to do. Controls a judge is confident the task does not need are hidden (needs TYPESAFE_API_KEY on the fleet side; fails open). Cuts a 300-row window to the handful that matter."),
     },
     annotations: { readOnlyHint: true, openWorldHint: true },
@@ -1029,7 +1034,9 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
         snapshotId: r.snapshotId, total: r.total, available: r.available,
         ...(focus ? { focus } : {}),
         elements: elements.map(({ frame: _frame, ...e }) => e),
-        ...(r.available ? {} : { note: "no accessibility elements here: use fleet_cu_screenshot_window and pixel x/y" }),
+        ...(r.available ? {} : { note: r.bounded
+          ? `maxElements ${maxElements} stopped the walk before any control (it counts containers too): raise or omit it`
+          : "no accessibility elements here: use fleet_cu_screenshot_window and pixel x/y" }),
       }));
     } catch (error) { return text(error instanceof Error ? error.message : String(error), true); }
   });
@@ -1066,7 +1073,7 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       + "to hold for stableSamples consecutive reads. " + sel,
     inputSchema: {
       host: z.string().describe("Host name or selector (first matched host is used)."),
-      app: z.string().describe("PID, process name, app name, or window title."),
+      app: z.string().describe("PID, window_id (w123), process name, app name, or window title."),
       expect: z.array(z.record(z.string(), z.any())).min(1).max(8).describe("Predicates, combined with AND."),
       timeoutMs: z.number().int().min(0).max(10000).optional().describe("Bounded wait (driver default 5000; 0 = one sample)."),
       stableSamples: z.number().int().min(1).max(5).optional().describe("Consecutive satisfied samples required (default 2)."),
@@ -1092,7 +1099,7 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       + "A completed step confirms driver exit, not its application effect. Screenshot is returned by default. " + sel,
     inputSchema: {
       host: z.string().describe("One host or route."),
-      app: z.string().min(1).describe("PID, process name, app name, or exact window title shared by every action."),
+      app: z.string().min(1).describe("PID, window_id (w123), process name, app name, or exact window title shared by every action."),
       actions: z.array(z.object({
         tool: z.enum(CU_BATCH_TOOLS),
         args: z.record(z.string(), z.any()).optional().describe("Raw tool arguments without pid/window_id/target or from_zoom."),
@@ -1159,6 +1166,274 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       `[${i + 1}/${run.steps.length}] fleet ${s.step}\n${renderExec(s.results)}`);
     const footer = run.ok ? `\n✓ ${run.name} complete` : `\n✗ ${run.name} failed — stopped early`;
     return text(`▶ recipe ${run.name}\n\n${blocks.join("\n\n")}${footer}`, !run.ok);
+  });
+
+  // ── Android phones (hosts with an "android" block) ──────────────────────────
+  const phoneHelp = "The host is a phone reached over SSH into Termux, whose adb drives the phone's own adbd. "
+    + "Coordinates are device pixels, the same frame fleet_android_elements reports centers in.";
+  const phoneState = (s: { pkg?: string; width?: number; height?: number; awake?: string; locked?: boolean }) =>
+    `${s.pkg || "nothing"} focused` + (s.width ? ` · ${s.width}x${s.height}` : "")
+    + (s.awake && s.awake !== "Awake" ? ` · screen ${s.awake}` : "") + (s.locked ? " · locked" : "");
+
+  server.registerTool("fleet_android_state", {
+    title: "Check an Android phone",
+    description: "Report every link from SSH to the phone's input system (Termux, adb, adbd, screen awake, "
+      + "unlocked, uiautomator) and which package holds focus. Input is refused while the screen is off or "
+      + "the phone is locked; a phone that rebooted needs Wireless debugging turned on by hand. " + phoneHelp,
+    inputSchema: { host: z.string().describe("An Android host name.") },
+    annotations: { readOnlyHint: true, openWorldHint: true },
+  }, async ({ host }) => {
+    try {
+      const r = await androidDoctor(cfg, await routeSelector(cfg, host));
+      return text([...r.checks.map((c) => `${c.ok ? "✓" : "✗"} ${c.check}: ${c.detail}`),
+        ...(r.state.pkg !== undefined ? [phoneState(r.state)] : [])].join("\n"), !r.ok);
+    } catch (error) { return text(error instanceof Error ? error.message : String(error), true); }
+  });
+
+  server.registerTool("fleet_android_bootstrap", {
+    title: "Restore adb on the phone after a reboot",
+    description: "After a reboot adbd stops listening on the fixed port. With Wireless debugging switched on by a "
+      + "person (it needs Wi-Fi), this finds its random port from Termux and switches adbd back to the fixed port, "
+      + "which then keeps working off Wi-Fi until the next reboot. pairPort/pairCode run a one-time pairing first, "
+      + "from Wireless debugging → Pair device with pairing code. " + phoneHelp,
+    inputSchema: {
+      host: z.string().describe("An Android host name."),
+      pairPort: z.number().int().min(1).max(65535).optional().describe("Port shown in the pairing dialog."),
+      pairCode: z.string().regex(/^\d{6}$/).optional().describe("6-digit code shown in the pairing dialog."),
+    },
+    annotations: { openWorldHint: true },
+  }, async ({ host, pairPort, pairCode }) => {
+    try {
+      if ((pairPort === undefined) !== (pairCode === undefined)) return text("pairPort and pairCode go together", true);
+      const r = await androidBootstrap(cfg, await routeSelector(cfg, host),
+        { pair: pairPort !== undefined ? { port: pairPort, code: pairCode! } : undefined });
+      return text(`${r.outcome}: ${r.detail}`, r.outcome === "failed");
+    } catch (error) { return text(error instanceof Error ? error.message : String(error), true); }
+  });
+
+  server.registerTool("fleet_android_elements", {
+    title: "List what is on the phone's screen",
+    description: "Read the current screen's UI tree with uiautomator, WITHOUT a screenshot: each element's role "
+      + "(class), label (text, else content-desc, else its children's text for a clickable container), "
+      + "resource id, actions (tap, long_press, scroll, check, type), state, and center in device pixels. "
+      + "Pass a label to fleet_android_act instead of reading coordinates off an image. Takes ~2.5 s. "
+      + "An empty list means the screen draws itself (a game, a canvas): use fleet_android_screenshot. " + phoneHelp,
+    inputSchema: {
+      host: z.string().describe("An Android host name."),
+      filter: z.string().optional().describe("Case-insensitive substring over labels, text, content-desc and ids."),
+      role: z.string().optional().describe("Keep only this class short name: Button, EditText, TextView, Switch, …"),
+      all: z.boolean().optional().describe("Include unlabeled inert nodes (layout containers)."),
+    },
+    annotations: { readOnlyHint: true, openWorldHint: true },
+  }, async ({ host, filter, role, all }) => {
+    try {
+      const r = await androidElementsOf(cfg, await routeSelector(cfg, host), { filter, role, all });
+      if (!r.result.ok) return text(r.result.stderr || "uiautomator dump failed", true);
+      return text(JSON.stringify({
+        state: r.state, total: r.total,
+        elements: r.elements.map(({ ancestors: _a, bounds: _b, index: _i, ...e }) => e),
+        ...(r.state.locked || (r.state.awake && r.state.awake !== "Awake")
+          ? { note: "the phone is locked or its screen is off; this is the lock screen, and input is refused" } : {}),
+      }));
+    } catch (error) { return text(error instanceof Error ? error.message : String(error), true); }
+  });
+
+  server.registerTool("fleet_android_screenshot", {
+    title: "Screenshot the phone",
+    description: "Capture the phone's screen, encoded to WebP on the phone (half size by default, ~60 KB). "
+      + "The reply states the scale from image pixels to device pixels. grid captures full size and labels "
+      + "device pixels. Prefer fleet_android_elements, which needs no image. " + phoneHelp,
+    inputSchema: {
+      host: z.string().describe("An Android host name."),
+      width: z.number().int().min(100).max(10000).optional().describe("Image width in pixels (default half the device width)."),
+      grid: z.boolean().optional().describe("Full-size capture with a device-pixel coordinate grid."),
+    },
+    annotations: { openWorldHint: true },
+  }, async ({ host, width, grid }) =>
+    withTempImage("fleet-android-", async (local) => {
+      try {
+        const r = await androidShot(cfg, await routeSelector(cfg, host), local.replace(/\.png$/, ".webp"),
+          { width: grid ? 100000 : width });
+        if (!r.localImage || !r.image) return text(renderExec([r.result]), true);
+        const gridApplied = grid ? await overlayGrid(r.localImage, { step: 100,
+          caption: `device pixels ${r.image.deviceWidth}x${r.image.deviceHeight} · ${r.state.pkg || "nothing"} focused` }) : false;
+        const scale = r.image.deviceWidth / r.image.width;
+        return { content: [
+          { type: "text" as const, text: [phoneState(r.state),
+            `image ${r.image.width}x${r.image.height}` + (scale !== 1 ? `; multiply by ${+scale.toFixed(3)} for device pixels` : " (device pixels)"),
+            ...(grid ? [gridApplied ? "coordinate grid applied" : "grid skipped (python3 + Pillow required)"] : [])].join("\n") },
+          { type: "image" as const, data: await consumeImage(r.localImage), mimeType: `image/${r.image.format}` },
+        ] };
+      } catch (error) { return text(error instanceof Error ? error.message : String(error), true); }
+    }));
+
+  server.registerTool("fleet_android_act", {
+    title: "Act on the phone and verify the effect",
+    description: "Send one input to the phone and report WHAT ITS PIXELS DID: changed, no_change, or indeterminate, "
+      + "from frame hashes taken on the phone (the status bar is excluded; its clock and network meter change on "
+      + "their own). Refused BEFORE any input when the screen is off, the phone is locked, or `target` does not "
+      + "hold focus: target is a package (com.android.chrome), a word in one (chrome), or \"any\". PREFER "
+      + "element.label over x/y; an ambiguous label is refused with the candidates listed. type sends printable "
+      + "ASCII only and reads the focused field back. Keys that turn the screen off are refused. " + phoneHelp,
+    inputSchema: {
+      host: z.string().describe("An Android host name."),
+      target: z.string().describe("Package that must hold focus, a word in it, or \"any\"."),
+      action: z.enum(["tap", "long_press", "swipe", "scroll", "key", "type"]),
+      x: z.number().optional().describe("Device pixel X for tap/long_press, or the swipe start."),
+      y: z.number().optional().describe("Device pixel Y for tap/long_press, or the swipe start."),
+      x2: z.number().optional().describe("Swipe end X."),
+      y2: z.number().optional().describe("Swipe end Y."),
+      element: z.object({
+        label: z.string().optional().describe("Text, content-desc, or resource id: exact first, then substring."),
+        role: z.string().optional().describe("Class short name to narrow a match: Button, EditText, …"),
+        nth: z.number().int().min(1).optional().describe("1-based pick among several matches."),
+      }).strict().optional().describe("Address an element instead of x/y (tap, long_press, type, scroll)."),
+      direction: z.enum(["up", "down", "left", "right"]).optional().describe("scroll: which content to reveal."),
+      amount: z.number().int().min(1).max(10).optional().describe("scroll: number of swipes (default 1)."),
+      key: z.string().optional().describe("key: back, home, enter, recents, tab, backspace, wakeup, … or KEYCODE_*."),
+      text: z.string().optional().describe("type: printable ASCII typed into the focused field (or element)."),
+      durationMs: z.number().int().min(1).max(10000).optional().describe("long_press hold or swipe duration."),
+      settleMs: z.number().int().min(0).max(10000).optional().describe("Wait before the after-hash (default 400)."),
+      screenshot: z.boolean().optional().describe("Return the after image."),
+    },
+    annotations: { openWorldHint: true },
+  }, async ({ host, target, action, x, y, x2, y2, element, direction, amount, key, text: typed, durationMs, settleMs, screenshot }) => {
+    const need = <T>(v: T | undefined, what: string): T => {
+      if (v === undefined) throw new Error(`${action} needs ${what}`);
+      return v;
+    };
+    const run = async (local?: string) => {
+      const a: AndroidAction =
+        action === "tap" ? { kind: "tap", x, y }
+        : action === "long_press" ? { kind: "long_press", x, y, ms: durationMs }
+        : action === "swipe" ? { kind: "swipe", x1: need(x, "x"), y1: need(y, "y"), x2: need(x2, "x2"), y2: need(y2, "y2"), ms: durationMs }
+        : action === "scroll" ? { kind: "scroll", direction: need(direction, "direction"), amount }
+        : action === "key" ? { kind: "key", key: need(key, "key") }
+        : { kind: "type", text: need(typed, "text") };
+      const r = await androidAct(cfg, await routeSelector(cfg, host), target, a,
+        { settleMs, element, imageOut: local?.replace(/\.png$/, ".webp") });
+      const lines = [
+        r.refusal ? `refused: ${r.refusal}` : `effect: ${r.effect}${r.reason ? ` — ${r.reason}` : ""}`,
+        `${phoneState(r.state)} · ${r.summary}`
+        + (r.element ? ` → ${r.element.role} ${JSON.stringify(r.element.label)}${r.element.id ? ` #${r.element.id}` : ""}`
+          + (r.element.within ? ` in ${r.element.within}` : "") : ""),
+        ...(r.result.stderr && !r.refusal ? ["", r.result.stderr] : []),
+      ];
+      const content: any[] = [{ type: "text" as const, text: lines.join("\n") }];
+      if (r.localImage) content.push({ type: "image" as const, data: await consumeImage(r.localImage),
+        mimeType: r.localImage.endsWith(".png") ? "image/png" : "image/webp" });
+      return { content, isError: !r.result.ok };
+    };
+    try {
+      return screenshot ? await withTempImage("fleet-android-act-", run) : await run();
+    } catch (error) { return text(error instanceof Error ? error.message : String(error), true); }
+  });
+
+  server.registerTool("fleet_android_batch", {
+    title: "Run several phone inputs in one call",
+    description: "Run up to 50 steps in one round trip, with one before/after pixel check for the whole batch. "
+      + "Labels resolve against the screen before the batch; each later label step checks its element's rows "
+      + "still look the same and stops the batch if not. Every step re-checks that target holds focus, and "
+      + "every point is checked against the display before anything runs. The first failure stops the batch; "
+      + "later steps report not_run. " + phoneHelp,
+    inputSchema: {
+      host: z.string().describe("An Android host name."),
+      target: z.string().describe("Package that must hold focus throughout, a word in it, or \"any\"."),
+      steps: z.array(z.object({
+        action: z.enum(["tap", "long_press", "swipe", "scroll", "key", "type", "sleep"]),
+        x: z.number().optional(), y: z.number().optional(), x2: z.number().optional(), y2: z.number().optional(),
+        label: z.string().optional(), role: z.string().optional(), nth: z.number().int().min(1).optional(),
+        key: z.string().optional(), text: z.string().optional(),
+        direction: z.enum(["up", "down", "left", "right"]).optional(), amount: z.number().int().min(1).max(10).optional(),
+        ms: z.number().int().min(0).max(10000).optional().describe("sleep length, long_press hold, or swipe duration."),
+      }).strict()).min(1).max(50),
+      gapMs: z.number().int().min(0).max(10000).optional().describe("Pause between steps (default 250)."),
+      settleMs: z.number().int().min(0).max(10000).optional().describe("Wait before the after-hash (default 400)."),
+    },
+    annotations: { openWorldHint: true },
+  }, async ({ host, target, steps, gapMs, settleMs }) => {
+    try {
+      const r = await androidBatch(cfg, await routeSelector(cfg, host), target, steps as AndroidBatchStep[], { gapMs, settleMs });
+      return text([
+        r.refusal ? `refused: ${r.refusal}` : `effect: ${r.effect}${r.reason ? ` — ${r.reason}` : ""}`,
+        `${phoneState(r.state)} · ${r.steps.filter((s) => s.status === "done").length}/${r.steps.length} steps`,
+        ...r.steps.map((s) => `${s.index + 1}. ${s.status} ${s.summary}${s.detail ? ` — ${s.detail}` : ""}`),
+      ].join("\n"), !r.result.ok);
+    } catch (error) { return text(error instanceof Error ? error.message : String(error), true); }
+  });
+
+  server.registerTool("fleet_android_wait", {
+    title: "Wait for something on the phone",
+    description: "Poll on the phone until an element with a label appears (gone: disappears), or until a package "
+      + "holds focus (gone: leaves). Label polls take a UI dump each (~2.5 s), focus polls ~0.2 s. The result "
+      + "is confirmed with the same matcher as a label tap. " + phoneHelp,
+    inputSchema: {
+      host: z.string().describe("An Android host name."),
+      label: z.string().optional(), role: z.string().optional(),
+      focus: z.string().optional().describe("A package, or a word in one."),
+      gone: z.boolean().optional(),
+      timeoutMs: z.number().int().min(0).max(MCP_WAIT_CAP_S * 1000).optional().describe("Default 10000."),
+    },
+    annotations: { readOnlyHint: true, openWorldHint: true },
+  }, async ({ host, label, role, focus, gone, timeoutMs }) => {
+    try {
+      const r = await androidWait(cfg, await routeSelector(cfg, host), { label, role, focus, gone, timeoutMs });
+      return text(`${r.satisfied ? "satisfied" : "unsatisfied"} after ${r.elapsedMs} ms`
+        + (r.element ? ` · ${r.element.role} ${JSON.stringify(r.element.label)} @${r.element.center.x},${r.element.center.y}` : "")
+        + (r.reason ? `\n${r.reason}` : ""), !r.satisfied);
+    } catch (error) { return text(error instanceof Error ? error.message : String(error), true); }
+  });
+
+  server.registerTool("fleet_android_release", {
+    title: "Stop the phone's UI helper",
+    description: "Stop the helper that serves fast UI-tree reads, releasing its accessibility connection now "
+      + "instead of after 2 idle minutes. Call it when you are done with the phone: some apps react to an "
+      + "accessibility client being present. " + phoneHelp,
+    inputSchema: { host: z.string().describe("An Android host name.") },
+    annotations: { openWorldHint: true },
+  }, async ({ host }) => {
+    try {
+      const r = await androidRelease(cfg, await routeSelector(cfg, host));
+      return text(r.detail, !r.result.ok);
+    } catch (error) { return text(error instanceof Error ? error.message : String(error), true); }
+  });
+
+  server.registerTool("fleet_android_open", {
+    title: "Open an app or URL on the phone",
+    description: "Launch a package (com.android.chrome) through its launcher activity, or open a URL with a VIEW "
+      + "intent, then wait for focus to move and report the package now in front. List packages with "
+      + "fleet_android_apps. Refused while the screen is off or the phone is locked. " + phoneHelp,
+    inputSchema: {
+      host: z.string().describe("An Android host name."),
+      what: z.string().describe("A package name or a URL."),
+      inPackage: z.string().optional().describe("For a URL: the package that should open it, skipping the chooser."),
+      waitMs: z.number().int().min(0).max(60000).optional().describe("How long to wait for focus to move (default 5000)."),
+    },
+    annotations: { openWorldHint: true },
+  }, async ({ host, what, waitMs, inPackage }) => {
+    try {
+      const r = await androidOpen(cfg, await routeSelector(cfg, host), what, { waitMs, inPackage });
+      if (r.refusal) return text(`refused: ${r.refusal}`, true);
+      if (!r.result.ok) return text(r.result.stderr || "open failed", true);
+      return text(`opened ${r.what}: ${phoneState(r.state)}`);
+    } catch (error) { return text(error instanceof Error ? error.message : String(error), true); }
+  });
+
+  server.registerTool("fleet_android_apps", {
+    title: "List the phone's packages",
+    description: "List installed package names, user-installed ones by default, for fleet_android_open. " + phoneHelp,
+    inputSchema: {
+      host: z.string().describe("An Android host name."),
+      filter: z.string().optional().describe("Case-insensitive substring."),
+      all: z.boolean().optional().describe("Include system packages."),
+    },
+    annotations: { readOnlyHint: true, openWorldHint: true },
+  }, async ({ host, filter, all }) => {
+    try {
+      const r = await androidApps(cfg, await routeSelector(cfg, host), { filter, all });
+      if (!r.result.ok) return text(r.result.stderr || "pm list packages failed", true);
+      return text(r.packages.join("\n") || "no packages match");
+    } catch (error) { return text(error instanceof Error ? error.message : String(error), true); }
   });
 
   return server;

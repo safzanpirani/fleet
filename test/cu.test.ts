@@ -312,6 +312,25 @@ describe("target resolution", () => {
     expect(() => cuResolveTargetFrom(snap, "Search")).toThrow(/no app, process, or window title matching "Search"/);
   });
 
+  test("a window_id from `windows` targets that window, bare or as w<id>", () => {
+    // `windows` prints window_id in the first column; agents passed it where a
+    // pid was expected and got "134428 (pid 134428) has no top-level windows".
+    const modal = windowFixture({ window_id: 9, title: "Save As", width: 420, height: 200, z_index: 22 });
+    const snap = snapshotFixture({ windows: [windowFixture(), modal] });
+    for (const query of ["9", "w9", "W9"]) {
+      const t = cuResolveTargetFrom(snap, query);
+      expect(t.pid).toBe(100);
+      expect(t.window.window_id).toBe(9);
+      expect(t.matched).toBe("window");
+    }
+    // A live pid still wins over a window with the same number.
+    const clash = snapshotFixture({ windows: [windowFixture(), windowFixture({ window_id: 100, pid: 200, title: "Other" })] });
+    expect(cuResolveTargetFrom(clash, "100").pid).toBe(100);
+    expect(cuResolveTargetFrom(clash, "w100").pid).toBe(200);
+    expect(() => cuResolveTargetFrom(snap, "w55")).toThrow(/no window w55 on screen/);
+    expect(() => cuResolveTargetFrom(snap, "55")).toThrow(/no window has id 55/);
+  });
+
   test("exact and partial dialog titles select that window instead of its larger parent", () => {
     const modal = windowFixture({ window_id: 9, title: "Save As", width: 420, height: 200, z_index: 22 });
     const snap = snapshotFixture({ windows: [windowFixture(), modal] });
@@ -439,6 +458,21 @@ describe("verified actions", () => {
     expect(r.effect).toBe(scenario.effect as any);
     // cua-driver's own field is useless here — that is the whole point.
     expect(r.driverOutput).toContain("unverifiable");
+  });
+
+  test("a window that is gone after the input reports that it closed", async () => {
+    let listings = 0;
+    const act = (windows: CuWindowInfo[]) => cuAct(cfgWin, "win", "Playnite", "click", { x: 1, y: 1 }, {}, {
+      snapshot: async () => (listings++ ? snapshotFixture({ windows }) : snapshotFixture()),
+      exec: async (target) => ({ host: target.name, ok: true, code: 0, stderr: "", stdout: hashes("aa", "") }),
+    });
+    const closed = await act([]);
+    expect(closed.effect).toBe("changed");
+    expect(closed.reason).toBe("the window closed (w7 is no longer listed)");
+    listings = 0;
+    const still = await act([windowFixture()]);
+    expect(still.effect).toBe("indeterminate");
+    expect(still.reason).toContain("capture failed");
   });
 
   test("a still-repainting window is reported as indeterminate, not a false change", async () => {

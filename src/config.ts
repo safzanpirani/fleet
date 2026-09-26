@@ -1,7 +1,8 @@
 /** Fleet config — loads fleet.config.json next to the package root. */
 import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
+import { realpathSync } from "node:fs";
 
 export type OS = "linux" | "windows" | "mac";
 export type ServiceType = "systemd" | "systemd-user" | "nssm" | "winservice" | "schtask";
@@ -25,6 +26,12 @@ export interface Host {
   cdp?: string;       // Chrome DevTools Protocol endpoint used by `fleet browse`
   deploy?: DeployTarget;   // where `fleet deploy` ships the fleet source on this host
   proxy?: string;     // `proxies` entry name, or an inline URL (socks5h://user:pass@host:1080)
+  android?: AndroidSpec;   // `fleet cu` drives an Android phone through adb inside Termux on this host
+}
+/** A phone reached over SSH into Termux, whose own adb client drives the phone's
+ *  adbd (legacy `adb tcpip` mode, so it keeps listening off Wi-Fi). */
+export interface AndroidSpec {
+  serial?: string;    // adb serial Termux uses; default 127.0.0.1:5555
 }
 /** How `fleet doctor` proves a proxy actually changes the egress IP. */
 export interface ProxyVerify {
@@ -278,7 +285,7 @@ export function validateConfig(cfg: FleetConfig, path: string): void {
   for (const [name, rawHost] of Object.entries(cfg.hosts)) {
     const h = record(rawHost, `hosts.${name}`) as unknown as Host;
     knownKeys(h as unknown as Record<string, unknown>,
-      ["name", "ssh", "os", "transport", "gpu", "wsl", "winShell", "python", "services", "health", "cdp", "deploy", "proxy"],
+      ["name", "ssh", "os", "transport", "gpu", "wsl", "winShell", "python", "services", "health", "cdp", "deploy", "proxy", "android"],
       `hosts.${name}`);
     if (!h.ssh || typeof h.ssh !== "string") fail(`hosts.${name}: missing/invalid \`ssh\``);
     if (h.ssh.startsWith("-")) fail(`hosts.${name}.ssh must not begin with '-' (ssh would parse it as an option)`);
@@ -291,6 +298,14 @@ export function validateConfig(cfg: FleetConfig, path: string): void {
     httpUrlIfPresent(h.health, `hosts.${name}.health`);
     httpUrlIfPresent(h.cdp, `hosts.${name}.cdp`);
     checkProxyRef(h.proxy, `hosts.${name}.proxy`);
+    if (h.android !== undefined) {
+      const a = record(h.android, `hosts.${name}.android`) as unknown as AndroidSpec;
+      knownKeys(a as unknown as Record<string, unknown>, ["serial"], `hosts.${name}.android`);
+      stringIfPresent(a.serial, `hosts.${name}.android.serial`);
+      if (a.serial !== undefined && !/^[A-Za-z0-9._:-]+$/.test(a.serial))
+        fail(`hosts.${name}.android.serial must be an adb serial like 127.0.0.1:5555 (got '${a.serial}')`);
+      if (h.os !== "linux") fail(`hosts.${name}: android needs os linux (Termux runs the host's bash)`);
+    }
     if (h.winShell && !WIN_SHELLS.has(h.winShell))
       fail(`hosts.${name}: winShell must be one of ${[...WIN_SHELLS].join("|")} (got '${h.winShell}')`);
     if (h.winShell && h.os !== "windows")
@@ -419,11 +434,37 @@ export function configNotFoundMessage(paths = configSearchPaths()): string {
   ].join("\n");
 }
 
+/** An unknown config field may be one a newer source checkout accepts, which
+ *  means this fleet is simply older than its config. The checkout is found
+ *  through the config's real path, because an installed config is usually a
+ *  symlink into it. Nothing is said when that checkout is the running source:
+ *  the field is then genuinely unknown. */
+export async function staleBinaryHint(message: string, configPath: string, root = ROOT): Promise<string | undefined> {
+  const listed = message.match(/unknown fields? ((?:'[^']+'(?:, )?)+)/)?.[1];
+  if (!listed) return undefined;
+  const fields = [...listed.matchAll(/'([^']+)'/g)].map((m) => m[1]!);
+  let dir: string;
+  try { dir = dirname(realpathSync(configPath)); } catch { return undefined; }
+  const real = (p: string) => { try { return realpathSync(p); } catch { return resolve(p); } };
+  if (real(dir) === real(root)) return undefined;
+  const source = Bun.file(join(dir, "src", "config.ts"));
+  if (!await source.exists()) return undefined;
+  const text = await source.text();
+  if (!fields.every((f) => text.includes(`"${f}"`))) return undefined;
+  return `this fleet is older than the source at ${dir}, which accepts ${fields.map((f) => `'${f}'`).join(", ")}; `
+    + `rebuild it there with: bun run build:local`;
+}
+
 export async function loadConfig(): Promise<FleetConfig> {
   const path = await resolveConfigPath();
   if (!await Bun.file(path).exists()) throw new Error(configNotFoundMessage());
   const raw = await Bun.file(path).json() as FleetConfig;
-  validateConfig(raw, path);
+  try { validateConfig(raw, path); }
+  catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const hint = await staleBinaryHint(message, path);
+    throw new Error(hint ? `${message}\n${hint}` : message);
+  }
   for (const [name, h] of Object.entries(raw.hosts)) h.name = name;
   setActiveConfig(raw);
   return raw;

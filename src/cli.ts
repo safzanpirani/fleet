@@ -60,6 +60,11 @@ import {
   stampSkill,
 } from "./tools.ts";
 import type { ServiceAction, CuTarget, GridOptions, CuElementLocator } from "./core.ts";
+import {
+  isAndroidHost, androidState, androidDoctor, androidElementsOf, androidShot, androidAct, androidOpen, androidApps,
+  androidBootstrap, androidBatch, androidWait, androidRelease,
+} from "./android.ts";
+import type { AndroidAction, AndroidBatchStep, AndroidLocator, AndroidState } from "./android.ts";
 
 /** Colour only for a person at a terminal. Output piped to an agent or a file
  *  is data, and escape codes inside it are noise every reader has to strip.
@@ -129,6 +134,250 @@ const heat = (p: number | null | undefined, t: string) =>
 const BLK = " ▁▂▃▄▅▆▇█";
 const blk = (p: number | null | undefined): string =>
   p == null ? " " : (BLK[Math.max(1, Math.min(8, Math.round(p / 100 * 8)))] ?? " ");
+
+const ANDROID_USAGE = `usage (Android host):
+  fleet cu <phone> doctor | state | release | apps [FILTER] [--all] | bootstrap [PAIR-PORT PAIR-CODE]
+  fleet cu <phone> elements [FILTER] [--role R] [--all] [--json]
+  fleet cu <phone> shot [--out FILE] [--width N] [--grid]
+  fleet cu <phone> open <PACKAGE|URL> [--in PACKAGE] [--wait MS]
+  fleet cu <phone> tap|long-press <TARGET> <X> <Y> | --label TEXT [--role R] [--nth N]
+  fleet cu <phone> swipe <TARGET> <X1> <Y1> <X2> <Y2> [--duration MS]
+  fleet cu <phone> scroll <TARGET> <up|down|left|right> [AMOUNT] [--label TEXT]
+  fleet cu <phone> key <TARGET> <KEY> | type <TARGET> <TEXT> [--label TEXT]
+  fleet cu <phone> batch <TARGET> <JSON-array|-> | batch <TARGET> --file FILE [--gap MS]
+  fleet cu <phone> wait --label TEXT [--role R] [--gone] | wait --focus PACKAGE [--gone] [--timeout MS]
+    TARGET is the package that must hold focus (a word in it matches), or "any".
+    input flags: [--settle MS] [--shot] [--out FILE] [--json]`;
+
+const androidStateLine = (s: AndroidState) =>
+  `${s.pkg || "nothing"} focused` + (s.width ? ` · ${s.width}x${s.height}` : "")
+  + (s.awake && s.awake !== "Awake" ? ` · screen ${s.awake}` : "") + (s.locked ? " · locked" : "");
+
+/** `fleet cu` on a host with an "android" block: the phone's own verbs, with the
+ *  desktop contracts — explicit target, refusal before input, effect from pixels. */
+async function androidCu(
+  cfg: FleetConfig, target: string, sel: string, rest: string[],
+  o: { grid: boolean; gridStep: number; out?: string; noOpen: boolean; settle: number; wantShot: boolean;
+       label?: string; role?: string; nth?: string },
+): Promise<number> {
+  const json = pullFlag(rest, "--json");
+  const all = pullFlag(rest, "--all");
+  const wait = pullVal(rest, "--wait");
+  const widthArg = pullVal(rest, "--width");
+  const durationArg = pullVal(rest, "--duration");
+  const inPackage = pullVal(rest, "--in");
+  const fileArg = pullVal(rest, "--file");
+  const gapArg = pullVal(rest, "--gap");
+  const timeoutArg = pullVal(rest, "--timeout");
+  const focusArg = pullVal(rest, "--focus");
+  const gone = pullFlag(rest, "--gone");
+  const verb = rest[0];
+  const args = rest.slice(1);
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  const open = (p?: string) => {
+    if (p && !o.noOpen && !json && process.platform === "darwin") Bun.spawn(["open", p], { stdout: "ignore", stderr: "ignore" });
+  };
+  const posInt = (v: string | undefined, name: string, max: number) => {
+    if (v === undefined) return undefined;
+    if (!/^\d+$/.test(v) || Number(v) < 1 || Number(v) > max) die(`${name} must be an integer from 1 to ${max} (got '${v}')`);
+    return Number(v);
+  };
+  if (o.nth !== undefined) posInt(o.nth, "--nth", 1000);
+  const locator: AndroidLocator | undefined = [o.label, o.role, o.nth].some((v) => v !== undefined)
+    ? { label: o.label, role: o.role, nth: o.nth === undefined ? undefined : Number(o.nth) } : undefined;
+  const need = (n: number, usage: string) => { if (args.length !== n) die(`usage: fleet cu ${sel} ${usage}`); };
+  const num = (v: string | undefined, what: string) => {
+    const n = Number(v);
+    if (v === undefined || !Number.isFinite(n)) die(`${what} must be a number (got '${v}')`);
+    return n;
+  };
+
+  if (verb === "doctor") {
+    need(0, "doctor");
+    const r = await androidDoctor(cfg, target);
+    if (json) { console.log(JSON.stringify(r)); return r.ok ? 0 : 1; }
+    for (const c of r.checks) console.log(`${c.ok ? A.g("●") : A.r("✗")} ${c.check.padEnd(22)} ${A.d(c.detail)}`);
+    if (r.state.pkg !== undefined) console.log(A.d(androidStateLine(r.state)));
+    return r.ok ? 0 : 1;
+  }
+  if (verb === "bootstrap") {
+    if (args.length !== 0 && args.length !== 2) die(`usage: fleet cu ${sel} bootstrap [PAIR-PORT PAIR-CODE]`);
+    const pair = args.length === 2 ? { port: num(args[0], "pairing port"), code: args[1]! } : undefined;
+    let r;
+    try { r = await androidBootstrap(cfg, target, { pair }); }
+    catch (error) { die(error instanceof Error ? error.message : String(error)); }
+    if (json) { console.log(JSON.stringify(r)); return r.outcome === "failed" ? 1 : 0; }
+    console.log(`${r.outcome === "failed" ? A.r("✗") : A.g("●")} ${r.outcome} ${A.d(r.detail)}`);
+    return r.outcome === "failed" ? 1 : 0;
+  }
+  if (verb === "release") {
+    need(0, "release");
+    const r = await androidRelease(cfg, target);
+    if (json) { console.log(JSON.stringify(r)); return r.result.ok ? 0 : 1; }
+    console.log(`${r.result.ok ? A.g("●") : A.r("✗")} ${r.detail}`);
+    return r.result.ok ? 0 : 1;
+  }
+  if (verb === "state" || verb === "windows") {
+    need(0, "state");
+    const r = await androidState(cfg, target);
+    if (json) { console.log(JSON.stringify(r)); return r.result.ok ? 0 : 1; }
+    if (!r.result.ok) { printResult(r.result); return 1; }
+    console.log(`${r.state.awake === "Awake" && !r.state.locked ? A.g("●") : A.y("▲")} ${androidStateLine(r.state)}`);
+    if (r.state.focus) console.log(A.d(`  ${r.state.focus}`));
+    return 0;
+  }
+  if (verb === "apps") {
+    if (args.length > 1) die(`usage: fleet cu ${sel} apps [FILTER] [--all]`);
+    const r = await androidApps(cfg, target, { filter: args[0], all });
+    if (json) { console.log(JSON.stringify(r)); return r.result.ok ? 0 : 1; }
+    if (!r.result.ok) { printResult(r.result); return 1; }
+    for (const p of r.packages) console.log(p);
+    console.log(A.d(`${r.packages.length} ${all ? "" : "user-installed "}package(s)`));
+    return 0;
+  }
+  if (verb === "elements") {
+    if (args.length > 1) die(`usage: fleet cu ${sel} elements [FILTER] [--role R] [--all] [--json]`);
+    const r = await androidElementsOf(cfg, target, { all, filter: args[0] ?? o.label, role: o.role });
+    if (json) { console.log(JSON.stringify(r)); return r.result.ok ? 0 : 1; }
+    if (!r.result.ok) { printResult(r.result); return 1; }
+    console.log(A.d(`${androidStateLine(r.state)} · ${r.elements.length} of ${r.total} element(s)` + (r.via ? ` · via ${r.via}` : "")));
+    if (r.state.locked || (r.state.awake && r.state.awake !== "Awake"))
+      console.error(A.y("▲ the phone is locked or its screen is off; this is the lock screen, and input is refused"));
+    for (const e of r.elements) {
+      const indent = "  ".repeat(Math.min(6, Math.max(0, e.depth - 1)));
+      console.log(`${A.d(`@${e.center.x},${e.center.y}`.padEnd(11))} ${indent}${A.b(e.role)} ${JSON.stringify(e.label)}`
+        + (e.derived ? A.d(" (from children)") : "")
+        + (e.id ? A.d(` #${e.id}`) : "")
+        + (e.actions.length ? A.g(` [${e.actions.join(",")}]`) : "")
+        + (e.checked !== undefined ? (e.checked ? A.g(" checked") : A.d(" unchecked")) : "")
+        + (e.enabled ? "" : A.y(" disabled"))
+        + (e.focused ? A.c(" focused") : "")
+        + (e.selected ? A.g(" selected") : "")
+        + (e.within && o.label === undefined && args[0] === undefined ? "" : e.within ? A.d(` in ${e.within}`) : ""));
+    }
+    if (!r.total) console.error(A.y("▲ uiautomator found no elements; this screen needs pixels (shot)"));
+    return 0;
+  }
+  if (verb === "shot" || verb === "screenshot" || verb === "shot-window") {
+    if (args.length > (verb === "shot-window" ? 1 : 0)) die(`usage: fleet cu ${sel} shot [--out FILE] [--width N] [--grid]`);
+    // A grid labels image pixels, so it needs the full-size frame to label device pixels.
+    const width = o.grid ? 100000 : posInt(widthArg, "--width", 100000);
+    const local = o.out ?? `${sel}-screen-${stamp}.webp`;
+    const r = await androidShot(cfg, target, local, { width });
+    if (json) { console.log(JSON.stringify(r)); return r.result.ok ? 0 : 1; }
+    if (!r.localImage || !r.image) { printResult(r.result); return 1; }
+    if (o.grid && !await overlayGrid(r.localImage, { step: o.gridStep,
+      caption: `${sel} · device pixels ${r.image.deviceWidth}x${r.image.deviceHeight} · ${r.state.pkg || "nothing"} focused` }))
+      console.error(A.y("grid overlay skipped (need python3 + Pillow)"));
+    const scale = r.image.deviceWidth / r.image.width;
+    console.log(`${A.g("●")} ${A.d(androidStateLine(r.state) + " →")} ${r.localImage}`);
+    console.log(A.d(`  image ${r.image.width}x${r.image.height} ${r.image.format}`
+      + (scale !== 1 ? ` · multiply by ${+scale.toFixed(3)} for device pixels (tap takes device pixels)` : " · device pixels")));
+    if (r.state.locked || (r.state.awake && r.state.awake !== "Awake"))
+      console.error(A.y("▲ the phone is locked or its screen is off"));
+    open(r.localImage);
+    return 0;
+  }
+  if (verb === "open") {
+    need(1, "open <PACKAGE|URL> [--in PACKAGE] [--wait MS]");
+    let r;
+    try {
+      r = await androidOpen(cfg, target, args[0]!, { waitMs: wait === undefined ? undefined : posInt(wait, "--wait", 60000), inPackage });
+    } catch (error) { die(error instanceof Error ? error.message : String(error)); }
+    if (json) { console.log(JSON.stringify(r)); return r.result.ok ? 0 : 1; }
+    if (r.refusal) { console.log(`${A.r("✗ refused")} ${A.d(r.refusal)}`); return 1; }
+    if (!r.result.ok) { printResult(r.result); return 1; }
+    console.log(`${A.g("●")} opened ${r.what}: ${A.b(r.state.pkg || "nothing")} ${A.d("focused")}`);
+    return 0;
+  }
+
+  if (verb === "wait") {
+    if (args.length) die(`usage: fleet cu ${sel} wait --label TEXT [--role R] [--gone] | --focus PACKAGE [--gone] [--timeout MS]`);
+    let r;
+    try {
+      r = await androidWait(cfg, target, { label: o.label, role: o.role, gone, focus: focusArg,
+        timeoutMs: timeoutArg === undefined ? undefined : posInt(timeoutArg, "--timeout", 120000) });
+    } catch (error) { die(error instanceof Error ? error.message : String(error)); }
+    if (json) { console.log(JSON.stringify(r)); return r.satisfied ? 0 : 1; }
+    const what = focusArg !== undefined ? `focus ${gone ? "left" : "on"} ${focusArg}`
+      : `${[o.role, o.label !== undefined && JSON.stringify(o.label)].filter(Boolean).join(" ")} ${gone ? "gone" : "present"}`;
+    console.log(`${r.satisfied ? A.g("● satisfied") : A.r("✗ unsatisfied")} ${what}`
+      + A.d(` · ${r.elapsedMs} ms`) + (r.element ? A.d(` · @${r.element.center.x},${r.element.center.y}`) : ""));
+    if (r.reason) console.log(A.d(`  ${r.reason}`));
+    return r.satisfied ? 0 : 1;
+  }
+  if (verb === "batch") {
+    const app = args[0];
+    if (!app || (fileArg ? args.length !== 1 : args.length !== 2))
+      die(`usage: fleet cu ${sel} batch <TARGET> <JSON-array|-> | batch <TARGET> --file FILE [--gap MS]`);
+    const source = fileArg ? await readFile(fileArg, "utf8") : args[1] === "-" ? await Bun.stdin.text() : args[1]!;
+    let steps: AndroidBatchStep[];
+    try { steps = JSON.parse(source); } catch { die("batch needs a valid JSON array of steps"); }
+    const shotPath = o.wantShot || o.out ? (o.out ?? `${sel}-after-${stamp}.webp`) : undefined;
+    let r;
+    try {
+      r = await androidBatch(cfg, target, app, steps!, { settleMs: o.settle, imageOut: shotPath,
+        gapMs: gapArg === undefined ? undefined : Number(gapArg === "0" ? 0 : posInt(gapArg, "--gap", 10000)) });
+    } catch (error) { die(error instanceof Error ? error.message : String(error)); }
+    if (json) { console.log(JSON.stringify(r)); return r.result.ok ? 0 : 1; }
+    const ran = r.steps.filter((s) => s.status === "done").length;
+    const badge = r.refusal ? A.r("✗ refused") : !r.result.ok ? A.r(`✗ stopped (${r.effect})`)
+      : r.effect === "changed" ? A.g("● changed") : r.effect === "no_change" ? A.y("○ no_change") : A.d("? indeterminate");
+    console.log(`${badge} ${A.b(r.state.pkg || "nothing")} ${A.d("·")} batch ${ran}/${r.steps.length} steps`);
+    for (const s of r.steps)
+      console.log(`  ${s.index + 1}. ${s.status === "done" ? A.g("done   ") : s.status === "failed" ? A.r("failed ") : A.d("not run")} ${s.summary}`
+        + (s.detail ? A.r(` — ${s.detail}`) : ""));
+    if (r.reason) console.log(A.d(`  ${r.reason}`));
+    if (r.localImage) { console.log(`after → ${r.localImage}`); open(r.localImage); }
+    return r.result.ok ? 0 : 1;
+  }
+
+  const INPUT = ["tap", "click", "long-press", "swipe", "scroll", "key", "type"];
+  if (!verb || !INPUT.includes(verb)) die(verb ? `'${verb}' is not an Android verb\n${ANDROID_USAGE}` : ANDROID_USAGE);
+  const app = args[0] ?? die(`usage: fleet cu ${sel} ${verb} <TARGET> …  (TARGET: a package, a word in one, or "any")`);
+  const p = args.slice(1);
+  const duration = posInt(durationArg, "--duration", 10000);
+  let action: AndroidAction;
+  if (verb === "tap" || verb === "click" || verb === "long-press") {
+    const kind = verb === "long-press" ? "long_press" : "tap";
+    if (locator) { if (p.length) die(`give x y or --label, not both`); action = { kind } as AndroidAction; }
+    else {
+      if (p.length !== 2) die(`usage: fleet cu ${sel} ${verb} <TARGET> <X> <Y> | --label TEXT [--role R] [--nth N]`);
+      action = { kind, x: num(p[0], "x"), y: num(p[1], "y") } as AndroidAction;
+    }
+    if (kind === "long_press" && duration) (action as { ms?: number }).ms = duration;
+  } else if (verb === "swipe") {
+    if (p.length !== 4) die(`usage: fleet cu ${sel} swipe <TARGET> <X1> <Y1> <X2> <Y2> [--duration MS]`);
+    action = { kind: "swipe", x1: num(p[0], "x1"), y1: num(p[1], "y1"), x2: num(p[2], "x2"), y2: num(p[3], "y2"), ms: duration };
+  } else if (verb === "scroll") {
+    if (p.length < 1 || p.length > 2 || !["up", "down", "left", "right"].includes(p[0]!))
+      die(`usage: fleet cu ${sel} scroll <TARGET> <up|down|left|right> [AMOUNT] [--label TEXT]`);
+    action = { kind: "scroll", direction: p[0] as "up", amount: p[1] === undefined ? 1 : posInt(p[1], "amount", 10) };
+  } else if (verb === "key") {
+    if (p.length !== 1) die(`usage: fleet cu ${sel} key <TARGET> <KEY>   (back, home, enter, recents, … or KEYCODE_*)`);
+    action = { kind: "key", key: p[0]! };
+  } else {
+    if (p.length !== 1) die(`usage: fleet cu ${sel} type <TARGET> <TEXT> [--label TEXT]`);
+    action = { kind: "type", text: p[0]! };
+  }
+  const shotPath = o.wantShot || o.out ? (o.out ?? `${sel}-after-${stamp}.webp`) : undefined;
+  let r;
+  try {
+    r = await androidAct(cfg, target, app, action, { settleMs: o.settle, imageOut: shotPath, element: locator });
+  } catch (error) { die(error instanceof Error ? error.message : String(error)); }
+  if (json) { console.log(JSON.stringify(r)); return r.result.ok ? 0 : 1; }
+  const badge = r.refusal ? A.r("✗ refused")
+    : !r.result.ok ? A.r(`✗ failed (${r.effect})`)
+    : r.effect === "changed" ? A.g("● changed")
+    : r.effect === "no_change" ? A.y("○ no_change") : A.d("? indeterminate");
+  const el = r.element ? ` → ${r.element.role} ${JSON.stringify(r.element.label)}${r.element.id ? A.d(` #${r.element.id}`) : ""}`
+    + (r.element.within ? A.d(` in ${r.element.within}`) : "") : "";
+  console.log(`${badge} ${A.b(r.state.pkg || "nothing")} ${A.d("·")} ${r.summary}${el}`);
+  if (r.reason) console.log(A.d(`  ${r.reason}`));
+  if (!r.refusal && r.result.stderr) console.error(A.d(r.result.stderr.split("\n").map((l) => "  " + l).join("\n")));
+  if (r.localImage) { console.log(`after → ${r.localImage}`); open(r.localImage); }
+  return r.result.ok ? 0 : 1;
+}
 
 function printResult(r: ExecResult) {
   console.log(`${r.ok ? A.g("●") : A.r("●")} ${A.b(r.host)} ${A.d("· exit " + r.code)}`);
@@ -717,6 +966,16 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       const sel = rest.shift();
       if (!sel) die("usage: fleet cu <host> <cua-driver args…> [--out f.png] [--grid]  |  fleet cu <sel> install");
       const target = await routeSelector(cfg, sel);
+      if (isAndroidHost(cfg, target)) {
+        const desktopOnly = [["--space", spaceArg], ["--button", button], ["--probe", probeArg], ["--element", elementToken],
+          ["--for", forApp], ["--foreground", foreground || undefined], ["--count", clickCount !== 1 || undefined],
+          ["--no-composite", noComposite || undefined], ["--full", full || undefined], ["--brief", brief || undefined]]
+          .filter(([, v]) => v !== undefined).map(([f]) => f);
+        if (desktopOnly.length) die(`${desktopOnly.join(", ")} ${desktopOnly.length === 1 ? "does" : "do"} not apply to an Android host`);
+        return androidCu(cfg, target, sel, rest, {
+          grid, gridStep, out, noOpen, settle, wantShot, label: elementLabel, role: elementRole, nth: elementNth,
+        });
+      }
 
       if (spaceArg && spaceArg !== "window" && spaceArg !== "screen")
         die(`--space must be window or screen (got '${spaceArg}')`);
@@ -879,7 +1138,9 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
         console.log(A.d(`${r.target.name} · pid ${r.target.pid} · w${w.window_id} · ${w.title || "(untitled)"}`
           + (r.snapshotId ? ` · snapshot ${r.snapshotId}` : "") + ` · ${shown.length} of ${r.total} element(s)`));
         if (!r.available) {
-          console.error(A.y("▲ the accessibility walk found nothing here — address this window with pixels (shot-window --grid)"));
+          console.error(A.y(r.bounded
+            ? `▲ --max ${max} stopped the walk before it reached a control (cua-driver counts every node, containers included) — raise --max or drop it`
+            : "▲ the accessibility walk found nothing here — address this window with pixels (shot-window --grid)"));
           return 1;
         }
         for (const e of shown) {

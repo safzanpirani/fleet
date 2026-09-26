@@ -24,6 +24,8 @@ function executable(path: string, source: string): void {
   chmodSync(path, 0o755);
 }
 
+const RUN_CLI_DEADLINE_MS = 20_000;
+
 async function runCli(
   args: string[],
   config: string,
@@ -42,14 +44,17 @@ async function runCli(
     stderr: "pipe",
     stdin: "ignore",
   });
-  const deadline = setTimeout(() => proc.kill("SIGKILL"), 5000);
+  // Generous, because a loaded machine starts bun slowly, and loud, because a
+  // silent SIGKILL reads as a wrong exit code with empty stderr.
+  let killed = false;
+  const deadline = setTimeout(() => { killed = true; proc.kill("SIGKILL"); }, RUN_CLI_DEADLINE_MS);
   const [stdout, stderr, code] = await Promise.all([
     new Response(proc.stdout).text(),
     new Response(proc.stderr).text(),
     proc.exited,
   ]);
   clearTimeout(deadline);
-  return { stdout, stderr, code };
+  return { stdout, stderr: killed ? `${stderr}\nrunCli: killed after ${RUN_CLI_DEADLINE_MS} ms` : stderr, code };
 }
 
 describe("machine-readable CLI output", () => {
@@ -379,7 +384,9 @@ describe("machine-readable CLI output", () => {
       const r = await runCli(["jobs", "wait", "local:sample", "--timeout", "1", "--json"], config, bin);
       expect(r.code, r.stderr).toBe(124);
       expect(JSON.parse(r.stdout).outcome).toBe("timeout");
-      expect(Date.now() - start).toBeLessThan(3000);
+      // A 1 s wait that ignored its bound would run into runCli's deadline; this
+      // only needs to prove it stopped well short of that, even on a busy machine.
+      expect(Date.now() - start).toBeLessThan(10_000);
       expect(r.stdout).not.toContain("\u001b[");
     } finally { rmSync(root, { recursive: true, force: true }); }
   });

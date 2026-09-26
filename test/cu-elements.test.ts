@@ -1,6 +1,6 @@
 import { beforeAll, describe, expect, test } from "bun:test";
 import {
-  cuAct, cuElements, cuPickElement, cuReplyRefusal, cuRun, sameRole, cuReplyText, cuResolveTargetFrom, cuVerify,
+  cuAct, cuElements, cuElementSupport, cuPickElement, cuReplyRefusal, cuRun, sameRole, cuReplyText, cuResolveTargetFrom, cuVerify,
   parseCuElements, takeInlineImages,
 } from "../src/core.ts";
 import type { CuElement, CuSnapshot } from "../src/core.ts";
@@ -203,6 +203,29 @@ describe("elements", () => {
     expect(JSON.parse(args[1]!)).toEqual({ pid: 42, window_id: 7, include_screenshot: false, query: "copy" });
     expect(r.elements.length).toBe(5);
   });
+
+  const cappedEmpty = '{"elements":[],"degraded":true,"element_count":0,"total_element_count":0}';
+
+  test("a small --max that walks no control is reported as bounded, not unavailable", async () => {
+    // cua-driver counts containers against max_elements: charmap with 15
+    // controls returned nothing for max_elements 3.
+    const run = async () => ({ host: "win", result: { ...ok, stdout: cappedEmpty } });
+    expect((await cuElements(cfg, "win", "Character Map", { maxElements: 3 }, { snapshot, run })).bounded).toBe(true);
+    expect((await cuElements(cfg, "win", "Character Map", {}, { snapshot, run })).bounded).toBeUndefined();
+  });
+
+  test("element support retries uncapped before calling a window unavailable", async () => {
+    const calls: any[] = [];
+    const r = await cuElementSupport(cfg, "win", "Character Map", {
+      snapshot,
+      run: async (_c, _s, a) => {
+        calls.push(JSON.parse(a[1]!));
+        return { host: "win", result: { ...ok, stdout: calls.length === 1 ? cappedEmpty : elementsReply } };
+      },
+    });
+    expect(calls.map((c) => c.max_elements)).toEqual([40, undefined]);
+    expect(r.available).toBe(true);
+  });
 });
 
 describe("picking an element", () => {
@@ -251,6 +274,83 @@ describe("element-addressed actions", () => {
       exec: async (h, command) => { script = command; return { ...ok, host: h.name, stdout: "" }; },
     });
     expect(script).toContain('"element_token":"s00000009:4"');
+  });
+
+  const withValue = (value: string) => elementsReply.replace('"value":""', `"value":${JSON.stringify(value)}`);
+  const typeInto = async (hashes: string, driverReply: string, valueAfter: string, tool = "type_text") => {
+    let reads = 0;
+    const r = await cuAct(cfg, "lin", "Character Map", tool, tool === "set_value" ? { value: "fleet" } : { text: "fleet" },
+      { element: { label: "Characters to copy" } }, {
+        snapshot,
+        elements: async (_c, _s, _q, _o, deps) => ({ host: "lin", result: ok,
+          ...parseCuElements(reads++ ? withValue(valueAfter) : elementsReply, deps!.target!) }),
+        exec: async (h) => ({ ...ok, host: h.name,
+          stdout: `__FLEET_HASH__A|aa\n__FLEET_CAP__act|\n${driverReply}\n__FLEET_END__\n${hashes}` }),
+      });
+    return { r, reads };
+  };
+  const delivered = JSON.stringify({ route: "accessibility", effect: "unverifiable" });
+  const refused = JSON.stringify({ route: "synthetic_events", escalation: { reason: "delivery_failed" } });
+
+  test("text that arrived settles an indeterminate pixel check by the control's value", async () => {
+    const { r, reads } = await typeInto("__FLEET_HASH__B|bb\n__FLEET_HASH__C|cc", delivered, "fleet ", "set_value");
+    expect(reads).toBe(2);
+    expect(r.effect).toBe("changed");
+    expect(r.reason).toContain('now reads "fleet"');
+    expect(r.valueAfter).toBe("fleet ");
+    expect(r.result.ok).toBe(true);
+  });
+
+  test("a delivery_failed type_text whose text arrived is not a refusal", async () => {
+    // cua-driver 0.28.2 on Windows reports delivery_failed for charmap's Search
+    // field although every character lands there.
+    const { r } = await typeInto("__FLEET_HASH__B|aa", refused, "fleet");
+    expect(r.refusal).toBeUndefined();
+    expect(r.effect).toBe("changed");
+    expect(r.reason).toContain("although cua-driver said");
+    expect(r.result.ok).toBe(true);
+    expect(r.result.code).toBe(0);
+  });
+
+  test("a refusal stands when the value did not change or lacks the text", async () => {
+    for (const after of ["", "fle"]) {
+      const { r } = await typeInto("__FLEET_HASH__B|aa", refused, after);
+      expect(r.refusal).toBeDefined();
+      expect(r.result.ok).toBe(false);
+      expect(r.valueAfter).toBe(after);
+    }
+  });
+
+  test("pixels that already changed need no value read", async () => {
+    const { r, reads } = await typeInto("__FLEET_HASH__B|bb\n__FLEET_HASH__C|bb", delivered, "fleet");
+    expect(reads).toBe(1);
+    expect(r.effect).toBe("changed");
+    expect(r.valueAfter).toBeUndefined();
+  });
+
+  const checkbox = (on: boolean) =>
+    elementsReply.replace('"label":"Advanced view","actions"', `"label":"Advanced view","selected":${on},"actions"`);
+  const clickToggle = async (hashes: string, before: boolean, after: boolean) => {
+    let reads = 0;
+    const r = await cuAct(cfg, "lin", "Character Map", "click", {}, { element: { label: "Advanced view" } }, {
+      snapshot,
+      elements: async (_c, _s, _q, _o, deps) => ({ host: "lin", result: ok,
+        ...parseCuElements(checkbox(reads++ ? after : before), deps!.target!) }),
+      exec: async (h) => ({ ...ok, host: h.name,
+        stdout: `__FLEET_HASH__A|aa\n__FLEET_CAP__act|\n${delivered}\n__FLEET_END__\n${hashes}` }),
+    });
+    return { r, reads };
+  };
+
+  test("a checkbox click is judged by its toggle state, not by pixels a caret moved", async () => {
+    const moved = "__FLEET_HASH__B|bb\n__FLEET_HASH__C|bb";
+    const same = await clickToggle(moved, false, false);
+    expect(same.reads).toBe(2);
+    expect(same.r.effect).toBe("no_change");
+    expect(same.r.reason).toContain('"Advanced view" is still off although');
+    const flipped = await clickToggle("__FLEET_HASH__B|aa", false, true);
+    expect(flipped.r.effect).toBe("changed");
+    expect(flipped.r.reason).toContain("is now on");
   });
 
   test("an element and a pixel point cannot both address one action", async () => {

@@ -7,3 +7,4 @@ fleet.config.local.json
 dist/
 .scratch/
 fleet.config.json.bak-*
+android/uiserver/fleet-ui.jar

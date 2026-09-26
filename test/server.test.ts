@@ -38,6 +38,16 @@ const READ_TOOLS = [
 ].sort();
 
 const MUTATING_TOOLS = [
+  "fleet_android_act",
+  "fleet_android_apps",
+  "fleet_android_batch",
+  "fleet_android_bootstrap",
+  "fleet_android_elements",
+  "fleet_android_open",
+  "fleet_android_release",
+  "fleet_android_screenshot",
+  "fleet_android_state",
+  "fleet_android_wait",
   "fleet_bios",
   "fleet_browse",
   "fleet_cp",
