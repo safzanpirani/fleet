@@ -32,6 +32,7 @@ export interface Host {
  *  adbd (legacy `adb tcpip` mode, so it keeps listening off Wi-Fi). */
 export interface AndroidSpec {
   serial?: string;    // adb serial Termux uses; default 127.0.0.1:5555
+  shotWidth?: number; // default screenshot width in pixels (smaller for a slow route)
 }
 /** How `fleet doctor` proves a proxy actually changes the egress IP. */
 export interface ProxyVerify {
@@ -300,7 +301,9 @@ export function validateConfig(cfg: FleetConfig, path: string): void {
     checkProxyRef(h.proxy, `hosts.${name}.proxy`);
     if (h.android !== undefined) {
       const a = record(h.android, `hosts.${name}.android`) as unknown as AndroidSpec;
-      knownKeys(a as unknown as Record<string, unknown>, ["serial"], `hosts.${name}.android`);
+      knownKeys(a as unknown as Record<string, unknown>, ["serial", "shotWidth"], `hosts.${name}.android`);
+      if (a.shotWidth !== undefined && (!Number.isInteger(a.shotWidth) || a.shotWidth < 100 || a.shotWidth > 10000))
+        fail(`hosts.${name}.android.shotWidth must be an integer from 100 to 10000 (got '${a.shotWidth}')`);
       stringIfPresent(a.serial, `hosts.${name}.android.serial`);
       if (a.serial !== undefined && !/^[A-Za-z0-9._:-]+$/.test(a.serial))
         fail(`hosts.${name}.android.serial must be an adb serial like 127.0.0.1:5555 (got '${a.serial}')`);

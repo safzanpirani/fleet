@@ -62,7 +62,8 @@ import {
 import type { ServiceAction, CuTarget, GridOptions, CuElementLocator } from "./core.ts";
 import {
   isAndroidHost, androidState, androidDoctor, androidElementsOf, androidShot, androidAct, androidOpen, androidApps,
-  androidBootstrap, androidBatch, androidWait, androidRelease,
+  androidBootstrap, androidBatch, androidWait, androidRelease, androidNotifications,
+  androidRecordStart, androidRecordStatus, androidRecordStop, androidRevive, androidWatch,
 } from "./android.ts";
 import type { AndroidAction, AndroidBatchStep, AndroidLocator, AndroidState } from "./android.ts";
 
@@ -137,11 +138,16 @@ const blk = (p: number | null | undefined): string =>
 
 const ANDROID_USAGE = `usage (Android host):
   fleet cu <phone> doctor | state | release | apps [FILTER] [--all] | bootstrap [PAIR-PORT PAIR-CODE]
+  fleet cu <phone> notifications [PACKAGE] [--max N] | revive [--restart] | watch [--view-only]
+  fleet cu <phone> record start [--out FILE.mp4] [--limit S] [--bit-rate MBPS] | record stop | record status
   fleet cu <phone> elements [FILTER] [--role R] [--all] [--json]
   fleet cu <phone> shot [--out FILE] [--width N] [--grid]
   fleet cu <phone> open <PACKAGE|URL> [--in PACKAGE] [--wait MS]
   fleet cu <phone> tap|long-press <TARGET> <X> <Y> | --label TEXT [--role R] [--nth N]
   fleet cu <phone> swipe <TARGET> <X1> <Y1> <X2> <Y2> [--duration MS]
+  fleet cu <phone> swipe2 <TARGET> <X1> <Y1> <X2> <Y2> <DX> <DY> [--duration MS]
+  fleet cu <phone> zoom <TARGET> <in|out> [X Y | --label TEXT] [--scale F] [--duration MS]
+  fleet cu <phone> gesture <TARGET> <X1,Y1,X2,Y2> [X1,Y1,X2,Y2 …] [--duration MS]
   fleet cu <phone> scroll <TARGET> <up|down|left|right> [AMOUNT] [--label TEXT]
   fleet cu <phone> key <TARGET> <KEY> | type <TARGET> <TEXT> [--label TEXT]
   fleet cu <phone> batch <TARGET> <JSON-array|-> | batch <TARGET> --file FILE [--gap MS]
@@ -165,12 +171,14 @@ async function androidCu(
   const wait = pullVal(rest, "--wait");
   const widthArg = pullVal(rest, "--width");
   const durationArg = pullVal(rest, "--duration");
+  const scaleArg = pullVal(rest, "--scale");
   const inPackage = pullVal(rest, "--in");
   const fileArg = pullVal(rest, "--file");
   const gapArg = pullVal(rest, "--gap");
   const timeoutArg = pullVal(rest, "--timeout");
   const focusArg = pullVal(rest, "--focus");
   const gone = pullFlag(rest, "--gone");
+  const maxArg = pullVal(rest, "--max");
   const verb = rest[0];
   const args = rest.slice(1);
   const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
@@ -209,6 +217,23 @@ async function androidCu(
     if (json) { console.log(JSON.stringify(r)); return r.outcome === "failed" ? 1 : 0; }
     console.log(`${r.outcome === "failed" ? A.r("✗") : A.g("●")} ${r.outcome} ${A.d(r.detail)}`);
     return r.outcome === "failed" ? 1 : 0;
+  }
+  if (verb === "notifications") {
+    if (args.length > 1) die(`usage: fleet cu ${sel} notifications [PACKAGE] [--max N] [--json]`);
+    const r = await androidNotifications(cfg, target, { pkg: args[0], limit: posInt(maxArg, "--max", 1000) });
+    if (json) { console.log(JSON.stringify(r)); return r.result.ok ? 0 : 1; }
+    if (!r.result.ok) { printResult(r.result); return 1; }
+    const ago = (ms?: number) => {
+      if (!ms) return "";
+      const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
+      return s < 60 ? `${s}s` : s < 3600 ? `${Math.round(s / 60)}m` : s < 86400 ? `${Math.round(s / 3600)}h` : `${Math.round(s / 86400)}d`;
+    };
+    for (const n of r.notifications)
+      console.log(`${A.d(ago(n.when).padStart(4))} ${A.b(n.pkg)} ${JSON.stringify(n.title)}`
+        + (n.text ? ` ${n.text.length > 120 ? n.text.slice(0, 117) + "…" : n.text}` : "")
+        + (n.subText ? A.d(` (${n.subText})`) : ""));
+    console.log(A.d(`${r.notifications.length} notification(s)`));
+    return 0;
   }
   if (verb === "release") {
     need(0, "release");
@@ -332,7 +357,7 @@ async function androidCu(
     return r.result.ok ? 0 : 1;
   }
 
-  const INPUT = ["tap", "click", "long-press", "swipe", "scroll", "key", "type"];
+  const INPUT = ["tap", "click", "long-press", "swipe", "swipe2", "zoom", "gesture", "scroll", "key", "type"];
   if (!verb || !INPUT.includes(verb)) die(verb ? `'${verb}' is not an Android verb\n${ANDROID_USAGE}` : ANDROID_USAGE);
   const app = args[0] ?? die(`usage: fleet cu ${sel} ${verb} <TARGET> …  (TARGET: a package, a word in one, or "any")`);
   const p = args.slice(1);
@@ -349,6 +374,22 @@ async function androidCu(
   } else if (verb === "swipe") {
     if (p.length !== 4) die(`usage: fleet cu ${sel} swipe <TARGET> <X1> <Y1> <X2> <Y2> [--duration MS]`);
     action = { kind: "swipe", x1: num(p[0], "x1"), y1: num(p[1], "y1"), x2: num(p[2], "x2"), y2: num(p[3], "y2"), ms: duration };
+  } else if (verb === "swipe2") {
+    if (p.length !== 6) die(`usage: fleet cu ${sel} swipe2 <TARGET> <X1> <Y1> <X2> <Y2> <DX> <DY> [--duration MS]`);
+    action = { kind: "swipe2", x1: num(p[0], "x1"), y1: num(p[1], "y1"), x2: num(p[2], "x2"), y2: num(p[3], "y2"),
+      dx: num(p[4], "dx"), dy: num(p[5], "dy"), ms: duration };
+  } else if (verb === "zoom") {
+    if ((p.length !== 1 && p.length !== 3) || !["in", "out"].includes(p[0]!))
+      die(`usage: fleet cu ${sel} zoom <TARGET> <in|out> [X Y | --label TEXT] [--scale F] [--duration MS]`);
+    action = { kind: "zoom", direction: p[0] as "in", ...(p.length === 3 ? { x: num(p[1], "x"), y: num(p[2], "y") } : {}),
+      ...(scaleArg !== undefined ? { scale: num(scaleArg, "--scale") } : {}), ms: duration };
+  } else if (verb === "gesture") {
+    if (!p.length) die(`usage: fleet cu ${sel} gesture <TARGET> <X1,Y1,X2,Y2> [X1,Y1,X2,Y2 …] [--duration MS]  (one stroke per finger)`);
+    action = { kind: "gesture", ms: duration, strokes: p.map((v) => {
+      const n = v.split(",").map(Number);
+      if (n.length !== 4 || n.some((x) => !Number.isFinite(x))) die(`a stroke is X1,Y1,X2,Y2 (got '${v}')`);
+      return n as [number, number, number, number];
+    }) };
   } else if (verb === "scroll") {
     if (p.length < 1 || p.length > 2 || !["up", "down", "left", "right"].includes(p[0]!))
       die(`usage: fleet cu ${sel} scroll <TARGET> <up|down|left|right> [AMOUNT] [--label TEXT]`);
@@ -965,7 +1006,60 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       const elementNth = pullVal(rest, "--nth");
       const sel = rest.shift();
       if (!sel) die("usage: fleet cu <host> <cua-driver args…> [--out f.png] [--grid]  |  fleet cu <sel> install");
-      const target = await routeSelector(cfg, sel);
+      // watch, record and revive run on this machine through its own adb, and
+      // revive runs precisely when SSH to the phone is down, so none of them
+      // probes the route first.
+      if (["revive", "watch", "record"].includes(rest[0] ?? "")) {
+        const names = cfg.routes?.[sel]?.prefer ?? [sel];
+        const hosts = names.map((n) => cfg.hosts[n]).filter((h): h is NonNullable<typeof h> => !!h?.android);
+        if (!hosts.length) die(`${sel} is not an Android host or a route of Android hosts`);
+        const json = pullFlag(rest, "--json");
+        const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+        if (rest[0] === "revive") {
+          const restart = pullFlag(rest, "--restart");
+          if (rest.length !== 1) die(`usage: fleet cu ${sel} revive [--restart]`);
+          const r = await androidRevive(hosts, { restart });
+          if (json) { console.log(JSON.stringify(r)); return r.ok ? 0 : 1; }
+          for (const s of r.steps) console.log(A.d(`  ${s}`));
+          console.log(`${r.ok ? A.g("●") : A.r("✗")} ${r.detail}`);
+          return r.ok ? 0 : 1;
+        }
+        if (rest[0] === "watch") {
+          const viewOnly = pullFlag(rest, "--view-only");
+          if (rest.length !== 1) die(`usage: fleet cu ${sel} watch [--view-only]`);
+          const r = await androidWatch(hosts, { viewOnly });
+          if (json) { console.log(JSON.stringify(r)); return r.ok ? 0 : 1; }
+          console.log(`${r.ok ? A.g("●") : A.r("✗")} ${r.detail}`);
+          return r.ok ? 0 : 1;
+        }
+        const limitArg = pullVal(rest, "--limit");
+        const rateArg = pullVal(rest, "--bit-rate");
+        const action = rest[1];
+        if (rest.length !== 2 || !["start", "stop", "status"].includes(action ?? ""))
+          die(`usage: fleet cu ${sel} record start [--out FILE.mp4] [--limit S] [--bit-rate MBPS] | record stop | record status`);
+        if (limitArg !== undefined && (!/^\d+$/.test(limitArg) || Number(limitArg) < 1)) die(`--limit must be a positive integer (got '${limitArg}')`);
+        if (rateArg !== undefined && !Number.isFinite(Number(rateArg))) die(`--bit-rate must be a number (got '${rateArg}')`);
+        let r;
+        try {
+          r = action === "start"
+            ? await androidRecordStart(hosts, out ?? `${sel}-rec-${stamp}.mp4`,
+                { limitS: limitArg === undefined ? undefined : Number(limitArg), bitRateMbps: rateArg === undefined ? undefined : Number(rateArg) })
+            : action === "status" ? await androidRecordStatus(hosts) : await androidRecordStop(hosts);
+        } catch (error) { die(error instanceof Error ? error.message : String(error)); }
+        if (json) { console.log(JSON.stringify(r)); return r.ok ? 0 : 1; }
+        console.log(`${!r.ok ? A.r("✗") : r.recording ? A.g("● recording") : A.d("○")} ${r.detail}`);
+        if (action === "stop" && r.ok && r.localVideo && !noOpen && process.platform === "darwin")
+          Bun.spawn(["open", r.localVideo], { stdout: "ignore", stderr: "ignore" });
+        return r.ok ? 0 : 1;
+      }
+      let target: string;
+      try { target = await routeSelector(cfg, sel); }
+      catch (error) {
+        const names = cfg.routes?.[sel]?.prefer ?? [];
+        const phone = names.length > 0 && names.every((n) => cfg.hosts[n]?.android);
+        die((error instanceof Error ? error.message : String(error))
+          + (phone ? `\nif Termux's SSH server died, try: fleet cu ${sel} revive` : ""));
+      }
       if (isAndroidHost(cfg, target)) {
         const desktopOnly = [["--space", spaceArg], ["--button", button], ["--probe", probeArg], ["--element", elementToken],
           ["--for", forApp], ["--foreground", foreground || undefined], ["--count", clickCount !== 1 || undefined],

@@ -5,6 +5,9 @@ import android.app.UiAutomation;
 import android.graphics.Rect;
 import android.os.HandlerThread;
 import android.os.Looper;
+import android.os.SystemClock;
+import android.view.InputDevice;
+import android.view.MotionEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
 
 import java.io.BufferedReader;
@@ -29,7 +32,8 @@ import java.util.concurrent.TimeoutException;
  * answers a request only when it carries the token from a file that only the
  * shell user can read, and exits after an idle period so the connection does
  * not outlive the session that needed it. The output matches `uiautomator
- * dump`'s XML, so fleet parses both the same way.
+ * dump`'s XML, so fleet parses both the same way. It also injects multi-finger
+ * gestures, which `input` cannot send.
  *
  * Usage: app_process / fleet.UiServer PORT TOKEN-FILE IDLE-MS
  */
@@ -75,6 +79,7 @@ public final class UiServer {
                 OutputStream out = s.getOutputStream();
                 if (parts[1].equals("ping")) out.write("pong\n".getBytes(StandardCharsets.UTF_8));
                 else if (parts[1].equals("dump")) out.write(dump(ui).getBytes(StandardCharsets.UTF_8));
+                else if (parts[1].startsWith("gesture ")) out.write((gesture(ui, parts[1].substring(8)) + "\n").getBytes(StandardCharsets.UTF_8));
                 else if (parts[1].equals("quit")) { out.write("bye\n".getBytes(StandardCharsets.UTF_8)); out.flush(); break; }
                 out.flush();
             } catch (Exception e) {
@@ -101,6 +106,88 @@ public final class UiServer {
         connect.setAccessible(true);
         connect.invoke(ui, UiAutomation.FLAG_DONT_SUPPRESS_ACCESSIBILITY_SERVICES);
         return ui;
+    }
+
+    /** Fingers that go down together, move in straight lines, and lift together.
+     *  The spec is "MS X1,Y1,X2,Y2 X1,Y1,X2,Y2 …", one path per finger. Answers
+     *  "ok", or "err" and why; nothing is retried here. */
+    static String gesture(UiAutomation ui, String spec) throws InterruptedException {
+        String[] parts = spec.trim().split(" +");
+        if (parts.length < 2 || parts.length > 6) return "err a gesture needs a duration and 1-5 finger paths";
+        long ms;
+        float[][] paths = new float[parts.length - 1][];
+        try {
+            ms = Long.parseLong(parts[0]);
+            for (int i = 1; i < parts.length; i++) {
+                String[] p = parts[i].split(",");
+                if (p.length != 4) return "err a finger path is X1,Y1,X2,Y2";
+                paths[i - 1] = new float[] { Float.parseFloat(p[0]), Float.parseFloat(p[1]), Float.parseFloat(p[2]), Float.parseFloat(p[3]) };
+            }
+        } catch (NumberFormatException bad) {
+            return "err bad number in the gesture";
+        }
+        if (ms < 50 || ms > 5000) return "err the duration must be 50-5000 ms";
+        int n = paths.length;
+        MotionEvent.PointerProperties[] props = new MotionEvent.PointerProperties[n];
+        MotionEvent.PointerCoords[] coords = new MotionEvent.PointerCoords[n];
+        for (int i = 0; i < n; i++) {
+            props[i] = new MotionEvent.PointerProperties();
+            props[i].id = i;
+            props[i].toolType = MotionEvent.TOOL_TYPE_FINGER;
+            coords[i] = new MotionEvent.PointerCoords();
+            coords[i].pressure = 1;
+            coords[i].size = 1;
+        }
+        long down = SystemClock.uptimeMillis();
+        place(paths, coords, 0);
+        // Fingers go down one after another and lift in reverse, as a hand does.
+        for (int i = 0; i < n; i++) {
+            int action = i == 0 ? MotionEvent.ACTION_DOWN
+                : MotionEvent.ACTION_POINTER_DOWN | (i << MotionEvent.ACTION_POINTER_INDEX_SHIFT);
+            if (!inject(ui, down, down, action, i + 1, props, coords)) return "err the phone refused the touch-down";
+        }
+        int steps = (int) Math.max(5, ms / 10);
+        for (int s = 1; s <= steps; s++) {
+            long at = down + ms * s / steps;
+            long wait = at - SystemClock.uptimeMillis();
+            if (wait > 0) Thread.sleep(wait);
+            place(paths, coords, (float) s / steps);
+            if (!inject(ui, down, at, MotionEvent.ACTION_MOVE, n, props, coords)) {
+                lift(ui, down, n, props, coords);
+                return "err the phone refused a move";
+            }
+        }
+        return lift(ui, down, n, props, coords) ? "ok" : "err the phone refused the lift";
+    }
+
+    private static boolean lift(UiAutomation ui, long down, int n,
+                                MotionEvent.PointerProperties[] props, MotionEvent.PointerCoords[] coords) {
+        long now = SystemClock.uptimeMillis();
+        boolean ok = true;
+        for (int i = n - 1; i >= 0; i--) {
+            int action = i == 0 ? MotionEvent.ACTION_UP
+                : MotionEvent.ACTION_POINTER_UP | (i << MotionEvent.ACTION_POINTER_INDEX_SHIFT);
+            ok &= inject(ui, down, now, action, i + 1, props, coords);
+        }
+        return ok;
+    }
+
+    private static void place(float[][] paths, MotionEvent.PointerCoords[] coords, float t) {
+        for (int i = 0; i < paths.length; i++) {
+            coords[i].x = paths[i][0] + (paths[i][2] - paths[i][0]) * t;
+            coords[i].y = paths[i][1] + (paths[i][3] - paths[i][1]) * t;
+        }
+    }
+
+    private static boolean inject(UiAutomation ui, long down, long at, int action, int count,
+                                  MotionEvent.PointerProperties[] props, MotionEvent.PointerCoords[] coords) {
+        MotionEvent e = MotionEvent.obtain(down, at, action, count, props, coords, 0, 0, 1, 1, 0, 0,
+            InputDevice.SOURCE_TOUCHSCREEN, 0);
+        try {
+            return ui.injectInputEvent(e, true);
+        } finally {
+            e.recycle();
+        }
     }
 
     private static String dump(UiAutomation ui) throws InterruptedException {

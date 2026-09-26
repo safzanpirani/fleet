@@ -1,7 +1,7 @@
 import { test, expect, describe } from "bun:test";
 import {
   deployHosts, deployScript, logsCmd, parseLeadingFlags, parseRecipeStep, resolveDeploySourceRoot,
-  restartCmd, routeSelector, statusCmd, waitFor, writeRemoteFile,
+  restartCmd, routeSelector, statusCmd, waitFor, writeRemoteFile, pickPreferred,
 } from "../src/core.ts";
 import type { FleetConfig, Host } from "../src/config.ts";
 import { lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
@@ -336,5 +336,32 @@ describe("hard deadlines and deploy source", () => {
     await expect(deployHosts(cfg, "app", { restart: "typo" })).rejects.toThrow(
       /restart service 'typo' is not configured/,
     );
+  });
+});
+
+describe("pickPreferred", () => {
+  const after = (ms: number, ok: boolean) => () => new Promise<boolean>((r) => setTimeout(() => r(ok), ms));
+  test("a prompt preferred transport is the only one probed", async () => {
+    const started: number[] = [];
+    const probe = (i: number, ms: number, ok: boolean) => () => { started.push(i); return after(ms, ok)(); };
+    expect(await pickPreferred([probe(0, 10, true), probe(1, 10, true)], 200)).toBe(0);
+    expect(started).toEqual([0]);
+  });
+  test("a slow preferred transport lets the next one start after the grace", async () => {
+    const t0 = Date.now();
+    expect(await pickPreferred([after(2000, false), after(10, true)], 100)).toBe(1);
+    expect(Date.now() - t0).toBeLessThan(1000);
+  });
+  test("a failed preferred transport starts the next at once", async () => {
+    const t0 = Date.now();
+    expect(await pickPreferred([after(5, false), after(5, true)], 5000)).toBe(1);
+    expect(Date.now() - t0).toBeLessThan(1000);
+  });
+  test("the preferred transport still wins if it answers first after the grace", async () => {
+    expect(await pickPreferred([after(150, true), after(400, true)], 100)).toBe(0);
+  });
+  test("none reachable is -1", async () => {
+    expect(await pickPreferred([after(5, false), after(5, false)], 50)).toBe(-1);
+    expect(await pickPreferred([], 50)).toBe(-1);
   });
 });

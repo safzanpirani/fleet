@@ -29,7 +29,8 @@ import { listSandboxes } from "./daytona.ts";
 import { toolsStatus } from "./tools.ts";
 import {
   androidDoctor, androidElementsOf, androidShot, androidAct, androidOpen, androidApps, androidBootstrap,
-  androidBatch, androidWait, androidRelease,
+  androidBatch, androidWait, androidRelease, androidNotifications,
+  androidRecordStart, androidRecordStatus, androidRecordStop,
 } from "./android.ts";
 import type { AndroidAction, AndroidBatchStep } from "./android.ts";
 import { tmpdir } from "node:os";
@@ -1274,30 +1275,40 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       + "their own). Refused BEFORE any input when the screen is off, the phone is locked, or `target` does not "
       + "hold focus: target is a package (com.android.chrome), a word in one (chrome), or \"any\". PREFER "
       + "element.label over x/y; an ambiguous label is refused with the candidates listed. type sends printable "
-      + "ASCII only and reads the focused field back. Keys that turn the screen off are refused. " + phoneHelp,
+      + "ASCII only and reads the focused field back. Keys that turn the screen off are refused. "
+      + "swipe2 lands two fingers together at x,y and x2,y2 and moves both by dx,dy (default 200 ms). zoom spreads "
+      + "two fingers apart (in) or together (out) on a diagonal; with no x/y or element it guesses the target (the "
+      + "largest image, map, web or terminal view, else the largest scrollable one) and the spread from the UI "
+      + "tree. gesture sends 1-5 fingers that land together, one straight stroke each. " + phoneHelp,
     inputSchema: {
       host: z.string().describe("An Android host name."),
       target: z.string().describe("Package that must hold focus, a word in it, or \"any\"."),
-      action: z.enum(["tap", "long_press", "swipe", "scroll", "key", "type"]),
-      x: z.number().optional().describe("Device pixel X for tap/long_press, or the swipe start."),
-      y: z.number().optional().describe("Device pixel Y for tap/long_press, or the swipe start."),
-      x2: z.number().optional().describe("Swipe end X."),
-      y2: z.number().optional().describe("Swipe end Y."),
+      action: z.enum(["tap", "long_press", "swipe", "swipe2", "zoom", "gesture", "scroll", "key", "type"]),
+      x: z.number().optional().describe("Device pixel X for tap/long_press/zoom centre, the swipe start, or swipe2's first finger."),
+      y: z.number().optional().describe("Device pixel Y for tap/long_press/zoom centre, the swipe start, or swipe2's first finger."),
+      x2: z.number().optional().describe("Swipe end X, or swipe2's second finger X."),
+      y2: z.number().optional().describe("Swipe end Y, or swipe2's second finger Y."),
+      dx: z.number().optional().describe("swipe2: how far both fingers move in X."),
+      dy: z.number().optional().describe("swipe2: how far both fingers move in Y."),
+      strokes: z.array(z.tuple([z.number(), z.number(), z.number(), z.number()])).min(1).max(5).optional()
+        .describe("gesture: one [x1, y1, x2, y2] per finger, in device pixels."),
+      zoom: z.enum(["in", "out"]).optional().describe("zoom: in spreads the fingers apart, out pinches them together."),
+      scale: z.number().min(1.2).max(10).optional().describe("zoom: ratio of the far to the near finger spacing (default 2.5)."),
       element: z.object({
         label: z.string().optional().describe("Text, content-desc, or resource id: exact first, then substring."),
         role: z.string().optional().describe("Class short name to narrow a match: Button, EditText, …"),
         nth: z.number().int().min(1).optional().describe("1-based pick among several matches."),
-      }).strict().optional().describe("Address an element instead of x/y (tap, long_press, type, scroll)."),
+      }).strict().optional().describe("Address an element instead of x/y (tap, long_press, type, scroll, zoom)."),
       direction: z.enum(["up", "down", "left", "right"]).optional().describe("scroll: which content to reveal."),
       amount: z.number().int().min(1).max(10).optional().describe("scroll: number of swipes (default 1)."),
       key: z.string().optional().describe("key: back, home, enter, recents, tab, backspace, wakeup, … or KEYCODE_*."),
       text: z.string().optional().describe("type: printable ASCII typed into the focused field (or element)."),
-      durationMs: z.number().int().min(1).max(10000).optional().describe("long_press hold or swipe duration."),
+      durationMs: z.number().int().min(1).max(10000).optional().describe("long_press hold, or swipe/swipe2/zoom/gesture duration."),
       settleMs: z.number().int().min(0).max(10000).optional().describe("Wait before the after-hash (default 400)."),
       screenshot: z.boolean().optional().describe("Return the after image."),
     },
     annotations: { openWorldHint: true },
-  }, async ({ host, target, action, x, y, x2, y2, element, direction, amount, key, text: typed, durationMs, settleMs, screenshot }) => {
+  }, async ({ host, target, action, x, y, x2, y2, dx, dy, strokes, zoom, scale, element, direction, amount, key, text: typed, durationMs, settleMs, screenshot }) => {
     const need = <T>(v: T | undefined, what: string): T => {
       if (v === undefined) throw new Error(`${action} needs ${what}`);
       return v;
@@ -1307,6 +1318,10 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
         action === "tap" ? { kind: "tap", x, y }
         : action === "long_press" ? { kind: "long_press", x, y, ms: durationMs }
         : action === "swipe" ? { kind: "swipe", x1: need(x, "x"), y1: need(y, "y"), x2: need(x2, "x2"), y2: need(y2, "y2"), ms: durationMs }
+        : action === "swipe2" ? { kind: "swipe2", x1: need(x, "x"), y1: need(y, "y"), x2: need(x2, "x2"), y2: need(y2, "y2"),
+          dx: need(dx, "dx"), dy: need(dy, "dy"), ms: durationMs }
+        : action === "zoom" ? { kind: "zoom", direction: need(zoom, "zoom (in or out)"), x, y, scale, ms: durationMs }
+        : action === "gesture" ? { kind: "gesture", strokes: need(strokes, "strokes"), ms: durationMs }
         : action === "scroll" ? { kind: "scroll", direction: need(direction, "direction"), amount }
         : action === "key" ? { kind: "key", key: need(key, "key") }
         : { kind: "type", text: need(typed, "text") };
@@ -1340,12 +1355,14 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       host: z.string().describe("An Android host name."),
       target: z.string().describe("Package that must hold focus throughout, a word in it, or \"any\"."),
       steps: z.array(z.object({
-        action: z.enum(["tap", "long_press", "swipe", "scroll", "key", "type", "sleep"]),
+        action: z.enum(["tap", "long_press", "swipe", "swipe2", "gesture", "scroll", "key", "type", "sleep"]),
         x: z.number().optional(), y: z.number().optional(), x2: z.number().optional(), y2: z.number().optional(),
+        dx: z.number().optional(), dy: z.number().optional(),
+        strokes: z.array(z.tuple([z.number(), z.number(), z.number(), z.number()])).min(1).max(5).optional(),
         label: z.string().optional(), role: z.string().optional(), nth: z.number().int().min(1).optional(),
         key: z.string().optional(), text: z.string().optional(),
         direction: z.enum(["up", "down", "left", "right"]).optional(), amount: z.number().int().min(1).max(10).optional(),
-        ms: z.number().int().min(0).max(10000).optional().describe("sleep length, long_press hold, or swipe duration."),
+        ms: z.number().int().min(0).max(10000).optional().describe("sleep length, long_press hold, or swipe/swipe2/gesture duration."),
       }).strict()).min(1).max(50),
       gapMs: z.number().int().min(0).max(10000).optional().describe("Pause between steps (default 250)."),
       settleMs: z.number().int().min(0).max(10000).optional().describe("Wait before the after-hash (default 400)."),
@@ -1395,6 +1412,51 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     try {
       const r = await androidRelease(cfg, await routeSelector(cfg, host));
       return text(r.detail, !r.result.ok);
+    } catch (error) { return text(error instanceof Error ? error.message : String(error), true); }
+  });
+
+  server.registerTool("fleet_android_notifications", {
+    title: "Read the phone's notifications",
+    description: "List the notifications currently in the phone's shade, newest first: package, title, text, "
+      + "and when. They can hold private messages and one-time codes, so call this only when the user asked "
+      + "for something that needs them. " + phoneHelp,
+    inputSchema: {
+      host: z.string().describe("An Android host name."),
+      pkg: z.string().optional().describe("Only notifications from packages containing this (e.g. whatsapp)."),
+      limit: z.number().int().min(1).max(1000).optional(),
+    },
+    annotations: { readOnlyHint: true, openWorldHint: true },
+  }, async ({ host, pkg, limit }) => {
+    try {
+      const r = await androidNotifications(cfg, await routeSelector(cfg, host), { pkg, limit });
+      if (!r.result.ok) return text(r.result.stderr || "dumpsys notification failed", true);
+      return text(JSON.stringify(r.notifications));
+    } catch (error) { return text(error instanceof Error ? error.message : String(error), true); }
+  });
+
+  server.registerTool("fleet_android_record", {
+    title: "Record the phone's screen",
+    description: "start records the phone's screen to an MP4 on the machine running fleet, with scrcpy over this "
+      + "machine's adb (the phone's own screenrecord is blocked on some ROMs); it stops by itself at the limit "
+      + "(default 600 s). stop finishes the file and returns its path. status says whether one is running. Needs "
+      + "adb and scrcpy where fleet runs. " + phoneHelp,
+    inputSchema: {
+      host: z.string().describe("An Android host name or a route of them."),
+      action: z.enum(["start", "stop", "status"]),
+      out: z.string().optional().describe("start: local path for the MP4 (required for start)."),
+      limitS: z.number().int().min(1).max(3600).optional().describe("start: stop after this many seconds (default 600)."),
+      bitRateMbps: z.number().min(0.5).max(40).optional().describe("start: video bit rate."),
+    },
+    annotations: { openWorldHint: true },
+  }, async ({ host, action, out, limitS, bitRateMbps }) => {
+    try {
+      const names = cfg.routes?.[host]?.prefer ?? [host];
+      const hosts = names.map((n) => cfg.hosts[n]).filter((h): h is NonNullable<typeof h> => !!h?.android);
+      if (!hosts.length) return text(`${host} is not an Android host or a route of Android hosts`, true);
+      if (action === "start" && !out) return text("start needs `out`, a local path for the MP4", true);
+      const r = action === "start" ? await androidRecordStart(hosts, out!, { limitS, bitRateMbps })
+        : action === "status" ? await androidRecordStatus(hosts) : await androidRecordStop(hosts);
+      return text(r.detail, !r.ok);
     } catch (error) { return text(error instanceof Error ? error.message : String(error), true); }
   });
 

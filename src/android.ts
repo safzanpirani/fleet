@@ -16,10 +16,11 @@
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { gunzipSync } from "node:zlib";
+import { createConnection } from "node:net";
 import { dirname, join } from "node:path";
 import type { FleetConfig, Host } from "./config.ts";
 import { resolveHosts } from "./config.ts";
-import { exec, type ExecResult } from "./ssh.ts";
+import { exec, probe, type ExecResult } from "./ssh.ts";
 import { emitImage, takeInlineImages, validateImageArtifact } from "./core.ts";
 import { UI_JAR_B64, UI_JAR_MD5 } from "./android-ui-jar.ts";
 
@@ -273,6 +274,20 @@ const DEVICE_DUMP = [
   `  [ -s "$1" ] || { sleep 0.4; x=$(uiautomator dump "$1" 2>&1); }`,
   `  [ -s "$1" ]`,
   `}`,
+  // A helper started from an older jar would not know the gesture request;
+  // installing the current jar stops it.
+  `ui_ready() {`,
+  `  [ "$(md5sum ${UI.jar} 2>/dev/null | cut -c1-32)" = ${UI_JAR_MD5} ] || { echo "${P}UIJAR missing"; refuse "the UI helper that sends multi-finger gestures is missing or out of date"; }`,
+  `  [ "$(ui_ask ping)" = pong ] && return 0`,
+  `  ui_start || refuse "the UI helper that sends multi-finger gestures is not on the phone yet"`,
+  `  [ "$(ui_ask ping)" = pong ] || refuse "the UI helper did not start; see ${UI.log} on the phone"`,
+  `}`,
+  // Sent once. A lost reply is a failure, never a resend: the fingers may
+  // already have moved.
+  `ui_gesture() {`,
+  `  r=$(printf '%s gesture %s\\n' "$(cat ${UI.token})" "$1" | timeout -s KILL 12 nc -w 2 127.0.0.1 "$(cat ${UI.port})" 2>/dev/null)`,
+  `  [ "$r" = ok ] || { echo "gesture failed: \${r:-the UI helper did not answer}"; return 1; }`,
+  `}`,
   `dump() {`,
   `  f=/data/local/tmp/fleet-ui-$$.xml`,
   `  if dumpto "$f"; then echo "${P}UIVIA $UIVIA"; echo "${P}XML"; cat "$f"; echo; echo "${P}XMLEND"`,
@@ -345,6 +360,7 @@ export interface AndroidState {
 
 interface PhoneRun {
   result: ExecResult;
+  images: Map<string, Uint8Array>;
   lines: Map<string, string[]>;
   state: AndroidState;
   refusal?: string;
@@ -392,7 +408,7 @@ function termuxCapture(width: number | undefined): string {
  *  that is skipped when the device script refused. */
 async function runPhone(
   cfg: FleetConfig, sel: string, device: string,
-  opts: { capture?: { width?: number }; extraTermux?: string; deviceTimeoutS?: number } = {},
+  opts: { capture?: { width?: number }; extraTermux?: string; extraAfter?: string; deviceTimeoutS?: number } = {},
   run: Run = exec,
 ): Promise<PhoneRun> {
   const deviceTimeoutS = opts.deviceTimeoutS ?? 60;
@@ -423,6 +439,7 @@ async function runPhone(
     `if [ \${#out} -gt 2048 ] && command -v gzip >/dev/null 2>&1; then echo "${P}GZ"; printf '%s\\n' "$out" | gzip -c -6 | base64; echo "${P}GZEND"; else printf '%s\\n' "$out"; fi`,
     `[ $code = 124 ] || [ $code = 137 ] && { echo "${P}ERR the phone did not finish within ${deviceTimeoutS} s"; exit 1; }`,
     `case "$out" in *${P}REFUSE*) exit ${REFUSED} ;; *${P}STALE*) exit ${STALE} ;; esac`,
+    ...(opts.extraAfter ? [opts.extraAfter] : []),
     ...(opts.capture ? [termuxCapture(opts.capture.width)] : []),
     `exit $code`,
   ].join("\n");
@@ -455,7 +472,7 @@ async function runPhone(
   const refusal = one("REFUSE");
   const error = one("ERR") ?? (one("DUMPERR") !== undefined ? `uiautomator dump failed: ${one("DUMPERR")}` : undefined);
   const result: ExecResult = { ...raw, stdout: kept.join("\n") };
-  const out: PhoneRun = { result, lines, state, ...(refusal ? { refusal } : {}), ...(error ? { error } : {}), ...(xml ? { xml } : {}) };
+  const out: PhoneRun = { result, images, lines, state, ...(refusal ? { refusal } : {}), ...(error ? { error } : {}), ...(xml ? { xml } : {}) };
   const bytes = images.get("screen");
   const info = one("IMG")?.split(" ");
   if (bytes && info) out.image = {
@@ -617,7 +634,7 @@ export async function androidShot(
   cfg: FleetConfig, sel: string, out: string, opts: { width?: number } = {}, deps: { exec?: Run } = {},
 ): Promise<AndroidShotResult> {
   const { host } = androidHost(cfg, sel);
-  const r = await runPhone(cfg, sel, DEVICE_STATE, { capture: { width: opts.width } }, deps.exec);
+  const r = await runPhone(cfg, sel, DEVICE_STATE, { capture: { width: opts.width ?? host.android?.shotWidth } }, deps.exec);
   if (r.error) return { host: host.name, result: failed(r, r.error), state: r.state };
   if (!r.image) return { host: host.name, result: failed(r, "the capture produced no image"), state: r.state };
   const { bytes, ...image } = r.image;
@@ -632,10 +649,84 @@ export type AndroidAction =
   | { kind: "long_press"; x?: number; y?: number; ms?: number }
   | { kind: "swipe"; x1: number; y1: number; x2: number; y2: number; ms?: number }
   | { kind: "scroll"; direction: "up" | "down" | "left" | "right"; amount?: number }
+  /** Two fingers, each from its own start, both moved by dx,dy. */
+  | { kind: "swipe2"; x1: number; y1: number; x2: number; y2: number; dx: number; dy: number; ms?: number }
+  /** Fingers that land together and move in straight lines, one stroke each. */
+  | { kind: "gesture"; strokes: AndroidStroke[]; ms?: number; summary?: string }
+  /** Two fingers apart (in) or together (out). With no point and no element,
+   *  the target and the spread are guessed from the UI tree. */
+  | { kind: "zoom"; direction: "in" | "out"; x?: number; y?: number; scale?: number; ms?: number }
   | { kind: "key"; key: string }
   | { kind: "type"; text: string };
 
 export type AndroidEffect = "changed" | "no_change" | "indeterminate";
+/** One finger's path in device pixels: [x1, y1, x2, y2]. */
+export type AndroidStroke = [number, number, number, number];
+
+const GESTURE_LIMITS = { fingers: 5, minMs: 50, maxMs: 5000 };
+
+/** Classes and ids of views that usually take a pinch: images, maps, web
+ *  pages, documents, camera previews, drawing surfaces. */
+const ZOOMABLE = /image|photo|picture|map|web|pdf|document|zoom|scale|canvas|preview|viewer|surface|texture|gl|terminal/i;
+
+export interface AndroidZoomPlan { strokes: AndroidStroke[]; element?: AndroidElement; center: { x: number; y: number }; scale: number; guess: string }
+
+/** Where a zoom goes and how far its fingers travel. An element (from a label)
+ *  or a point fixes the centre; otherwise the largest view that looks zoomable
+ *  is the target, then the largest scrollable one, then the largest of all.
+ *  The fingers sit on a diagonal through the centre and stay 8% inside the
+ *  target and the display, clear of the status bar and the gesture bar. */
+export function androidZoomPlan(
+  elements: AndroidElement[],
+  o: { direction: "in" | "out"; x?: number; y?: number; scale?: number; element?: AndroidElement; width?: number; height?: number },
+): AndroidZoomPlan {
+  const scale = o.scale ?? 2.5;
+  if (!Number.isFinite(scale) || scale < 1.2 || scale > 10) throw new Error("zoom scale must be from 1.2 to 10");
+  if ((o.x === undefined) !== (o.y === undefined) || [o.x, o.y].some((n) => n !== undefined && !Number.isFinite(n)))
+    throw new Error("zoom takes both x and y, or neither");
+  const W = o.width ?? Math.max(0, ...elements.map((e) => e.bounds.x2));
+  const H = o.height ?? Math.max(0, ...elements.map((e) => e.bounds.y2));
+  const area = (e: AndroidElement) => (e.bounds.x2 - e.bounds.x1) * (e.bounds.y2 - e.bounds.y1);
+  const holds = (e: AndroidElement, x: number, y: number) =>
+    x >= e.bounds.x1 && x < e.bounds.x2 && y >= e.bounds.y1 && y < e.bounds.y2;
+  const zoomable = (e: AndroidElement) => ZOOMABLE.test(e.role) || ZOOMABLE.test(e.id) || /\b(map|photo|image|picture)\b/i.test(e.desc);
+  const largest = (es: AndroidElement[]) => es.reduce<AndroidElement | undefined>((a, e) => !a || area(e) > area(a) ? e : a, undefined);
+  const describe = (e: AndroidElement) => `${e.role}${e.id ? ` #${e.id}` : ""}${e.label ? ` ${JSON.stringify(e.label)}` : ""}`;
+
+  let el = o.element;
+  let guess: string;
+  if (el) guess = `on ${describe(el)}`;
+  else if (o.x !== undefined && o.y !== undefined) {
+    const under = elements.filter((e) => area(e) > 0 && holds(e, o.x!, o.y!));
+    // The smallest zoomable view under the point, else the largest view there.
+    el = under.filter(zoomable).reduce<AndroidElement | undefined>((a, e) => !a || area(e) < area(a) ? e : a, undefined)
+      ?? largest(under);
+    guess = el ? `inside ${describe(el)} (guessed)` : "on the display";
+  } else {
+    const big = elements.filter((e) => area(e) >= 0.05 * W * H);
+    el = largest(big.filter(zoomable)) ?? largest(big.filter((e) => e.actions.includes("scroll"))) ?? largest(elements);
+    guess = el ? `on ${describe(el)} (guessed)` : "on the display (guessed)";
+  }
+  const b = el?.bounds ?? { x1: 0, y1: 0, x2: W, y2: H };
+  const box = { x1: Math.max(b.x1, 0), y1: Math.max(b.y1, 0), x2: Math.min(b.x2, W || b.x2), y2: Math.min(b.y2, H || b.y2) };
+  const insetX = 0.08 * (box.x2 - box.x1), insetY = 0.08 * (box.y2 - box.y1);
+  const safe = { x1: Math.max(box.x1 + insetX, 0.08 * W), y1: Math.max(box.y1 + insetY, 0.08 * H),
+    x2: Math.min(box.x2 - insetX, 0.92 * W), y2: Math.min(box.y2 - insetY, 0.92 * H) };
+  const cx = Math.round(o.x ?? (safe.x1 + safe.x2) / 2), cy = Math.round(o.y ?? (safe.y1 + safe.y2) / 2);
+  if (!(W > 0 && H > 0)) throw new Error("zoom needs the display size; read the screen with elements first");
+  if (cx < 0 || cx >= W || cy < 0 || cy >= H) throw new Error(`point ${cx},${cy} is outside the ${W}x${H} display`);
+  // Per-axis offset of each finger from the centre, on a 45° diagonal.
+  const far = Math.floor(Math.min(cx - safe.x1, safe.x2 - cx, cy - safe.y1, safe.y2 - cy));
+  const MIN_NEAR = 40;   // keeps the fingers ~110 px apart, so they read as two
+  if (far < MIN_NEAR * 1.2) throw new Error(`there is no room to zoom around ${cx},${cy}: the target is too small or the point too near its edge`);
+  const near = Math.max(MIN_NEAR, Math.round(far / scale));
+  const [from, to] = o.direction === "in" ? [near, far] : [far, near];
+  const strokes: AndroidStroke[] = [
+    [cx - from, cy - from, cx - to, cy - to],
+    [cx + from, cy + from, cx + to, cy + to],
+  ];
+  return { strokes, ...(el ? { element: el } : {}), center: { x: cx, y: cy }, scale: Math.round(far / near * 10) / 10, guess };
+}
 
 /** Frames hashed after the first changed one, looking for two in a row that agree. */
 const STABLE_TRIES = 6;
@@ -710,6 +801,18 @@ function inputCommands(a: AndroidAction, el: AndroidElement | undefined): { chec
       return { checks: [], cmds: Array.from({ length: amount }, (_, i) => i ? `sleep 0.15; ${one}` : one),
         summary: `scroll ${a.direction} ${amount}` };
     }
+    case "swipe2": {
+      const p = [a.x1, a.y1, a.x2, a.y2, a.dx, a.dy];
+      if (p.some((n) => !Number.isFinite(n))) throw new Error("swipe2 needs six finite numbers: x1 y1 x2 y2 dx dy");
+      const [x1, y1, x2, y2, dx, dy] = p.map((n) => Math.round(n)) as [number, number, number, number, number, number];
+      const g = gestureCommands([[x1, y1, x1 + dx, y1 + dy], [x2, y2, x2 + dx, y2 + dy]], a.ms ?? 200);
+      return { ...g, summary: `swipe2 ${x1},${y1} + ${x2},${y2} by ${dx},${dy} ${g.ms}ms` };
+    }
+    case "gesture": {
+      const g = gestureCommands(a.strokes, a.ms ?? 300);
+      return { ...g, summary: a.summary ?? `gesture ${a.strokes.length} finger${a.strokes.length === 1 ? "" : "s"} ${g.ms}ms` };
+    }
+    case "zoom": throw new Error("zoom resolves to a gesture before it is sent");
     case "key": {
       const code = androidKeycode(a.key);
       return { checks: [], cmds: [`input keyevent ${code}`], summary: `key ${code}` };
@@ -721,6 +824,27 @@ function inputCommands(a: AndroidAction, el: AndroidElement | undefined): { chec
     }
   }
 }
+
+/** The helper call for fingers that land together and move in straight lines.
+ *  Every end point is checked against the display first. */
+function gestureCommands(strokes: AndroidStroke[], ms: number): { checks: string[]; cmds: string[]; ms: number } {
+  if (!Array.isArray(strokes) || !strokes.length || strokes.length > GESTURE_LIMITS.fingers)
+    throw new Error(`a gesture takes 1 to ${GESTURE_LIMITS.fingers} strokes`);
+  if (!Number.isInteger(ms) || ms < GESTURE_LIMITS.minMs || ms > GESTURE_LIMITS.maxMs)
+    throw new Error(`gesture duration must be ${GESTURE_LIMITS.minMs}–${GESTURE_LIMITS.maxMs} ms`);
+  const pts = strokes.map((s, i) => {
+    if (!Array.isArray(s) || s.length !== 4 || s.some((n) => !Number.isFinite(n)))
+      throw new Error(`stroke ${i + 1} must be four numbers: x1, y1, x2, y2`);
+    return s.map(int);
+  });
+  return {
+    checks: [...pts.flatMap(([x1, y1, x2, y2]) => [`inb ${x1} ${y1}`, `inb ${x2} ${y2}`]), "ui_ready"],
+    cmds: [`ui_gesture ${sq(`${ms} ${pts.map((p) => p.join(",")).join(" ")}`)}`],
+    ms,
+  };
+}
+
+const MULTI_TOUCH = new Set(["swipe2", "gesture", "zoom"]);
 
 /** Send one input to the phone and report what its pixels did, the same way
  *  desktop computer use does: two status-bar-free frame hashes decide
@@ -734,12 +858,13 @@ export async function androidAct(
 ): Promise<AndroidActResult> {
   const { host } = androidHost(cfg, sel);
   androidTargetPattern(target);
+  if (action.kind === "zoom") return androidZoom(cfg, sel, target, action, opts, deps);
   if (!opts.element) {
     const r = await sendInput(cfg, sel, target, action, undefined, undefined, opts, deps);
     if (r === "stale") throw new Error("the phone withheld an input that carried no screen expectation");
     return r;
   }
-  if (action.kind === "key" || action.kind === "swipe") throw new Error(`--label does not apply to ${action.kind}`);
+  if (["key", "swipe", "swipe2", "gesture"].includes(action.kind)) throw new Error(`--label does not apply to ${action.kind}`);
   const usable = (el: AndroidElement) => {
     if (!el.enabled) throw new Error(`${el.role} ${JSON.stringify(el.label)} is disabled`);
     return el;
@@ -770,6 +895,44 @@ export async function androidAct(
   return { host: host.name, state: listed.state, summary: action.kind, element: el, effect: "indeterminate",
     reason, refusal: reason, hashes: [],
     result: { ...listed.result, ok: false, code: 1, stderr: `refused: ${reason}` } };
+}
+
+/** A zoom planned against the UI tree: the saved one when the screen still
+ *  hashes the same (the phone checks), else a fresh read. */
+async function androidZoom(
+  cfg: FleetConfig, sel: string, target: string, action: Extract<AndroidAction, { kind: "zoom" }>,
+  opts: { settleMs?: number; imageOut?: string; imageWidth?: number; element?: AndroidLocator },
+  deps: AndroidDeps,
+): Promise<AndroidActResult> {
+  const { host } = androidHost(cfg, sel);
+  if (opts.element && action.x !== undefined) throw new Error("give x y or --label, not both");
+  const plan = (elements: AndroidElement[], width?: number, height?: number) => {
+    const el = opts.element ? androidPick(elements, opts.element) : undefined;
+    const p = androidZoomPlan(elements, { ...action, element: el, width, height });
+    const gesture: AndroidAction = { kind: "gesture", strokes: p.strokes, ms: action.ms ?? 400,
+      summary: `zoom ${action.direction} ×${p.scale} at ${p.center.x},${p.center.y} ${p.guess}` };
+    return { gesture, el: p.element };
+  };
+  const cached = await readTreeCache(deps, host.name);
+  if (cached) {
+    let p: ReturnType<typeof plan> | undefined;
+    try {
+      p = plan(androidElements(parseUiDump(cached.xml), { all: true, width: cached.width, height: cached.height }), cached.width, cached.height);
+    } catch { p = undefined; }
+    if (p) {
+      const r = await sendInput(cfg, sel, target, p.gesture, p.el, cached.hash, opts, deps);
+      if (r !== "stale") return r;
+    }
+  }
+  const listed = await androidElementsOf(cfg, sel, { all: true }, deps);
+  if (!listed.result.ok) return { host: host.name, result: listed.result, state: listed.state,
+    effect: "indeterminate", summary: "zoom", hashes: [] };
+  const p = plan(listed.elements, listed.state.width, listed.state.height);
+  const r = await sendInput(cfg, sel, target, p.gesture, p.el, listed.frame, opts, deps);
+  if (r !== "stale") return r;
+  const reason = "the screen changed between reading it and acting on it; nothing was sent";
+  return { host: host.name, state: listed.state, summary: "zoom", ...(p.el ? { element: p.el } : {}), effect: "indeterminate",
+    reason, refusal: reason, hashes: [], result: { ...listed.result, ok: false, code: 1, stderr: `refused: ${reason}` } };
 }
 
 /** The check that the screen is still the one the element was read from.
@@ -804,16 +967,18 @@ async function sendInput(
   expect: string | undefined,
   opts: { settleMs?: number; imageOut?: string; imageWidth?: number },
   deps: AndroidDeps,
+  installed = false,
 ): Promise<AndroidActResult | "stale"> {
   const { host } = androidHost(cfg, sel);
   const settle = opts.settleMs ?? 400;
   const { checks, cmds, summary } = inputCommands(action, el);
   const wake = action.kind === "key" && androidKeycode(action.key) === "KEYCODE_WAKEUP";
   const readBack = action.kind === "type";
+  const multi = MULTI_TOUCH.has(action.kind);
   if (expect !== undefined && !/^[0-9a-f]{32}$/.test(expect)) expect = undefined;
   const device = [
     DEVICE_STATE,
-    ...(readBack ? [DEVICE_DUMP] : []),
+    ...(readBack || multi ? [DEVICE_DUMP] : []),
     deviceGates(wake ? undefined : target, { needAwake: !wake, needUnlocked: !wake }),
     ...checks,
     `HA=$(fh); echo "${P}HA $HA"`,
@@ -831,8 +996,14 @@ async function sendInput(
     `fi`,
     ...(readBack ? [`[ -n "$HA" ] && [ "$HA" != "$HB" ] && [ -z "$HC" ] && dump`] : []),
   ].join("\n");
-  const r = await runPhone(cfg, sel, device, opts.imageOut ? { capture: { width: opts.imageWidth } } : {}, deps.exec);
+  const r = await runPhone(cfg, sel, device, opts.imageOut ? { capture: { width: opts.imageWidth ?? host.android?.shotWidth } } : {}, deps.exec);
   if (r.lines.has("STALE")) return "stale";
+  // The helper was missing, so the refusal came before any input: install it
+  // and send once more.
+  if (r.refusal && r.lines.has("UIJAR") && !installed) {
+    const ok = await installUiHelper(cfg, sel, deps);
+    if (ok.ok) return sendInput(cfg, sel, target, action, el, expect, opts, deps, true);
+  }
   const state = r.state;
   const base = { host: host.name, state, summary, ...(el ? { element: el } : {}) };
   if (r.refusal) return { ...base, result: failed(r, `refused: ${r.refusal}`), refusal: r.refusal,
@@ -995,8 +1166,9 @@ export async function androidBootstrap(
 // ── batch and wait ───────────────────────────────────────────────────────────
 
 export interface AndroidBatchStep {
-  action: "tap" | "long_press" | "swipe" | "scroll" | "key" | "type" | "sleep";
-  x?: number; y?: number; x2?: number; y2?: number;
+  action: "tap" | "long_press" | "swipe" | "swipe2" | "gesture" | "scroll" | "key" | "type" | "sleep";
+  x?: number; y?: number; x2?: number; y2?: number; dx?: number; dy?: number;
+  strokes?: AndroidStroke[];
   label?: string; role?: string; nth?: number;
   key?: string; text?: string;
   direction?: "up" | "down" | "left" | "right"; amount?: number;
@@ -1023,6 +1195,9 @@ function batchAction(step: AndroidBatchStep, i: number): AndroidAction | { kind:
     case "tap": return { kind: "tap", x: step.x, y: step.y };
     case "long_press": return { kind: "long_press", x: step.x, y: step.y, ms: step.ms };
     case "swipe": return { kind: "swipe", x1: need(step.x, "x"), y1: need(step.y, "y"), x2: need(step.x2, "x2"), y2: need(step.y2, "y2"), ms: step.ms };
+    case "swipe2": return { kind: "swipe2", x1: need(step.x, "x"), y1: need(step.y, "y"), x2: need(step.x2, "x2"), y2: need(step.y2, "y2"),
+      dx: need(step.dx, "dx"), dy: need(step.dy, "dy"), ms: step.ms };
+    case "gesture": return { kind: "gesture", strokes: need(step.strokes, "strokes"), ms: step.ms };
     case "scroll": return { kind: "scroll", direction: need(step.direction, "direction"), amount: step.amount };
     case "key": return { kind: "key", key: need(step.key, "key") };
     case "type": return { kind: "type", text: need(step.text, "text") };
@@ -1031,7 +1206,7 @@ function batchAction(step: AndroidBatchStep, i: number): AndroidAction | { kind:
       if (!Number.isInteger(ms) || ms < 0 || ms > BATCH_LIMITS.sleepMs) throw new Error(`${at}: ms must be 0–${BATCH_LIMITS.sleepMs}`);
       return { kind: "sleep", ms };
     }
-    default: throw new Error(`${at}: unknown action; use tap, long_press, swipe, scroll, key, type, or sleep`);
+    default: throw new Error(`${at}: unknown action; use tap, long_press, swipe, swipe2, gesture, scroll, key, type, or sleep`);
   }
 }
 
@@ -1045,6 +1220,7 @@ export async function androidBatch(
   cfg: FleetConfig, sel: string, target: string, steps: AndroidBatchStep[],
   opts: { gapMs?: number; settleMs?: number; imageOut?: string; imageWidth?: number } = {},
   deps: AndroidDeps = {},
+  installed = false,
 ): Promise<AndroidBatchResult> {
   const { host } = androidHost(cfg, sel);
   androidTargetPattern(target);
@@ -1059,7 +1235,7 @@ export async function androidBatch(
   // (the phone checks), else a fresh read.
   const labelled = steps.map((s, i) => (s.label !== undefined || s.role !== undefined) ? i : -1).filter((i) => i >= 0);
   for (const i of labelled)
-    if (["key", "swipe", "sleep"].includes(steps[i]!.action)) throw new Error(`step ${i + 1}: a label does not apply to ${steps[i]!.action}`);
+    if (["key", "swipe", "swipe2", "gesture", "sleep"].includes(steps[i]!.action)) throw new Error(`step ${i + 1}: a label does not apply to ${steps[i]!.action}`);
   let tree: { hash?: string; elements: AndroidElement[] } | undefined;
   if (labelled.length) {
     const cached = await readTreeCache(deps, host.name);
@@ -1110,11 +1286,13 @@ export async function androidBatch(
     );
   });
   const first = labelled.length ? picked.get(labelled[0]!) : undefined;
+  const multi = actions.some((a) => MULTI_TOUCH.has(a.kind));
   const device = [
     DEVICE_STATE,
+    ...(multi ? [DEVICE_DUMP] : []),
     `halt() { echo "${P}HALT $1 $2"; exit ${HALTED}; }`,
     deviceGates(target),
-    ...pointChecks,
+    ...new Set(pointChecks),
     `HA=$(fh); echo "${P}HA $HA"`,
     ...(tree?.hash ? [staleGuard(tree.hash, first)] : []),
     ...body,
@@ -1143,6 +1321,9 @@ export async function androidBatch(
     const why = "the screen changed since the elements were read; nothing was sent";
     return { ...base, effect: "indeterminate", reason: why, refusal: why, result: failed(r, `refused: ${why}`) };
   }
+  // A missing helper refuses before the first input, so the batch can run again.
+  if (r.refusal && r.lines.has("UIJAR") && !installed && (await installUiHelper(cfg, sel, deps)).ok)
+    return androidBatch(cfg, sel, target, steps, opts, deps, true);
   if (r.refusal) return { ...base, effect: "indeterminate", reason: r.refusal, refusal: r.refusal, result: failed(r, `refused: ${r.refusal}`) };
   if (r.error && !r.lines.has("HA")) return { ...base, effect: "indeterminate", result: failed(r, r.error) };
   const { effect, reason } = androidEffect(one("HA"), one("HB"), one("HC"), r.lines.has("UNSTABLE"));
@@ -1280,4 +1461,276 @@ export async function androidRelease(cfg: FleetConfig, sel: string, deps: Androi
   const released = r.lines.has("RELEASED");
   return { host: host.name, result: r.result, running: false,
     detail: released ? "stopped the UI helper; its accessibility connection is released" : "the UI helper was not running" };
+}
+
+// ── notifications ────────────────────────────────────────────────────────────
+
+export interface AndroidNotification {
+  pkg: string;
+  key: string;
+  importance?: number;
+  when?: number;           // epoch ms
+  title: string;
+  text: string;
+  subText?: string;
+}
+
+/** `String (hello)` → `hello`; other value types pass through. */
+const unwrapValue = (v: string) => {
+  const m = v.match(/^(?:String|SpannableString|SpannedString)\s*\((.*)\)\s*$/s);
+  return (m ? m[1]! : v === "null" ? "" : v).trim();
+};
+
+/** The current notifications from the lines `androidNotifications` keeps of
+ *  `dumpsys notification --noredact`: each record header, then its extras. */
+export function parseNotifications(lines: string[]): AndroidNotification[] {
+  const out: AndroidNotification[] = [];
+  let cur: AndroidNotification | undefined;
+  for (const raw of lines) {
+    const line = raw.trim();
+    const rec = line.match(/NotificationRecord\([^:]*: pkg=(\S+).*?importance=(\d+) key=([^:\s]+)/);
+    if (rec) {
+      cur = { pkg: rec[1]!, importance: Number(rec[2]), key: rec[3]!, title: "", text: "" };
+      out.push(cur);
+      continue;
+    }
+    if (!cur) continue;
+    const kv = line.match(/^(android\.title|android\.text|android\.subText|android\.bigText|when)=(.*)$/);
+    if (!kv) continue;
+    const value = unwrapValue(kv[2]!);
+    if (kv[1] === "when") { const ms = Number(value.split("/")[0]); if (ms > 0 && cur.when === undefined) cur.when = ms; }
+    else if (kv[1] === "android.title" && !cur.title) cur.title = value;
+    else if (kv[1] === "android.text" && !cur.text) cur.text = value;
+    else if (kv[1] === "android.bigText" && !cur.text) cur.text = value;
+    else if (kv[1] === "android.subText" && value && !cur.subText) cur.subText = value;
+  }
+  return out.filter((n) => n.title || n.text).sort((a, b) => (b.when ?? 0) - (a.when ?? 0));
+}
+
+export interface AndroidNotificationsResult { host: string; result: ExecResult; notifications: AndroidNotification[] }
+
+/** The notifications currently in the shade, newest first. They can hold
+ *  message text and codes, so this runs only when a caller asks for it. */
+export async function androidNotifications(
+  cfg: FleetConfig, sel: string, opts: { pkg?: string; limit?: number } = {}, deps: AndroidDeps = {},
+): Promise<AndroidNotificationsResult> {
+  const { host } = androidHost(cfg, sel);
+  // Only the live list (the archive after it holds dismissed ones), and only the
+  // lines the parser reads, so the reply stays small.
+  const device = `dumpsys notification --noredact 2>/dev/null | awk '/^  mArchive=/{exit} /NotificationRecord\\(|android\\.(title|text|subText|bigText)=|^ +when=/{print}' | head -4000 | sed 's/^ */${P}N /'`;
+  const r = await runPhone(cfg, sel, device, {}, deps.exec);
+  if (r.error) return { host: host.name, result: failed(r, r.error), notifications: [] };
+  let notifications = parseNotifications(r.lines.get("N") ?? []);
+  if (opts.pkg) notifications = notifications.filter((n) => n.pkg.toLowerCase().includes(opts.pkg!.toLowerCase()));
+  if (opts.limit) notifications = notifications.slice(0, opts.limit);
+  return { host: host.name, result: r.result, notifications };
+}
+
+// ── the controller's own adb: watch, record, revive ─────────────────────────
+
+type LocalRun = (cmd: string[], timeoutMs?: number) => Promise<{ code: number; stdout: string; stderr: string }>;
+
+const localRun: LocalRun = async (cmd, timeoutMs = 20_000) => {
+  const proc = Bun.spawn(cmd, { stdout: "pipe", stderr: "pipe", stdin: "ignore", timeout: timeoutMs, killSignal: "SIGKILL" });
+  const [stdout, stderr, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
+  return { code, stdout, stderr };
+};
+
+/** The phone's network adb serial as this machine reaches it: the host's SSH
+ *  alias resolved by `ssh -G`, with the port adbd listens on. Connected and
+ *  checked; undefined with a reason when adb here cannot reach it. */
+async function networkSerial(h: Host, run: LocalRun): Promise<{ serial?: string; why?: string }> {
+  const hostname = (await run(["ssh", "-G", h.ssh])).stdout.match(/^hostname (\S+)$/m)?.[1];
+  if (!hostname) return { why: `${h.name}: no hostname from ssh -G ${h.ssh}` };
+  const port = (h.android?.serial ?? ANDROID_DEFAULT_SERIAL).split(":")[1] ?? "5555";
+  const serial = `${hostname}:${port}`;
+  // adb connect waits a long time on an address that is not there (the home
+  // LAN, away from home); a quick TCP check skips it.
+  if (!await portOpen(hostname, Number(port), 1500)) return { why: `${h.name}: nothing answers on ${serial}` };
+  await run(["adb", "connect", serial]);
+  const state = (await run(["adb", "-s", serial, "get-state"])).stdout.trim();
+  return state === "device" ? { serial } : { why: `${h.name}: adb at ${serial} is ${state || "unreachable"}` };
+}
+
+function portOpen(host: string, port: number, timeoutMs: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = createConnection({ host, port });
+    const done = (ok: boolean) => { socket.destroy(); resolve(ok); };
+    socket.setTimeout(timeoutMs);
+    socket.once("connect", () => done(true));
+    socket.once("timeout", () => done(false));
+    socket.once("error", () => done(false));
+  });
+}
+
+async function firstNetworkSerial(hosts: Host[], run: LocalRun, need: string[]): Promise<{ host?: Host; serial?: string; why: string[] }> {
+  const why: string[] = [];
+  for (const tool of need) {
+    const v = await run([tool, "--version"]).catch(() => ({ code: 127, stdout: "", stderr: "" }));
+    if (v.code !== 0 && tool !== "adb") return { why: [`${tool} is not installed on this machine`] };
+    if (tool === "adb" && (await run(["adb", "version"]).catch(() => ({ code: 127 }))).code !== 0)
+      return { why: ["adb is not installed on this machine"] };
+  }
+  for (const h of hosts) {
+    if (!h.android) continue;
+    const r = await networkSerial(h, run);
+    if (r.serial) return { host: h, serial: r.serial, why };
+    why.push(r.why!);
+  }
+  return { why: why.length ? why : ["no Android host in that selector"] };
+}
+
+/** scrcpy settings for a host: a smaller, cheaper stream for one with a
+ *  reduced default screenshot width (a slow route). */
+function scrcpyQuality(h: Host): string[] {
+  return h.android?.shotWidth ? ["--max-size", String(Math.max(480, h.android.shotWidth * 2)), "--video-bit-rate", "2M"]
+    : ["--max-size", "1600", "--video-bit-rate", "8M"];
+}
+
+export interface AndroidWatchResult { ok: boolean; host?: string; serial?: string; pid?: number; detail: string }
+
+/** Open a live scrcpy window of the phone on this machine, detached, so the
+ *  person can watch an agent work (or record a demo). `viewOnly` ignores the
+ *  window's mouse and keyboard. */
+export async function androidWatch(
+  hosts: Host[], opts: { viewOnly?: boolean } = {}, deps: { local?: LocalRun; spawn?: typeof Bun.spawn } = {},
+): Promise<AndroidWatchResult> {
+  const run = deps.local ?? localRun;
+  const found = await firstNetworkSerial(hosts, run, ["adb", "scrcpy"]);
+  if (!found.serial || !found.host) return { ok: false, detail: found.why.join("; ") };
+  const proc = (deps.spawn ?? Bun.spawn)(["scrcpy", "-s", found.serial, "--no-audio", "--window-title", `fleet · ${found.host.name}`,
+    ...scrcpyQuality(found.host), ...(opts.viewOnly ? ["--no-control"] : [])],
+    { stdout: "ignore", stderr: "ignore", stdin: "ignore" });
+  proc.unref();
+  return { ok: true, host: found.host.name, serial: found.serial, pid: proc.pid,
+    detail: `watching ${found.host.name} (${found.serial})${opts.viewOnly ? ", view only" : ""}` };
+}
+
+export const RECORD_MAX_S = 3600;
+
+export interface AndroidRecordResult {
+  ok: boolean; host?: string; recording: boolean; elapsedS?: number; limitS?: number;
+  localVideo?: string; bytes?: number; detail: string;
+}
+
+interface RecordState { pid: number; file: string; started: number; limitS: number; host: string }
+const recordStateFile = (cacheDir: string | undefined, host: string) =>
+  join(cacheDir ?? join(homedir(), ".fleet"), `android-rec-${host.replace(/[^A-Za-z0-9._-]/g, "_")}.json`);
+const pidAlive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+
+/** Record the phone's screen to an MP4 on this machine with scrcpy (no window).
+ *  The phone's own screenrecord cannot be used: OxygenOS refuses its output
+ *  file for adb's shell. */
+export async function androidRecordStart(
+  hosts: Host[], out: string, opts: { limitS?: number; bitRateMbps?: number } = {},
+  deps: { local?: LocalRun; spawn?: typeof Bun.spawn; cacheDir?: string } = {},
+): Promise<AndroidRecordResult> {
+  const run = deps.local ?? localRun;
+  const limit = opts.limitS ?? 600;
+  if (!Number.isInteger(limit) || limit < 1 || limit > RECORD_MAX_S) throw new Error(`the time limit must be 1–${RECORD_MAX_S} s`);
+  if (opts.bitRateMbps !== undefined && (!Number.isFinite(opts.bitRateMbps) || opts.bitRateMbps < 0.5 || opts.bitRateMbps > 40))
+    throw new Error("the bit rate must be 0.5–40 Mbit/s");
+  const found = await firstNetworkSerial(hosts, run, ["adb", "scrcpy"]);
+  if (!found.serial || !found.host) return { ok: false, recording: false, detail: found.why.join("; ") };
+  const stateFile = recordStateFile(deps.cacheDir, found.host.name);
+  try {
+    const prev = JSON.parse(await readFile(stateFile, "utf8")) as RecordState;
+    if (pidAlive(prev.pid)) return { ok: true, host: found.host.name, recording: true, localVideo: prev.file,
+      detail: `already recording to ${prev.file}` };
+  } catch { /* none running */ }
+  const file = /\.mp4$/i.test(out) ? out : `${out}.mp4`;
+  const quality = scrcpyQuality(found.host);
+  if (opts.bitRateMbps) quality.splice(quality.indexOf("--video-bit-rate"), 2, "--video-bit-rate", `${opts.bitRateMbps}M`);
+  const proc = (deps.spawn ?? Bun.spawn)(["scrcpy", "-s", found.serial, "--no-playback", "--no-audio", "--no-control",
+    "--record", file, "--time-limit", String(limit), ...quality], { stdout: "ignore", stderr: "ignore", stdin: "ignore" });
+  proc.unref();
+  const state: RecordState = { pid: proc.pid, file, started: Date.now(), limitS: limit, host: found.host.name };
+  await mkdir(dirname(stateFile), { recursive: true });
+  await writeFile(stateFile, JSON.stringify(state));
+  return { ok: true, host: found.host.name, recording: true, limitS: limit, localVideo: file,
+    detail: `recording to ${file}; stops by itself after ${limit} s` };
+}
+
+async function readRecordState(hosts: Host[], cacheDir?: string): Promise<{ state?: RecordState; stateFile?: string }> {
+  for (const h of hosts) {
+    const stateFile = recordStateFile(cacheDir, h.name);
+    try { return { state: JSON.parse(await readFile(stateFile, "utf8")) as RecordState, stateFile }; } catch { /* next */ }
+  }
+  return {};
+}
+
+export async function androidRecordStatus(hosts: Host[], deps: { cacheDir?: string } = {}): Promise<AndroidRecordResult> {
+  const { state } = await readRecordState(hosts, deps.cacheDir);
+  if (!state) return { ok: true, recording: false, detail: "not recording" };
+  const elapsed = Math.round((Date.now() - state.started) / 1000);
+  if (pidAlive(state.pid)) return { ok: true, host: state.host, recording: true, elapsedS: elapsed, limitS: state.limitS,
+    localVideo: state.file, detail: `recording for ${elapsed} s of ${state.limitS} s to ${state.file}` };
+  return { ok: true, host: state.host, recording: false, localVideo: state.file,
+    detail: `not recording; the last recording ended (${state.file})` };
+}
+
+/** Stop the recording: SIGINT lets scrcpy finish the MP4. */
+export async function androidRecordStop(hosts: Host[], deps: { cacheDir?: string } = {}): Promise<AndroidRecordResult> {
+  const { state, stateFile } = await readRecordState(hosts, deps.cacheDir);
+  if (!state || !stateFile) return { ok: false, recording: false, detail: "no recording was started from this machine" };
+  if (pidAlive(state.pid)) {
+    process.kill(state.pid, "SIGINT");
+    const deadline = Date.now() + 10_000;
+    while (pidAlive(state.pid) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 200));
+  }
+  await rm(stateFile, { force: true });
+  const bytes = await Bun.file(state.file).exists() ? Bun.file(state.file).size : 0;
+  if (!bytes) return { ok: false, host: state.host, recording: false, detail: `scrcpy wrote nothing to ${state.file}` };
+  return { ok: true, host: state.host, recording: false, localVideo: state.file, bytes,
+    detail: `saved ${(bytes / 1_000_000).toFixed(1)} MB to ${state.file}` };
+}
+
+// ── revive: Termux from the controller's own adb ─────────────────────────────
+
+export interface AndroidReviveResult { host?: string; ok: boolean; steps: string[]; detail: string }
+
+/** Bring Termux's SSH server back when SSH to the phone fails, using this
+ *  machine's own adb against the phone's network adbd (reachable while USB
+ *  debugging keeps adbd running). Opening Termux starts a session whose
+ *  ~/.bashrc starts sshd; that works when Termux's process has died (an app
+ *  update, the system killing it). If Termux is alive with sshd dead, opening
+ *  it creates no session: `restart` force-stops Termux first, which also ends
+ *  the user's own Termux sessions. The app the user was in is brought back. */
+export async function androidRevive(
+  hosts: Host[], opts: { restart?: boolean; waitMs?: number } = {},
+  deps: { local?: LocalRun; probe?: (h: Host) => Promise<boolean> } = {},
+): Promise<AndroidReviveResult> {
+  const run = deps.local ?? localRun;
+  const alive = deps.probe ?? probe;
+  const steps: string[] = [];
+  const adb = await run(["adb", "version"]).catch(() => ({ code: 127, stdout: "", stderr: "" }));
+  if (adb.code !== 0) return { ok: false, steps, detail: "revive needs adb on this machine, with a key the phone trusts" };
+  for (const h of hosts) {
+    if (!h.android) continue;
+    if (await alive(h)) return { host: h.name, ok: true, steps, detail: `SSH to ${h.name} already works` };
+    const net = await networkSerial(h, run);
+    if (!net.serial) { steps.push(net.why!); continue; }
+    const serial = net.serial;
+    const shell = (cmd: string) => run(["adb", "-s", serial, "shell", "-n", cmd]);
+    const focus = (await shell("dumpsys window | grep -m1 mCurrentFocus=")).stdout;
+    const before = focus.match(/ ([\w.]+)\/\S+\}/)?.[1];
+    if (opts.restart) { await shell("am force-stop com.termux"); steps.push("force-stopped Termux"); }
+    await shell("am start -n com.termux/.app.TermuxActivity");
+    steps.push(`opened Termux through adb at ${serial}`);
+    const deadline = Date.now() + (opts.waitMs ?? 15_000);
+    let up = false;
+    while (!up && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 1500));
+      up = await alive(h);
+    }
+    if (before && before !== "com.termux") {
+      await shell(`monkey -p ${before} -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1`);
+      steps.push(`returned to ${before}`);
+    }
+    if (up) return { host: h.name, ok: true, steps, detail: `SSH to ${h.name} is back` };
+    return { host: h.name, ok: false, steps, detail: opts.restart
+      ? "Termux opened but SSH did not come back; open Termux on the phone and run sshd"
+      : "SSH did not come back: Termux is probably still running with sshd dead. Retry with --restart (this ends your own Termux sessions), or run sshd in Termux" };
+  }
+  return { ok: false, steps, detail: steps.length ? "no route to the phone's adb" : "no Android host in that selector" };
 }

@@ -935,14 +935,57 @@ async function resolveLiveHostOrSelf(
   return name;
 }
 
+/** How long a preferred transport may stay unanswered before the next one is
+ *  probed too. A reachable LAN host answers well inside it; an unreachable one
+ *  would otherwise cost its whole probe timeout before the fallback was tried. */
+export const ROUTE_GRACE_MS = 1500;
+
+/** The index of the first transport, in preference order, whose probe succeeds.
+ *  Probes still start in order: the next one starts when the previous fails or
+ *  has been pending for `graceMs`, so a transport that answers promptly is the
+ *  only one probed. Once a probe succeeds, every more preferred one has either
+ *  failed or been pending past its grace, so the success is taken at once, and
+ *  the earliest success wins if several are known. Returns -1 when none succeed. */
+export function pickPreferred(starters: Array<() => Promise<boolean>>, graceMs: number): Promise<number> {
+  return new Promise((resolve) => {
+    const results: (boolean | undefined)[] = starters.map(() => undefined);
+    const timers: ReturnType<typeof setTimeout>[] = [];
+    let started = 0;
+    let done = false;
+    const finish = (index: number) => {
+      if (done) return;
+      done = true;
+      timers.forEach(clearTimeout);
+      resolve(index);
+    };
+    const settle = (i: number, ok: boolean) => {
+      results[i] = ok;
+      if (done) return;
+      const winner = results.findIndex((r) => r === true);
+      if (winner >= 0) return finish(winner);
+      if (!ok) startNext(i);
+      if (started === starters.length && results.every((r) => r === false)) finish(-1);
+    };
+    const startNext = (after: number) => {
+      if (done || after + 1 !== started || started >= starters.length) return;
+      const i = started++;
+      starters[i]!().then((ok) => settle(i, ok), () => settle(i, false));
+      timers.push(setTimeout(() => startNext(i), graceMs));
+    };
+    if (!starters.length) return finish(-1);
+    startNext(-1);
+  });
+}
+
 /** Resolve logical routes or dual-boot machine names anywhere in a selector.
- *  Independent comma tokens resolve concurrently; each route still probes its
- *  transports sequentially and chooses one BEFORE dispatch. Commands are never
- *  retried on another route after dispatch. */
+ *  Independent comma tokens resolve concurrently; a route probes its transports
+ *  in order, starting the next early when one is slow (see pickPreferred), and
+ *  chooses one BEFORE dispatch. Commands are never retried on another route after
+ *  dispatch. */
 export async function routeSelector(
   cfg: FleetConfig,
   sel: string,
-  deps: { probe?: (host: Host) => Promise<boolean> } = {},
+  deps: { probe?: (host: Host) => Promise<boolean>; graceMs?: number } = {},
 ): Promise<string> {
   const probeHost = deps.probe ?? probe;
   const cache = new Map<string, Promise<string>>();
@@ -954,10 +997,11 @@ export async function routeSelector(
         return token;
       const route = cfg.routes?.[token];
       if (route) {
-        for (const name of route.prefer) {
+        const chosen = await pickPreferred(route.prefer.map((name) => () => {
           const host = cfg.hosts[name];
-          if (host && await probeHost(host)) return name;
-        }
+          return host ? probeHost(host) : Promise.resolve(false);
+        }), deps.graceMs ?? ROUTE_GRACE_MS);
+        if (chosen >= 0) return route.prefer[chosen]!;
         throw new Error(`route ${token} is not reachable (tried: ${route.prefer.join(", ")})`);
       }
       if (!cfg.machines?.[token]) return token;

@@ -317,8 +317,10 @@ A host with an `android` block is a phone reached over SSH into
 the phone and the before/after checks hash frames there.
 
 ```json
-"phone": { "ssh": "phone", "os": "linux", "android": { "serial": "127.0.0.1:5555" } }
+"phone": { "ssh": "phone", "os": "linux", "android": { "serial": "127.0.0.1:5555", "shotWidth": 400 } }
 ```
+
+`shotWidth` (optional) sets the default screenshot width, which helps on a slow route.
 
 One-time setup on the phone: install Termux with `sshd`, then
 `pkg install android-tools libwebp nmap`. Turn on Developer options → Wireless
@@ -338,6 +340,13 @@ fleet cu phone batch any '[{"action":"key","key":"back"},{"action":"key","key":"
 fleet cu phone wait --label "Wi-Fi" --timeout 8000
 fleet cu phone open https://example.com --in com.android.chrome
 fleet cu phone shot --width 400                # WebP encoded on the phone
+fleet cu phone swipe2 any 500 1200 800 1200 -400 0   # two fingers, both moved by -400,0
+fleet cu phone zoom any in                     # target view and finger spread guessed from the tree
+fleet cu phone gesture any 500,1300,300,1100 760,1500,960,1700  # one stroke per finger, 1-5 fingers
+fleet cu phone notifications [PACKAGE]         # the notification shade, newest first
+fleet cu phone watch                           # live scrcpy window on this machine
+fleet cu phone record start --out demo.mp4     # scrcpy recording here; record stop ends it
+fleet cu phone revive                          # SSH down: reopen Termux through this machine's adb
 fleet cu phone release                         # stop the UI helper now
 ```
 
@@ -357,7 +366,14 @@ The desktop contracts carry over:
   field back.
 - **Batches** run up to 50 steps in one round trip, re-check focus before every
   step, and stop at the first failure.
-- **A fast UI tree.** A 4 KB helper (`android/uiserver`, a dex run by adb's shell
+- **Multi-finger gestures.** adb's `input` sends one finger, so `swipe2`, `zoom`
+  and `gesture` go through the UI helper below, which injects multi-pointer touch
+  events. The fingers land together, move in straight lines, and lift together.
+  `zoom in|out` without a point picks the largest image, map, web, or terminal view
+  and keeps the fingers 8% inside it and the display; the output names its pick.
+- **Watch and record** run scrcpy on this machine, so they need adb and scrcpy here
+  and the phone's adbd reachable over the network.
+- **A fast UI tree.** A 6 KB helper (`android/uiserver`, a dex run by adb's shell
   through `app_process`, nothing installed as an app) holds one UiAutomation
   connection and serves the tree in ~0.1 s, against ~2.5 s for `uiautomator dump`.
   It leaves other accessibility services running, answers only a token that only

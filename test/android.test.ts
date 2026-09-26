@@ -5,7 +5,8 @@ import { join } from "node:path";
 import { mkdtempSync } from "node:fs";
 import {
   androidAct, androidBatch, androidBootstrap, androidElements, androidOpen, androidRelease, androidWait, androidElementsOf, androidInputText, androidKeycode, androidPick, androidShot,
-  androidState, androidTargetPattern, parseUiDump, unpackReply,
+  androidState, androidTargetPattern, parseUiDump, unpackReply, parseNotifications, androidNotifications,
+  androidRecordStart, androidRecordStatus, androidRecordStop, androidRevive, androidWatch, androidZoomPlan,
 } from "../src/android.ts";
 import type { FleetConfig, Host } from "../src/config.ts";
 import { UI_JAR_MD5 } from "../src/android-ui-jar.ts";
@@ -137,6 +138,10 @@ describe("config", () => {
   test("rejects a serial with shell characters", () =>
     expect(() => validateConfig(base({ serial: "x;y" }), "t")).toThrow(/adb serial/));
   test("needs os linux", () => expect(() => validateConfig(base({}, "mac"), "t")).toThrow(/os linux/));
+  test("accepts a default screenshot width and bounds it", () => {
+    expect(() => validateConfig(base({ shotWidth: 400 }), "t")).not.toThrow();
+    expect(() => validateConfig(base({ shotWidth: 50 }), "t")).toThrow(/shotWidth/);
+  });
 });
 
 // ── the runner, against a fake phone ────────────────────────────────────────
@@ -235,6 +240,109 @@ describe("androidAct", () => {
   });
 });
 
+describe("multi-finger gestures", () => {
+  const MAP = `<hierarchy><node class="android.widget.FrameLayout" bounds="[0,0][1000,2000]">`
+    + `<node class="android.widget.Button" text="Go" clickable="true" bounds="[0,100][200,200]" />`
+    + `<node class="com.google.android.gms.maps.MapView" resource-id="app:id/map" bounds="[0,400][1000,1400]" />`
+    + `</node></hierarchy>`;
+  const all = (xml: string) => androidElements(parseUiDump(xml), { all: true, width: 1000, height: 2000 });
+  const acted = [...STATE, "__FA__HA a", "__FA__INPUT 0", "__FA__HB b", "__FA__HC b"];
+
+  test("swipe2 lands two fingers and moves both by the same offset", async () => {
+    const f = fake({ stdout: acted });
+    const r = await androidAct(cfg, "phone", "any", { kind: "swipe2", x1: 500, y1: 1200, x2: 800, y2: 1200, dx: -400, dy: 0 }, {}, deps(f));
+    expect(r.effect).toBe("changed");
+    expect(r.summary).toBe("swipe2 500,1200 + 800,1200 by -400,0 200ms");
+    const dev = deviceScript(f.scripts[0]!);
+    expect(dev).toContain("ui_gesture '200 500,1200,100,1200 800,1200,400,1200'");
+    for (const p of ["inb 500 1200", "inb 100 1200", "inb 800 1200", "inb 400 1200", "ui_ready"])
+      expect(dev.indexOf(p)).toBeLessThan(dev.indexOf("HA=$(fh)"));
+  });
+  test("gesture sends one stroke per finger and bounds its duration and fingers", async () => {
+    const f = fake({ stdout: acted });
+    await androidAct(cfg, "phone", "any", { kind: "gesture", strokes: [[1, 2, 3, 4], [5, 6, 7, 8], [9, 9, 9, 9]], ms: 150 }, {}, deps(f));
+    expect(deviceScript(f.scripts[0]!)).toContain("ui_gesture '150 1,2,3,4 5,6,7,8 9,9,9,9'");
+    await expect(androidAct(cfg, "phone", "any", { kind: "gesture", strokes: [[1, 2, 3, 4]], ms: 10 }, {}, deps(f))).rejects.toThrow(/50–5000/);
+    await expect(androidAct(cfg, "phone", "any", { kind: "gesture", strokes: Array(6).fill([1, 1, 1, 1]) }, {}, deps(f))).rejects.toThrow(/1 to 5/);
+    await expect(androidAct(cfg, "phone", "any", { kind: "gesture", strokes: [[1, 2, 3] as any] }, {}, deps(f))).rejects.toThrow(/four numbers/);
+    await expect(androidAct(cfg, "phone", "any", { kind: "swipe2", x1: 1, y1: 1, x2: 2, y2: 2, dx: 0, dy: 0 },
+      { element: { label: "x" } }, deps(f))).rejects.toThrow(/does not apply/);
+  });
+  test("a helper failure fails the input", async () => {
+    const f = fake({ stdout: [...STATE, "__FA__HA a", "__FA__INPUT 1", "__FA__INPUTOUT gesture failed: the UI helper did not answer", "__FA__HB a"] });
+    const r = await androidAct(cfg, "phone", "any", { kind: "swipe2", x1: 1, y1: 1, x2: 2, y2: 2, dx: 300, dy: 0 }, {}, deps(f));
+    expect(r.result.ok).toBe(false);
+    expect(r.result.stderr).toMatch(/did not answer/);
+  });
+  test("a missing helper refuses before input, is installed, and the input is sent once more", async () => {
+    const f = fake(
+      { stdout: [...STATE, "__FA__UIJAR missing", "__FA__REFUSE the UI helper that sends multi-finger gestures is missing or out of date"], code: 3 },
+      { stdout: [] },
+      { stdout: acted },
+    );
+    const r = await androidAct(cfg, "phone", "any", { kind: "swipe2", x1: 1, y1: 1, x2: 2, y2: 2, dx: 300, dy: 0 }, {}, deps(f));
+    expect(f.scripts.length).toBe(3);
+    expect(f.scripts[1]).toContain('adb -s "$S" push "$j" /data/local/tmp/fleet-ui.jar');
+    expect(r.effect).toBe("changed");
+    const dev = deviceScript(f.scripts[0]!);
+    expect(dev.indexOf("ui_ready()")).toBeLessThan(dev.indexOf(`= ${UI_JAR_MD5} ] || { echo "__FA__UIJAR missing"; refuse`) + 1);
+  });
+
+  test("zoom guesses the largest zoomable view and keeps the fingers inside it", () => {
+    const p = androidZoomPlan(all(MAP), { direction: "in", width: 1000, height: 2000 });
+    expect(p.element?.id).toBe("map");
+    expect(p.guess).toMatch(/MapView #map \(guessed\)/);
+    expect(p.center).toEqual({ x: 500, y: 900 });
+    // The map is 1000 tall inset 8% (80) → y 480–1320; the nearest edge is 420 away.
+    expect(p.strokes).toEqual([[332, 732, 80, 480], [668, 1068, 920, 1320]]);
+    expect(p.scale).toBe(2.5);
+  });
+  test("zoom out pinches from far to near; scale and direction are honoured", () => {
+    const p = androidZoomPlan(all(MAP), { direction: "out", scale: 4, width: 1000, height: 2000 });
+    expect(p.strokes[0]).toEqual([80, 480, 395, 795]);
+    expect(p.scale).toBe(4);
+    expect(() => androidZoomPlan(all(MAP), { direction: "in", scale: 1, width: 1000, height: 2000 })).toThrow(/1.2 to 10/);
+  });
+  test("zoom at a point sizes the spread from the smallest zoomable view under it", () => {
+    const p = androidZoomPlan(all(MAP), { direction: "in", x: 300, y: 600, width: 1000, height: 2000 });
+    expect(p.element?.id).toBe("map");
+    expect(p.center).toEqual({ x: 300, y: 600 });
+    expect(p.strokes[0]).toEqual([252, 552, 180, 480]);
+    expect(() => androidZoomPlan(all(MAP), { direction: "in", x: 300, width: 1000, height: 2000 })).toThrow(/both x and y/);
+    expect(() => androidZoomPlan(all(MAP), { direction: "in", x: 90, y: 490, width: 1000, height: 2000 })).toThrow(/no room/);
+  });
+  test("with nothing zoomable, zoom falls back to the largest view, clear of the display's edges", () => {
+    const p = androidZoomPlan(all(XML), { direction: "in", width: 1000, height: 2000 });
+    expect(p.element?.role).toBe("FrameLayout");
+    for (const [x1, y1, x2, y2] of p.strokes)
+      for (const [x, y] of [[x1, y1], [x2, y2]]) { expect(x).toBeGreaterThanOrEqual(80); expect(y).toBeGreaterThanOrEqual(160); expect(y).toBeLessThanOrEqual(1840); }
+  });
+  test("zoom reads the tree, then sends the planned gesture with the stale check", async () => {
+    const H = "0123456789abcdef0123456789abcdef";
+    const f = fake({ stdout: [...STATE, "__FA__XML", MAP, "__FA__XMLEND", "__FA__FRAME " + H] }, { stdout: acted });
+    const r = await androidAct(cfg, "phone", "maps", { kind: "zoom", direction: "in" }, {}, deps(f));
+    expect(r.summary).toBe("zoom in ×2.5 at 500,900 on MapView #map (guessed)");
+    const dev = deviceScript(f.scripts[1]!);
+    expect(dev).toContain("ui_gesture '400 332,732,80,480 668,1068,920,1320'");
+    expect(dev).toContain(`if [ "$HA" != ${H} ]; then`);
+    expect(r.element?.id).toBe("map");
+  });
+
+  test("batch runs swipe2 and gesture steps through the helper, checked once", async () => {
+    const f = fake({ stdout: [...STATE, "__FA__HA a", "__FA__STEP 0 start", "__FA__STEP 0 done", "__FA__STEP 1 start",
+      "__FA__STEP 1 done", "__FA__HB b", "__FA__HC b"] });
+    const r = await androidBatch(cfg, "phone", "any", [
+      { action: "swipe2", x: 500, y: 1200, x2: 800, y2: 1200, dx: 400, dy: 0 },
+      { action: "gesture", strokes: [[1, 1, 2, 2]], ms: 100 },
+    ], {}, deps(f));
+    expect(r.result.ok).toBe(true);
+    const dev = deviceScript(f.scripts[0]!);
+    expect(dev).toContain("ui_gesture '200 500,1200,900,1200 800,1200,1200,1200'");
+    expect(dev.match(/^ui_ready$/gm)?.length).toBe(1);
+    await expect(androidBatch(cfg, "phone", "any", [{ action: "swipe2", x: 1, y: 1, x2: 2, y2: 2 }])).rejects.toThrow(/needs dx/);
+  });
+});
+
 describe("androidState and androidElementsOf", () => {
   test("an unreachable adbd fails with the recovery hint", async () => {
     const f = fake({ stdout: ["__FA__ERR adb cannot reach 127.0.0.1:5555 (offline). adbd stops listening after a reboot"], code: 3 });
@@ -251,6 +359,12 @@ describe("androidState and androidElementsOf", () => {
 });
 
 describe("androidShot", () => {
+  test("a host's shotWidth is the default capture width", async () => {
+    const slow: FleetConfig = { hosts: { p: { name: "p", ssh: "p", os: "linux", android: { shotWidth: 400 } } } };
+    const f = fake({ stdout: [...STATE] });
+    await androidShot(slow, "p", "/tmp/never.webp", {}, deps(f)).catch(() => {});
+    expect(f.scripts[0]).toContain("OUTW=$(( 400 < RW ? 400 : RW ))");
+  });
   test("writes the inline image with the extension of its format", async () => {
     const body = Buffer.alloc(18);
     const webp = Buffer.concat([Buffer.from("RIFF"), Buffer.alloc(4), Buffer.from("WEBP"), body]);
@@ -486,4 +600,102 @@ describe("compressed replies", () => {
     expect(r.elements.some((e) => e.id === "row")).toBe(true);
   });
   test("a reply without a block is unchanged", () => expect(unpackReply("a\nb")).toBe("a\nb"));
+});
+
+describe("notifications", () => {
+  const lines = [
+    "NotificationRecord(0x0abc: pkg=com.whatsapp user=UserHandle{0} id=1 tag=null importance=4 key=0|com.whatsapp|1|null|10123: Notification(channel=group shortcut=x)",
+    "when=1790000000000/+5m",
+    "android.title=String (Family)",
+    "android.text=String (see you at 8)",
+    "android.subText=null",
+    "NotificationRecord(0x0def: pkg=com.android.systemui user=UserHandle{0} id=7 tag=x importance=1 key=0|com.android.systemui|7|x|10000: Notification(channel=x)",
+    "when=1790000100000/+1m",
+    "android.title=SpannableString (USB debugging connected)",
+    "android.text=String (Tap to turn off)",
+    "NotificationRecord(0x0fff: pkg=com.empty user=UserHandle{0} id=2 tag=null importance=2 key=0|com.empty|2|null|10: Notification(channel=x)",
+  ];
+  test("parses records, unwraps values, drops empty ones, newest first", () => {
+    const n = parseNotifications(lines);
+    expect(n.map((x) => x.pkg)).toEqual(["com.android.systemui", "com.whatsapp"]);
+    expect(n[1]).toEqual({ pkg: "com.whatsapp", importance: 4, key: "0|com.whatsapp|1|null|10123",
+      when: 1790000000000, title: "Family", text: "see you at 8" });
+    expect(n[0]!.title).toBe("USB debugging connected");
+  });
+  test("reads only the live list and filters by package", async () => {
+    const f = fake({ stdout: lines.map((l) => "__FA__N " + l) });
+    const r = await androidNotifications(cfg, "phone", { pkg: "whats" }, deps(f));
+    expect(r.notifications.map((x) => x.title)).toEqual(["Family"]);
+    expect(deviceScript(f.scripts[0]!)).toContain("awk '/^  mArchive=/{exit}");
+  });
+});
+
+describe("the controller's own adb", () => {
+  const lan: Host = { name: "handset-wifi", ssh: "phone", os: "linux", android: { serial: "127.0.0.1:5555" } };
+  // A local runner that answers ssh -G and adb like a reachable phone.
+  const local = (calls: string[][], opts: { adbState?: string; sshUp?: boolean } = {}) => async (cmd: string[]) => {
+    calls.push(cmd);
+    if (cmd[0] === "ssh") return { code: 0, stdout: "hostname 127.0.0.1\nport 8022\n", stderr: "" };
+    if (cmd.includes("get-state")) return { code: 0, stdout: `${opts.adbState ?? "device"}\n`, stderr: "" };
+    if (cmd.join(" ").includes("mCurrentFocus")) return { code: 0, stdout: "  mCurrentFocus=Window{1 u0 com.whatsapp/com.whatsapp.Main}\n", stderr: "" };
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const fakeSpawn = (argvs: string[][]) => ((argv: string[]) => { argvs.push(argv); return { pid: 999999, unref() {} }; }) as any;
+
+  test("watch opens scrcpy on the phone's network serial, view-only on request", async () => {
+    // 127.0.0.1:5555 is closed here, so point the serial at a port that answers.
+    const server = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { data() {} } });
+    try {
+      const h: Host = { ...lan, android: { serial: `127.0.0.1:${server.port}` } };
+      const argvs: string[][] = [];
+      const r = await androidWatch([h], { viewOnly: true }, { local: local([]), spawn: fakeSpawn(argvs) });
+      expect(r.ok).toBe(true);
+      expect(argvs[0]).toEqual(expect.arrayContaining(["scrcpy", "-s", `127.0.0.1:${server.port}`, "--no-control"]));
+    } finally { server.stop(true); }
+  });
+  test("an unreachable adb address is skipped without adb connect", async () => {
+    const calls: string[][] = [];
+    const h: Host = { ...lan, android: { serial: "127.0.0.1:1" } };
+    const r = await androidWatch([h], {}, { local: local(calls), spawn: fakeSpawn([]) });
+    expect(r.ok).toBe(false);
+    expect(r.detail).toMatch(/nothing answers on 127.0.0.1:1/);
+    expect(calls.some((c) => c.includes("connect"))).toBe(false);
+  });
+  test("record start remembers the scrcpy process, status and stop read it back", async () => {
+    const server = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { data() {} } });
+    const dir = mkdtempSync(join(tmpdir(), "fleet-rec-"));
+    try {
+      const h: Host = { ...lan, android: { serial: `127.0.0.1:${server.port}` } };
+      const argvs: string[][] = [];
+      const file = join(dir, "demo.mp4");
+      const r = await androidRecordStart([h], file, { limitS: 30 }, { local: local([]), spawn: fakeSpawn(argvs), cacheDir: dir });
+      expect(r.recording).toBe(true);
+      expect(argvs[0]).toEqual(expect.arrayContaining(["--no-playback", "--record", file, "--time-limit", "30"]));
+      // pid 999999 is not a live process, so the recording reads as ended.
+      expect((await androidRecordStatus([h], { cacheDir: dir })).recording).toBe(false);
+      await Bun.write(file, "fake mp4 bytes");
+      const stopped = await androidRecordStop([h], { cacheDir: dir });
+      expect(stopped).toMatchObject({ ok: true, localVideo: file, bytes: 14 });
+      expect((await androidRecordStop([h], { cacheDir: dir })).ok).toBe(false);
+      await expect(androidRecordStart([h], file, { limitS: 5000 })).rejects.toThrow(/1–3600/);
+    } finally { server.stop(true); await rm(dir, { recursive: true, force: true }); }
+  });
+  test("revive opens Termux through adb and returns to the app the user was in", async () => {
+    const server = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { data() {} } });
+    try {
+      const h: Host = { ...lan, android: { serial: `127.0.0.1:${server.port}` } };
+      const calls: string[][] = [];
+      let probes = 0;
+      const r = await androidRevive([h], { waitMs: 5000 }, { local: local(calls), probe: async () => ++probes > 1 });
+      expect(r.ok).toBe(true);
+      const shells = calls.filter((c) => c.includes("shell")).map((c) => c.at(-1));
+      expect(shells).toContain("am start -n com.termux/.app.TermuxActivity");
+      expect(shells.some((c) => c?.startsWith("monkey -p com.whatsapp"))).toBe(true);
+      expect(shells).not.toContain("am force-stop com.termux");
+    } finally { server.stop(true); }
+  });
+  test("revive says so when SSH already works", async () => {
+    const r = await androidRevive([lan], {}, { local: local([]), probe: async () => true });
+    expect(r).toMatchObject({ ok: true, detail: "SSH to handset-wifi already works" });
+  });
 });

@@ -306,6 +306,17 @@ desktop ones; `fleet help cu` lists them.
 - **Several inputs:** `batch <TARGET> '[{"action":"tap","label":"Search"},{"action":"sleep","ms":800},{"action":"type","text":"wifi"}]'`
   runs in one round trip and stops at the first failure. Labels resolve against the
   screen before the batch starts; split the batch where a new page opens.
+- **Two fingers:** `swipe2 <TARGET> X1 Y1 X2 Y2 DX DY [--duration MS]` lands both
+  fingers together and moves each by DX,DY (default 200 ms). `zoom <TARGET> in|out
+  [X Y | --label T] [--scale F]` spreads (in) or pinches (out) two fingers on a
+  diagonal; with no point it guesses the target view and the spread from the tree and
+  says what it picked. `gesture <TARGET> X1,Y1,X2,Y2 …` sends 1-5 fingers, one straight
+  stroke each. Batch takes `swipe2` and `gesture` steps.
+- **Watch, record, notifications:** `watch [--view-only]` opens a live scrcpy window
+  here; `record start [--out F.mp4]` / `record stop` writes an MP4 here;
+  `notifications [pkg]` lists the shade (private: read it only when asked).
+- **SSH to Termux down?** `revive` opens Termux through this machine's adb so its shell
+  setup starts sshd; `--restart` force-stops Termux first.
 - **Other verbs:** `open PACKAGE|URL [--in PACKAGE]`, `apps [filter]`,
   `key TARGET back|home|enter|…`, `swipe`, `state`, `doctor`. `type` sends printable
   ASCII only.
