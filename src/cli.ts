@@ -43,7 +43,7 @@ import {
   pullFlag, pullVal, parseFlags, parseLeadingFlags, lsHosts, runExec, runScript, rebootRefusal, droppedStdinCheck, readScriptSource, editRemoteFile,
   pushFile, pullFile, parseRemoteSpec, restartService, serviceLogs, svcStatus,
   gpuRows, diskRows, fetchDashboard, hostStatus, runRecipe, captureScreenshot, rebootHosts,
-  cuInstall, cuRun, cuTools, cuDescribe, cuRecordStart, cuRecordStop, cuRecordStatus,
+  cuInstall, cuRun, cuTools, cuDescribe, cuRecordStart, cuRecordStop, cuRecordStatus, cuRegions, cuPerception,
   cuApps, cuShotWindow, browseHost, preferredImageExt, overlayGrid,
   cuSnapshot, cuResolveTargetFrom, cuResolvePoint, cuAct, cuBatch, cuBlockerNote, cuElements, cuOpen, sameRole, cuVerify,
   cuGridCaption, cuElementSupport, compactCuOutput, briefDescribe,
@@ -61,6 +61,7 @@ import {
   stampSkill,
 } from "./tools.ts";
 import type { ServiceAction, CuTarget, GridOptions, CuElementLocator } from "./core.ts";
+import type { CuRegionLocator } from "./perception.ts";
 import {
   isAndroidHost, androidState, androidDoctor, androidElementsOf, androidShot, androidAct, androidOpen, androidApps,
   androidBootstrap, androidBatch, androidWait, androidRelease, androidNotifications,
@@ -1037,6 +1038,9 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       const elementLabel = pullVal(rest, "--label");
       const elementRole = pullVal(rest, "--role");
       const elementNth = pullVal(rest, "--nth");
+      const regionText = pullVal(rest, "--region");
+      const regionAt = pullVal(rest, "--region-at");
+      const regionKind = pullVal(rest, "--kind");
       const sel = rest.shift();
       if (!sel) die("usage: fleet cu <host> <cua-driver args…> [--out f.png] [--grid]  |  fleet cu <sel> install");
       // watch, record and revive run on this machine through its own adb, and
@@ -1095,6 +1099,7 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       }
       if (isAndroidHost(cfg, target)) {
         const desktopOnly = [["--space", spaceArg], ["--button", button], ["--probe", probeArg], ["--element", elementToken],
+          ["--region", regionText], ["--region-at", regionAt], ["--kind", regionKind],
           ["--for", forApp], ["--foreground", foreground || undefined], ["--count", clickCount !== 1 || undefined],
           ["--no-composite", noComposite || undefined], ["--full", full || undefined], ["--brief", brief || undefined]]
           .filter(([, v]) => v !== undefined).map(([f]) => f);
@@ -1144,6 +1149,62 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
         if (actions.length > 1)
           console.log(A.d(`${actions.length - failed.length}/${actions.length} host(s) installed`));
         return failed.length ? 1 : 0;
+      }
+      if (verb === "perception") {
+        const json = pullFlag(rest, "--json");
+        const version = pullVal(rest, "--version");
+        const action = rest[1] ?? "status";
+        if (rest.length > 2 || !["status", "install", "remove"].includes(action))
+          die("usage: fleet cu <sel> perception [status] | perception install [--version V] | perception remove");
+        if (version !== undefined && action !== "install") die("--version applies to perception install");
+        if (action === "install" && !json)
+          console.log(A.d(`◎ installing cua-perception on ${target} (≈420 MB download on the host; `
+            + "includes the AGPL-3.0 OmniParser detector) …"));
+        let actions;
+        try { actions = await cuPerception(cfg, target, action as "install" | "status" | "remove", { version }); }
+        catch (error) { die(error instanceof Error ? error.message : String(error)); }
+        if (json) { console.log(JSON.stringify(actions)); return actions.every((a) => a.result.ok) ? 0 : 1; }
+        actions.forEach((a) => printResult(a.result));
+        return actions.every((a) => a.result.ok) ? 0 : 1;
+      }
+      if (verb === "regions") {
+        const json = pullFlag(rest, "--json");
+        const max = pullVal(rest, "--max");
+        const minConf = pullVal(rest, "--min-confidence");
+        const q = rest[1];
+        const usage = "usage: fleet cu <host> regions <target> [filter] [--kind text|icon] [--min-confidence F] [--max N] [--out FILE] [--json]";
+        if (!q || rest.length > 3) die(usage);
+        if (regionText !== undefined || regionAt !== undefined) die("--region/--region-at address a click; filter regions with a positional filter");
+        if (regionKind !== undefined && regionKind !== "text" && regionKind !== "icon") die(`--kind must be text or icon (got '${regionKind}')`);
+        if (max !== undefined && (!/^\d+$/.test(max) || Number(max) < 1)) die(`--max must be a positive integer (got '${max}')`);
+        if (minConf !== undefined && !(Number(minConf) >= 0 && Number(minConf) <= 1)) die(`--min-confidence must be from 0 to 1 (got '${minConf}')`);
+        const imageOut = out ?? (wantShot ? `${autoName(q)}-regions.${await preferredImageExt()}` : undefined);
+        let r;
+        try {
+          r = await cuRegions(cfg, target, q, {
+            filter: rest[2], kinds: regionKind ? [regionKind as "text" | "icon"] : undefined,
+            minConfidence: minConf === undefined ? undefined : Number(minConf), maxRegions: max ? Number(max) : undefined, imageOut,
+          });
+        } catch (error) { die(error instanceof Error ? error.message : String(error)); }
+        if (json) { console.log(JSON.stringify(r)); return r.result.ok ? 0 : 1; }
+        const w = r.target.window;
+        if (!r.result.ok) {
+          console.error(A.r(`✗ ${r.target.name} w${w.window_id}: ${r.error ? `${r.error.code}: ${r.error.message}` : "regions failed"}`));
+          if (r.hint) console.error(A.y(`▲ ${r.hint}`));
+          else if (r.result.stderr) console.error(A.d(r.result.stderr));
+          return 1;
+        }
+        console.log(A.d(`${r.target.name} · pid ${r.target.pid} · w${w.window_id} · ${w.title || "(untitled)"} · capture ${r.width}x${r.height}`
+          + ` · ${r.regions.length} of ${r.total} region(s)` + (r.durationMs !== undefined ? ` · parsed in ${(r.durationMs / 1000).toFixed(1)}s` : "")));
+        for (const g of r.regions) {
+          const name = g.kind === "text" ? JSON.stringify(g.text ?? "") : A.d(g.label ?? "icon");
+          console.log(`${A.d(g.id.padEnd(9))} ${g.kind === "text" ? A.b("text") : A.c("icon")} ${name}`
+            + A.d(` ${g.bounds.width}x${g.bounds.height}@${g.bounds.x},${g.bounds.y} @${g.center.x},${g.center.y} conf ${g.confidence.toFixed(2)}`));
+        }
+        for (const warning of r.warnings) console.error(A.y(`▲ ${warning}`));
+        console.log(A.d(`click one with: fleet cu ${target} click ${JSON.stringify(q)} --region TEXT | --region-at X,Y (re-parses a fresh capture; ids and OCR text can change between parses)`));
+        if (r.localImage) { console.log(`${A.g("●")} ${A.d("capture →")} ${r.localImage}`); openImg(r.localImage); }
+        return 0;
       }
       if (verb === "tools") {
         if (rest.length > 2) die("usage: fleet cu <host> tools [filter]");
@@ -1382,7 +1443,25 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       const ACT_VERBS = ["click", "right-click", "double-click", "drag", "scroll", "hotkey", "key", "type", "set", "menu", "act"] as const;
       const rawInput = ["click", "drag", "scroll", "hotkey"].includes(verb ?? "") && /^\s*\{/.test(rest[1] ?? "");
       const isAct = !rawInput && ACT_VERBS.includes(verb as typeof ACT_VERBS[number]);
-      const locating = [elementToken, elementLabel, elementRole, elementNth].some((v) => v !== undefined);
+      const regionLocating = regionText !== undefined || regionAt !== undefined;
+      if (regionKind !== undefined && !regionLocating && verb !== "regions") die("--kind narrows --region or --region-at, or filters fleet cu <host> regions");
+      if (regionLocating && !["click", "right-click", "double-click"].includes(verb ?? ""))
+        die("--region/--region-at address click, right-click, and double-click; list regions with: fleet cu <host> regions <target>");
+      const regionPoint = (() => {
+        if (regionAt === undefined) return undefined;
+        const m = regionAt.match(/^\s*(\d+)\s*[, ]\s*(\d+)\s*$/);
+        if (!m) die(`--region-at needs X,Y in the capture's pixels (got '${regionAt}')`);
+        return { x: Number(m![1]), y: Number(m![2]) };
+      })();
+      if (regionLocating && (elementToken !== undefined || elementLabel !== undefined || elementRole !== undefined))
+        die("address the click by --region or by --label/--element, not both");
+      if (regionKind !== undefined && regionKind !== "text" && regionKind !== "icon") die(`--kind must be text or icon (got '${regionKind}')`);
+      const regionLoc: CuRegionLocator | undefined = regionLocating ? {
+        ...(regionText !== undefined ? { text: regionText } : {}), ...(regionPoint ? { at: regionPoint } : {}),
+        ...(regionKind ? { kind: regionKind as "text" | "icon" } : {}),
+        ...(elementNth !== undefined ? { nth: Number(elementNth) } : {}),
+      } : undefined;
+      const locating = !regionLocating && [elementToken, elementLabel, elementRole, elementNth].some((v) => v !== undefined);
       if (locating && (!isAct || verb === "drag" || verb === "menu"))
         die("--element/--label/--role/--nth address a control for click, right-click, double-click, type, set, key, hotkey, scroll, and act; list them with: fleet cu <host> elements <target>");
       if (elementNth !== undefined && (!/^\d+$/.test(elementNth) || Number(elementNth) < 1)) die(`--nth must be a positive integer (got '${elementNth}')`);
@@ -1404,7 +1483,10 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
           if (clickCount > 3) die("--count must be 1, 2, or 3");
           tool = verb === "right-click" ? "right_click" : verb === "double-click" ? "double_click" : "click";
           payload = tool === "click" ? { count: clickCount, ...(button ? { button } : {}) } : {};
-          if (element) {
+          if (regionLoc) {
+            if (rest.length !== 2) die(`usage: fleet cu <host> ${verb} <app> --region TEXT | --region-at X,Y [--kind text|icon] [--nth N]`);
+            summary = tool;
+          } else if (element) {
             if (rest.length !== 2) die(`usage: fleet cu <host> ${verb} <app> --label TEXT [--role R] [--nth N] | --element TOKEN`);
             summary = tool;
           } else {
@@ -1469,8 +1551,14 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
         }
         if (foreground) payload.delivery_mode = "foreground";
 
-        const r = await cuAct(cfg, target, q, tool, payload,
-          { settleMs: settle, imageOut: shotPath, point, space, element });
+        let r;
+        try {
+          r = await cuAct(cfg, target, q, tool, payload,
+            { settleMs: settle, imageOut: shotPath, point, space, element, region: regionLoc });
+        } catch (error) {
+          if (!regionLoc) throw error;
+          die(error instanceof Error ? error.message : String(error));
+        }
         if (json) {
           if (r.localImage) await applyGrid(r.localImage, gridOpts(r.target, cuBlockerNote(r.target)));
           console.log(JSON.stringify(r));
@@ -1480,6 +1568,9 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
           summary = `${tool} ${r.payload.x},${r.payload.y}`
             + (space === "screen" ? A.d(` (from screen ${point.x},${point.y})`) : "")
             + (clickCount > 1 ? ` x${clickCount}` : "");
+        if (r.region)
+          summary += ` → ${r.region.kind} ${r.region.kind === "text" ? JSON.stringify(r.region.text ?? "") : r.region.label ?? ""}`
+            + A.d(` ${r.region.id} @${r.region.center.x},${r.region.center.y} (capture-bound)`);
         if (element)
           summary += r.element ? ` → ${r.element.role} ${JSON.stringify(r.element.label)} ${A.d(r.element.token ?? "")}`
             : ` → ${A.d(String(r.payload.element_token))}`;

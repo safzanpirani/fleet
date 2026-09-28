@@ -48,6 +48,8 @@ fleet exec win-box "nvidia-smi"
 | `fleet cu <host> windows [target]` · `shot-window <target>` | List windows (blockers flagged) or capture one, with owned popups composited in. |
 | `fleet cu <host> elements <target> [filter]` · `verify <target> …` | List a window's controls with tokens (no screenshot), or check its state with `verify_state`. |
 | `fleet cu <host> click\|set\|type <target> --label TEXT` · `menu <target> <item…>` | Act on a control by label or `--element TOKEN` instead of x,y; invoke a native menu path. |
+| `fleet cu <host> regions <target> [filter]` · `click <target> --region TEXT` | Read text and icons from a window's pixels with the optional Cua Perception extension, and click one bound to its capture. For windows with no accessibility tree. |
+| `fleet cu <sel> perception [status\|install\|remove]` | Check, install (≈420 MB signed download on the host, AGPL-3.0 component), or remove the cua-perception extension. |
 | `fleet restart <host> <service>` | Restart a **configured** service (see config). |
 | `fleet bios <sel> [--yes]` | Reboot Windows UEFI/systemd Linux hosts into firmware setup. |
 | `fleet logs <host> <service> [-n N]` | Recent logs / status for a service. |
@@ -252,6 +254,33 @@ and exposes computer-use tools. Same interactive-desktop requirement as `fleet s
     background input. Fleet fails the action; retry with `--foreground` (it takes focus).
     Windows 11 Notepad and Electron apps ignore background input; classic Win32 controls
     (Character Map, most dialogs) accept it.
+- **Cua Perception** (cua-driver ≥ 0.29.1 plus the optional `cua-perception` extension):
+  - Use it only when `elements` finds nothing: canvases, games, remote desktops,
+    custom-drawn UI. Parsing runs on the host's CPU, a few seconds per capture.
+  - `fleet cu <host> regions <target> [filter] [--kind text|icon] [--min-confidence F]
+    [--max N] [--out f.png] [--json]` lists each region's id, OCR text, bounds and
+    center in the capture's pixels. `--out` returns the parsed capture itself. Icons
+    carry a detector class (`icon-class-0`), not a name.
+  - `fleet cu <host> click|right-click|double-click <target> --region TEXT` (or
+    `--region-at X,Y`, plus `--kind`, `--nth`) captures, parses, picks one region and
+    clicks its center with that capture's `capture_id`, all in one driver session, then
+    verifies by pixels like any click. Exact text beats substring; `--region-at` picks
+    the smallest region containing the point. An ambiguous or missing match lists
+    candidates and sends nothing. Region ids and OCR text change between parses of the
+    same window, so name an icon or a listed region by its `@X,Y` center, never by id.
+  - A `capture_id` resolves only inside the `cua-driver mcp --socket` session that
+    captured it; a separate CLI call gets `capture_not_found`. A capture-bound click
+    consumes the capture, and a refused one (`capture_expired`,
+    `capture_frame_mismatch`, …) is never retried as a plain x,y click.
+  - Background delivery can still fail with `background_unavailable` (GTK on X11
+    drops synthetic pointer events); `--foreground` takes the real pointer.
+  - `fleet cu <sel> perception [status|install|remove]`: install resolves the newest
+    `cua-perception-v*` release (or `--version`), downloads it on the host (about
+    420 MB), checks `SHA256SUMS`, refuses a catalog that is not `publisher-verified`,
+    installs or updates, and runs the self-test. The extension bundles OmniParser
+    under AGPL-3.0; a `not_installed` reply never justifies installing it without the
+    user's go-ahead.
+  - MCP: `fleet_cu_regions`, and `fleet_cu_act` with `region: {text | at: {x, y}, kind?, nth?}`.
 - **Convenience verbs** (resolve the pid/window_id loop for you):
   - `fleet cu <host> apps [name]` — compact `pid  name` table (optional name filter).
   - `fleet cu <host> windows [target]` — every top-level window, or one process's

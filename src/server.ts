@@ -20,7 +20,7 @@ import {
   cuInstall, cuTools, cuDescribe, cuRecordStart, cuRecordStop, cuRecordStatus,
   cuApps, cuShotWindow, browseHost, deployHosts, diagnose,
   cuSnapshot, cuResolveTargetFrom, cuResolvePoint, cuAct, cuBatch, CU_BATCH_TOOLS, cuBlockerNote,
-  cuGridCaption, cuElementSupport, compactCuOutput, briefDescribe, cuElements, cuOpen, cuVerify, sameRole,
+  cuGridCaption, cuElementSupport, compactCuOutput, briefDescribe, cuElements, cuRegions, cuOpen, cuVerify, sameRole,
   rebootHosts, firmwareRebootHosts, dropMasters, bootState, switchMachine, firmwareEntries, waitFor, routeSelector, svcStatus,
 } from "./core.ts";
 import {
@@ -1027,6 +1027,13 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
         role: z.string().optional().describe("Control role to narrow a label match: Button, Edit, MenuItem, CheckBox, …"),
         nth: z.number().int().min(1).optional().describe("1-based pick among several matches."),
       }).strict().optional().describe("Address a control by accessibility instead of x/y."),
+      region: z.object({
+        text: z.string().optional().describe("OCR text of the region: exact match first, then substring, case-insensitive."),
+        at: z.object({ x: z.number().int().min(0), y: z.number().int().min(0) }).strict().optional()
+          .describe("A point inside the region in capture pixels, such as a center from fleet_cu_regions; the smallest region containing it in a fresh parse is clicked. Region ids and OCR text change between parses, so name a listed region by its point."),
+        kind: z.enum(["text", "icon"]).optional().describe("Keep only this kind of region."),
+        nth: z.number().int().min(1).optional().describe("1-based pick among several matches."),
+      }).strict().optional().describe("Click, right_click or double_click a Cua Perception region: fleet captures, parses, picks one region and clicks its center bound to that capture, in one driver session. For windows with no accessibility tree. Needs the cua-perception extension on the host."),
       space: z.enum(["window", "screen"]).optional()
         .describe("Frame for all coordinates, including args.from_x/from_y/to_x/to_y. window (default) = shot-window pixels; screen = desktop."),
       settleMs: z.number().int().min(0).max(10000).optional()
@@ -1035,20 +1042,21 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       grid: z.boolean().optional().describe("Overlay the coordinate grid on the after image."),
     },
     annotations: { openWorldHint: true },
-  }, async ({ host, app, tool, args, x, y, element, space, settleMs, screenshot, grid }) => {
+  }, async ({ host, app, tool, args, x, y, element, region, space, settleMs, screenshot, grid }) => {
     const target = await routeSelector(cfg, host);
     const run = async (local?: string) => {
       if ((x === undefined) !== (y === undefined))
         return text("x and y must be given together", true);
       const r = await cuAct(cfg, target, app, tool, { ...(args ?? {}) }, {
-        settleMs, imageOut: local, space, element,
+        settleMs, imageOut: local, space, element, region,
         point: x !== undefined && y !== undefined ? { x, y, space: space ?? "window" } : undefined,
       });
       const note = cuBlockerNote(r.target);
       const lines = [
         `effect: ${r.effect}${r.reason ? ` — ${r.reason}` : ""}`,
         `${r.target.name} · pid ${r.target.pid} · window_id ${r.target.window.window_id} · ${tool}`
-        + (r.element ? ` → ${r.element.role} ${JSON.stringify(r.element.label)} (${r.element.token})` : ""),
+        + (r.element ? ` → ${r.element.role} ${JSON.stringify(r.element.label)} (${r.element.token})` : "")
+        + (r.region ? ` → region ${r.region.id} ${JSON.stringify(r.region.text ?? r.region.label ?? "")} at ${r.region.center.x},${r.region.center.y} (capture-bound)` : ""),
         ...(note ? [note] : []),
         ...(r.driverOutput ? ["", r.driverOutput] : []),
         ...(r.result.stderr ? ["", r.result.stderr] : []),
@@ -1103,6 +1111,42 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
           : "no accessibility elements here: use fleet_cu_screenshot_window and pixel x/y" }),
       }));
     } catch (error) { return text(error instanceof Error ? error.message : String(error), true); }
+  });
+
+  server.registerTool("fleet_cu_regions", {
+    title: "Read a window's text and icons from its pixels",
+    description: "For a window whose accessibility tree is empty (canvas, game, remote desktop, custom-drawn UI), "
+      + "capture it and parse the capture with the optional cua-perception extension into text regions (OCR) and icon "
+      + "regions, each with an id, bounds and center in the capture's pixels, and a confidence. Prefer fleet_cu_elements "
+      + "when it finds controls. Click a region with fleet_cu_act `region` (text or at); that call parses a fresh capture "
+      + "and binds the click to it; name a listed region by its `center` (region.at), because ids and OCR text change between parses. A region is an observation, not proof that it accepts input. Parsing costs about 3 s "
+      + "on Linux and 8-9 s on Windows. not_installed means the host lacks the extension (fleet cu <host> perception install). " + sel,
+    inputSchema: {
+      host: z.string().describe("Host name or selector (first matched host is used)."),
+      app: z.string().describe("PID, window_id (w123), process name, app name, or window title."),
+      filter: z.string().optional().describe("Keep regions whose OCR text contains this, case-insensitive."),
+      kind: z.enum(["text", "icon"]).optional().describe("Parse only this kind of region."),
+      minConfidence: z.number().min(0).max(1).optional().describe("Drop regions below this confidence."),
+      maxRegions: z.number().int().min(1).max(1000).optional().describe("Cap on regions returned by the parser."),
+      screenshot: z.boolean().optional().describe("Return the parsed capture itself; region bounds index its pixels."),
+    },
+    annotations: { readOnlyHint: true, openWorldHint: true },
+  }, async ({ host, app, filter, kind, minConfidence, maxRegions, screenshot }) => {
+    const run = async (local?: string) => {
+      const r = await cuRegions(cfg, await routeSelector(cfg, host), app,
+        { filter, kinds: kind ? [kind] : undefined, minConfidence, maxRegions, imageOut: local });
+      if (!r.result.ok) return text(r.result.stderr || "parse_visual_regions failed", true);
+      const content: any[] = [{ type: "text" as const, text: JSON.stringify({
+        target: { name: r.target.name, pid: r.target.pid, window_id: r.target.window.window_id, title: r.target.window.title },
+        capture: { width: r.width, height: r.height }, total: r.total, parser: r.parser, durationMs: r.durationMs,
+        ...(r.warnings.length ? { warnings: r.warnings } : {}),
+        regions: r.regions,
+      }) }];
+      if (r.localImage) content.push({ type: "image" as const, data: await consumeImage(r.localImage), mimeType: "image/png" });
+      return { content };
+    };
+    try { return screenshot ? await withTempImage("fleet-cua-regions-", run) : await run(); }
+    catch (error) { return text(error instanceof Error ? error.message : String(error), true); }
   });
 
   server.registerTool("fleet_cu_open", {

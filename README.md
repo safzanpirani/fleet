@@ -681,6 +681,35 @@ only the rows it is confident the task does not need: an Explorer window at
 30 rows, needs `TYPESAFE_API_KEY`, and lists every row when the key is missing or
 the call fails. Each use is a paid API call.
 
+### Reading pixels with Cua Perception
+
+For a window whose accessibility tree is empty (a canvas, a game, a remote desktop,
+custom-drawn UI), cua-driver's optional `cua-perception` extension parses a capture
+into text regions (OCR) and icon regions on the host's CPU. It needs cua-driver
+0.29.1 or later. `perception install` downloads the signed release on the host
+(about 420 MB), checks `SHA256SUMS`, refuses a catalog that the driver does not
+report as publisher-verified, and runs the extension's self-test. The extension
+bundles the OmniParser icon detector under AGPL-3.0; Fleet never installs it
+implicitly.
+
+```sh
+fleet cu win-box perception install          # status | install [--version V] | remove
+fleet cu win-box regions calc --kind text    # id, text, bounds, and center in capture pixels
+fleet cu win-box click calc --region 7       # exact OCR text first, then substring
+fleet cu win-box click calc --region-at 66,192 --kind icon
+```
+
+A region click captures the window, parses it, picks one region, and clicks its
+center with that capture's `capture_id`, all inside one `cua-driver mcp` session:
+a capture ID does not resolve from a separate CLI call. The driver consumes the
+capture, so one parse authorizes one click, and a refused capture-bound click is
+never retried as a plain coordinate click. An ambiguous or missing match lists the
+candidates and sends nothing. Region IDs and OCR text change between parses of the
+same window, so `--region-at X,Y` names a region from an earlier listing by a point
+inside it; the smallest region containing that point is clicked. Linux and macOS
+hosts need `python3`. MCP: `fleet_cu_regions`, and `fleet_cu_act` with
+`region: {text | at, kind?, nth?}`.
+
 A batch targets one fixed window, executes ordered input on the host, and captures
 before/after the whole sequence. Use `--file actions.json` or `-` for stdin. Each
 entry has `tool`, optional `args`, optional coordinate `space`, and optional

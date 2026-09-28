@@ -60,6 +60,7 @@ const MUTATING_TOOLS = [
   "fleet_cu_apps",
   "fleet_cu_elements",
   "fleet_cu_open",
+  "fleet_cu_regions",
   "fleet_cu_verify",
   "fleet_cu_screenshot_window",
   "fleet_cu_windows",

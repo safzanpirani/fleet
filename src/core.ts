@@ -28,6 +28,11 @@ import {
   bootNextCommand, checkEntries, espListCommand, firmwareListCommand, parseEspList, parseFirmwareTable,
   pickFirmwareEntry, type EfiPartition, type EntryCheck, type FirmwareEntry, type FirmwareTable,
 } from "./firmware.ts";
+import {
+  cuPickRegion, encodeRegionConfig, parseRegionEvents, perceptionScript, regionErrorHint, regionPs,
+  validateRegionLocator, validateRegionOptions, PV_SENTINEL, REGION_PY,
+  type CuRegion, type CuRegionError, type CuRegionLocator, type CuRegionParse, type CuRegionParseOptions,
+} from "./perception.ts";
 
 // ── tiny arg helpers (shared by cli flag parsing + recipe step parsing) ──────
 export function pullFlag(rest: string[], flag: string): boolean {
@@ -3630,6 +3635,8 @@ export interface CuActResult extends CuResult {
   driverOutput: string;
   /** The control the action addressed, when it was addressed by label. */
   element?: CuElement;
+  /** The perception region a region click hit, in its capture's pixels. */
+  region?: CuRegion;
   /** Why the driver says the input was refused or not delivered. */
   refusal?: string;
   /** The addressed control's value read back after set_value / type_text, when
@@ -3663,6 +3670,8 @@ export interface CuInputOptions {
   point?: { x: number; y: number; space?: "window" | "screen" };
   /** Address a control by accessibility instead of by pixel. */
   element?: CuElementLocator;
+  /** Address a click by a Cua Perception region of a fresh capture. */
+  region?: CuRegionLocator;
 }
 
 function cuInputPayload(target: CuTarget, payload: Record<string, unknown>, opts: CuInputOptions): Record<string, unknown> {
@@ -3707,7 +3716,9 @@ export async function cuAct(
   deps: { exec?: typeof exec; deliver?: typeof deliverImage; snapshot?: typeof cuSnapshot; elements?: typeof cuElements } = {},
 ): Promise<CuActResult> {
   const host = resolveHosts(cfg, sel)[0]!;
+  if (opts.region) validateRegionLocator(opts.region);
   const { target } = await cuResolveTarget(cfg, sel, query, { snapshot: deps.snapshot, exec: deps.exec });
+  if (opts.region) return cuConfirmClosed(cfg, sel, await cuActOnRegion(host, target, tool, payload, opts, deps), deps);
   let element: CuElement | undefined;
   if (opts.element) {
     if (opts.point || ["x", "y", "element_index", "element_token"].some((key) => Object.hasOwn(payload ?? {}, key)))
@@ -3725,6 +3736,64 @@ export async function cuAct(
   result = await cuConfirmClosed(cfg, sel, result, deps);
   if (!element || element.index < 0) return result;
   return cuConfirmByValue(cfg, sel, query, tool, payload, { ...result, element }, opts.element!, deps.elements);
+}
+
+/** A click addressed by a perception region. Capture, parse, pick and click run
+ *  in one `cua-driver mcp` session inside the verified-action script, because a
+ *  `capture_id` resolves nowhere else. The click carries that id and a point in
+ *  the capture's own pixels; the driver maps it and consumes the capture. A
+ *  failed parse or pick sends no input and throws. */
+async function cuActOnRegion(
+  host: Host, target: CuTarget, tool: string, payload: Record<string, unknown>,
+  opts: CuInputOptions, deps: { exec?: typeof exec; deliver?: typeof deliverImage },
+): Promise<CuActResult> {
+  if (!["click", "right_click", "double_click"].includes(tool))
+    throw new Error("a region addresses click, right_click, and double_click only");
+  if (opts.element || opts.point || ["x", "y", "element_index", "element_token", "capture_id"].some((key) => Object.hasOwn(payload ?? {}, key)))
+    throw new Error("address the click by region, by element, or by x,y — only one");
+  const loc = opts.region!;
+  const args = cuInputPayload(target, payload, { ...opts, point: undefined });
+  const config = encodeRegionConfig({ pid: target.pid, window_id: target.window.window_id, options: {},
+    pick: { ...(loc.text !== undefined ? { text: loc.text } : {}), ...(loc.at ? { at: { x: loc.at.x, y: loc.at.y } } : {}),
+      ...(loc.kind ? { kind: loc.kind } : {}), ...(loc.nth !== undefined ? { nth: loc.nth } : {}) },
+    click: { tool, args } });
+  const input = host.os === "windows"
+    ? { prelude: regionPs(), invoke: `Invoke-FleetRegions '${config}'` }
+    : { prelude: [
+        `_fleet_regions() {`,
+        `  command -v python3 >/dev/null 2>&1 || { echo '${PV_SENTINEL}error|{"code":"session_unavailable","message":"python3 is required for perception"}'; return 3; }`,
+        `  python3 -c ${shellQuote(REGION_PY, host.os)} "$fcd" '${config}'`,
+        `}`,
+      ].join("\n"), invoke: "_fleet_regions" };
+  const r = await cuActOnTarget(host, target, tool, args, opts, deps, input);
+  const events = parseRegionEvents(r.driverOutput);
+  const parsed = events.regions;
+  const fail = (message: string): never => { throw new Error(message + (r.result.stderr ? `\n${r.result.stderr}` : "")); };
+  if (events.error) fail(regionFailure(events.error, host.name));
+  if (!parsed) fail("the perception parse did not report; nothing was clicked" + (r.driverOutput ? `:\n${r.driverOutput}` : ""));
+  if (!("regions" in parsed!)) fail(regionFailure(parsed as CuRegionError, host.name));
+  const regions = (parsed as CuRegionParse).regions;
+  if (!events.pick?.region) {
+    // The remote rule refused; the local copy of it names the candidates.
+    cuPickRegion(regions, loc);
+    fail(`the region pick was refused on the host (${events.pick?.error ?? "no pick reported"}); nothing was clicked`);
+  }
+  const region = events.pick!.region!;
+  const driverOutput = events.click === undefined ? "" : cuReplyText(events.click).trim();
+  const refusal = events.click === undefined ? undefined : cuReplyRefusal(driverOutput);
+  let result: ExecResult = { ...r.result, stdout: driverOutput };
+  if (refusal && result.ok) result = { ...result, ok: false, code: 1, stderr: [result.stderr, refusal].filter(Boolean).join("\n") };
+  if (events.click === undefined) result = { ...result, ok: false, code: result.code || 1,
+    stderr: [result.stderr, "the click did not report; inspect the window before sending more input"].filter(Boolean).join("\n") };
+  const captureId = (events.capture as { capture_id?: string } | undefined)?.capture_id;
+  return { ...r, region, driverOutput, result, ...(refusal ? { refusal } : {}),
+    payload: { ...args, x: region.center.x, y: region.center.y, ...(captureId ? { capture_id: captureId } : {}) } };
+}
+
+function regionFailure(error: CuRegionError, host: string): string {
+  const hint = regionErrorHint(error.code, host);
+  return `perception ${error.code}: ${error.message}${error.detail ? ` (${error.detail})` : ""}; nothing was clicked`
+    + (hint ? `\n${hint}` : "");
 }
 
 /** A window captured before the input but not after it has usually closed: a
@@ -4332,6 +4401,112 @@ export async function cuElements(
   return { ...response, ...parsed, ...(!parsed.available && opts.maxElements !== undefined ? { bounded: true } : {}) };
 }
 
+// ── Cua Perception: regions read from pixels ────────────────────────────────
+// For windows whose accessibility walk finds nothing (canvases, games, remote
+// desktops), the optional cua-perception extension parses one capture into
+// text and icon regions. See src/perception.ts for the session rule.
+
+export interface CuRegions extends CuResult {
+  target: CuTarget;
+  captureId?: string;
+  /** The capture's pixel size; region bounds are in these pixels. */
+  width: number;
+  height: number;
+  regions: CuRegion[];
+  /** Regions before the text filter. */
+  total: number;
+  parser?: string;
+  durationMs?: number;
+  warnings: string[];
+  error?: CuRegionError;
+  hint?: string;
+}
+
+/** Capture one window and parse it into regions, in one driver session. The
+ *  filter keeps regions whose OCR text contains it. With `imageOut`, the parsed
+ *  capture itself comes back, so its pixels are the ones the bounds index. */
+export async function cuRegions(
+  cfg: FleetConfig, sel: string, query: string,
+  opts: CuRegionParseOptions & { filter?: string; imageOut?: string } = {},
+  deps: { exec?: typeof exec; deliver?: typeof deliverImage; snapshot?: typeof cuSnapshot } = {},
+): Promise<CuRegions> {
+  const options = validateRegionOptions(opts);
+  const host = resolveHosts(cfg, sel)[0]!;
+  const run = deps.exec ?? exec;
+  const { target } = await cuResolveTarget(cfg, sel, query, { snapshot: deps.snapshot, exec: deps.exec });
+  const { prelude } = cuaBin(host.os);
+  const config = encodeRegionConfig({ pid: target.pid, window_id: target.window.window_id, options });
+  const win = host.os === "windows";
+  const script = win ? [
+    `$ErrorActionPreference='Continue'`,
+    prelude,
+    cuWinSession(),
+    regionPs(),
+    opts.imageOut ? `$fleetRegionShot = Join-Path $env:TEMP ('fleet_pv_' + [guid]::NewGuid().ToString('N') + '.png')` : `$fleetRegionShot = $null`,
+    `Invoke-FleetRegions '${config}'`,
+    `$rc = $LASTEXITCODE`,
+    `Stop-FleetCua`,
+    emitImage(host.os, "fleetRegionShot", "regions"),
+    `exit $rc`,
+  ].join("\n") : [
+    prelude,
+    `command -v python3 >/dev/null 2>&1 || { echo '${PV_SENTINEL}error|{"code":"session_unavailable","message":"python3 is required for perception"}'; exit 3; }`,
+    opts.imageOut ? `shot="\${TMPDIR:-/tmp}/fleet_pv_$$.png"; rm -f "$shot"` : `shot=""`,
+    `python3 -c ${shellQuote(REGION_PY, host.os)} "$fcd" '${config}' $shot`,
+    `rc=$?`,
+    emitImage(host.os, "shot", "regions"),
+    `exit $rc`,
+  ].join("\n");
+  const executed = await run(host, script, win ? "powershell" : "bash");
+  const { images, rest } = takeInlineImages(executed.stdout);
+  const events = parseRegionEvents(rest);
+  const base = { host: host.name, target, width: 0, height: 0, regions: [] as CuRegion[], total: 0, warnings: [] as string[] };
+  const failed = (error: CuRegionError): CuRegions => {
+    const hint = regionErrorHint(error.code, host.name);
+    return { ...base, error, ...(hint ? { hint } : {}), captureId: events.capture?.capture_id,
+      result: { ...executed, stdout: "", ok: false, code: executed.code || 1,
+        stderr: [executed.stderr, `perception ${error.code}: ${error.message}`, hint].filter(Boolean).join("\n") } };
+  };
+  if (events.error) return failed(events.error);
+  if (!events.regions) return failed({ code: "no_reply", message: rest.trim() || executed.stderr.trim() || "the parse did not report" });
+  if (!("regions" in events.regions)) return failed(events.regions);
+  const parsed = events.regions;
+  const q = opts.filter?.toLowerCase().split(/\s+/).filter(Boolean).join(" ");
+  const regions = q ? parsed.regions.filter((r) => r.text?.toLowerCase().split(/\s+/).filter(Boolean).join(" ").includes(q)) : parsed.regions;
+  const out: CuRegions = { ...base, captureId: parsed.captureId, width: parsed.width, height: parsed.height,
+    regions, total: parsed.regions.length, warnings: parsed.warnings,
+    ...(parsed.parser ? { parser: parsed.parser } : {}), ...(parsed.durationMs !== undefined ? { durationMs: parsed.durationMs } : {}),
+    result: { ...executed, stdout: "" } };
+  if (!opts.imageOut) return out;
+  const bytes = images.get("regions");
+  if (!bytes) return { ...out, result: { ...out.result, ok: false, code: 1,
+    stderr: [out.result.stderr, "cua-driver produced no capture image"].filter(Boolean).join("\n") } };
+  const { result: pull, path } = await (deps.deliver ?? deliverImage)(host, "inline", opts.imageOut, { pull: inlinePull(host, bytes) });
+  if (!pull.ok) return { ...out, result: { ...out.result, ok: false, code: pull.code || 1, stderr: `image pull failed: ${pull.stderr}` } };
+  await validateImageArtifact(path);
+  return { ...out, localImage: path };
+}
+
+export interface CuPerceptionAction { host: string; os: Host["os"]; action: "install" | "status" | "remove"; result: ExecResult; }
+
+/** Check, install, or remove the cua-perception extension on every host a
+ *  selector resolves to. Install downloads the signed release on the host
+ *  itself (~420 MB), checks SHA256SUMS, and refuses a catalog the driver does
+ *  not report as publisher-verified. The extension includes an AGPL-3.0
+ *  component; nothing installs it implicitly. */
+export async function cuPerception(
+  cfg: FleetConfig, sel: string, action: "install" | "status" | "remove", opts: { version?: string } = {},
+  deps: { exec?: typeof exec } = {},
+): Promise<CuPerceptionAction[]> {
+  const run = deps.exec ?? exec;
+  const hosts = resolveHosts(cfg, sel);
+  for (const h of hosts) if (h.android) throw new Error(`${h.name} is an Android host; cua-perception runs on desktops`);
+  const scripts = hosts.map((h) => perceptionScript(h.os, action, opts.version));
+  return Promise.all(hosts.map(async (h, i) => ({
+    host: h.name, os: h.os, action, result: await run(h, scripts[i]!, h.os === "windows" ? "powershell" : "bash"),
+  })));
+}
+
 /** Roles match without case or macOS's `AX` prefix, so `--role Button` finds
  *  Windows' `Button` and macOS's `AXButton` alike. */
 export function sameRole(a: string, b: string): boolean {
@@ -4386,6 +4561,8 @@ export function cuReplyRefusal(text: string): string | undefined {
   if (reply.isError === true) return "the driver returned an error";
   if (["refused", "error", "failed"].includes(reply.status)) return `the driver reported status ${reply.status}`;
   if (reply.refusal) return `the driver refused the input: ${typeof reply.refusal === "string" ? reply.refusal : JSON.stringify(reply.refusal)}`;
+  // A capture-bound click the driver would not admit: stale, reused, moved.
+  if (reply.effect === "refused") return `the driver refused the input${typeof reply.code === "string" ? ` (${reply.code})` : ""}`;
   const reason = reply.escalation?.reason;
   if (reason === "delivery_failed" || reason === "background_unavailable")
     return `the driver could not deliver this input in the background (${reason}); retry with --foreground`;
