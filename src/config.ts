@@ -27,6 +27,14 @@ export interface Host {
   deploy?: DeployTarget;   // where `fleet deploy` ships the fleet source on this host
   proxy?: string;     // `proxies` entry name, or an inline URL (socks5h://user:pass@host:1080)
   android?: AndroidSpec;   // `fleet cu` drives an Android phone through adb inside Termux on this host
+  hostKeyAlias?: string;   // known_hosts name for this host's key; required when boots share an address
+  sudo?: SudoSpec;         // where `--sudo` finds the password when sudo asks for one
+}
+/** The sudo password for `--sudo`, read on the controller and sent over ssh
+ *  stdin. It never reaches an argv or a log. */
+export interface SudoSpec {
+  passwordEnv?: string;   // env var holding the password
+  passwordFile?: string;  // ~-expanded file holding the password (first line)
 }
 /** A phone reached over SSH into Termux, whose own adb client drives the phone's
  *  adbd (legacy `adb tcpip` mode, so it keeps listening off Wi-Fi). */
@@ -63,10 +71,14 @@ export interface DeployTarget {
 export interface Boot {
   host: string;        // host-entry name (Tailscale-reachable)
   lan?: string;        // host-entry name for LAN fallback
+  firmware?: string;   // UEFI boot entry description; `switch` looks it up by this label at switch time
 }
+/** A switch command: one string for every source boot, or one per source boot. */
+export type SwitchCommand = string | Record<string, string>;
 export interface Machine {
   boots: Record<string, Boot>;       // keyed by OS label: "cachyos" | "windows" | …
-  switch?: Record<string, string>;   // target-OS label -> command run on the LIVE boot
+  switch?: Record<string, SwitchCommand>;   // target-OS label -> command run on the LIVE boot
+  mac?: string;                      // NIC MAC address; `fleet find` looks it up in the ARP table
 }
 export interface Route {
   prefer: string[];                  // ordered host-entry names: preferred transport first
@@ -286,7 +298,8 @@ export function validateConfig(cfg: FleetConfig, path: string): void {
   for (const [name, rawHost] of Object.entries(cfg.hosts)) {
     const h = record(rawHost, `hosts.${name}`) as unknown as Host;
     knownKeys(h as unknown as Record<string, unknown>,
-      ["name", "ssh", "os", "transport", "gpu", "wsl", "winShell", "python", "services", "health", "cdp", "deploy", "proxy", "android"],
+      ["name", "ssh", "os", "transport", "gpu", "wsl", "winShell", "python", "services", "health", "cdp", "deploy", "proxy", "android",
+        "hostKeyAlias", "sudo"],
       `hosts.${name}`);
     if (!h.ssh || typeof h.ssh !== "string") fail(`hosts.${name}: missing/invalid \`ssh\``);
     if (h.ssh.startsWith("-")) fail(`hosts.${name}.ssh must not begin with '-' (ssh would parse it as an option)`);
@@ -308,6 +321,18 @@ export function validateConfig(cfg: FleetConfig, path: string): void {
       if (a.serial !== undefined && !/^[A-Za-z0-9._:-]+$/.test(a.serial))
         fail(`hosts.${name}.android.serial must be an adb serial like 127.0.0.1:5555 (got '${a.serial}')`);
       if (h.os !== "linux") fail(`hosts.${name}: android needs os linux (Termux runs the host's bash)`);
+    }
+    stringIfPresent(h.hostKeyAlias, `hosts.${name}.hostKeyAlias`);
+    if (h.hostKeyAlias !== undefined && !/^[A-Za-z0-9._-]+$/.test(h.hostKeyAlias))
+      fail(`hosts.${name}.hostKeyAlias must be a plain name like box-linux (got '${h.hostKeyAlias}')`);
+    if (h.sudo !== undefined) {
+      const su = record(h.sudo, `hosts.${name}.sudo`) as unknown as SudoSpec;
+      knownKeys(su as unknown as Record<string, unknown>, ["passwordEnv", "passwordFile"], `hosts.${name}.sudo`);
+      stringIfPresent(su.passwordEnv, `hosts.${name}.sudo.passwordEnv`);
+      stringIfPresent(su.passwordFile, `hosts.${name}.sudo.passwordFile`);
+      if (!!su.passwordEnv === !!su.passwordFile)
+        fail(`hosts.${name}.sudo: set exactly one of passwordEnv / passwordFile`);
+      if (h.os === "windows") fail(`hosts.${name}.sudo: sudo needs a POSIX host`);
     }
     if (h.winShell && !WIN_SHELLS.has(h.winShell))
       fail(`hosts.${name}: winShell must be one of ${[...WIN_SHELLS].join("|")} (got '${h.winShell}')`);
@@ -344,11 +369,17 @@ export function validateConfig(cfg: FleetConfig, path: string): void {
   }
   for (const [mn, rawMachine] of Object.entries(optionalRecord(cfg.machines, "machines"))) {
     const m = record(rawMachine, `machines.${mn}`) as unknown as Machine;
-    knownKeys(m as unknown as Record<string, unknown>, ["boots", "switch"], `machines.${mn}`);
+    knownKeys(m as unknown as Record<string, unknown>, ["boots", "switch", "mac"], `machines.${mn}`);
+    stringIfPresent(m.mac, `machines.${mn}.mac`);
+    if (m.mac !== undefined && !/^([0-9a-f]{2}[:-]){5}[0-9a-f]{2}$/i.test(m.mac))
+      fail(`machines.${mn}.mac must look like aa:bb:cc:dd:ee:ff (got '${m.mac}')`);
     if (!isRecord(m.boots) || !Object.keys(m.boots).length) fail(`machines.${mn}: needs at least one boot`);
     for (const [os, rawBoot] of Object.entries(m.boots)) {
       const b = record(rawBoot, `machines.${mn}.boots.${os}`) as unknown as Boot;
-      knownKeys(b as unknown as Record<string, unknown>, ["host", "lan"], `machines.${mn}.boots.${os}`);
+      knownKeys(b as unknown as Record<string, unknown>, ["host", "lan", "firmware"], `machines.${mn}.boots.${os}`);
+      stringIfPresent(b.firmware, `machines.${mn}.boots.${os}.firmware`);
+      if (b.firmware !== undefined && (!b.firmware.trim() || /[\r\n'"`$]/.test(b.firmware)))
+        fail(`machines.${mn}.boots.${os}.firmware must be a UEFI entry label without quotes or newlines (got '${b.firmware}')`);
       stringIfPresent(b.host, `machines.${mn}.boots.${os}.host`);
       if (!b.host) fail(`machines.${mn}.boots.${os}: missing host`);
       stringIfPresent(b.lan, `machines.${mn}.boots.${os}.lan`);
@@ -358,7 +389,17 @@ export function validateConfig(cfg: FleetConfig, path: string): void {
     for (const [target, command] of Object.entries(optionalRecord(m.switch, `machines.${mn}.switch`))) {
       if (!m.boots[target])
         fail(`machines.${mn}.switch.${target}: no such boot (have: ${Object.keys(m.boots).join(", ")})`);
-      stringIfPresent(command, `machines.${mn}.switch.${target}`);
+      if (isRecord(command)) {
+        for (const [source, sourceCommand] of Object.entries(command)) {
+          if (!m.boots[source])
+            fail(`machines.${mn}.switch.${target}.${source}: no such source boot (have: ${Object.keys(m.boots).join(", ")})`);
+          if (source === target) fail(`machines.${mn}.switch.${target}.${source}: a boot cannot switch to itself`);
+          if (typeof sourceCommand !== "string" || !sourceCommand.trim())
+            fail(`machines.${mn}.switch.${target}.${source} must be a non-empty command string`);
+        }
+      } else if (typeof command !== "string" || !command.trim()) {
+        fail(`machines.${mn}.switch.${target} must be a command string or an object keyed by source boot`);
+      }
     }
   }
   for (const [rn, rawRoute] of Object.entries(optionalRecord(cfg.routes, "routes"))) {
@@ -389,6 +430,18 @@ export function validateConfig(cfg: FleetConfig, path: string): void {
       && (!Array.isArray(tool.exclude) || tool.exclude.some((e) => typeof e !== "string" || !e)))
       fail(`tools.${tn}.exclude must be an array of non-empty strings`);
   }
+}
+
+/** Host key options. Boots of one machine share an address, so only the host
+ *  key tells them apart. With an alias, a key mismatch must fail the connection
+ *  rather than reach the wrong OS: StrictHostKeyChecking=no still logs in with
+ *  a public key when the key has changed. */
+export function hostKeyOpts(host: Host): string[] {
+  if (!host.hostKeyAlias) return [];
+  // An alias exists to be checked, so an ssh config line that points
+  // UserKnownHostsFile at /dev/null must not win. Aliases share the default store.
+  return ["-o", `HostKeyAlias=${host.hostKeyAlias}`, "-o", "StrictHostKeyChecking=yes",
+    "-o", `UserKnownHostsFile=${join(homedir(), ".ssh", "known_hosts")}`];
 }
 
 /** Bun's embedded filesystem prefix. `import.meta.url` resolves inside it in a

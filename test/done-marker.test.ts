@@ -62,3 +62,8 @@ describe("colour", () => {
     expect(useColor({ FORCE_COLOR: "0" }, false)).toBe(false);
   });
 });
+
+test("a one-shot Windows program flushes its formatted objects before the marker", () => {
+  const script = withDoneMarker("Get-Process | Select-Object Id", "powershell", doneMarker());
+  expect(script).toMatch(/FromBase64String\('[^']+'\)\)\)\) \| Out-Default/);
+});

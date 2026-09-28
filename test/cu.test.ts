@@ -703,3 +703,42 @@ describe("display names", () => {
     expect(cuResolveTargetFrom(snapshotFixture(), "Playnite.DesktopApp.exe").name).toBe("Playnite");
   });
 });
+
+describe("cua-driver start script (Linux)", () => {
+  /** Run the script with its final exec swapped for a print of what it resolved. */
+  async function resolve(env: Record<string, string>, runtime: string) {
+    const { CUA_START_SH } = await import("../src/core.ts");
+    const body = `fleet_session=wayland\n` + CUA_START_SH.replace(/^exec .*$/m,
+      `echo "$WAYLAND_DISPLAY|\${HYPRLAND_INSTANCE_SIGNATURE:-}|$CUA_DRIVER_RS_ENABLE_WAYLAND"`);
+    const r = Bun.spawnSync(["sh", "-c", body], { env: { PATH: process.env.PATH!, HOME: runtime, XDG_RUNTIME_DIR: runtime, ...env } });
+    return { code: r.exitCode, out: r.stdout.toString().trim() };
+  }
+
+  test("session values come from the live runtime dir, not from install time", async () => {
+    const { mkdtempSync, mkdirSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const dir = mkdtempSync(join(tmpdir(), "fleet-rt-"));
+    const server = Bun.listen({ unix: join(dir, "wayland-1"), socket: { data() {} } });
+    try {
+      mkdirSync(join(dir, "hypr", "livesig_1"), { recursive: true });
+      // Stale values a previous boot left in the user manager.
+      expect(await resolve({ WAYLAND_DISPLAY: "wayland-9", HYPRLAND_INSTANCE_SIGNATURE: "old_0" }, dir))
+        .toEqual({ code: 0, out: "wayland-1|livesig_1|1" });
+      server.stop(true);
+      rmSync(join(dir, "wayland-1"), { force: true });
+      // No compositor yet: fail so systemd retries instead of running blind.
+      expect((await resolve({}, dir)).code).toBe(1);
+    } finally { server.stop(true); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test("the unit drop-in carries no session values", async () => {
+    const { cuInstall } = await import("../src/core.ts");
+    let sent = "";
+    await cuInstall({ hosts: { l: { name: "l", ssh: "l", os: "linux" } } }, "l", {
+      exec: async (h, cmd) => { sent = cmd; return { host: h.name, ok: true, code: 0, stdout: "", stderr: "" }; },
+    });
+    expect(sent).toContain("ExecStart=%h/.config/cua-driver/fleet-start.sh");
+    expect(sent).not.toMatch(/Environment=(WAYLAND_DISPLAY|HYPRLAND_INSTANCE_SIGNATURE|XDG_RUNTIME_DIR)=/);
+  });
+});

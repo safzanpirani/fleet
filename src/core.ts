@@ -5,18 +5,29 @@
  * stdio MCP process. Presentation (ANSI tables, plain text) lives in the
  * frontends; the quoting-proof shell construction lives once, here + `ssh.ts`.
  */
-import { resolveHosts, REPO_ROOT, lookupProxy, normalizeProxy, resolveProxy } from "./config.ts";
+import { hostKeyOpts, resolveHosts, REPO_ROOT, lookupProxy, normalizeProxy, resolveProxy } from "./config.ts";
 import type { FleetConfig, Host, Service, ServiceType, Machine } from "./config.ts";
 import { connOpts, exec, probe, probeDetail, scp, scpPull, sshDiagnose, bashEsc, bashPathAssignment, psEsc } from "./ssh.ts";
 import { checkProxy, proxyCommandFor } from "./proxy.ts";
 import type { ProxyCheck } from "./proxy.ts";
 import type { ExecResult, Shell, TransferOptions } from "./ssh.ts";
-import { homedir, tmpdir } from "node:os";
+import { homedir, networkInterfaces, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { createConnection } from "node:net";
+import { createSocket } from "node:dgram";
 import { mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
+import { fstatSync, readFileSync, statSync } from "node:fs";
 import { installLockScript } from "./install-lock.ts";
+import { stopBroker as stopWinSessionBroker } from "./winsession.ts";
+import {
+  LINUX_MONITORS_SH, MAC_MONITORS_SH, mainMonitor, parseMonitors, parseRegion, pickMonitor, regionRect,
+  type Monitor, type MonitorSource, type Rect,
+} from "./monitors.ts";
+import {
+  bootNextCommand, checkEntries, espListCommand, firmwareListCommand, parseEspList, parseFirmwareTable,
+  pickFirmwareEntry, type EfiPartition, type EntryCheck, type FirmwareEntry, type FirmwareTable,
+} from "./firmware.ts";
 
 // ── tiny arg helpers (shared by cli flag parsing + recipe step parsing) ──────
 export function pullFlag(rest: string[], flag: string): boolean {
@@ -216,11 +227,102 @@ async function writeLsState(path: string, state: Record<string, boolean>): Promi
 // ── exec ──────────────────────────────────────────────────────────────────────
 export async function runExec(
   cfg: FleetConfig, sel: string, cmd: string,
-  opts: { wsl?: boolean; cwd?: string; timeoutMs?: number } = {},
+  opts: { wsl?: boolean; cwd?: string; timeoutMs?: number; sudo?: boolean; fresh?: boolean } = {},
 ): Promise<ExecResult[]> {
   const hosts = resolveHosts(cfg, sel);
   const shell: Shell = opts.wsl ? "wsl" : "auto";
-  return Promise.all(hosts.map((h) => exec(h, cmd, shell, { cwd: opts.cwd, timeoutMs: opts.timeoutMs })));
+  return Promise.all(hosts.map(async (h) => {
+    const sudo = opts.sudo ? await sudoWrap(h, cmd, !!opts.wsl) : { cmd };
+    if ("error" in sudo) return sudo.error;
+    return exec(h, sudo.cmd, shell, { cwd: opts.cwd, timeoutMs: opts.timeoutMs, fresh: opts.fresh });
+  }));
+}
+
+/** Wrap a POSIX command to run as root, or explain per host why it cannot. */
+async function sudoWrap(h: Host, cmd: string, wsl: boolean): Promise<{ cmd: string } | { error: ExecResult }> {
+  const fail = (stderr: string) => ({ error: { host: h.name, ok: false, code: 1, stdout: "", stderr } });
+  if (h.os === "windows" && !wsl)
+    return fail(`${h.name}: --sudo needs a POSIX shell; an elevated Windows session is already what fleet exec runs as an administrator`);
+  if (h.transport === "daytona") return fail(`${h.name}: --sudo is not supported on daytona sandboxes`);
+  try { return { cmd: asRoot(cmd, { password: wsl ? undefined : await sudoPassword(h), host: h.name }) }; }
+  catch (e) { return fail((e as Error).message); }
+}
+
+// ── reboot guard ──────────────────────────────────────────────────────────────
+// `fleet reboot` and `fleet switch` confirm before they reboot, check what came
+// back, and say so. A reboot hidden in `fleet exec` does none of that: a
+// helper run with `--help` "just to look" rebooted a machine once. exec refuses
+// commands that look like a reboot or power-off unless the caller says so.
+
+// Command position: the start of a line or pipeline stage, past any sudo/nohup.
+const CMD_POS = String.raw`(?:^|[;&|(\x60]|\$\()\s*(?:(?:sudo|doas|nohup|exec|command)(?:\s+-\S+)*\s+)*`;
+const END = String.raw`(?=$|[\s;&|)'"])`;
+const REBOOT_PATTERNS: [RegExp, string][] = [
+  [new RegExp(CMD_POS + String.raw`(?:reboot|poweroff|halt)(?:\.exe)?` + END, "im"), "reboot/poweroff/halt"],
+  [new RegExp(CMD_POS + String.raw`shutdown(?:\.exe)?\s+[^\n;|&]*?(?:\/[rgps]\b|\/fw\b|-[rhP]\b|--(?:reboot|poweroff|halt)\b|\bnow\b)`, "im"), "shutdown"],
+  [new RegExp(CMD_POS + String.raw`systemctl(?:\s+-\S+)*\s+(?:reboot|poweroff|halt|kexec|soft-reboot)` + END, "im"), "systemctl reboot/poweroff"],
+  [/\b(?:Restart|Stop)-Computer\b/im, "Restart-Computer/Stop-Computer"],
+  [new RegExp(CMD_POS + String.raw`(?:cmd(?:\.exe)?\s+\/[ck]\s+)?["']?(?:[\w.:~\\/-]*[\\/])?boot-[a-z0-9][a-z0-9-]*(?:\.cmd|\.ps1|\.sh|\.bat)?` + END, "im"), "a boot-<os> switch helper"],
+  [new RegExp(CMD_POS + String.raw`(?:telinit|init)\s+[06]` + END, "im"), "init 0/6"],
+];
+
+/** What in `cmd` looks like a reboot or power-off, or null. */
+export function rebootRisk(cmd: string): string | null {
+  for (const [re, what] of REBOOT_PATTERNS) {
+    const m = re.exec(cmd);
+    if (m) return `${what} ('${m[0].trim()}')`;
+  }
+  return null;
+}
+
+/** The refusal exec gives for a reboot-looking command. */
+export function rebootRefusal(cmd: string, confirm: string): string | null {
+  const risk = rebootRisk(cmd);
+  if (!risk) return null;
+  return `refusing: this command looks like it reboots or powers off the host: ${risk}. `
+    + `Use fleet switch (dual-boot) or fleet reboot, which confirm and verify the result. `
+    + `If a reboot is intended, pass ${confirm}.`;
+}
+
+// ── local stdin that exec would drop ─────────────────────────────────────────
+// exec sends the remote program over ssh's stdin, so the caller's own stdin
+// never reaches the remote command. `fleet exec host 'bash -s' < job.sh` used
+// to exit 0 having run nothing. Fleet never reads the caller's stdin to find
+// out (that would steal input from a `while read` loop around it); it only
+// looks at what kind of stdin it has.
+
+/** A remote command that expects its program or data on stdin. */
+export function readsStdin(cmd: string): boolean {
+  // Only a command that starts a pipeline reads the caller's stdin; after a |
+  // it reads the previous stage.
+  const c = cmd.trim();
+  const start = String.raw`(^|[;&(]\s*|&&\s*|\|\|\s*)(sudo\s+)?`;
+  const end = String.raw`\s*($|[;&|)])`;
+  return new RegExp(start + String.raw`(ba|z|da|k)?sh\s+(-[A-Za-z]*s\b|-` + end + ")").test(c)
+    || new RegExp(start + String.raw`(python3?|node|perl|ruby|bun)\s+-` + end).test(c)
+    || new RegExp(start + String.raw`(pwsh|powershell)(\.exe)?\s+(-\w+\s+)*-(Command|c)\s+-` + end, "i").test(c)
+    || /^(sudo\s+)?(cat\s*(>|$)|tee(\s+-a)?\s+\S)/.test(c);
+}
+
+export type LocalStdin = "tty" | "empty" | "file" | "pipe";
+/** What the caller's stdin is, without reading from it. */
+export function localStdin(): LocalStdin {
+  try {
+    const st = fstatSync(0);
+    if (st.isFile()) return st.size > 0 ? "file" : "empty";
+    if (st.isFIFO() || st.isSocket()) return "pipe";
+    return process.stdin.isTTY ? "tty" : "empty";
+  } catch { return "empty"; }
+}
+
+/** Refusal or warning for local stdin that exec would drop. */
+export function droppedStdinCheck(cmd: string, kind: LocalStdin = localStdin()): { refuse?: string; warn?: string } {
+  if (kind === "tty" || kind === "empty") return {};
+  const hint = "fleet exec sends only the command; the remote command's stdin is empty. "
+    + "To run local input as the program, use: fleet exec --script - --interp bash <host> < file";
+  if (readsStdin(cmd)) return { refuse: `refusing: local stdin is a ${kind} but '${cmd.trim().slice(0, 60)}' reads stdin, which would get nothing. ${hint}` };
+  if (kind === "file") return { warn: `fleet: warning: local stdin is a file that fleet exec does not read. ${hint}` };
+  return {};
 }
 
 // ── exec --script ─────────────────────────────────────────────────────────────
@@ -322,7 +424,7 @@ export async function readScriptSource(path: string): Promise<ScriptSource> {
  *  extension-derived interpreter; "-" as `path` reads stdin. */
 export async function runScript(
   cfg: FleetConfig, sel: string, script: ScriptSource,
-  opts: { wsl?: boolean; cwd?: string; timeoutMs?: number; interp?: string } = {},
+  opts: { wsl?: boolean; cwd?: string; timeoutMs?: number; interp?: string; sudo?: boolean; fresh?: boolean } = {},
 ): Promise<ExecResult[]> {
   if (script.label === "<stdin>" && !script.ext && !opts.interp)
     throw new Error("fleet: --script - needs --interp <command> unless stdin starts with a supported shebang");
@@ -333,7 +435,9 @@ export async function runScript(
     const os = opts.wsl ? "linux" : h.os;
     const interp = opts.interp ?? interpreterFor(script.ext, os);
     const cmd = buildScriptCommand(script.source, interp, os, shell);
-    return exec(h, cmd, shell, { cwd: opts.cwd, timeoutMs: opts.timeoutMs });
+    const eo = { cwd: opts.cwd, timeoutMs: opts.timeoutMs, fresh: opts.fresh };
+    if (!opts.sudo) return exec(h, cmd, shell, eo);
+    return sudoWrap(h, cmd, !!opts.wsl).then((sudo) => "error" in sudo ? sudo.error : exec(h, sudo.cmd, shell, eo));
   }));
 }
 
@@ -388,10 +492,60 @@ export async function pullFile(
 // concurrent remote change. This does neither: read bytes, replace exactly,
 // write back only if the file is still byte-identical to what we read.
 
-/** Run a POSIX script as root without a password prompt. The script travels
- *  base64-encoded, so nothing in it needs quoting for sudo's argv. */
-export function asRoot(script: string): string {
-  return `printf %s '${Buffer.from(script, "utf8").toString("base64")}' | base64 -d | sudo -n bash`;
+/** Run a POSIX script as root. The script travels base64-encoded, so nothing in
+ *  it needs quoting for sudo's argv, and it runs inside `( … ) </dev/null` so a
+ *  command that reads stdin cannot swallow the rest of it.
+ *
+ *  Root runs it directly and passwordless sudo runs it with `-n`. Otherwise the
+ *  password goes first on sudo's stdin, ahead of the script: sudo reads exactly
+ *  one line for it. `-k` makes sudo ask even when a cached ticket exists, so the
+ *  password line can never fall through to bash. A trial `sudo -k -S true`
+ *  first means a wrong password fails on its own instead of consuming script
+ *  lines as further attempts. The password never reaches an argv: printf is a
+ *  shell builtin. */
+export function asRoot(script: string, opts: { password?: string; host?: string } = {}): string {
+  const b64 = Buffer.from(`(\n${script}\n) </dev/null\n`, "utf8").toString("base64");
+  const where = opts.host ? ` on ${opts.host}` : "";
+  const lines = [
+    `fleet_root_script() { printf %s '${b64}' | base64 -d; }`,
+    `if [ "$(id -u)" = 0 ]; then fleet_root_script | bash`,
+    `elif sudo -n true 2>/dev/null; then fleet_root_script | sudo -n bash`,
+  ];
+  if (opts.password === undefined) {
+    lines.push(`else echo "fleet: sudo${where} needs a password; set hosts.${opts.host ?? "<host>"}.sudo.passwordFile to a 0600 file holding it" 1>&2; exit 1`);
+  } else {
+    const pw = Buffer.from(opts.password, "utf8").toString("base64");
+    lines.push(
+      `else`,
+      `  fleet_sudo_pw() { printf '%s\\n' "$(printf %s '${pw}' | base64 -d)"; }`,
+      `  fleet_sudo_pw | sudo -k -S -p '' true 2>/dev/null || { echo "fleet: sudo${where} rejected the configured password" 1>&2; exit 1; }`,
+      `  { fleet_sudo_pw; fleet_root_script; } | sudo -k -S -p '' bash`,
+    );
+  }
+  lines.push(`fi`);
+  return lines.join("\n");
+}
+
+/** The sudo password configured for a host, or undefined when none is. A file
+ *  readable by other users is refused: it holds a root credential. */
+export async function sudoPassword(host: Host): Promise<string | undefined> {
+  const spec = host.sudo;
+  if (!spec) return undefined;
+  if (spec.passwordEnv) {
+    const v = process.env[spec.passwordEnv];
+    if (!v) throw new Error(`${host.name}: sudo password env ${spec.passwordEnv} is unset or empty`);
+    return v;
+  }
+  const raw = spec.passwordFile!;
+  const path = raw === "~" ? homedir() : raw.startsWith("~/") ? join(homedir(), raw.slice(2)) : raw;
+  if (!path.startsWith("/")) throw new Error(`${host.name}: sudo.passwordFile must be an absolute or ~ path (got '${raw}')`);
+  let mode: number;
+  try { mode = statSync(path).mode; }
+  catch { throw new Error(`${host.name}: sudo password file not found: ${path}`); }
+  if ((mode & 0o077) !== 0) throw new Error(`${host.name}: ${path} is readable by other users; chmod 600 it`);
+  const text = readFileSync(path, "utf8").split("\n")[0]!.replace(/\r$/, "");
+  if (!text) throw new Error(`${host.name}: sudo password file is empty: ${path}`);
+  return text;
 }
 
 function refuseWindowsSudo(host: Host, win: boolean, sudo?: boolean): void {
@@ -413,7 +567,7 @@ set -o pipefail
 base64 < "$p" | tr -d '\\n'`;
   const cmd = win
     ? `[Convert]::ToBase64String([IO.File]::ReadAllBytes('${psEsc(path)}'))`
-    : opts.sudo ? asRoot(posix) : posix;
+    : opts.sudo ? asRoot(posix, { password: await sudoPassword(host), host: host.name }) : posix;
   const r = await exec(host, cmd, shell);
   if (!r.ok) throw new Error(`${host.name}: cannot read ${path}: ${r.stderr.trim() || "exit " + r.code}`);
   const b64 = r.stdout.replace(/\s/g, "");
@@ -465,7 +619,8 @@ export async function writeRemoteFile(
         `mv -- "$tmp" "$p"`,
         `trap - EXIT HUP INT TERM`,
       ].join("\n");
-  return (deps.exec ?? exec)(host, deps.sudo && !win ? asRoot(cmd) : cmd, shell);
+  return (deps.exec ?? exec)(host,
+    deps.sudo && !win ? asRoot(cmd, { password: await sudoPassword(host), host: host.name }) : cmd, shell);
 }
 
 export interface EditResult {
@@ -761,6 +916,7 @@ export interface Diagnosis {
   proxy?: string;        // resolved proxy name (redacted); absent when direct
   proxyCommand?: string; // the exact ProxyCommand fleet hands ssh
   proxyCheck?: ProxyCheck;   // endpoint reachability + the `verify` result
+  identity: string[];        // ways a probe could reach another OS on the same address
 }
 /** Map a verbose-ssh failure log to a human reason + actionable hints. */
 function classifySsh(stderr: string): { reason: string; hints: string[] } {
@@ -782,20 +938,190 @@ function classifySsh(stderr: string): { reason: string; hints: string[] } {
     return { reason: "host-key mismatch", hints: ["the host key changed — clear the stale ~/.ssh/known_hosts entry"] };
   return { reason: "ssh failed for an unrecognised reason", hints: ["see the raw ssh -vv output with --verbose"] };
 }
+// ── host identity (boots that share an address) ──────────────────────────────
+// Every boot of a dual-boot machine answers on the same LAN and Tailscale
+// address. The host key is the only thing that tells them apart, and only when
+// each boot's key is stored under its own name (HostKeyAlias) and checked.
+
+interface SshEffective { hostname: string; port: string; alias?: string; strict: string; knownHosts: string[] }
+
+async function sshEffective(h: Host): Promise<SshEffective | null> {
+  const proc = Bun.spawn(["ssh", "-G", ...hostKeyOpts(h), h.ssh], { stdin: "ignore", stdout: "pipe", stderr: "ignore" });
+  const [out, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+  if (code !== 0) return null;
+  const get = (k: string) => new RegExp(`^${k} (.*)$`, "m").exec(out)?.[1]?.trim();
+  return {
+    hostname: (get("hostname") ?? "").toLowerCase(), port: get("port") ?? "22", alias: get("hostkeyalias"),
+    strict: get("stricthostkeychecking") ?? "ask", knownHosts: (get("userknownhostsfile") ?? "").split(/\s+/).filter(Boolean),
+  };
+}
+
+/** The machine boot a host serves, as "machine:boot", or null. */
+function bootOf(cfg: FleetConfig, host: string): string | null {
+  for (const [mn, m] of Object.entries(cfg.machines ?? {}))
+    for (const [bn, b] of Object.entries(m.boots)) if (b.host === host || b.lan === host) return `${mn}:${bn}`;
+  return null;
+}
+
+/** Keys stored for `name` in the given known_hosts files, as "type base64". */
+async function knownKeys(name: string, files: string[]): Promise<string[]> {
+  const keys: string[] = [];
+  for (const f of files) {
+    if (f === "/dev/null") continue;
+    const proc = Bun.spawn(["ssh-keygen", "-F", name, "-f", f], { stdin: "ignore", stdout: "pipe", stderr: "ignore" });
+    const out = await new Response(proc.stdout).text();
+    await proc.exited;
+    for (const line of out.split("\n")) {
+      const m = /^\S+\s+(\S+)\s+(\S+)/.exec(line);
+      if (m && !line.startsWith("#")) keys.push(`${m[1]} ${m[2]}`);
+    }
+  }
+  return keys;
+}
+
+/** Problems that let a probe of `host` reach a different OS on the same address. */
+export async function identityWarnings(cfg: FleetConfig, host: Host): Promise<string[]> {
+  if (host.transport === "daytona") return [];
+  const all = Object.values(cfg.hosts).filter((h) => h.transport !== "daytona");
+  const eff = new Map(await Promise.all(all.map(async (h) => [h.name, await sshEffective(h)] as const)));
+  const me = eff.get(host.name);
+  if (!me?.hostname) return [];
+  const myBoot = bootOf(cfg, host.name);
+  const warnings: string[] = [];
+  const peers = all.filter((h) => {
+    if (h.name === host.name) return false;
+    const e = eff.get(h.name);
+    if (!e || e.hostname !== me.hostname || e.port !== me.port) return false;
+    const theirBoot = bootOf(cfg, h.name);
+    return h.os !== host.os || (!!myBoot && !!theirBoot && myBoot !== theirBoot);
+  });
+  if (!peers.length) return [];
+  const myKey = me.alias ?? me.hostname;
+  for (const p of peers) {
+    const e = eff.get(p.name)!;
+    if ((e.alias ?? e.hostname) === myKey)
+      warnings.push(`${host.name} and ${p.name} share ${me.hostname} but store host keys under the same name '${myKey}'; `
+        + `set a distinct hosts.<name>.hostKeyAlias on each`);
+  }
+  if (!host.hostKeyAlias && /^(false|no|off)$/i.test(me.strict))
+    warnings.push(`ssh config for ${host.ssh} turns StrictHostKeyChecking off, so another OS on ${me.hostname} still logs in; set hosts.${host.name}.hostKeyAlias`);
+  if (host.hostKeyAlias) {
+    if (!(await knownKeys(host.hostKeyAlias, me.knownHosts)).length)
+      warnings.push(`no key is pinned for alias '${host.hostKeyAlias}'; run fleet hostkey ${host.name} --pin while ${myBoot?.split(":")[1] ?? "that OS"} is live`);
+  }
+  return warnings;
+}
+
+/** Whether any key is stored under the host's alias. True for unaliased hosts. */
+export async function aliasPinned(host: Host): Promise<boolean> {
+  if (!host.hostKeyAlias) return true;
+  const eff = await sshEffective(host);
+  return !!eff && (await knownKeys(host.hostKeyAlias, eff.knownHosts)).length > 0;
+}
+
+/** Target-boot hosts whose alias has no key yet, split by whether `switch` may
+ *  pin one on arrival. That is safe only when every other boot of the same OS
+ *  has its own key pinned, so the owner check can tell them apart (the banner
+ *  already tells Windows from Linux). */
+async function unpinnedTargets(cfg: FleetConfig, machine: string, target: string)
+  : Promise<{ autoPin: Host[]; blocked: Host[] }> {
+  const m = getMachine(cfg, machine);
+  const b = m.boots[target]!;
+  const mine = [b.lan, b.host].filter((n): n is string => !!n).map((n) => cfg.hosts[n]!);
+  const unpinned: Host[] = [];
+  for (const h of mine) if (!await aliasPinned(h)) unpinned.push(h);
+  if (!unpinned.length) return { autoPin: [], blocked: [] };
+  const os = mine[0]!.os;
+  const others = Object.entries(m.boots).filter(([n]) => n !== target)
+    .flatMap(([, ob]) => [ob.lan, ob.host]).filter((n): n is string => !!n).map((n) => cfg.hosts[n]!)
+    .filter((h) => h.os === os);
+  const safe = (await Promise.all(others.map(async (h) => !!h.hostKeyAlias && await aliasPinned(h)))).every(Boolean);
+  return safe ? { autoPin: unpinned, blocked: [] } : { autoPin: [], blocked: unpinned };
+}
+
+export interface HostKeyReport {
+  host: string; alias: string; address: string;
+  banner?: string;              // the ssh server's version banner
+  presented: string[];          // "type base64" keys the address serves now
+  pinned: string[];             // keys stored under the alias
+  matches: boolean;             // a presented key is pinned
+  owners: { key: string; name: string }[];   // other hosts/aliases of the same machine that already hold a presented key
+  pinnedNow?: boolean;
+}
+
+/** Compare the key a host's address serves now with the key pinned under its
+ *  alias, and optionally pin it. Pinning refuses a key that another boot of
+ *  the same machine already holds: that means the wrong OS is up. */
+export async function hostKey(cfg: FleetConfig, name: string, opts: { pin?: boolean } = {}): Promise<HostKeyReport> {
+  const host = cfg.hosts[name];
+  if (!host) throw new Error(`unknown host: ${name}`);
+  if (!host.hostKeyAlias) throw new Error(`hosts.${name} has no hostKeyAlias to pin a key under`);
+  if (resolveProxy(host)) throw new Error(`${name} is reached through a proxy; ssh-keyscan cannot follow it`);
+  const eff = await sshEffective(host);
+  if (!eff?.hostname) throw new Error(`ssh -G ${host.ssh} failed`);
+  const scan = Bun.spawn(["ssh-keyscan", "-T", "5", "-p", eff.port, eff.hostname], { stdin: "ignore", stdout: "pipe", stderr: "ignore" });
+  const scanned = await new Response(scan.stdout).text();
+  await scan.exited;
+  const presented = [...new Set(scanned.split("\n").filter((l) => !l.startsWith("#"))
+    .map((l) => /^\S+\s+(\S+)\s+(\S+)/.exec(l)).filter((m) => !!m).map((m) => `${m![1]} ${m![2]}`))];
+  if (!presented.length) throw new Error(`${eff.hostname}:${eff.port} presented no host key (is it up?)`);
+  const banner = /^#\s*\S+\s+(SSH-\S+)/m.exec(scanned)?.[1];
+  const bannerOs = banner ? (/windows/i.test(banner) ? "windows" : "posix") : null;
+  const files = eff.knownHosts.filter((f) => f !== "/dev/null");
+  const pinned = await knownKeys(host.hostKeyAlias, files);
+  const matches = presented.some((k) => pinned.includes(k));
+  // Other boots of the same machine: their aliases (or addresses when unaliased).
+  const myBoot = bootOf(cfg, name);
+  const machine = myBoot?.split(":")[0];
+  const owners: { key: string; name: string }[] = [];
+  if (machine) {
+    const others = Object.values(cfg.hosts).filter((h) => {
+      const b = bootOf(cfg, h.name);
+      return b && b.startsWith(machine + ":") && b !== myBoot;
+    });
+    const names = new Set<string>();
+    for (const o of others) {
+      if (o.hostKeyAlias && o.hostKeyAlias !== host.hostKeyAlias) names.add(o.hostKeyAlias);
+      // An unaliased host's keys sit under its bare address. An aliased host's
+      // bare address is skipped: shared addresses collect every boot's keys.
+      const oe = o.hostKeyAlias ? null : await sshEffective(o);
+      if (oe?.hostname && oe.hostname !== eff.hostname) names.add(oe.hostname);
+    }
+    for (const n of names) for (const k of await knownKeys(n, files)) if (presented.includes(k)) owners.push({ key: k, name: n });
+  }
+  const report: HostKeyReport = { host: name, alias: host.hostKeyAlias, address: `${eff.hostname}:${eff.port}`, banner, presented, pinned, matches, owners };
+  if (!opts.pin || matches) return report;
+  if (bannerOs && (bannerOs === "windows") !== (host.os === "windows"))
+    throw new Error(`refusing to pin: ${eff.hostname} answers with ${banner}, but ${name} is a ${host.os} host, so a different boot is up`);
+  if (owners.length)
+    throw new Error(`refusing to pin: ${eff.hostname} presents the key already stored for ${[...new Set(owners.map((o) => o.name))].join(", ")}, `
+      + `so a different boot is up. Boot ${myBoot?.split(":")[1] ?? name} first.`);
+  if (!files.length) throw new Error(`ssh config for ${host.ssh} has no usable UserKnownHostsFile`);
+  const target = files[0]!;
+  if (pinned.length) {
+    const rm = Bun.spawn(["ssh-keygen", "-R", host.hostKeyAlias, "-f", target], { stdout: "ignore", stderr: "ignore" });
+    await rm.exited;
+  }
+  const lines = presented.map((k) => `${host.hostKeyAlias} ${k}`).join("\n") + "\n";
+  await writeFile(target, lines, { flag: "a" });
+  return { ...report, pinned: presented, matches: true, pinnedNow: true };
+}
+
 /** Diagnose one host (or dual-boot machine): is ssh up, and if not, why — plus a
  *  health-URL cross-check so an alive-but-unreachable box is obvious. */
 export async function diagnose(cfg: FleetConfig, sel: string): Promise<Diagnosis> {
   const host = resolveHosts(cfg, await routeSelector(cfg, sel))[0]!;
   const resolvedProxy = resolveProxy(host);
-  const [probe, httpUp, proxyCheck] = await Promise.all([
+  const [probe, httpUp, proxyCheck, identity] = await Promise.all([
     sshDiagnose(host),
     host.health ? probeHttp(host.health) : Promise.resolve(undefined),
     resolvedProxy ? checkProxy(resolvedProxy) : Promise.resolve(undefined),
+    identityWarnings(cfg, host),
   ]);
   const base: Diagnosis = {
     host: host.name, os: host.os, ssh: host.ssh, services: Object.keys(host.services ?? {}),
     sshUp: probe.ok, ms: probe.ms, health: host.health, httpUp, hints: [],
-    proxy: resolvedProxy?.name, proxyCommand: proxyCommandFor(host), proxyCheck,
+    proxy: resolvedProxy?.name, proxyCommand: proxyCommandFor(host), proxyCheck, identity,
   };
   if (probe.ok) return base;
   const { reason, hints } = classifySsh(probe.stderr);
@@ -806,6 +1132,10 @@ export async function diagnose(cfg: FleetConfig, sel: string): Promise<Diagnosis
       hints: [`check the proxy endpoint itself, then retry`,
         `FLEET_NO_PROXY=1 fleet doctor ${host.name}   # test the direct route`] };
   if (httpUp) hints.unshift("health URL answers → the box is ALIVE; this is an ssh/route problem, not a dead host");
+  const boot = bootOf(cfg, host.name);
+  if (boot && reason === "host-key mismatch")
+    hints.unshift(`${host.name} is the ${boot.split(":")[1]} boot of ${boot.split(":")[0]}; another OS on the same address presents a different key. `
+      + `Check fleet boot ${boot.split(":")[0]} before touching known_hosts`);
   if (resolvedProxy) hints.push(`the route goes through proxy ${resolvedProxy.name} — compare with FLEET_NO_PROXY=1`);
   return { ...base, reason, hints };
 }
@@ -848,8 +1178,11 @@ export async function dropMasters(cfg: FleetConfig, sel: string): Promise<{ host
     const proc = Bun.spawn(["ssh", ...connOpts(h), "-O", "exit", h.ssh], { stdout: "pipe", stderr: "pipe" });
     const [err, code] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
     const detail = err.trim();
-    // "No such file or directory"/"not found" just means there was no master.
-    return { host: h.name, dropped: code === 0, detail: code === 0 ? "master closed" : (detail || "no live master") };
+    // A Windows host's kept-open pwsh is a login of its own; stop its broker too.
+    const brokers = h.os === "windows" ? stopWinSessionBroker(h) : 0;
+    const parts = [code === 0 ? "master closed" : "no live master"];
+    if (brokers) parts.push("session broker stopped");
+    return { host: h.name, dropped: code === 0 || brokers > 0, detail: parts.join("; ") };
   }));
 }
 
@@ -1031,34 +1364,355 @@ async function probePort(hostname: string, port: number, timeoutMs: number): Pro
   });
 }
 
+export type SwitchPhase = "probe" | "plan" | "trigger" | "reboot" | "wait" | "done";
+export interface SwitchProgress { phase: SwitchPhase; detail: string; elapsedMs: number }
+/** How the switch is triggered on the live boot. */
+export type SwitchPlan =
+  | { kind: "command"; command: string; source: string }
+  | { kind: "firmware"; label: string; entry: FirmwareEntry; note?: string; warning?: string; command: string };
 export interface SwitchResult {
   machine: string; from: string | null; to: string;
-  triggered: ExecResult; arrived: boolean; waitedMs: number;
+  plan: SwitchPlan;
+  triggered: ExecResult | null;   // null for a dry run
+  wentDown: boolean;              // the source boot stopped answering after the trigger
+  arrived: boolean; waitedMs: number;
+  landedIn: string | null;        // the boot that answers at the end (null: none)
+  progress: SwitchProgress[];
 }
 
-/** Boot a machine into target OS: detect the live boot, run switch[target] on it,
- *  then poll until the target boot answers (unless wait:false). */
+/** The switch command configured for target from source: a plain string serves
+ *  every source; an object is keyed by source boot. */
+export function switchCommandFor(m: Machine, target: string, source: string): string | undefined {
+  const entry = m.switch?.[target];
+  if (typeof entry === "string") return entry;
+  return entry?.[source];
+}
+
+/** How long the trigger itself may take. A reboot helper returns within seconds;
+ *  anything longer means the command never ran or the session wedged. */
+const SWITCH_TRIGGER_MS = 60_000;
+
+async function planSwitch(
+  cfg: FleetConfig, machine: string, m: Machine, target: string, live: string, liveHost: Host,
+  run: typeof exec,
+): Promise<SwitchPlan> {
+  const command = switchCommandFor(m, target, live);
+  if (command) return { kind: "command", command, source: `machines.${machine}.switch.${target}` };
+  const label = m.boots[target]!.firmware;
+  if (!label)
+    throw new Error(`no way to switch ${machine} from ${live} to ${target}: set machines.${machine}.boots.${target}.firmware `
+      + `to its UEFI entry label, or machines.${machine}.switch.${target}.${live} to a command`);
+  const os = liveHost.os === "windows" ? "windows" : liveHost.os === "linux" ? "linux" : null;
+  if (!os) throw new Error(`${liveHost.name}: firmware switching needs Windows or Linux`);
+  const listed = await run(liveHost, firmwareListCommand(os), "auto", { timeoutMs: 30_000 });
+  if (!listed.ok)
+    throw new Error(`${liveHost.name}: could not read firmware entries (${firmwareListCommand(os)}): ${listed.stderr.trim() || "exit " + listed.code}`);
+  const table = parseFirmwareTable(os, listed.stdout);
+  const { entry, note } = pickFirmwareEntry(table, label);
+  let warning: string | undefined;
+  const esps = await run(liveHost, espListCommand(os), "auto", { timeoutMs: 30_000 });
+  if (esps.ok) warning = checkEntries({ ...table, entries: [entry] }, parseEspList(os, esps.stdout))[0]?.warning;
+  const next = bootNextCommand(os, entry, target);
+  const cmd = os === "linux" ? asRoot(next, { password: await sudoPassword(liveHost), host: liveHost.name }) : next;
+  return { kind: "firmware", label, entry, note, warning, command: cmd };
+}
+
+/** Boot a machine into target OS: detect the live boot, trigger the switch on
+ *  it, watch the source boot go down, then poll until the target answers.
+ *  Every phase is reported through `onProgress` as it happens. */
 export async function switchMachine(
   cfg: FleetConfig, machine: string, target: string,
-  opts: { timeoutMs?: number; intervalMs?: number; wait?: boolean } = {},
+  opts: {
+    timeoutMs?: number; intervalMs?: number; wait?: boolean; dryRun?: boolean;
+    onProgress?: (p: SwitchProgress) => void;
+    deps?: { exec?: typeof exec; probe?: (host: Host, capMs?: number) => Promise<boolean> };
+  } = {},
 ): Promise<SwitchResult> {
   const m = getMachine(cfg, machine);
   if (!m.boots[target]) throw new Error(`machine ${machine} has no boot '${target}' (have: ${Object.keys(m.boots).join(", ")})`);
-  const cmd = m.switch?.[target];
-  if (!cmd) throw new Error(`no switch command for ${machine} -> ${target} (add machines.${machine}.switch.${target})`);
-  const st = await bootState(cfg, machine);
+  const run = opts.deps?.exec ?? exec;
+  const probeHost = opts.deps?.probe ?? probe;
+  const timeoutMs = opts.timeoutMs ?? 300_000, intervalMs = opts.intervalMs ?? 5_000;
+  const start = Date.now();
+  const progress: SwitchProgress[] = [];
+  const report = (phase: SwitchPhase, detail: string) => {
+    const p = { phase, detail, elapsedMs: Date.now() - start };
+    progress.push(p);
+    opts.onProgress?.(p);
+  };
+
+  report("probe", `probing every boot of ${machine}`);
+  const st = await bootState(cfg, machine, { probe: (h) => probeHost(h) });
   if (st.live === target) throw new Error(`${machine} is already in ${target}`);
-  if (!st.live || !st.liveHost) throw new Error(`${machine} is not reachable — can't issue a switch (power it on first)`);
+  if (!st.live || !st.liveHost) throw new Error(`${machine} is not reachable in any boot; power it on before switching`);
   const liveHost = cfg.hosts[st.liveHost]!;
-  const triggered = await exec(liveHost, cmd);     // reboot drops the link; non-zero is expected & ignored for arrival
-  let arrived = false, waitedMs = 0;
-  if (opts.wait !== false) {
-    const r = await waitFor(cfg, machine, {
-      boot: target, timeoutMs: opts.timeoutMs ?? 180_000, intervalMs: opts.intervalMs ?? 5_000,
-    });
-    arrived = r.ok; waitedMs = r.elapsedMs;
+  report("probe", `${machine} is in ${st.live} via ${st.transport} (${st.liveHost})`);
+
+  const plan = await planSwitch(cfg, machine, m, target, st.live, liveHost, run);
+  report("plan", plan.kind === "command"
+    ? `run ${plan.source} on ${liveHost.name}`
+    : `one-time boot firmware entry '${plan.label}' (${plan.entry.id}${plan.entry.path ? ", " + plan.entry.path : ""}) on ${liveHost.name}`);
+  if (plan.kind === "firmware" && plan.note) report("plan", plan.note);
+  if (plan.kind === "firmware" && plan.warning) report("plan", `warning: entry ${plan.warning}`);
+  const pins = opts.deps ? { autoPin: [], blocked: [] } : await unpinnedTargets(cfg, machine, target);
+  for (const h of pins.autoPin)
+    report("plan", `${h.name} has no key pinned under '${h.hostKeyAlias}'; it will be pinned when ${target} answers`);
+  for (const h of pins.blocked)
+    report("plan", `warning: ${h.name} has no key pinned under '${h.hostKeyAlias}', so fleet cannot recognise ${target}; `
+      + `after it boots run fleet hostkey ${h.name} --pin`);
+  const base = { machine, from: st.live, to: target, plan, progress };
+  if (opts.dryRun) {
+    report("done", "dry run; nothing was changed");
+    return { ...base, triggered: null, wentDown: false, arrived: false, waitedMs: 0, landedIn: st.live };
   }
-  return { machine, from: st.live, to: target, triggered, arrived, waitedMs };
+
+  report("trigger", `sending the switch to ${liveHost.name}`);
+  const triggered = await run(liveHost, plan.command, "auto", { timeoutMs: SWITCH_TRIGGER_MS });
+  // A reboot may cut the link before the reply: 255 is ssh's own failure code.
+  const dropped = triggered.code === 255 || triggered.code === 124;
+  const said = (triggered.stdout + "\n" + triggered.stderr).trim().split("\n").filter(Boolean).slice(-3).join(" | ");
+  if (!triggered.ok && !dropped) {
+    report("done", `trigger failed with exit ${triggered.code}; not waiting`);
+    throw new Error(`switch trigger on ${liveHost.name} failed (exit ${triggered.code}); ${machine} should still be in ${st.live}`
+      + (said ? `: ${said}` : ""));
+  }
+  report("trigger", triggered.ok
+    ? `trigger exit 0${said ? ": " + said : ""}`
+    : triggered.code === 124 ? `trigger gave no reply within ${SWITCH_TRIGGER_MS / 1000}s; checking whether ${machine} goes down`
+    : `link dropped during the trigger (exit ${triggered.code}); checking whether ${machine} goes down`);
+  if (opts.wait === false) {
+    report("done", "switch issued; not waiting");
+    return { ...base, triggered, wentDown: false, arrived: false, waitedMs: 0, landedIn: null };
+  }
+
+  const left = () => timeoutMs - (Date.now() - start);
+  // Phase: the source boot must stop answering. If it never does, the trigger
+  // did not reboot anything, and waiting for the target would only burn time.
+  let wentDown = false;
+  const downBy = Date.now() + Math.min(120_000, Math.max(0, left()));
+  while (Date.now() < downBy) {
+    if (!await probeHost(liveHost, 4000)) { wentDown = true; break; }
+    await Bun.sleep(Math.min(3000, Math.max(0, downBy - Date.now())));
+  }
+  if (!wentDown) {
+    const now = await bootState(cfg, machine, { probe: (h) => probeHost(h) });
+    report("done", `${liveHost.name} kept answering; no reboot happened`);
+    return { ...base, triggered, wentDown, arrived: false, waitedMs: Date.now() - start, landedIn: now.live };
+  }
+  report("reboot", `${liveHost.name} stopped answering; reboot under way`);
+
+  let lastDetail = "", lastAt = 0;
+  const w = await waitFor(cfg, machine, {
+    boot: target, timeoutMs: Math.max(1, left()), intervalMs,
+    onTick: (detail) => {
+      const now = Date.now();
+      if (detail !== lastDetail || now - lastAt >= 30_000) {
+        report("wait", `waiting for ${target}: ${detail}`);
+        lastDetail = detail; lastAt = now;
+      }
+    },
+  }, { probe: async (h, cap) => {
+    const i = pins.autoPin.findIndex((p) => p.name === h.name);
+    if (i >= 0) {
+      try {
+        await hostKey(cfg, h.name, { pin: true });
+        pins.autoPin.splice(i, 1);
+        report("wait", `pinned ${h.name}'s host key under '${h.hostKeyAlias}'`);
+      } catch { /* not up yet, or the wrong boot answered; try again next tick */ }
+    }
+    return probeHost(h, cap);
+  } });
+  const landedIn = w.ok ? target : (await bootState(cfg, machine, { probe: (h) => probeHost(h) })).live;
+  report("done", w.ok ? `${machine} is in ${target}` : landedIn
+    ? `${machine} came back in ${landedIn}, not ${target}` : `${machine} answers in no boot yet`);
+  return { ...base, triggered, wentDown, arrived: w.ok, waitedMs: Date.now() - start, landedIn };
+}
+
+export interface FirmwareReport {
+  machine: string; live: string; host: string;
+  order: string[]; esps: EfiPartition[];
+  entries: (EntryCheck & { boots: string[] })[];   // boots: machine boots whose firmware label names this entry
+  missing: string[];                                // configured labels with no entry
+}
+
+/** List a machine's UEFI entries from its live boot, marking which boot each
+ *  configured label resolves to and which entries sit off the first EFI
+ *  partition. Read-only. */
+export async function firmwareEntries(
+  cfg: FleetConfig, machine: string, deps: { exec?: typeof exec } = {},
+): Promise<FirmwareReport> {
+  const m = getMachine(cfg, machine);
+  const run = deps.exec ?? exec;
+  const st = await bootState(cfg, machine);
+  if (!st.live || !st.liveHost) throw new Error(`${machine} is not reachable in any boot`);
+  const host = cfg.hosts[st.liveHost]!;
+  const os = host.os === "windows" ? "windows" : host.os === "linux" ? "linux" : null;
+  if (!os) throw new Error(`${host.name}: firmware entries need Windows or Linux`);
+  const [listed, espOut] = await Promise.all([
+    run(host, firmwareListCommand(os), "auto", { timeoutMs: 30_000 }),
+    run(host, espListCommand(os), "auto", { timeoutMs: 30_000 }),
+  ]);
+  if (!listed.ok) throw new Error(`${host.name}: ${firmwareListCommand(os)} failed: ${listed.stderr.trim() || "exit " + listed.code}`);
+  const table: FirmwareTable = parseFirmwareTable(os, listed.stdout);
+  const esps = espOut.ok ? parseEspList(os, espOut.stdout) : [];
+  const checked = checkEntries(table, esps);
+  const boots = new Map<string, string[]>();
+  const missing: string[] = [];
+  for (const [bootName, b] of Object.entries(m.boots)) {
+    if (!b.firmware) continue;
+    try {
+      const { entry } = pickFirmwareEntry(table, b.firmware);
+      boots.set(entry.id, [...(boots.get(entry.id) ?? []), bootName]);
+    } catch { missing.push(`${bootName} ('${b.firmware}')`); }
+  }
+  return {
+    machine, live: st.live, host: host.name, order: table.order, esps,
+    entries: checked.map((e) => ({ ...e, boots: boots.get(e.id) ?? [] })), missing,
+  };
+}
+
+// ── find (locate a machine on the LAN by MAC) ────────────────────────────────
+// A boot that comes up on a new DHCP address is invisible to every configured
+// host entry. Its NIC's MAC does not change between OSes, so the ARP table
+// finds it once the subnet has been touched.
+
+export interface FindHit { ip: string; mac: string }
+export interface FindResult {
+  query: string; mac?: string; from?: string; hits: FindHit[]; swept: string[];
+  stale: { host: string; address: string }[];   // the machine's LAN host entries that point elsewhere
+}
+
+export function normalizeMac(mac: string): string {
+  return mac.split(/[:-]/).map((p) => p.padStart(2, "0").toLowerCase()).join(":");
+}
+
+/** IPv4 → MAC pairs from `arp -an` (macOS), `ip neigh` (Linux) or `arp -a` (Windows). */
+export function parseArp(text: string): FindHit[] {
+  const hits: FindHit[] = [];
+  for (const line of text.split("\n")) {
+    const ip = /\b(\d{1,3}(?:\.\d{1,3}){3})\b/.exec(line)?.[1];
+    const mac = /\b([0-9a-f]{1,2}(?:[:-][0-9a-f]{1,2}){5})\b/i.exec(line)?.[1];
+    if (ip && mac && !/^(ff[:-]){5}ff$/i.test(mac)) hits.push({ ip, mac: normalizeMac(mac) });
+  }
+  return hits;
+}
+
+async function readArp(): Promise<FindHit[]> {
+  const cmd = process.platform === "linux" ? ["ip", "neigh"] : process.platform === "win32" ? ["arp", "-a"] : ["arp", "-an"];
+  const proc = Bun.spawn(cmd, { stdin: "ignore", stdout: "pipe", stderr: "ignore" });
+  const out = await new Response(proc.stdout).text();
+  await proc.exited;
+  return parseArp(out);
+}
+
+const ipToInt = (ip: string) => ip.split(".").reduce((a, o) => (a << 8) + Number(o), 0) >>> 0;
+const intToIp = (n: number) => [24, 16, 8, 0].map((b) => (n >>> b) & 255).join(".");
+
+/** Every other address of a private IPv4 network, or null when it is not a
+ *  private network or is larger than /22. */
+export function subnetAddrs(address: string, bits: number): { cidr: string; addrs: string[] } | null {
+  if (!/^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(address) || bits < 22 || bits > 30) return null;
+  const size = 2 ** (32 - bits);
+  const net = (ipToInt(address) & ~(size - 1)) >>> 0;
+  const addrs: string[] = [];
+  for (let i = 1; i < size - 1; i++) if (net + i !== ipToInt(address)) addrs.push(intToIp(net + i));
+  return { cidr: `${intToIp(net)}/${bits}`, addrs };
+}
+
+function localSubnets(): { cidr: string; addrs: string[] }[] {
+  const nets: { cidr: string; addrs: string[] }[] = [];
+  for (const list of Object.values(networkInterfaces())) for (const a of list ?? []) {
+    if (a.family !== "IPv4" || a.internal) continue;
+    const bits = a.netmask.split(".").reduce((c, o) => c + Number(o).toString(2).replace(/0/g, "").length, 0);
+    const net = subnetAddrs(a.address, bits);
+    if (net && !nets.some((n) => n.cidr === net.cidr)) nets.push(net);
+  }
+  return nets;
+}
+
+/** Make the kernel ARP every address: one empty UDP datagram to the discard port each. */
+async function touchSubnet(addrs: string[]): Promise<void> {
+  const sock = createSocket("udp4");
+  await Promise.all(addrs.map((ip) => new Promise<void>((resolve) => sock.send(Buffer.alloc(0), 9, ip, () => resolve()))));
+  await Bun.sleep(2000);
+  sock.close();
+}
+
+/** Where `find` reads ARP from: this controller, or a Linux host on the LAN. */
+interface ArpSource { read(): Promise<FindHit[]>; subnets(): Promise<{ cidr: string; addrs: string[] }[]>; sweep(addrs: string[]): Promise<void> }
+
+function localArp(): ArpSource {
+  return { read: readArp, subnets: async () => localSubnets(), sweep: touchSubnet };
+}
+
+function remoteArp(h: Host, run: typeof exec): ArpSource {
+  if (h.os !== "linux") throw new Error(`fleet find --from needs a Linux host (${h.name} is ${h.os})`);
+  const must = async (cmd: string) => {
+    const r = await run(h, cmd, "auto", { timeoutMs: 30_000 });
+    if (!r.ok) throw new Error(`${h.name}: ${r.stderr.trim() || "exit " + r.code}`);
+    return r.stdout;
+  };
+  return {
+    read: async () => parseArp(await must("ip neigh")),
+    subnets: async () => {
+      const out = await must("ip -4 -o addr show scope global");
+      const nets: { cidr: string; addrs: string[] }[] = [];
+      for (const line of out.split("\n")) {
+        const m = /^\d+:\s+(\S+)\s+inet\s+(\d+\.\d+\.\d+\.\d+)\/(\d+)/.exec(line);
+        if (!m || /^(docker|br-|veth|virbr|tailscale|zt|wg)/.test(m[1]!)) continue;
+        const net = subnetAddrs(m[2]!, Number(m[3]));
+        if (net && !nets.some((n) => n.cidr === net.cidr)) nets.push(net);
+      }
+      return nets;
+    },
+    sweep: async (addrs) => { await must(`for ip in ${addrs.join(" ")}; do ping -c1 -W1 "$ip" >/dev/null 2>&1 & done; wait`); },
+  };
+}
+
+/** Find a machine (by name, its configured MAC, or a raw MAC) in the ARP table,
+ *  sweeping the local subnets when it is not there yet. */
+export async function findHost(
+  cfg: FleetConfig, query: string, opts: { from?: string; deps?: { exec?: typeof exec } } = {},
+): Promise<FindResult> {
+  let from: string | undefined;
+  if (opts.from) {
+    const hosts = resolveHosts(cfg, await routeSelector(cfg, opts.from));
+    if (hosts.length !== 1) throw new Error(`--from needs exactly one host (got ${hosts.length})`);
+    from = hosts[0]!.name;
+  }
+  const src = from ? remoteArp(cfg.hosts[from]!, opts.deps?.exec ?? exec) : localArp();
+  let mac: string | undefined;
+  let machine: string | undefined;
+  if (/^([0-9a-f]{1,2}[:-]){5}[0-9a-f]{1,2}$/i.test(query)) mac = normalizeMac(query);
+  else {
+    machine = cfg.machines?.[query] ? query
+      : Object.entries(cfg.machines ?? {}).find(([, m]) => Object.values(m.boots).some((b) => b.host === query || b.lan === query))?.[0];
+    const configured = machine ? cfg.machines![machine]!.mac : undefined;
+    if (!configured)
+      throw new Error(machine ? `set machines.${machine}.mac to its NIC's MAC address to find it`
+        : `'${query}' is not a MAC address or a machine with a configured mac`);
+    mac = normalizeMac(configured);
+  }
+  const table = await src.read();
+  let hits = table.filter((h) => h.mac === mac);
+  const swept: string[] = [];
+  if (!hits.length) {
+    for (const net of await src.subnets()) { swept.push(net.cidr); await src.sweep(net.addrs); }
+    const after = await src.read();
+    if (!from && !table.length && !after.length)
+      throw new Error("this controller's ARP table reads empty (recent macOS hides it); run the lookup from a Linux host on the LAN with --from <host>");
+    hits = after.filter((h) => h.mac === mac);
+  }
+  const stale: { host: string; address: string }[] = [];
+  if (machine && hits.length) {
+    const lan = Object.values(cfg.machines![machine]!.boots).map((b) => b.lan).filter((n): n is string => !!n);
+    for (const name of lan) {
+      const eff = await sshEffective(cfg.hosts[name]!);
+      const addr = eff?.hostname ?? "";
+      if (/^\d{1,3}(\.\d{1,3}){3}$/.test(addr) && !hits.some((h) => h.ip === addr)) stale.push({ host: name, address: addr });
+    }
+  }
+  return { query, mac, from, hits: [...new Map(hits.map((h) => [h.ip, h])).values()], swept, stale };
 }
 
 // ── wait (poll until a condition holds; macOS has no `timeout`) ────────────────
@@ -1404,7 +2058,23 @@ Image.alpha_composite(im.convert("RGBA"), ov).convert("RGB").save(path)
 /** Per-OS command that captures the screen to a temp file and prints the path
  *  as its last stdout line. Best-effort on Linux (needs grim/scrot/imagemagick
  *  + a reachable display). Windows/mac capture the active interactive session. */
-export function captureCmd(os: Host["os"]): { cmd: string; shell: Shell } {
+/** What to capture: the whole desktop (no target), or one rectangle of the
+ *  layout. `output` is set when the rectangle is a whole monitor, so Wayland can
+ *  capture that output natively. Windows resolves its screens inside the user's
+ *  session, so it takes the raw selector and region fractions instead. */
+export interface CaptureTarget {
+  rect?: Rect; scale?: number; output?: string; wholeOutput?: boolean;
+  winOutput?: string; winRegion?: [number, number, number, number];
+  macDisplay?: number;
+  /** Wayland outputs that are powered off: turned on for the capture, then off again. */
+  wake?: { source: MonitorSource; outputs: string[] };
+}
+
+/** How long a Linux capture may take. grim waits for a frame, and a compositor
+ *  renders none for an output that is off, so an unbounded grim hangs. */
+const LINUX_CAPTURE_TIMEOUT_S = 20;
+
+export function captureCmd(os: Host["os"], target: CaptureTarget = {}): { cmd: string; shell: Shell } {
   if (os === "windows") return { shell: "powershell", cmd: [
     // sshd runs in session 0 (no desktop), so a direct CopyFromScreen captures a
     // blank virtual screen. Run the grab inside the logged-in user's interactive
@@ -1416,12 +2086,30 @@ export function captureCmd(os: Host["os"]): { cmd: string; shell: Shell } {
     `$ErrorActionPreference='Stop'`,
     `$out=[IO.Path]::ChangeExtension($MyInvocation.MyCommand.Path,'png')`,
     `$code=0; $bmp=$null; $g=$null`,
+    `$fleetOutput='${psEsc(target.winOutput ?? "")}'; $fleetRegion='${target.winRegion ? target.winRegion.join(",") : ""}'`,
     `try {`,
     `  Add-Type -AssemblyName System.Windows.Forms,System.Drawing`,
     `  $vs=[System.Windows.Forms.SystemInformation]::VirtualScreen`,
-    `  $bmp=New-Object System.Drawing.Bitmap($vs.Width,$vs.Height)`,
+    `  $r=New-Object System.Drawing.Rectangle($vs.X,$vs.Y,$vs.Width,$vs.Height)`,
+    // Screens are only visible from inside the user's session, so --output
+    // resolves here: main, a 1-based index, or a device name (DISPLAY2).
+    `  if ($fleetOutput) {`,
+    `    $all=@([System.Windows.Forms.Screen]::AllScreens)`,
+    `    $s = if ($fleetOutput -eq 'main' -or $fleetOutput -eq 'primary') { $all | Where-Object Primary | Select-Object -First 1 }`,
+    `      elseif ($fleetOutput -match '^\\d+$') { if ([int]$fleetOutput -ge 1 -and [int]$fleetOutput -le $all.Count) { $all[[int]$fleetOutput - 1] } }`,
+    `      else { $all | Where-Object { $_.DeviceName -ieq $fleetOutput -or $_.DeviceName -ieq ('\\\\.\\' + $fleetOutput) } | Select-Object -First 1 }`,
+    `    if (-not $s) { throw ("no monitor '" + $fleetOutput + "' (have: " + ((@(for ($i = 0; $i -lt $all.Count; $i++) { [string]($i + 1) + ':' + $all[$i].DeviceName.TrimStart('\\.') + $(if ($all[$i].Primary) { ' (main)' } else { '' }) })) -join ', ') + ")") }`,
+    `    $r=$s.Bounds`,
+    `  }`,
+    `  if ($fleetRegion) {`,
+    `    $f=@($fleetRegion.Split(',') | ForEach-Object { [double]$_ })`,
+    `    $x=[int][math]::Round($r.X + $f[0] * $r.Width); $y=[int][math]::Round($r.Y + $f[1] * $r.Height)`,
+    `    $x2=[int][math]::Round($r.X + ($f[0] + $f[2]) * $r.Width); $y2=[int][math]::Round($r.Y + ($f[1] + $f[3]) * $r.Height)`,
+    `    $r=New-Object System.Drawing.Rectangle($x,$y,($x2 - $x),($y2 - $y))`,
+    `  }`,
+    `  $bmp=New-Object System.Drawing.Bitmap($r.Width,$r.Height)`,
     `  $g=[System.Drawing.Graphics]::FromImage($bmp)`,
-    `  $g.CopyFromScreen($vs.Location,[System.Drawing.Point]::Empty,$vs.Size)`,
+    `  $g.CopyFromScreen($r.Location,[System.Drawing.Point]::Empty,$r.Size)`,
     `  $bmp.Save($out,[System.Drawing.Imaging.ImageFormat]::Png)`,
     `} catch { $code=1; [IO.File]::WriteAllText("$out.error",[string]$_) }`,
     `finally { if($g){$g.Dispose()}; if($bmp){$bmp.Dispose()} }`,
@@ -1453,15 +2141,38 @@ export function captureCmd(os: Host["os"]): { cmd: string; shell: Shell } {
     `  if(-not $captured){Remove-Item -LiteralPath $out -Force -ErrorAction SilentlyContinue}`,
     `}`,
   ].join("\n") };
-  if (os === "mac") return { shell: "bash", cmd:
-    `set -e; t="$(mktemp -t fleet_shot)"; p="$t.png"; rm -f "$t"; screencapture -x "$p"; [ -s "$p" ]; echo "$p"` };
-  // linux: try wayland (grim) then X11 (scrot / imagemagick import)
+  if (os === "mac") {
+    const r = target.rect;
+    const which = target.macDisplay && target.wholeOutput ? `-D ${target.macDisplay} `
+      : r ? `-R ${r.x},${r.y},${r.width},${r.height} ` : "";
+    return { shell: "bash", cmd:
+      `set -e; t="$(mktemp -t fleet_shot)"; p="$t.png"; rm -f "$t"; screencapture -x ${which}"$p"; [ -s "$p" ]; echo "$p"` };
+  }
+  const r = target.rect;
+  const out = target.output && /^[A-Za-z0-9._-]+$/.test(target.output) ? target.output : undefined;
+  const grim = !r ? `grim "$p"`
+    : target.wholeOutput && out ? `grim -o '${out}' "$p"`
+    : `grim -s ${target.scale ?? 1} -g '${r.x},${r.y} ${r.width}x${r.height}' "$p"`;
+  const x11 = r
+    ? [`elif command -v import >/dev/null 2>&1; then DISPLAY="\${DISPLAY:-:0}" import -window root -crop ${r.width}x${r.height}+${r.x}+${r.y} +repage "$p"`,
+       `elif command -v scrot >/dev/null 2>&1; then scrot -a ${r.x},${r.y},${r.width},${r.height} "$p"`]
+    : [`elif command -v scrot >/dev/null 2>&1; then scrot "$p"`,
+       `elif command -v import >/dev/null 2>&1; then DISPLAY="\${DISPLAY:-:0}" import -window root "$p"`];
+  // Outputs that were off are switched on for the capture and off again on
+  // exit, so the capture leaves the power state as it found it.
+  const names = (target.wake?.outputs ?? []).filter((n) => /^[A-Za-z0-9._-]+$/.test(n));
+  const power = (state: "on" | "off") => names.map((n) => target.wake!.source === "sway"
+    ? `swaymsg output '${n}' power ${state} >/dev/null`
+    // Hyprland 0.56 reads dispatch arguments as Lua; older releases take the classic form.
+    : `{ hyprctl dispatch dpms ${state} '${n}' >/dev/null 2>&1 || hyprctl dispatch 'hl.dsp.dpms({ action = "${state}", monitor = "${n}" })' >/dev/null; }`).join("; ");
   return { shell: "bash", cmd: [
+    GRAPHICAL_ENV_SH,
     `set -e`,
     `p="/tmp/fleet_shot_$$.png"`,
-    `if command -v grim >/dev/null 2>&1; then grim "$p"`,
-    `elif command -v scrot >/dev/null 2>&1; then scrot "$p"`,
-    `elif command -v import >/dev/null 2>&1; then DISPLAY="\${DISPLAY:-:0}" import -window root "$p"`,
+    ...(names.length ? [`trap '${power("off").replace(/'/g, `'\\''`)}' EXIT`, `${power("on")}`, `sleep 1`] : []),
+    `if [ -n "\${WAYLAND_DISPLAY:-}" ] && command -v grim >/dev/null 2>&1; then`,
+    `  timeout ${LINUX_CAPTURE_TIMEOUT_S} ${grim} || { rc=$?; [ "$rc" = 124 ] && echo "grim got no frame in ${LINUX_CAPTURE_TIMEOUT_S}s; a monitor may be off (fleet shot --wake)" >&2; exit "$rc"; }`,
+    ...x11,
     `else echo "no screenshot tool (install grim, scrot, or imagemagick)" >&2; exit 3; fi`,
     `[ -s "$p" ] || { echo "capture produced no image" >&2; exit 4; }`,
     `echo "$p"`,
@@ -1473,6 +2184,69 @@ function rmCmd(os: Host["os"], remote: string): { cmd: string; shell: Shell } {
     : { shell: "bash", cmd: `rm -f -- '${bashEsc(remote)}'` };
 }
 
+export interface MonitorList { host: string; source: MonitorSource; monitors: Monitor[]; main?: string }
+
+/** The monitor layout as the host's compositor reports it (Linux: Hyprland,
+ *  sway or X11; macOS: NSScreen). Windows screens are visible only inside the
+ *  user's session, so Windows is not listed here. */
+export async function listMonitors(
+  cfg: FleetConfig, sel: string, deps: { exec?: typeof exec } = {},
+): Promise<MonitorList> {
+  const host = resolveHosts(cfg, sel)[0]!;
+  if (host.os === "windows") throw new Error(`${host.name}: listing monitors is not supported on Windows; --output main|<n>|DISPLAYn still works`);
+  const script = host.os === "mac" ? MAC_MONITORS_SH : `${GRAPHICAL_ENV_SH}\n${LINUX_MONITORS_SH}`;
+  const r = await (deps.exec ?? exec)(host, script, "bash", { timeoutMs: 20_000 });
+  if (!r.ok) throw new Error(`${host.name}: could not read the monitor layout: ${r.stderr.trim() || "exit " + r.code}`);
+  const { source, monitors } = parseMonitors(r.stdout);
+  if (source === "none")
+    throw new Error(`${host.name}: no monitor source (needs Hyprland's hyprctl, swaymsg, or xrandr with a DISPLAY)`);
+  return { host: host.name, source, monitors, main: mainMonitor(monitors)?.name };
+}
+
+/** Turn `--output`/`--region` into a capture target. A region alone applies to
+ *  the main monitor. */
+export async function captureTarget(
+  cfg: FleetConfig, host: Host, opts: { output?: string; region?: string; wake?: boolean }, deps: { exec?: typeof exec } = {},
+): Promise<CaptureTarget> {
+  if (host.os === "linux" && !host.android) return linuxCaptureTarget(cfg, host, opts, deps);
+  if (!opts.output && !opts.region) return {};
+  const fractions = opts.region ? parseRegion(opts.region) : undefined;
+  if (host.os === "windows") {
+    const out = opts.output ?? "main";
+    if (!/^[A-Za-z0-9._\\-]+$/.test(out)) throw new Error(`--output must be main, a number, or a device name like DISPLAY2 (got '${out}')`);
+    return { winOutput: out, winRegion: fractions };
+  }
+  const { monitors } = await listMonitors(cfg, host.name, deps);
+  const m = pickMonitor(monitors, opts.output ?? "main");
+  return { rect: regionRect(m, opts.region), macDisplay: Number(m.name) || undefined, wholeOutput: !opts.region };
+}
+
+/** Linux: read the layout even for a whole-desktop capture, because a Wayland
+ *  output that is off (DPMS, usually idle) makes grim wait forever. Refuse
+ *  with the reason, or with `wake` switch those outputs on for the capture. */
+async function linuxCaptureTarget(
+  cfg: FleetConfig, host: Host, opts: { output?: string; region?: string; wake?: boolean }, deps: { exec?: typeof exec },
+): Promise<CaptureTarget> {
+  let layout: MonitorList | undefined;
+  try { layout = await listMonitors(cfg, host.name, deps); }
+  catch (e) { if (opts.output || opts.region) throw e; }   // no layout source: plain capture still works
+  const monitors = layout?.monitors ?? [];
+  const m = opts.output || opts.region ? pickMonitor(monitors, opts.output ?? "main") : undefined;
+  const target: CaptureTarget = m
+    ? { rect: regionRect(m, opts.region), scale: m.scale, output: m.name, wholeOutput: !opts.region }
+    : {};
+  const involved = m ? [m] : monitors;
+  const off = involved.filter((x) => x.on === false).map((x) => x.name);
+  if (off.length && layout && (layout.source === "hyprland" || layout.source === "sway")) {
+    if (!opts.wake)
+      throw new Error(`${host.name}: ${off.join(", ")} ${off.length === 1 ? "is" : "are"} off (DPMS, usually idle), `
+        + `and the compositor renders no frames to capture. Pass --wake to switch ${off.length === 1 ? "it" : "them"} on `
+        + `for the capture and back off afterwards.`);
+    target.wake = { source: layout.source, outputs: off };
+  }
+  return target;
+}
+
 export interface ScreenshotResult {
   host: string; localPath: string; remotePath: string;
   capture: ExecResult; pull: ExecResult;
@@ -1481,10 +2255,11 @@ export interface ScreenshotResult {
 export async function captureScreenshot(
   cfg: FleetConfig, sel: string, localPath: string,
   deps: { exec?: typeof exec; deliver?: typeof deliverImage } = {},
+  opts: { output?: string; region?: string; wake?: boolean } = {},
 ): Promise<ScreenshotResult> {
   const host = resolveHosts(cfg, sel)[0]!;
   const run = deps.exec ?? exec;
-  const { cmd, shell } = captureCmd(host.os);
+  const { cmd, shell } = captureCmd(host.os, await captureTarget(cfg, host, opts, { exec: run }));
   const capture = await run(host, cmd, shell);
   if (!capture.ok) throw new Error(
     `screenshot capture failed on ${host.name}: ${capture.stderr || capture.stdout || "exit " + capture.code}`);
@@ -1691,6 +2466,38 @@ function inlinePull(host: Host, bytes: Uint8Array): typeof scpPull {
   };
 }
 
+/** Borrow the graphical session's environment on Linux. An ssh login carries
+ *  none of it, so grim fails with "failed to create display" and X tools find
+ *  no DISPLAY. The user manager holds what the compositor imported (Hyprland,
+ *  sway and GNOME all import WAYLAND_DISPLAY and friends). When it does not,
+ *  the first Wayland socket in the runtime dir stands in. */
+export const GRAPHICAL_ENV_SH = [
+  `while IFS= read -r fleet_kv; do`,
+  `  case "$fleet_kv" in`,
+  `    WAYLAND_DISPLAY=*|XDG_RUNTIME_DIR=*|HYPRLAND_INSTANCE_SIGNATURE=*|SWAYSOCK=*|DISPLAY=*|XAUTHORITY=*|XDG_SESSION_TYPE=*|XDG_CURRENT_DESKTOP=*) export "$fleet_kv" ;;`,
+  `  esac`,
+  `done <<FLEET_ENV_EOF`,
+  `$(systemctl --user show-environment 2>/dev/null)`,
+  `FLEET_ENV_EOF`,
+  `unset fleet_kv`,
+  `: "\${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; export XDG_RUNTIME_DIR`,
+  // The manager can hold a previous login's values; a dead socket or a missing
+  // Hyprland instance directory is ignored in favour of the live one.
+  `[ -z "\${WAYLAND_DISPLAY:-}" ] || [ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ] || unset WAYLAND_DISPLAY`,
+  `if [ -d "$XDG_RUNTIME_DIR/hypr" ] && { [ -z "\${HYPRLAND_INSTANCE_SIGNATURE:-}" ] || [ ! -d "$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE" ]; }; then`,
+  `  fleet_sig=$(ls -t "$XDG_RUNTIME_DIR/hypr" 2>/dev/null | head -n1)`,
+  `  [ -z "$fleet_sig" ] || export HYPRLAND_INSTANCE_SIGNATURE="$fleet_sig"`,
+  `  unset fleet_sig`,
+  `fi`,
+  `if [ -z "\${WAYLAND_DISPLAY:-}" ]; then`,
+  `  for fleet_sock in "$XDG_RUNTIME_DIR"/wayland-[0-9]*; do`,
+  `    case "$fleet_sock" in *.lock) continue ;; esac`,
+  `    [ -S "$fleet_sock" ] && { WAYLAND_DISPLAY="\${fleet_sock##*/}"; export WAYLAND_DISPLAY; break; }`,
+  `  done`,
+  `  unset fleet_sock`,
+  `fi`,
+].join("\n");
+
 /** The systemd user unit that runs the daemon on Linux.
  *
  *  cua-driver does not write this itself: its `autostart enable` is Windows-only
@@ -1716,6 +2523,62 @@ const CUA_LINUX_UNIT = [
   "",
   "[Install]",
   "WantedBy=graphical-session.target default.target",
+].join("\n");
+
+/** The daemon's start script on Linux. It finds the running session at every
+ *  start instead of at install time: a Wayland socket name and a Hyprland
+ *  instance signature change with every login, so values baked into the unit
+ *  go stale after the next reboot. Values the user manager holds win while
+ *  they still point at a live socket. A Wayland host with no compositor yet
+ *  (the unit is also wanted by default.target, which starts before it) exits
+ *  1, and systemd retries until the compositor is up. */
+export const CUA_START_SH = [
+  `: "\${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; export XDG_RUNTIME_DIR`,
+  `if [ "$fleet_session" = wayland ]; then`,
+  `  if [ -z "\${WAYLAND_DISPLAY:-}" ] || [ ! -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]; then`,
+  `    WAYLAND_DISPLAY=`,
+  `    for s in "$XDG_RUNTIME_DIR"/wayland-[0-9]*; do`,
+  `      case "$s" in *.lock) continue ;; esac`,
+  `      [ -S "$s" ] && { WAYLAND_DISPLAY="\${s##*/}"; break; }`,
+  `    done`,
+  `  fi`,
+  `  [ -n "$WAYLAND_DISPLAY" ] || { echo "cua-driver: no Wayland compositor socket in $XDG_RUNTIME_DIR yet; retrying" 1>&2; exit 1; }`,
+  `  export WAYLAND_DISPLAY CUA_DRIVER_RS_ENABLE_WAYLAND=1`,
+  `  if [ -d "$XDG_RUNTIME_DIR/hypr" ]; then`,
+  `    sig="\${HYPRLAND_INSTANCE_SIGNATURE:-}"`,
+  `    [ -n "$sig" ] && [ -d "$XDG_RUNTIME_DIR/hypr/$sig" ] || sig=$(ls -t "$XDG_RUNTIME_DIR/hypr" 2>/dev/null | head -n1)`,
+  `    [ -z "$sig" ] || export HYPRLAND_INSTANCE_SIGNATURE="$sig"`,
+  `  fi`,
+  `fi`,
+  `[ -n "\${DISPLAY:-}" ] || export DISPLAY=:0`,
+  `exec "$HOME/.local/bin/cua-driver" serve --socket "$HOME/.cache/cua-driver/cua-driver.sock"`,
+].join("\n");
+
+/** Point the daemon at the start script with a drop-in the install rewrites
+ *  every time. The drop-in holds no session values: `Environment=` empty
+ *  drops the base unit's DISPLAY=:0 so the manager's own DISPLAY comes
+ *  through, and the script resolves the rest when the daemon starts. Only the
+ *  session TYPE is recorded, from the user manager at install time. */
+const CUA_SESSION_DROPIN_SH = [
+  `fleet_env=$(systemctl --user show-environment 2>/dev/null)`,
+  `fleet_get() { printf '%s\\n' "$fleet_env" | sed -n "s/^$1=//p" | head -n1; }`,
+  `fleet_session=$(fleet_get XDG_SESSION_TYPE)`,
+  `[ -n "$(fleet_get WAYLAND_DISPLAY)" ] && fleet_session=wayland`,
+  `[ "$fleet_session" = wayland ] || fleet_session=x11`,
+  `starter="$HOME/.config/cua-driver/fleet-start.sh"`,
+  `mkdir -p "$(dirname "$starter")"`,
+  `{`,
+  `  printf '#!/bin/sh\\n# Written by fleet cu install; rewritten on every install.\\nfleet_session=%s\\n' "$fleet_session"`,
+  `  cat <<'FLEET_START'`,
+  CUA_START_SH,
+  `FLEET_START`,
+  `} > "$starter"`,
+  `chmod 755 "$starter"`,
+  `dropin="$HOME/.config/systemd/user/cua-driver.service.d/fleet-session.conf"`,
+  `mkdir -p "$(dirname "$dropin")"`,
+  `printf '%s\\n' "# Written by fleet cu install for a $fleet_session session; rewritten on every install." \\`,
+  `  "# No session values here: $starter finds them at every start." \\`,
+  `  "[Service]" "Environment=" "ExecStart=" "ExecStart=%h/.config/cua-driver/fleet-start.sh" "RestartSec=5" > "$dropin"`,
 ].join("\n");
 
 /** Install the current release, then restart the host's desktop daemon. */
@@ -1744,10 +2607,12 @@ function cuInstallCmd(os: Host["os"]): { cmd: string; shell: Shell } {
       + `if [ ! -f "$unit" ]; then\n`
       + `  mkdir -p "$(dirname "$unit")"\n`
       + `  cat > "$unit" <<'CUA_UNIT'\n${CUA_LINUX_UNIT}\nCUA_UNIT\n`
-      + `  systemctl --user daemon-reload\n`
       + `  systemctl --user enable cua-driver.service\n`
       + `fi\n`
-      + `systemctl --user restart cua-driver.service`,
+      + CUA_SESSION_DROPIN_SH + `\n`
+      + `systemctl --user daemon-reload\n`
+      + `systemctl --user restart cua-driver.service || exit $?\n`
+      + `echo "fleet: cua-driver runs for a $fleet_session session (drop-in $dropin)"`,
   };
 }
 
@@ -1804,6 +2669,74 @@ function cuInvocation(args: string[], os: Host["os"], invoke: string, outVar = "
 export async function cuRun(
   cfg: FleetConfig, sel: string, args: string[], imageOut?: string,
   deps: { exec?: typeof exec } = {},
+): Promise<CuResult> {
+  const host = resolveHosts(cfg, sel)[0]!;
+  // Desktop-wide calls on Linux: cua-driver refuses them on a multi-monitor
+  // Wayland layout, and its own grim waits forever on a powered-off monitor.
+  // Check the layout first and answer those cases here.
+  if (host.os === "linux" && !host.android && (args[0] === "get_screen_size" || args[0] === "get_desktop_state") && !deps.exec) {
+    let layout: MonitorList | undefined;
+    try { layout = await listMonitors(cfg, host.name); } catch { /* no layout source: let cua-driver answer */ }
+    const off = layout?.monitors.filter((m) => m.on === false).map((m) => m.name) ?? [];
+    if (args[0] === "get_desktop_state" && off.length && (layout?.source === "hyprland" || layout?.source === "sway"))
+      return { host: host.name, result: { host: host.name, ok: false, code: 1, stdout: "",
+        stderr: `fleet: ${off.join(", ")} ${off.length === 1 ? "is" : "are"} off (DPMS, usually idle); a desktop capture would wait forever. `
+          + `Check fleet session ${host.name}, or capture with fleet shot ${host.name} --wake.` } };
+    if (layout && layout.monitors.length > 1 && (layout.source === "hyprland" || layout.source === "sway")) {
+      const fb = await cuDesktopFallback(cfg, host, args, imageOut, deps);
+      if (fb) return fb;
+    }
+  }
+  const r = await cuRunInner(cfg, sel, args, imageOut, deps);
+  const note = cuLimitNote(r.result.stdout + "\n" + r.result.stderr);
+  if (!note) return r;
+  if (host.os === "linux" && !host.android) {
+    const fb = await cuDesktopFallback(cfg, host, args, imageOut, deps);
+    if (fb) return fb;
+  }
+  return { ...r, result: { ...r.result, stderr: [r.result.stderr, note].filter(Boolean).join("\n") } };
+}
+
+/** Answer the desktop-wide calls cua-driver refuses on a multi-monitor
+ *  Wayland layout ("requires exactly one active output") from the
+ *  compositor's own monitor list and fleet's grim capture. Both describe the
+ *  main monitor, as get_screen_size does on a single-monitor desktop. */
+async function cuDesktopFallback(
+  cfg: FleetConfig, host: Host, args: string[], imageOut: string | undefined, deps: { exec?: typeof exec },
+): Promise<CuResult | undefined> {
+  const tool = args[0];
+  if (tool !== "get_screen_size" && tool !== "get_desktop_state") return undefined;
+  const fail = (stderr: string): CuResult => ({ host: host.name, result: { host: host.name, ok: false, code: 1, stdout: "", stderr } });
+  let layout: MonitorList;
+  try { layout = await listMonitors(cfg, host.name, deps); }
+  catch (e) { return fail(`${cuLimitNote("exactly one active output")}\n${(e as Error).message}`); }
+  const m = mainMonitor(layout.monitors);
+  if (!m) return undefined;
+  const size = { width: m.width, height: m.height, scale_factor: m.scale, monitor: m.name };
+  const note = `fleet: cua-driver refuses desktop-wide calls with ${layout.monitors.length} active monitors; `
+    + `answered from ${layout.source} for the main monitor ${m.name}`;
+  if (tool === "get_screen_size") return { host: host.name, result: { host: host.name, ok: true, code: 0,
+    stdout: JSON.stringify({ ...size, monitors: layout.monitors, source: `fleet (${layout.source})` }, null, 2), stderr: note } };
+  if (!imageOut) return fail(`${note}. Pass --out FILE for the main monitor's image, or use fleet shot ${host.name} --output ${m.name}.`);
+  try {
+    const shot = await captureScreenshot(cfg, host.name, imageOut, { exec: deps.exec }, { output: m.name });
+    return { host: host.name, localImage: shot.localPath,
+      result: { host: host.name, ok: true, code: 0, stdout: JSON.stringify(size, null, 2), stderr: note } };
+  } catch (e) { return fail(`${note}; ${(e as Error).message}`); }
+}
+
+/** Plain words for driver limits whose raw error reads like a fleet bug. */
+export function cuLimitNote(text: string): string | undefined {
+  if (/exactly one active output/i.test(text))
+    return "fleet: cua-driver's full-desktop commands on this compositor work only with one active monitor. "
+      + "Target a window instead (fleet cu <host> windows, then a window-scoped command), "
+      + "or use fleet shot <host>, which captures every monitor.";
+  return undefined;
+}
+
+async function cuRunInner(
+  cfg: FleetConfig, sel: string, args: string[], imageOut: string | undefined,
+  deps: { exec?: typeof exec },
 ): Promise<CuResult> {
   const host = resolveHosts(cfg, sel)[0]!;
   const win = host.os === "windows";
@@ -2092,16 +3025,33 @@ function extractJson(s: string): any {
 export interface CuApp { name: string; pid: number; active?: boolean; kind?: string; }
 export interface CuWindow { window_id: number; title: string; pid: number; width?: number; height?: number; }
 
-/** `list_apps` → typed app list (optionally name-filtered, case-insensitive). */
+/** `list_apps` → typed app list (optionally name-filtered, case-insensitive).
+ *  On Linux, cua-driver lists every process, kernel threads included, so only
+ *  processes that own a window are kept unless `all` is set. */
 export async function cuApps(
-  cfg: FleetConfig, sel: string, filter?: string,
-): Promise<{ apps: CuApp[]; result: ExecResult }> {
-  const { result } = await cuRun(cfg, sel, ["list_apps"]);
-  if (!result.ok) return { apps: [], result };
-  const data = extractJson(result.stdout);
-  let apps: CuApp[] = Array.isArray(data) ? data : data.apps ?? [];
+  cfg: FleetConfig, sel: string, filter?: string, opts: { all?: boolean } = {},
+): Promise<{ apps: CuApp[]; result: ExecResult; hidden: number }> {
+  const host = resolveHosts(cfg, sel)[0]!;
+  let apps: CuApp[];
+  let result: ExecResult;
+  let hidden = 0;
+  if (host.os === "linux" && !host.android && !opts.all) {
+    const snap = await cuSnapshot(cfg, sel);
+    result = snap.result;
+    if (!result.ok) return { apps: [], result, hidden };
+    const owners = new Set(snap.windows.map((w) => w.pid));
+    // No windows at all means the driver cannot see the desktop (a Wayland
+    // session without the Wayland backend); filtering would then hide everything.
+    apps = owners.size ? snap.apps.filter((a) => owners.has(a.pid)) : snap.apps;
+    hidden = snap.apps.length - apps.length;
+  } else {
+    result = (await cuRun(cfg, sel, ["list_apps"])).result;
+    if (!result.ok) return { apps: [], result, hidden };
+    const data = extractJson(result.stdout);
+    apps = Array.isArray(data) ? data : data.apps ?? [];
+  }
   if (filter) apps = apps.filter((a) => a.name?.toLowerCase().includes(filter.toLowerCase()));
-  return { apps, result };
+  return { apps, result, hidden };
 }
 
 /** `list_windows {pid}` → typed window list. */

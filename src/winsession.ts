@@ -22,7 +22,7 @@ import { createHash } from "node:crypto";
 import { mkdirSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { Host } from "./config.ts";
+import { hostKeyOpts, type Host } from "./config.ts";
 import { fleetReinvocation, proxyOpts } from "./proxy.ts";
 
 const READY = "__FLEET_SESSION_READY__";
@@ -75,7 +75,10 @@ while ($null -ne ($__fsLine = $__fsReader.ReadLine())) {
   $script:__fsCode = 1
   $__fsGlobals = @{}; Get-Variable -Scope Global | Where-Object Name -NotLike '__fs*' | ForEach-Object { $__fsGlobals[$_.Name] = $_.Value }
   try {
-    & $__fsFile
+    # Its own Out-Default, not the loop's: the whole while statement is one
+    # pipeline, so a table formatter started by this program's objects would
+    # hold them until a later call, after this call's end marker.
+    & $__fsFile | Out-Default
     $script:__fsCode = if (-not $global:__fleetFell) { if ($null -ne $global:LASTEXITCODE) { $global:LASTEXITCODE } else { 0 } }
       elseif ($global:__fleetOk) { 0 } elseif ($global:__fleetLast) { $global:__fleetLast } else { 1 }
   } catch {
@@ -84,7 +87,7 @@ while ($null -ne ($__fsLine = $__fsReader.ReadLine())) {
   }
   # Sent the way program output travels (the pipeline), unlike the end markers.
   # Its absence means the session lost this call's output.
-  '${PIPE_PROBE}' + $__fsEnd
+  '${PIPE_PROBE}' + $__fsEnd | Out-Default
   foreach ($__fsVar in @(Get-Variable -Scope Global)) {
     if ($__fsVar.Name -notlike '__fs*' -and -not $__fsGlobals.ContainsKey($__fsVar.Name)) { Remove-Variable -Name $__fsVar.Name -Scope Global -EA SilentlyContinue }
   }
@@ -209,6 +212,25 @@ export async function trySessionExec(
   return r?.busy ? undefined : (r ?? lostReply());
 }
 
+/** Stop the kept-open session broker for `host`, if one runs. Its pwsh holds
+ *  a login made before any later group or policy change. Returns how many
+ *  broker processes were signalled. */
+export function stopBroker(host: Host): number {
+  if (process.platform === "win32") return 0;
+  const ps = Bun.spawnSync(["ps", "-axo", "pid=,command="], { stdout: "pipe", stderr: "ignore" });
+  let n = 0;
+  for (const line of ps.stdout.toString().split("\n")) {
+    const m = /^\s*(\d+)\s+(.*)$/.exec(line);
+    if (!m || Number(m[1]) === process.pid) continue;
+    const argv = m[2]!.trim().split(/\s+/);
+    const at = argv.indexOf("__win-session");
+    if (at >= 0 && argv[at + 1] === host.name && argv.length === at + 2) {
+      try { process.kill(Number(m[1]), "SIGTERM"); n++; } catch { /* already gone */ }
+    }
+  }
+  return n;
+}
+
 function startBroker(host: Host): void {
   try {
     const proc = Bun.spawn([...fleetReinvocation(), "__win-session", host.name], {
@@ -329,7 +351,7 @@ class Session {
     const encoded = Buffer.from(sessionLoopScript(), "utf16le").toString("base64");
     // Its own connection, not the shared control master: killing this ssh must
     // close the channel, so a timed-out program dies with its session.
-    const proc = Bun.spawn(["ssh", ...proxyOpts(host), "-o", "ControlMaster=no", "-o", "ControlPath=none",
+    const proc = Bun.spawn(["ssh", ...proxyOpts(host), ...hostKeyOpts(host), "-o", "ControlMaster=no", "-o", "ControlPath=none",
       "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=30", host.ssh,
       "pwsh", "-NoProfile", "-NonInteractive", "-OutputFormat", "Text", "-EncodedCommand", encoded],
       { stdin: "pipe", stdout: "pipe", stderr: "pipe" });

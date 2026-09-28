@@ -13,14 +13,15 @@ import { z } from "zod";
 import type { FleetConfig } from "./config.ts";
 import type { ExecResult } from "./ssh.ts";
 import { focusElements } from "./focus.ts";
+import { formatIdle, sessionStates } from "./session.ts";
 import {
-  lsHosts, runExec, runScript, readScriptSource, editRemoteFile, pushFile, pullFile, restartService, serviceLogs,
+  lsHosts, runExec, runScript, rebootRefusal, readScriptSource, editRemoteFile, pushFile, pullFile, restartService, serviceLogs,
   gpuRows, diskRows, hostStatus, runRecipe, captureScreenshot, overlayGrid, cuRun,
   cuInstall, cuTools, cuDescribe, cuRecordStart, cuRecordStop, cuRecordStatus,
   cuApps, cuShotWindow, browseHost, deployHosts, diagnose,
   cuSnapshot, cuResolveTargetFrom, cuResolvePoint, cuAct, cuBatch, CU_BATCH_TOOLS, cuBlockerNote,
   cuGridCaption, cuElementSupport, compactCuOutput, briefDescribe, cuElements, cuOpen, cuVerify, sameRole,
-  rebootHosts, firmwareRebootHosts, bootState, switchMachine, waitFor, routeSelector, svcStatus,
+  rebootHosts, firmwareRebootHosts, dropMasters, bootState, switchMachine, firmwareEntries, waitFor, routeSelector, svcStatus,
 } from "./core.ts";
 import {
   spawnJob, listJobs, jobLog, jobTail, killJob, waitJob, pruneJobs,
@@ -181,6 +182,22 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     return text(output || "(no output yet)");
   });
 
+  server.registerTool("fleet_session", {
+    title: "Desktop session state",
+    description: "For each host: whether the desktop is logged in, locked, or at the login screen, "
+      + "who is on it, idle time where the desktop reports it, and which displays are powered off. "
+      + "Check this before computer use or a screenshot. " + sel,
+    inputSchema: { selector: z.string().describe("Host selector.") },
+    annotations: { readOnlyHint: true, openWorldHint: true },
+  }, async ({ selector }) => {
+    const states = await sessionStates(cfg, await routeSelector(cfg, selector));
+    return text(states.map((st) => st.error ? `○ ${st.host}: ${st.error}`
+      : `${st.host}: ${st.state}${st.user ? " · user " + st.user : ""} · idle ${formatIdle(st.idleSeconds)}`
+        + (st.displays?.length ? ` · displays ${st.displays.map((d) => `${d.name}=${d.on === false ? "off" : d.on ? "on" : "?"}`).join(" ")}` : "")
+        + (st.lock ? ` (${st.lock})` : "") + st.notes.map((n) => `\n  ${n}`).join("")).join("\n"),
+      states.some((st) => st.error));
+  });
+
   server.registerTool("fleet_boot", {
     title: "Which OS is live on a dual-boot machine",
     description: "Report which boot (OS) is currently live on a dual-boot machine, and the "
@@ -188,9 +205,18 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       + (Object.keys(cfg.machines ?? {}).join(", ") || "none configured") + ".",
     inputSchema: {
       machine: z.string().describe("Dual-boot machine name."),
+      entries: z.boolean().optional().describe("List the UEFI boot entries from the live boot instead, "
+        + "with the boot each configured firmware label resolves to and entries off the first EFI partition."),
     },
     annotations: { readOnlyHint: true, openWorldHint: true },
-  }, async ({ machine }) => {
+  }, async ({ machine, entries }) => {
+    if (entries) {
+      const r = await firmwareEntries(cfg, machine);
+      const lines = r.entries.map((e) => `  ${e.label} ${e.id} ${e.path ?? ""}${e.boots.length ? " <- " + e.boots.join(", ") : ""}`
+        + (e.warning ? `\n    warning: ${e.warning}` : ""));
+      const missing = r.missing.map((m) => `  no entry matches boot ${m}`);
+      return text([`${machine}: firmware entries read from ${r.live} (${r.host})`, ...lines, ...missing].join("\n"), r.missing.length > 0);
+    }
     const st = await bootState(cfg, machine);
     const head = st.live ? `● ${machine}: ${st.live} (via ${st.transport}, ${st.liveHost})`
       : `○ ${machine}: powered off / unreachable`;
@@ -449,11 +475,14 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       host: z.string().describe("Host name (or selector — first matched host is used)."),
       grid: z.boolean().optional().describe("Overlay a labeled coordinate grid on the returned image."),
       gridStep: z.number().int().positive().max(1000).optional().describe("Grid spacing in pixels (default 100)."),
+      output: z.string().optional().describe("One monitor: a connector name (DP-3), main, focused (Linux), or a 1-based index. Windows: main, an index, or DISPLAYn."),
+      region: z.string().optional().describe("Part of that monitor (main when output is omitted): top-left, top-right, bottom-left, bottom-right, top, bottom, left, right, center, or X,Y,W,H fractions."),
+      wake: z.boolean().optional().describe("Linux Wayland: switch powered-off monitors on for the capture and back off. Without it, a capture of an off monitor is refused."),
     },
     annotations: { openWorldHint: true },
-  }, async ({ host, grid, gridStep }) => withTempImage("fleet-shot-", async (local) => {
+  }, async ({ host, grid, gridStep, output, region, wake }) => withTempImage("fleet-shot-", async (local) => {
     try {
-      const r = await captureScreenshot(cfg, await routeSelector(cfg, host), local);
+      const r = await captureScreenshot(cfg, await routeSelector(cfg, host), local, {}, { output, region, wake });
       const gridApplied = grid ? await overlayGrid(r.localPath, gridStep ?? 100) : false;
       const data = await consumeImage(r.localPath);
       return { content: [
@@ -480,12 +509,29 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       cwd: z.string().optional().describe("Working directory on the target (fails fast if missing)."),
       timeout: z.number().int().positive().optional()
         .describe("Wall-clock cap in seconds — a hung command returns exit 124 instead of blocking forever."),
+      sudo: z.boolean().optional().describe("Run as root (POSIX only). Passwordless sudo is used when it works; otherwise the password comes from the host's sudo.passwordFile/passwordEnv, sent over ssh stdin."),
+      confirmReboot: z.boolean().optional().describe("Required when the command looks like a reboot or power-off. Prefer fleet_switch or fleet_reboot."),
+      fresh: z.boolean().optional().describe("Open a new ssh login instead of reusing a shared connection (and skip the kept-open Windows session), e.g. after a group change such as usermod -aG docker."),
     },
     annotations: { openWorldHint: true },
-  }, async ({ selector, command, wsl, cwd, timeout }) => {
+  }, async ({ selector, command, wsl, cwd, timeout, sudo, confirmReboot, fresh }) => {
+    const refusal = confirmReboot ? null : rebootRefusal(command, "confirmReboot: true");
+    if (refusal) return text(refusal, true);
     const results = await runExec(cfg, await routeSelector(cfg, selector), command,
-      { wsl, cwd, timeoutMs: timeout ? timeout * 1000 : undefined });
+      { wsl, cwd, sudo, fresh, timeoutMs: timeout ? timeout * 1000 : undefined });
     return text(renderExec(results), results.some((r) => !r.ok));
+  });
+
+  server.registerTool("fleet_drop", {
+    title: "Close shared connections to host(s)",
+    description: "Close fleet's shared ssh connection to each selected host, and stop a Windows "
+      + "host's kept-open PowerShell session, so the next call logs in fresh (for example after "
+      + "usermod -aG docker). fleet_exec with fresh: true does the same for one call. " + sel,
+    inputSchema: { selector: z.string().describe("Host selector.") },
+    annotations: { openWorldHint: false, idempotentHint: true },
+  }, async ({ selector }) => {
+    const rows = await dropMasters(cfg, await routeSelector(cfg, selector));
+    return text(rows.map((d) => `${d.dropped ? "●" : "○"} ${d.host} · ${d.detail}`).join("\n"));
   });
 
   server.registerTool("fleet_edit", {
@@ -504,7 +550,7 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       all: z.boolean().optional().describe("Replace every occurrence instead of failing on multiple."),
       dryRun: z.boolean().optional().describe("Show the diff without writing anything."),
       wsl: z.boolean().optional().describe("Edit inside WSL on a Windows host."),
-      sudo: z.boolean().optional().describe("Read and write as root via passwordless sudo (POSIX only)."),
+      sudo: z.boolean().optional().describe("Read and write as root (POSIX only): passwordless sudo, or the host's configured sudo password."),
     },
     annotations: { openWorldHint: true },
   }, async ({ selector, path, old, new: neu, all, dryRun, wsl, sudo }) => {
@@ -537,9 +583,12 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       cwd: z.string().optional().describe("Directory to run in (fails fast if missing)."),
       wsl: z.boolean().optional().describe("Run inside WSL on a Windows host."),
       timeoutSeconds: z.number().int().positive().optional().describe("Kill the script after N seconds."),
+      sudo: z.boolean().optional().describe("Run as root (POSIX only). Passwordless sudo is used when it works; otherwise the password comes from the host's sudo.passwordFile/passwordEnv, sent over ssh stdin."),
+      confirmReboot: z.boolean().optional().describe("Required when the command looks like a reboot or power-off. Prefer fleet_switch or fleet_reboot."),
+      fresh: z.boolean().optional().describe("Open a new ssh login instead of reusing a shared connection (and skip the kept-open Windows session), e.g. after a group change such as usermod -aG docker."),
     },
     annotations: { openWorldHint: true },
-  }, async ({ selector, path, source, ext, interp, cwd, wsl, timeoutSeconds }) => {
+  }, async ({ selector, path, source, ext, interp, cwd, wsl, timeoutSeconds, sudo, confirmReboot, fresh }) => {
     if (!path && source === undefined) return text("give either `path` or `source`", true);
     if (path && source !== undefined) return text("give `path` or `source`, not both", true);
     try {
@@ -549,8 +598,10 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       if (!script.ext && !interp) {
         return text("inline `source` needs `ext` (e.g. '.py') or `interp` so an interpreter can be chosen", true);
       }
+      const refusal = confirmReboot ? null : rebootRefusal(script.source, "confirmReboot: true");
+      if (refusal) return text(refusal, true);
       const results = await runScript(cfg, await routeSelector(cfg, selector), script, {
-        wsl, cwd, interp, timeoutMs: timeoutSeconds ? timeoutSeconds * 1000 : undefined,
+        wsl, cwd, interp, sudo, fresh, timeoutMs: timeoutSeconds ? timeoutSeconds * 1000 : undefined,
       });
       return text(renderExec(results), results.some((r) => !r.ok));
     } catch (e) {
@@ -634,10 +685,15 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       cwd: z.string().optional().describe("Working directory to run in (fails fast if missing)."),
       label: z.string().optional().describe("Optional human-readable label prefixed onto the job id."),
       wsl: z.boolean().optional().describe("Windows hosts only: run the command in bash inside WSL, so its redirects and paths are Linux ones."),
+      elevated: z.boolean().optional().describe("Windows hosts only: run the job with the administrator token (needed by storage/CIM cmdlets such as Resize-Partition)."),
+      confirmReboot: z.boolean().optional().describe("Required when the command looks like a reboot or power-off."),
+      fresh: z.boolean().optional().describe("Open a new ssh login instead of reusing a shared connection (and skip the kept-open Windows session), e.g. after a group change such as usermod -aG docker."),
     },
     annotations: { openWorldHint: true },
-  }, async ({ selector, command, cwd, label, wsl }) => {
-    const results = await spawnJob(cfg, await routeSelector(cfg, selector), command, { cwd, label, wsl });
+  }, async ({ selector, command, cwd, label, wsl, elevated, confirmReboot, fresh }) => {
+    const refusal = confirmReboot ? null : rebootRefusal(command, "confirmReboot: true");
+    if (refusal) return text(refusal, true);
+    const results = await spawnJob(cfg, await routeSelector(cfg, selector), command, { cwd, label, wsl, elevated, fresh });
     const out = results.map((r) => r.ok
       ? `● ${r.host} job ${r.id} · pid ${r.pid}  (track: fleet_jobs / fleet_job_log ${r.host}:${r.id})`
       : `✗ ${r.host}:${r.id} · ${r.error ?? "spawn failed"}; inspect fleet_job_log before retrying`).join("\n");
@@ -711,25 +767,31 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
 
   server.registerTool("fleet_switch", {
     title: "Reboot a dual-boot machine into another OS",
-    description: "Switch a dual-boot machine into a target OS (reboots into the other boot and "
-      + "waits until it answers). Machines: " + (Object.keys(cfg.machines ?? {}).join(", ") || "none") + ".",
+    description: "Switch a dual-boot machine into a target OS: find the live boot, trigger the switch "
+      + "(a configured command, or a UEFI one-time boot looked up by label), confirm the source boot "
+      + "went down, then wait until the target answers. Returns every phase. On a timeout it says which "
+      + "OS the machine came back in. dryRun shows the plan without rebooting. Machines: "
+      + (Object.keys(cfg.machines ?? {}).join(", ") || "none") + ".",
     inputSchema: {
       machine: z.string().describe("Dual-boot machine name."),
       to: z.string().describe("Target OS/boot label to switch into."),
       wait: z.boolean().optional().describe("Wait until the target boot is reachable (default true)."),
+      dryRun: z.boolean().optional().describe("Resolve the trigger (and the firmware entry) without rebooting."),
       timeout: z.number().int().min(1).max(3600).optional()
-        .describe("Arrival deadline in seconds (default 180, max 3600)."),
+        .describe("Arrival deadline in seconds (default 300, max 3600)."),
     },
     annotations: { destructiveHint: true, openWorldHint: true },
-  }, async ({ machine, to, wait, timeout }) => {
+  }, async ({ machine, to, wait, dryRun, timeout }) => {
     const r = await switchMachine(cfg, machine, to, {
-      wait: wait ?? true,
-      timeoutMs: (timeout ?? 180) * 1000,
+      wait: wait ?? true, dryRun: dryRun ?? false,
+      timeoutMs: (timeout ?? 300) * 1000,
     });
-    if (wait === false) return text(`↻ ${machine}: switch to ${to} issued (from ${r.from ?? "?"}); not waiting`);
-    return text(r.arrived
-      ? `● ${machine} now in ${to} (${Math.round(r.waitedMs / 1000)}s)`
-      : `✗ ${machine} did not reach ${to} in time`, !r.arrived);
+    const log = r.progress.map((p) => `${String(Math.round(p.elapsedMs / 1000)).padStart(4)}s ${p.phase.padEnd(8)} ${p.detail}`).join("\n");
+    if (dryRun || wait === false) return text(log);
+    const verdict = r.arrived ? `● ${machine} now in ${to} (${Math.round(r.waitedMs / 1000)}s)`
+      : !r.wentDown ? `✗ ${machine} never went down; still in ${r.landedIn ?? "?"}`
+      : `✗ ${machine} did not reach ${to} in time; it is in ${r.landedIn ?? "no boot"} now`;
+    return text(`${log}\n${verdict}`, !r.arrived);
   });
 
   server.registerTool("fleet_browse", {
@@ -829,14 +891,15 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     inputSchema: {
       host: z.string().describe("Host name or selector (first matched host is used)."),
       filter: z.string().optional().describe("Case-insensitive app-name substring."),
+      all: z.boolean().optional().describe("Linux: include processes that own no window (kernel threads, daemons)."),
     },
     annotations: { openWorldHint: true },
-  }, async ({ host, filter }) => {
-    const { apps, result } = await cuApps(cfg, await routeSelector(cfg, host), filter);
+  }, async ({ host, filter, all }) => {
+    const { apps, result, hidden } = await cuApps(cfg, await routeSelector(cfg, host), filter, { all });
     if (!result.ok) return text(renderExec([result]), true);
     return text([
       ...apps.map((app) => `${String(app.pid).padStart(7)}  ${app.name}${app.active ? " · active" : ""}`),
-      `${apps.length} app(s)`,
+      `${apps.length} app(s)${hidden ? ` · ${hidden} windowless process(es) hidden; all:true shows them` : ""}`,
     ].join("\n"));
   });
 

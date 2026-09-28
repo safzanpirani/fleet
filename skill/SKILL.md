@@ -27,9 +27,9 @@ fleet exec win-box "nvidia-smi"
 
 | Command | Use |
 |---|---|
-| `fleet exec [--cwd dir] [--wsl] [--raw] [--json] <sel> "<cmd>"` | Run a command on host(s), **blocking** (returns exit code). `--cwd` expands a leading `~` and fails fast (exit 127) if the directory is missing. `--wsl` runs inside WSL on Windows boxes. `--raw` prints only remote stdout. |
+| `fleet exec [--cwd dir] [--wsl] [--sudo] [--fresh] [--confirm-reboot] [--raw] [--json] <sel> "<cmd>"` | Run a command on host(s), **blocking** (returns exit code). `--cwd` expands a leading `~` and fails fast (exit 127) if the directory is missing. `--wsl` runs inside WSL on Windows boxes. `--raw` prints only remote stdout. `--sudo` runs it as root on POSIX hosts (passwordless sudo, or `hosts.<h>.sudo.passwordFile` sent over ssh stdin). `--fresh` logs in again instead of reusing the shared connection. Reboot-looking commands need `--confirm-reboot`. |
 | `fleet exec --script <file\|-> [--interp cmd] <sel>` | Run a local script file or stdin on host(s). Fleet infers file extensions and supported stdin shebangs. Untyped stdin requires `--interp`. |
-| `fleet spawn [--wsl] [--cwd dir] [--json] <sel> "<cmd>"` | Launch a detached job that outlives the SSH session and returns a `host:id`. `--wsl` runs it under `bash -l` in a Windows box's WSL distro, so `> /tmp/x` lands in WSL. |
+| `fleet spawn [--wsl] [--elevated] [--fresh] [--cwd dir] [--json] <sel> "<cmd>"` | Launch a detached job that outlives the SSH session and returns a `host:id`. `--wsl` runs it under `bash -l` in a Windows box's WSL distro, so `> /tmp/x` lands in WSL. `--elevated` gives a Windows job the administrator token (storage/CIM cmdlets need it). |
 | `fleet jobs [<sel>]` | List detached jobs across the fleet (running ● / exited ○ / dead ✗). |
 | `fleet jobs log <host:id>` | Full captured output of a job. |
 | `fleet jobs tail <host:id> [-n N] [-f]` | Last N lines; `-f` streams live (foreground until Ctrl-C). |
@@ -37,8 +37,12 @@ fleet exec win-box "nvidia-smi"
 | `fleet jobs kill <host:id>` | TERM the verified job process tree and escalate against surviving descendants. |
 | `fleet jobs prune [<sel>] [--all]` | Remove finished job spools (`--all` also drops dead ones; never touches running). |
 | `fleet cp [-r] [--resume] <local> <sel>:<remote>` | Copy a file to host(s); fan-out across a group. `--resume` copies with rsync `--partial`, so rerunning after a drop continues the partial file (POSIX hosts only). A single-host copy on a terminal shows a progress meter. |
-| `fleet edit <sel>:<path> --old S --new S` | Edit a remote file in place, reject ambiguous matches, and print the diff. `--old-file`/`--new-file <file or ->` read multi-line text from a file or stdin; fleet never unescapes `\n`. `--sudo` edits root-owned files through passwordless `sudo -n` (POSIX). |
-| `fleet shot <host> [--out f] [--grid] [--no-open]` | Screenshot the remote desktop → local image (webp default; `--grid` overlays a coord ruler). Alias: `fleet screenshot`. |
+| `fleet edit <sel>:<path> --old S --new S` | Edit a remote file in place, reject ambiguous matches, and print the diff. `--old-file`/`--new-file <file or ->` read multi-line text from a file or stdin; fleet never unescapes `\n`. `--sudo` edits root-owned files as root (POSIX; passwordless sudo or the host's configured sudo password). |
+| `fleet shot <host> [--output NAME\|main\|N] [--region top-right\|…\|X,Y,W,H] [--wake] [--out f] [--grid] [--no-open]` | Screenshot the remote desktop → local image (webp default; `--grid` overlays a coord ruler). `--output` captures one monitor and `--region` part of it (the main monitor when `--output` is omitted); `--list` shows the layout. `--wake` switches powered-off Wayland monitors on for the capture. Alias: `fleet screenshot`. |
+| `fleet session <sel>` | Logged in, **locked**, or at the login screen; idle time where the desktop reports it; which displays are off. Check it before `cu` or `shot`. |
+| `fleet drop <sel>` | Close the shared ssh connection (and a Windows host's kept-open session) so the next call logs in fresh, e.g. after `usermod -aG docker`. |
+| `fleet boot <machine> [--entries]` · `fleet switch <machine> --to <os> [--dry-run] [--yes]` | Which boot of a dual-boot machine is live, its UEFI entries, and reboot into another boot with every phase printed (see **Dual-boot machines**). |
+| `fleet hostkey <host> [--pin]` · `fleet find <machine\|mac> [--from <host>]` | Pin a boot's host key under its `hostKeyAlias`; find a machine's LAN address by MAC. |
 | `fleet cu <host> <args…> [--out f.png]` | Computer-use via [cua-driver](https://github.com/trycua/cua): `install`, or pass a tool + JSON (`click`, `type_text`, `get_window_state`…). |
 | `fleet cu <host> click\|key\|type\|act <target> …` | Verified input: resolves the target, sends an explicit `window_id`, reports `changed` / `no_change` / `indeterminate`. |
 | `fleet cu <host> windows [target]` · `shot-window <target>` | List windows (blockers flagged) or capture one, with owned popups composited in. |
@@ -147,10 +151,42 @@ harness-backgrounded SSH session open for it.
   PowerShell output never arrived fails with "the Windows session lost this program's
   PowerShell output" and restarts the session; the program already ran, so rerun it only
   if it is safe to run twice.
+- **Local stdin is never forwarded.** The remote program travels on ssh's stdin, so
+  `fleet exec host 'bash -s' < job.sh` would run nothing. A command that reads stdin
+  (`bash -s`, `python3 -`, `cat > f`) with a file or pipe on local stdin is refused; use
+  `fleet exec --script - --interp bash host < job.sh`. Fleet never reads your stdin
+  itself, so `while read` loops around it keep working.
+- **Group changes need a new login.** Fleet reuses one ssh connection per host for a
+  minute and a Windows PowerShell session for ten. After `usermod -aG`, pass `--fresh`
+  or run `fleet drop <host>`.
+- **Formatted objects print normally on Windows.** `Select-Object`/`Format-Table` output
+  used to arrive after the completion marker and be reported as lost; each program now
+  flushes its own formatter.
 - **Commands that read stdin get an empty one.** Scripts arrive over stdin, so a
   command that reads stdin used to swallow the rest of the script. Now it sees EOF.
 - **Output is plain text when piped** (no ANSI); `FORCE_COLOR=1` restores colour, and
   `| head` no longer crashes fleet with a stack trace.
+
+## Dual-boot machines
+
+A `machines` entry lists the host entries of each boot of one box. All boots answer on
+the same addresses, so give each boot's host entries a distinct `hostKeyAlias`; fleet then
+checks keys strictly under that name and cannot reach the wrong OS.
+
+- **Always `fleet switch <machine> --to <os> --dry-run` first.** It shows the trigger: a
+  configured `switch` command (a string, or an object keyed by the live boot), or a
+  one-time UEFI boot looked up by the target's `firmware` label (`bcdedit` on Windows,
+  `efibootmgr` on Linux). A missing label refuses before anything reboots. The real run
+  prints each phase, says so when the source never goes down, and names the boot that
+  answers on a timeout.
+- **Never reboot through `exec`.** `exec` and `spawn` refuse reboot-looking commands
+  (`reboot`, `shutdown /r`, `systemctl reboot`, `Restart-Computer`, `boot-<os>` helpers)
+  without `--confirm-reboot`.
+- `fleet boot <machine> --entries` lists UEFI entries and flags ones off the first EFI
+  partition. `fleet hostkey <host> --pin` records a boot's key while that boot is up and
+  refuses the wrong boot's key; `fleet switch` pins an unpinned target on arrival when
+  the other boots of the same OS are pinned. `fleet find <machine> --from <linux host>`
+  finds a boot that came up on a new DHCP address, by the machine's `mac`.
 
 ## Computer use (`fleet cu`)
 
@@ -162,9 +198,17 @@ and exposes computer-use tools. Same interactive-desktop requirement as `fleet s
 - **Install or update:** `fleet cu <selector> install` runs each host's official
   current-release installer. Windows registers the `cua-driver-serve` autostart task
   and runs `autostart kick`, with one-time UAC elevation for RunLevel=Highest.
-  Linux creates and enables `cua-driver.service` when absent, with `DISPLAY=:0`,
-  and preserves existing units. Adjust the unit for other displays. Download,
-  installation, and service restart failures return a non-zero exit.
+  Linux creates and enables `cua-driver.service` when absent, then rewrites a
+  `fleet-session.conf` drop-in and a start script on every install. The script finds
+  the live Wayland socket and Hyprland instance at each daemon start and enables
+  cua-driver's Wayland backend; before the compositor is up it exits 1 and systemd
+  retries. Download, installation, and service restart failures return a non-zero exit.
+- **Multi-monitor Wayland.** On Hyprland or sway with several monitors, fleet answers
+  `get_screen_size` and `get_desktop_state --out FILE` for the main monitor itself,
+  because cua-driver refuses them. A desktop capture while a monitor is off (DPMS) is
+  refused at once; check `fleet session <host>` and use `fleet shot <host> --wake`.
+  On Linux, `fleet cu <host> apps` lists only processes that own a window (`--all`
+  shows the rest).
 - **Target by anything.** Every verb takes a pid, a process name (with or without
   `.exe`), an app display name, or a window title. One resolver serves all of them,
   and it reports which identity matched.

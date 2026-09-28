@@ -209,7 +209,7 @@ const WIN_RUNNER = [
   `Set-FleetJobExit $dir $code`,
 ].join("\n");
 
-function windowsSpawnScript(id: string, cmd: string, cwd?: string): string {
+function windowsSpawnScript(id: string, cmd: string, cwd?: string, elevated = false): string {
   assertId(id);
   // Register an Interactive-logon task → start it → wait for the runner to record
   // its pid → unregister the task definition (the running instance is unaffected).
@@ -232,7 +232,10 @@ function windowsSpawnScript(id: string, cmd: string, cwd?: string): string {
     `$psexe = (Get-Process -Id $PID).Path`,
     `$arg = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + "$dir\\run.ps1" + '"'`,
     `$action = New-ScheduledTaskAction -Execute $psexe -Argument $arg`,
-    `$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited`,
+    // Limited drops the administrator token, so storage and other CIM cmdlets
+    // fail with "Access to a CIM resource was not available". --elevated asks
+    // for the full token, which an administrator's ssh session can grant.
+    `$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel ${elevated ? "Highest" : "Limited"}`,
     `Register-ScheduledTask -TaskName $task -Action $action -Principal $principal -Force | Out-Null`,
     `Start-ScheduledTask -TaskName $task`,
     `for ($i=0; $i -lt 100; $i++) { if (Test-Path "$dir\\pid") { break }; Start-Sleep -Milliseconds 50 }`,
@@ -257,7 +260,7 @@ export function wslJobCommand(cmd: string, distro: string, cwd?: string): string
 }
 
 export async function spawnJob(
-  cfg: FleetConfig, sel: string, cmd: string, opts: { cwd?: string; label?: string; wsl?: boolean } = {},
+  cfg: FleetConfig, sel: string, cmd: string, opts: { cwd?: string; label?: string; wsl?: boolean; elevated?: boolean; fresh?: boolean } = {},
   dependencies: { exec?: typeof exec; newId?: typeof newId } = {},
 ): Promise<SpawnResult[]> {
   const hosts = resolveHosts(cfg, sel);
@@ -265,15 +268,19 @@ export async function spawnJob(
     const bad = hosts.filter((h) => h.os !== "windows").map((h) => h.name);
     if (bad.length) throw new Error(`--wsl needs Windows hosts; ${bad.join(", ")} ${bad.length === 1 ? "is" : "are"} not`);
   }
+  if (opts.elevated) {
+    const bad = hosts.filter((h) => h.os !== "windows").map((h) => h.name);
+    if (bad.length) throw new Error(`--elevated needs Windows hosts; on ${bad.join(", ")} put sudo inside the job's command`);
+  }
   return Promise.all(hosts.map(async (h): Promise<SpawnResult> => {
     const id = (dependencies.newId ?? newId)(opts.label);
     const script = h.os === "windows"
       ? (opts.wsl
-        ? windowsSpawnScript(id, wslJobCommand(cmd, h.wsl ?? "Ubuntu", opts.cwd))
-        : windowsSpawnScript(id, cmd, opts.cwd))
+        ? windowsSpawnScript(id, wslJobCommand(cmd, h.wsl ?? "Ubuntu", opts.cwd), undefined, opts.elevated)
+        : windowsSpawnScript(id, cmd, opts.cwd, opts.elevated))
       : unixSpawnScript(h, id, cmd, opts.cwd);
     try {
-      const r = await (dependencies.exec ?? exec)(h, script, shellFor(h));
+      const r = await (dependencies.exec ?? exec)(h, script, shellFor(h), opts.fresh ? { fresh: true } : undefined);
       const m = r.stdout.match(/^OK ([a-z0-9-]+) ([1-9]\d*)\r?$/m);
       if (!r.ok || !m || m[1] !== id) {
         const detail = r.stderr || (r.stdout.includes("ERR no pid")

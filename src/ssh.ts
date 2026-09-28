@@ -12,7 +12,7 @@
  */
 import type { Host } from "./config.ts";
 import { proxyControlKey, proxyOpts, proxyReachableCached } from "./proxy.ts";
-import { resolveProxy } from "./config.ts";
+import { hostKeyOpts, resolveProxy } from "./config.ts";
 import { dtExec, dtProbe, dtPush, dtPull } from "./daytona.ts";
 import { trySessionExec, winSessionEnabled } from "./winsession.ts";
 import { homedir, tmpdir } from "node:os";
@@ -54,20 +54,24 @@ export function muxOpts(host: Host): string[] {
     _muxDir = join(homedir(), ".fleet", "ssh");
     try { mkdirSync(_muxDir, { recursive: true }); } catch { /* best-effort; ssh falls back to no-mux if the socket can't be made */ }
   }
-  return ["-o", "ControlMaster=auto", "-o", `ControlPath=${join(_muxDir, `cm-%C-${proxyControlKey(host)}`)}`,
+  // `%C` covers the address, not the host key alias. Two boots of one machine
+  // answer on the same address, so the alias keeps their masters apart.
+  const alias = host.hostKeyAlias ? `-${host.hostKeyAlias}` : "";
+  return ["-o", "ControlMaster=auto", "-o", `ControlPath=${join(_muxDir, `cm-%C-${proxyControlKey(host)}${alias}`)}`,
     "-o", `ControlPersist=${muxPersist()}`];
 }
 
 /** Every connection option fleet adds to an ssh/scp argv, in one place: the
- *  route first, then the control socket that belongs to that route. */
+ *  route first, then the host key identity, then the control socket that
+ *  belongs to that route. */
 export function connOpts(host: Host): string[] {
-  return [...proxyOpts(host), ...muxOpts(host)];
+  return [...proxyOpts(host), ...hostKeyOpts(host), ...muxOpts(host)];
 }
 
 /** A one-shot connection that reuses no master and creates none — for `doctor`,
  *  and as the bounded fallback when a wedged master refuses a session. */
 export function freshConnOpts(host: Host): string[] {
-  return [...proxyOpts(host), "-o", "ControlMaster=no", "-o", "ControlPath=none"];
+  return [...proxyOpts(host), ...hostKeyOpts(host), "-o", "ControlMaster=no", "-o", "ControlPath=none"];
 }
 
 export interface ExecResult {
@@ -81,6 +85,9 @@ export interface ExecResult {
 export interface ExecOptions {
   cwd?: string;
   timeoutMs?: number;
+  /** A new connection that neither reuses nor leaves a shared master, and no
+   *  kept-open Windows session: a login that picks up fresh group membership. */
+  fresh?: boolean;
 }
 
 // ── completion marker ────────────────────────────────────────────────────────
@@ -153,7 +160,9 @@ export function withDoneMarker(script: string, shell: Shell, marker: string): st
 $global:LASTEXITCODE = 0
 $__fleetCode = $null
 try {
-  . ([scriptblock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${b64}'))))
+  # Out-Default here ends with the program, so a table formatter holding the
+  # program's objects flushes before the completion marker, not after it.
+  . ([scriptblock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${b64}')))) | Out-Default
   $__fleetCode = if ($__fleetOk) { 0 } elseif ($__fleetLast) { $__fleetLast } else { 1 }
 } catch {
   $__fleetCode = 1
@@ -245,11 +254,11 @@ async function resolveWinBin(host: Host, timeoutMs = 0): Promise<WinBin> {
   return detected;
 }
 
-export function buildArgs(host: Host, command: string, shell: Shell, winBin: WinBin = "powershell", cwd?: string): {
+export function buildArgs(host: Host, command: string, shell: Shell, winBin: WinBin = "powershell", cwd?: string, fresh = false): {
   args: string[];
   stdin?: Uint8Array;
 } {
-  const ssh = ["ssh", ...connOpts(host), "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", host.ssh];
+  const ssh = ["ssh", ...(fresh ? freshConnOpts(host) : connOpts(host)), "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", host.ssh];
 
   if (host.os === "windows") {
     if (shell === "bash")
@@ -336,7 +345,7 @@ export async function exec(
   // The cwd change goes INSIDE the wrapper, so a missing directory is a
   // reported failure rather than a statement PowerShell steps past.
   const located = opts.cwd ? (reportShell === "powershell" ? withCwdPwsh : withCwdBash)(command, opts.cwd) : command;
-  if (resolved === "powershell" && winBin === "pwsh" && winSessionEnabled(host)) {
+  if (resolved === "powershell" && winBin === "pwsh" && winSessionEnabled(host) && !opts.fresh) {
     const s = await trySessionExec(host, located, remainingMs);
     if (s) {
       const err = stripClixml(s.stderr.trimEnd());
@@ -345,7 +354,7 @@ export async function exec(
       return { host: host.name, ok: s.code === 0, code: s.code, stdout: s.stdout, stderr: err.trim() };
     }
   }
-  const { args, stdin } = buildArgs(host, withDoneMarker(located, reportShell, marker), resolved, winBin);
+  const { args, stdin } = buildArgs(host, withDoneMarker(located, reportShell, marker), resolved, winBin, undefined, opts.fresh);
 
   const proc = Bun.spawn(args, {
     stdin: stdin ?? "ignore",

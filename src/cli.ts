@@ -29,6 +29,7 @@ import { readFile } from "node:fs/promises";
 import { loadConfig, resolveHosts } from "./config.ts";
 import { runWinSessionBroker } from "./winsession.ts";
 import { focusElements } from "./focus.ts";
+import { sessionStates, formatIdle } from "./session.ts";
 import type { FleetConfig } from "./config.ts";
 import { helpText } from "./help.ts";
 import { sshInteractive } from "./ssh.ts";
@@ -39,14 +40,14 @@ import {
 } from "./jobs.ts";
 import type { JobRow } from "./jobs.ts";
 import {
-  pullFlag, pullVal, parseFlags, parseLeadingFlags, lsHosts, runExec, runScript, readScriptSource, editRemoteFile,
+  pullFlag, pullVal, parseFlags, parseLeadingFlags, lsHosts, runExec, runScript, rebootRefusal, droppedStdinCheck, readScriptSource, editRemoteFile,
   pushFile, pullFile, parseRemoteSpec, restartService, serviceLogs, svcStatus,
   gpuRows, diskRows, fetchDashboard, hostStatus, runRecipe, captureScreenshot, rebootHosts,
   cuInstall, cuRun, cuTools, cuDescribe, cuRecordStart, cuRecordStop, cuRecordStatus,
   cuApps, cuShotWindow, browseHost, preferredImageExt, overlayGrid,
   cuSnapshot, cuResolveTargetFrom, cuResolvePoint, cuAct, cuBatch, cuBlockerNote, cuElements, cuOpen, sameRole, cuVerify,
   cuGridCaption, cuElementSupport, compactCuOutput, briefDescribe,
-  bootState, switchMachine, waitFor, routeSelector, deployHosts, diagnose, firmwareRebootHosts,
+  bootState, switchMachine, firmwareEntries, hostKey, findHost, listMonitors, waitFor, routeSelector, deployHosts, diagnose, firmwareRebootHosts,
   proxyRows, proxyChecks, dropMasters,
 } from "./core.ts";
 import {
@@ -434,7 +435,7 @@ function printRaw(r: ExecResult): void {
 
 const SUBCOMMANDS = [
   "ls", "hosts", "dt", "exec", "spawn", "jobs", "cp", "edit", "restart", "reboot", "bios", "boot", "switch", "wait",
-  "gpu", "disk", "status", "top", "logs", "svc", "shot", "cu", "browse", "run", "deploy", "tools", "proxy", "doctor", "completion", "ssh", "help",
+  "gpu", "disk", "status", "top", "logs", "svc", "shot", "cu", "browse", "run", "deploy", "tools", "proxy", "doctor", "hostkey", "find", "session", "drop", "completion", "ssh", "help",
 ];
 /** Emit a bash/zsh completion script with this config's hosts/groups/recipes/
  *  services baked in. Source it: `eval "$(fleet completion zsh)"`. */
@@ -568,9 +569,14 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
     case "exec": {
       // Flags are parsed from the LEADING tokens only, so a --wsl/--json/… inside
       // the remote command is passed through verbatim instead of being hijacked.
-      const { flags, rest: pos } = parseLeadingFlags(rest, ["--json", "--wsl", "--raw"], ["--cwd", "--timeout", "--script", "--interp"]);
+      const EXEC_BOOLS = ["--json", "--wsl", "--raw", "--sudo", "--confirm-reboot", "--fresh"];
+      const EXEC_VALUES = ["--cwd", "--timeout", "--script", "--interp"];
+      const { flags, rest: pos } = parseLeadingFlags(rest, EXEC_BOOLS, EXEC_VALUES);
       const json = flags["--json"] === true;
       const wsl = flags["--wsl"] === true;
+      const sudo = flags["--sudo"] === true;          // run as root; a password comes from hosts.<h>.sudo
+      const confirmReboot = flags["--confirm-reboot"] === true;
+      const fresh = flags["--fresh"] === true;        // a new ssh login: no shared master, no kept-open session
       const raw = flags["--raw"] === true; // print ONLY remote stdout — no header, no indent (for piping/backup)
       if (raw && json) die("choose either --raw or --json");
       const cwd = typeof flags["--cwd"] === "string" && flags["--cwd"] ? flags["--cwd"] : undefined; // run in this dir (fails fast if missing)
@@ -585,17 +591,19 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       if (separated) pos.shift();
       const cmd = pos.join(" ");
       if (scriptPath) {
-        if (!sel) die("usage: fleet exec --script <file|-> [--interp cmd] [--cwd dir] [--timeout S] [--wsl] [--raw] [--json] <sel>");
+        if (!sel) die("usage: fleet exec --script <file|-> [--interp cmd] [--cwd dir] [--timeout S] [--wsl] [--sudo] [--raw] [--json] <sel>");
         if (cmd) die(`fleet exec --script takes no command after <sel> (got '${cmd}') — the script IS the command`);
         const script = await readScriptSource(scriptPath);
-        const results = await runScript(cfg, await routeSelector(cfg, sel!), script, { wsl, cwd, timeoutMs, interp });
+        const refusal = confirmReboot ? null : rebootRefusal(script.source, "--confirm-reboot");
+        if (refusal) die(refusal);
+        const results = await runScript(cfg, await routeSelector(cfg, sel!), script, { wsl, cwd, timeoutMs, interp, sudo, fresh });
         if (json) console.log(JSON.stringify(results, null, 2));
         else if (raw) results.forEach(printRaw);
         else results.forEach(printResult);
         return results.some((r) => !r.ok) ? 1 : 0;
       }
       if (interp) die("--interp requires --script");
-      if (!sel || !cmd) die("usage: fleet exec [--cwd dir] [--timeout S] [--wsl] [--raw] [--json] <sel> <cmd…>   |   fleet exec --script <file|-> <sel>");
+      if (!sel || !cmd) die("usage: fleet exec [--cwd dir] [--timeout S] [--wsl] [--sudo] [--fresh] [--confirm-reboot] [--raw] [--json] <sel> <cmd…>   |   fleet exec --script <file|-> <sel>");
       // A remote command starting with a fleet flag means the flag was written
       // AFTER <sel>, where it is treated as part of the command and shipped to
       // the remote shell verbatim — which fails far away from the real cause.
@@ -603,14 +611,19 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       const strayFlag = !separated && pos[0]?.startsWith("--") ? pos[0] : undefined;
       if (strayFlag === "--shell")
         die(`there is no --shell flag; use --wsl, and put it BEFORE the host: fleet exec --wsl ${sel} <cmd…>`);
-      if (strayFlag && ["--json", "--wsl", "--raw", "--cwd", "--timeout", "--script", "--interp"].includes(strayFlag))
+      if (strayFlag && [...EXEC_BOOLS, ...EXEC_VALUES].includes(strayFlag))
         die(`'${strayFlag}' must come BEFORE the host selector: fleet exec ${strayFlag} ${sel} <cmd…>`);
-      const trailing = separated ? undefined : trailingFleetFlag(pos, ["--json", "--wsl", "--raw"], ["--cwd", "--timeout", "--script", "--interp"]);
+      const trailing = separated ? undefined : trailingFleetFlag(pos, EXEC_BOOLS, EXEC_VALUES);
       if (trailing)
         die(`'${trailing}' must come BEFORE the host selector: fleet exec ${trailing} ${sel} <cmd…>  (quote the whole command if it really ends in ${trailing})`);
       // a bare machine name (dual-boot box) auto-routes to whichever boot is live
+      const refusal = confirmReboot ? null : rebootRefusal(cmd, "--confirm-reboot");
+      if (refusal) die(refusal);
+      const dropped = droppedStdinCheck(cmd);
+      if (dropped.refuse) die(dropped.refuse);
+      if (dropped.warn) console.error(A.y(dropped.warn));
       const target = await routeSelector(cfg, sel!);
-      const results = await runExec(cfg, target, cmd, { wsl, cwd, timeoutMs });
+      const results = await runExec(cfg, target, cmd, { wsl, cwd, timeoutMs, sudo, fresh });
       if (json) console.log(JSON.stringify(results, null, 2));
       else if (raw) results.forEach(printRaw);
       else results.forEach(printResult);
@@ -618,23 +631,29 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
     }
 
     case "spawn": {
-      const { flags, rest: pos } = parseLeadingFlags(rest, ["--json", "--wsl"], ["--cwd", "--label"]);
+      const { flags, rest: pos } = parseLeadingFlags(rest, ["--json", "--wsl", "--elevated", "--confirm-reboot", "--fresh"], ["--cwd", "--label"]);
       const json = flags["--json"] === true;
       const wsl = flags["--wsl"] === true;
+      const elevated = flags["--elevated"] === true;
       const cwd = typeof flags["--cwd"] === "string" && flags["--cwd"] ? flags["--cwd"] : undefined;
       const label = typeof flags["--label"] === "string" && flags["--label"] ? flags["--label"] : undefined;
       const sel = pos.shift();
       const separated = pos[0] === "--";
       if (separated) pos.shift();
       const cmd = pos.join(" ");
-      if (!sel || !cmd) die("usage: fleet spawn [--wsl] [--cwd dir] [--label name] [--json] <sel> <cmd…>");
-      const misplaced = separated ? undefined : ["--cwd", "--label", "--json", "--wsl", "--name"].includes(pos[0] ?? "") ? pos[0]
-        : trailingFleetFlag(pos, ["--json", "--wsl"], ["--cwd", "--label", "--name"]);
+      if (!sel || !cmd) die("usage: fleet spawn [--wsl] [--elevated] [--fresh] [--cwd dir] [--label name] [--json] <sel> <cmd…>");
+      const misplaced = separated ? undefined : ["--cwd", "--label", "--json", "--wsl", "--elevated", "--confirm-reboot", "--fresh", "--name"].includes(pos[0] ?? "") ? pos[0]
+        : trailingFleetFlag(pos, ["--json", "--wsl", "--elevated", "--confirm-reboot", "--fresh"], ["--cwd", "--label", "--name"]);
       if (misplaced === "--name")
         die("there is no --name flag; use --label, and put it BEFORE the host: fleet spawn --label <name> " + sel + " <cmd…>");
       if (misplaced)
         die("'" + misplaced + "' must come BEFORE the host selector: fleet spawn " + misplaced + " <value> " + sel + " <cmd…>  (quote the whole command if it really ends in " + misplaced + ")");
-      const results = await spawnJob(cfg, await routeSelector(cfg, sel!), cmd, { cwd, label, wsl });
+      const refusal = flags["--confirm-reboot"] === true ? null : rebootRefusal(cmd, "--confirm-reboot");
+      if (refusal) die(refusal);
+      const dropped = droppedStdinCheck(cmd);
+      if (dropped.refuse) die(dropped.refuse);
+      if (dropped.warn) console.error(A.y(dropped.warn));
+      const results = await spawnJob(cfg, await routeSelector(cfg, sel!), cmd, { cwd, label, wsl, elevated, fresh: flags["--fresh"] === true });
       if (json) { console.log(JSON.stringify(results, null, 2)); return results.some((r) => !r.ok) ? 1 : 0; }
       for (const r of results) {
         if (r.ok) console.log(`${A.g("●")} ${A.b(r.host)} ${A.d("job")} ${A.c(r.id!)} ${A.d("· pid " + r.pid)}  ${A.d("fleet jobs tail " + r.host + ":" + r.id)}`);
@@ -952,19 +971,33 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
     }
 
     case "shot": case "screenshot": {
-      const { flags, rest: pos } = parseFlags(rest, ["--no-open", "--grid"], ["--grid-step", "--out"]);
+      const { flags, rest: pos } = parseFlags(rest, ["--no-open", "--grid", "--list", "--json", "--wake"], ["--grid-step", "--out", "--output", "--monitor", "--region"]);
       const noOpen = flags["--no-open"] === true;
       const grid = flags["--grid"] === true;
       const gridStep = numFlag(flags, "--grid-step", 100);
       const out = flags["--out"] as string | undefined;
+      if (flags["--output"] !== undefined && flags["--monitor"] !== undefined) die("--monitor is another name for --output; pass one");
+      const output = (flags["--output"] ?? flags["--monitor"]) as string | undefined;
+      const region = flags["--region"] as string | undefined;
       const [sel] = pos;
-      if (!sel || pos.length !== 1) die("usage: fleet shot <host> [--out file.png] [--grid [--grid-step N]] [--no-open]");
+      if (!sel || pos.length !== 1)
+        die("usage: fleet shot <host> [--output NAME|main|focused|N] [--region top-right|…|X,Y,W,H] [--wake] [--out file.png] [--grid [--grid-step N]] [--no-open]\n       fleet shot <host> --list [--json]");
       const routed = await routeSelector(cfg, sel);
+      if (flags["--list"] === true) {
+        const l = await listMonitors(cfg, routed);
+        if (flags["--json"] === true) { console.log(JSON.stringify(l, null, 2)); return 0; }
+        console.log(`${A.b(l.host)} ${A.d(`monitors from ${l.source}`)}`);
+        l.monitors.forEach((m, i) => console.log(`  ${A.d(String(i + 1).padStart(2))} ${A.b(m.name.padEnd(10))} `
+          + `${m.width}x${m.height}@${m.x},${m.y} ${A.d(`scale ${m.scale}`)}`
+          + `${m.name === l.main ? A.g(" main") : ""}${m.focused ? A.c(" focused") : ""}${m.on === false ? A.y(" off") : ""}`
+          + `${m.description ? A.d("  " + m.description) : ""}`));
+        return 0;
+      }
       const host = resolveHosts(cfg, routed)[0]!;
       const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
       const local = out ?? `${host.name}-${ts}.${await preferredImageExt()}`;
-      process.stdout.write(A.d(`◎ capturing ${host.name} …\r`));
-      const r = await captureScreenshot(cfg, routed, local);
+      process.stdout.write(A.d(`◎ capturing ${host.name}${output || region ? ` (${[output ?? "main", region].filter(Boolean).join(", ")})` : ""} …\r`));
+      const r = await captureScreenshot(cfg, routed, local, {}, { output, region, wake: flags["--wake"] === true });
       if (grid && !await overlayGrid(r.localPath, gridStep)) console.error(A.y("grid overlay skipped (need python3 + Pillow)"));
       console.log(`${A.g("●")} ${A.b(r.host)} ${A.d("→")} ${r.localPath}${grid ? A.d(" (grid)") : ""}`);
       if (!noOpen && process.platform === "darwin")
@@ -1160,11 +1193,14 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       }
       // convenience verbs — cut the list→list→build-JSON loop
       if (verb === "apps") {
-        const { apps, result } = await cuApps(cfg, target, rest[1]);
+        const all = rest.includes("--all");
+        const words = rest.slice(1).filter((w) => w !== "--all");
+        if (words.length > 1) die("usage: fleet cu <host> apps [filter] [--all]");
+        const { apps, result, hidden } = await cuApps(cfg, target, words[0], { all });
         if (!result.ok) { printResult(result); return 1; }
         for (const a of apps)
           console.log(`${A.d((a.pid + "").padStart(7))}  ${A.b(a.name)}${a.active ? A.g(" •active") : ""}`);
-        console.log(A.d(`${apps.length} app(s)`));
+        console.log(A.d(`${apps.length} app(s)${hidden ? ` · ${hidden} windowless process(es) hidden; --all shows them` : ""}`));
         return 0;
       }
       if (verb === "windows") {
@@ -1484,10 +1520,24 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
     }
 
     case "boot": {
-      const { flags, rest: pos } = parseFlags(rest, ["--json"], []);
+      const { flags, rest: pos } = parseFlags(rest, ["--json", "--entries"], []);
       const json = flags["--json"] === true;
       const [sel] = pos;
-      if (!sel || pos.length !== 1) die("usage: fleet boot <machine> [--json]");
+      if (!sel || pos.length !== 1) die("usage: fleet boot <machine> [--entries] [--json]");
+      if (flags["--entries"] === true) {
+        const r = await firmwareEntries(cfg, sel);
+        if (json) { console.log(JSON.stringify(r, null, 2)); return 0; }
+        console.log(`${A.b(r.machine)}  ${A.d(`firmware entries read from ${r.live} (${r.host})`)}`);
+        r.esps.forEach((p, i) => console.log(A.d(`  EFI partition #${i + 1}: ${p.path ?? p.device ?? ""} ${p.uuid}`)));
+        const pos = (id: string) => { const i = r.order.findIndex((o) => o.toLowerCase() === id.toLowerCase()); return i < 0 ? "-" : String(i + 1); };
+        for (const e of r.entries) {
+          const tag = e.boots.length ? A.g(` ← ${e.boots.join(", ")}`) : "";
+          console.log(`  ${A.d(pos(e.id).padStart(2))} ${e.label.padEnd(22)} ${A.d(e.id.padEnd(40))} ${A.d(e.path ?? "")}${tag}`);
+          if (e.warning) console.log(`     ${A.y("⚠ " + e.warning)}`);
+        }
+        for (const miss of r.missing) console.log(`  ${A.r("✗")} no entry matches boot ${miss}`);
+        return r.missing.length || r.entries.some((e) => e.warning && e.boots.length) ? 1 : 0;
+      }
       const st = await bootState(cfg, sel);
       if (json) { console.log(JSON.stringify(st, null, 2)); return st.live ? 0 : 1; }
       const tag = st.live
@@ -1500,21 +1550,30 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
     }
 
     case "switch": {
-      const { flags, rest: pos } = parseFlags(rest, ["--yes", "-y", "--no-wait"], ["--to", "--timeout"]);
+      const { flags, rest: pos } = parseFlags(rest, ["--yes", "-y", "--no-wait", "--dry-run", "--json"], ["--to", "--timeout"]);
       const to = flags["--to"] as string | undefined;
       const yes = flags["--yes"] === true || flags["-y"] === true;
       const noWait = flags["--no-wait"] === true;
-      const timeout = numFlag(flags, "--timeout", 180) * 1000;
+      const dryRun = flags["--dry-run"] === true;
+      const json = flags["--json"] === true;
+      const timeout = numFlag(flags, "--timeout", 300) * 1000;
       const [sel] = pos;
-      if (!sel || !to || pos.length !== 1) die("usage: fleet switch <machine> --to <os> [--yes] [--no-wait] [--timeout S]");
+      if (!sel || !to || pos.length !== 1) die("usage: fleet switch <machine> --to <os> [--yes] [--dry-run] [--no-wait] [--timeout S] [--json]");
       // switch reboots the box into another OS — same destructive gate as reboot
-      if (!await confirm(`switch ${A.b(sel)} → ${A.b(to)} (reboots into the other OS)`, yes)) return 1;
-      console.log(A.d(`◎ switching ${sel} → ${to} …`));
-      const r = await switchMachine(cfg, sel, to!, { timeoutMs: timeout, wait: !noWait });
-      console.log(A.d(`↻ from ${r.from ?? "?"} · trigger exit ${r.triggered.code}`));
-      if (noWait) { console.log(A.y("switch issued; not waiting")); return 0; }
-      if (r.arrived) console.log(`${A.g("●")} ${A.b(sel)} ${A.d("now in")} ${A.b(to!)} ${A.d(`(${Math.round(r.waitedMs / 1000)}s)`)}`);
-      else console.log(`${A.r("✗")} ${sel} did not reach ${to} within ${timeout / 1000}s`);
+      if (!dryRun && !await confirm(`switch ${A.b(sel)} → ${A.b(to)} (reboots into the other OS)`, yes)) return 1;
+      const icon: Record<string, string> = { probe: "◎", plan: "▸", trigger: "⚡", reboot: "↻", wait: "…", done: "■" };
+      // Progress goes to stderr so --json keeps stdout to one value.
+      const onProgress = (p: { phase: string; detail: string; elapsedMs: number }) =>
+        console.error(`${A.d(String(Math.round(p.elapsedMs / 1000)).padStart(4) + "s")} ${icon[p.phase] ?? "·"} ${A.d(p.phase.padEnd(8))} ${p.detail}`);
+      const r = await switchMachine(cfg, sel, to!, { timeoutMs: timeout, wait: !noWait, dryRun, onProgress });
+      if (json) console.log(JSON.stringify(r, null, 2));
+      if (dryRun || noWait) return 0;
+      if (!json) {
+        if (r.arrived) console.log(`${A.g("●")} ${A.b(sel)} ${A.d("now in")} ${A.b(to!)} ${A.d(`(${Math.round(r.waitedMs / 1000)}s)`)}`);
+        else if (!r.wentDown) console.log(`${A.r("✗")} ${sel} never went down; the switch did not reboot it${r.landedIn ? ` (still in ${r.landedIn})` : ""}`);
+        else console.log(`${A.r("✗")} ${sel} did not reach ${to} within ${timeout / 1000}s; `
+          + (r.landedIn ? `it is in ${A.b(r.landedIn)} now` : "it answers in no boot yet"));
+      }
       return r.arrived ? 0 : 1;
     }
 
@@ -1798,11 +1857,71 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       }
       if (d.health) console.log(`  ${d.httpUp ? A.g("● health ok") : A.r("○ health down")} ${A.d(d.health)}`);
       if (d.services.length) console.log(`  ${A.d("services: " + d.services.join(", "))}`);
+      for (const w of d.identity) console.log(`  ${A.y("⚠ " + w)}`);
       if (!d.sshUp) {
         console.log(`  ${A.y("reason:")} ${d.reason}`);
         for (const h of d.hints) console.log(`    ${A.d("→ " + h)}`);
       }
       return d.sshUp ? 0 : 1;
+    }
+
+    case "find": {
+      const { flags, rest: pos } = parseFlags(rest, ["--json"], ["--from"]);
+      const [query] = pos;
+      if (!query || pos.length !== 1) die("usage: fleet find <machine|mac> [--from <linux host on the LAN>] [--json]");
+      const r = await findHost(cfg, query, { from: typeof flags["--from"] === "string" ? flags["--from"] : undefined });
+      if (flags["--json"] === true) { console.log(JSON.stringify(r, null, 2)); return r.hits.length ? 0 : 1; }
+      if (r.swept.length) console.error(A.d(`not in ${r.from ? r.from + "'s" : "the"} ARP table; swept ${r.swept.join(", ")}`));
+      if (!r.hits.length) { console.log(`${A.r("○")} ${r.mac} is not on ${r.swept.join(", ") || "any local subnet"}`); return 1; }
+      for (const h of r.hits) console.log(`${A.g("●")} ${A.b(h.ip)} ${A.d(h.mac)}`);
+      for (const st of r.stale) console.log(`  ${A.y("⚠")} hosts.${st.host} reaches ${st.address}, not ${r.hits.map((h) => h.ip).join(" or ")}; update its ssh HostName`);
+      return 0;
+    }
+
+    case "drop": {
+      const { rest: pos } = parseFlags(rest, [], []);
+      const [sel] = pos;
+      if (!sel || pos.length !== 1) die("usage: fleet drop <sel>");
+      for (const d of await dropMasters(cfg, await routeSelector(cfg, sel)))
+        console.log(`${d.dropped ? A.g("●") : A.d("○")} ${A.b(d.host.padEnd(10))} ${A.d(d.detail)}`);
+      return 0;
+    }
+
+    case "session": {
+      const { flags, rest: pos } = parseFlags(rest, ["--json"], []);
+      const [sel] = pos;
+      if (!sel || pos.length !== 1) die("usage: fleet session <sel> [--json]");
+      const states = await sessionStates(cfg, await routeSelector(cfg, sel));
+      if (flags["--json"] === true) { console.log(JSON.stringify(states, null, 2)); return states.some((s) => s.error) ? 1 : 0; }
+      for (const s of states) {
+        if (s.error) { console.log(`${A.r("○")} ${A.b(s.host)} ${A.r(s.error)}`); continue; }
+        const dot = s.state === "logged-in" ? A.g("●") : s.state === "locked" ? A.y("▲") : A.d("○");
+        const parts = [s.state, s.user && `user ${s.user}`, `idle ${formatIdle(s.idleSeconds)}`];
+        if (s.displays?.length) {
+          const off = s.displays.filter((d) => d.on === false).map((d) => d.name);
+          parts.push(off.length === s.displays.length ? "displays off" : off.length ? `off: ${off.join(", ")}` : "displays on");
+        }
+        console.log(`${dot} ${A.b(s.host)} ${parts.filter(Boolean).join(A.d(" · "))}${s.lock ? A.d(` (${s.lock})`) : ""}`);
+        for (const n of s.notes) console.log(A.d(`    ${n}`));
+      }
+      return states.some((s) => s.error) ? 1 : 0;
+    }
+
+    case "hostkey": {
+      const { flags, rest: pos } = parseFlags(rest, ["--pin", "--json"], []);
+      const [name] = pos;
+      if (!name || pos.length !== 1) die("usage: fleet hostkey <host> [--pin] [--json]");
+      const r = await hostKey(cfg, name, { pin: flags["--pin"] === true });
+      if (flags["--json"] === true) { console.log(JSON.stringify(r, null, 2)); return r.matches ? 0 : 1; }
+      const fp = (k: string) => k.split(" ")[0] + " …" + k.split(" ")[1]!.slice(-12);
+      console.log(`${A.b(r.host)} ${A.d(`alias ${r.alias} · ${r.address}${r.banner ? " · " + r.banner : ""}`)}`);
+      for (const k of r.presented) console.log(`  ${r.pinned.includes(k) ? A.g("✓") : A.y("·")} ${A.d("presented")} ${fp(k)}`);
+      for (const k of r.pinned.filter((k) => !r.presented.includes(k))) console.log(`  ${A.d("· pinned   ")} ${fp(k)}`);
+      for (const o of r.owners) console.log(`  ${A.r("✗")} ${fp(o.key)} ${A.r("already belongs to " + o.name)}`);
+      if (r.pinnedNow) console.log(`${A.g("●")} pinned ${r.presented.length} key(s) under ${r.alias}`);
+      else if (r.matches) console.log(`${A.g("●")} the pinned key matches`);
+      else console.log(`${A.y("○")} not pinned; ${r.owners.length ? "a different boot is up" : `run fleet hostkey ${r.host} --pin while this boot is live`}`);
+      return r.matches ? 0 : 1;
     }
 
     case "ssh": {

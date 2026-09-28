@@ -55,6 +55,8 @@ fleet exec --wsl win-box "uname -a"  # run inside WSL on a windows box
 fleet dt                            # list Daytona sandboxes (DAYTONA_API_KEY)
 fleet exec --cwd /srv/app web "./build.sh"   # run in a dir; fails fast if missing
 fleet exec --timeout 60 vps "slow-thing"        # wall-clock cap; a hung command exits 124
+fleet exec --sudo web "systemctl restart nginx"  # as root; a sudo password comes from a 0600 file
+fleet exec --fresh web "id -Gn"    # new ssh login (after usermod -aG); `fleet drop web` closes shared ones
 # a timeout returns within a second and keeps the output printed so far
 fleet spawn --cwd /srv/app web "./train.sh"  # detached job that outlives ssh -> job id
 fleet jobs                          # every detached job across the fleet
@@ -74,11 +76,15 @@ fleet status vps                    # one host
 fleet logs web cloudflared -n 50
 fleet shot web                 # screenshot the remote desktop -> local PNG
 fleet shot web --grid          # overlay a labeled pixel-coordinate grid (--grid-step N)
+fleet shot web --output DP-1 --region top-right   # one monitor, or part of it (--list shows the layout)
+fleet session web              # logged in, locked or at the login screen; idle time; displays on/off
 fleet cu @windows install      # install cua-driver across a selector (computer use)
 fleet cu web get_screen_size   # drive a desktop: click/type/read window state
 fleet cu web ... --grid        # same grid overlay on the cua capture, for click targeting
 fleet cu phone elements        # an Android phone's screen as a UI tree, no screenshot
 fleet doctor web               # diagnose why a host is unreachable (ssh -vv + health)
+fleet switch box --to linux --dry-run   # dual-boot: show the UEFI entry a switch would use
+fleet find box --from web      # find a machine's LAN address by its MAC
 fleet completion zsh                # shell completion:  eval "$(fleet completion zsh)"
 fleet ssh web                  # drop into an interactive shell
 ```
@@ -86,6 +92,49 @@ fleet ssh web                  # drop into an interactive shell
 `fleet bios` supports Windows UEFI and systemd Linux hosts. macOS entries in a
 fan-out are reported as unsupported without blocking the other hosts. Firmware
 that ignores the OS boot-to-firmware request may perform a normal reboot instead.
+
+`fleet exec` never forwards your local stdin: the remote program travels on
+ssh's stdin. A command that reads stdin (`bash -s`, `python3 -`, `cat > f`) with
+a file or pipe on local stdin is refused; use `fleet exec --script - --interp bash
+<host> < job.sh`. Commands that look like a reboot or power-off are refused
+without `--confirm-reboot`; `fleet reboot` and `fleet switch` confirm and verify.
+
+## Dual-boot machines
+
+A `machines` entry names the host entries of each boot of one physical box.
+`fleet boot box` says which boot is live, and `fleet switch box --to linux`
+reboots into another one, printing each phase: which boot is live, the trigger,
+the source going down, and the wait. On a timeout it names the boot that
+answers instead.
+
+```jsonc
+"machines": { "box": {
+  "mac": "02:00:00:aa:bb:cc",
+  "boots": {
+    "windows": { "host": "box-win-ts", "lan": "box-win", "firmware": "Windows Boot Manager" },
+    "linux":   { "host": "box-linux-ts", "lan": "box-linux", "firmware": "Arch Linux" }
+  },
+  "switch": { "windows": { "linux": "sudo boot-windows" } }
+} }
+```
+
+- Without a `switch` command for the live boot, fleet sets a one-time UEFI boot
+  itself. It looks the target's `firmware` label up at switch time
+  (`bcdedit /enum firmware` on Windows, `efibootmgr -v` on Linux), because entry
+  ids change when entries are added or recreated. A missing label refuses before
+  anything reboots; several entries with one label resolve to the earliest in
+  boot order. `--dry-run` shows the chosen entry. A Linux source needs root.
+- `fleet boot box --entries` lists the firmware entries and flags any on a
+  partition other than the first EFI system partition, which some firmware drops.
+- Boots share an address, so give each boot's host entries a `hostKeyAlias`.
+  Fleet then checks host keys strictly under that name, and a probe of one boot
+  cannot log in to another. `fleet hostkey <host> --pin` records the key the
+  address serves now; it refuses a key whose ssh banner is the wrong OS or that
+  another boot's alias already holds. `fleet doctor` warns about shared addresses
+  without distinct aliases.
+- A boot that comes up on a new DHCP address: `fleet find box` sweeps the local
+  subnet and reads the ARP table for the machine's `mac`. Where the local ARP table
+  is unreadable (recent macOS), pass `--from <linux host on the LAN>`.
 
 ## Logical routes
 
@@ -211,9 +260,17 @@ fleet cu all install            # the entire fleet
 Each selected host runs its OS's official current-release installer (`install.ps1`
 on Windows, `install.sh` elsewhere). Re-run `install` to update. Windows registers
 the autostart task and starts it with `autostart kick`; UAC elevation is required
-once for RunLevel=Highest. Linux creates and enables a missing systemd user unit
-with `DISPLAY=:0`, then restarts it. Existing units keep their display settings.
-Adjust the unit if your desktop uses another display.
+once for RunLevel=Highest. Linux creates and enables a missing systemd user unit,
+then rewrites a `fleet-session.conf` drop-in and a start script on every install.
+The start script finds the live Wayland socket and Hyprland instance at each
+daemon start, since both change with every login, and turns on cua-driver's
+Wayland backend. Before the compositor is up it exits 1, and systemd retries.
+
+On a multi-monitor Hyprland or sway layout, cua-driver refuses desktop-wide
+calls, so fleet answers `get_screen_size` and `get_desktop_state --out FILE` for
+the main monitor from the compositor and its own capture. A desktop capture while
+a monitor is powered off is refused at once instead of waiting for a frame that
+never comes; `fleet shot --wake` switches such monitors on for the capture.
 
 Fleet reports a result for each host and returns a non-zero exit if a download,
 installation, or daemon restart fails.
@@ -574,8 +631,8 @@ All prefixed `fleet_`, grouped by access:
 
 | Group | Tools |
 |---|---|
-| **Read-only** — carry `readOnlyHint`, always registered | `ls` · `logs` · `svc` · `gpu` · `disk` · `status` · `jobs` · `job_log` · `boot` |
-| **Mutating** — dropped by the read-only kill-switch | `exec` · `cp` · `restart` · `spawn` · `job_kill` · `reboot` · `bios` · `switch` · `screenshot` · `cu` · `run` · `android_*` (state, elements, screenshot, act, batch, wait, open, apps, bootstrap, release) |
+| **Read-only** — carry `readOnlyHint`, always registered | `ls` · `logs` · `svc` · `gpu` · `disk` · `status` · `jobs` · `job_log` · `boot` · `session` |
+| **Mutating** — dropped by the read-only kill-switch | `exec` · `cp` · `restart` · `spawn` · `drop` · `job_kill` · `reboot` · `bios` · `switch` · `screenshot` · `cu` · `run` · `android_*` (state, elements, screenshot, act, batch, wait, open, apps, bootstrap, release) |
 | **Not exposed** | `top` / `ssh` (need a live TTY) · job `tail -f` / `wait` (would block) |
 
 - `screenshot` counts as **mutating** — capturing runs commands on the host (on Windows it registers a one-shot scheduled task).
@@ -665,7 +722,9 @@ FLEET_MCP_TOKEN=<long-random> bun run src/http.ts     # or: bun run serve
 
 ## Config — `fleet.config.json`
 Each host has an `ssh` alias, `os` (`linux|windows|mac`), optional `wsl` distro,
-optional `winShell` (`pwsh|powershell`), and a `services` map. Configuring
+optional `winShell` (`pwsh|powershell`), optional `hostKeyAlias`, optional `sudo`
+(`passwordFile`, a 0600 file whose first line is the password, or `passwordEnv`),
+and a `services` map. `--sudo` sends that password only on ssh stdin. Configuring
 `winShell` skips a shell-discovery round trip on every short-lived CLI process.
 Top-level `routes` map logical names to ordered, same-OS host lists. Service
 `type` controls how `restart`/`logs` work:
