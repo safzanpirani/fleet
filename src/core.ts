@@ -1206,6 +1206,31 @@ function getMachine(cfg: FleetConfig, name: string): Machine {
   return m;
 }
 
+/** Why a host of a multi-boot machine may not answer: the machine is booted
+ *  into another OS. A failed connection to one boot's host while the machine
+ *  runs another OS reads as a DNS or timeout error that names nothing about boots. Returns a note only
+ *  when the failure looks like an unreachable address, the host belongs to a
+ *  configured machine, and a probe of every boot shows a different one live. */
+export async function bootMismatchNote(
+  cfg: FleetConfig, failed: { host: string; ok: boolean; code: number; stderr: string },
+  deps: { state?: typeof bootState } = {},
+): Promise<string | undefined> {
+  if (failed.ok || failed.code !== 255) return undefined;
+  if (!/could not resolve hostname|timed out|connection refused|no route to host|network is unreachable/i.test(failed.stderr)) return undefined;
+  for (const [name, m] of Object.entries(cfg.machines ?? {})) {
+    const own = Object.entries(m.boots).find(([, b]) => b.host === failed.host || b.lan === failed.host);
+    if (!own) continue;
+    let st: BootState;
+    try { st = await (deps.state ?? bootState)(cfg, name); } catch { return undefined; }
+    if (st.live && st.live !== own[0])
+      return `${name} is booted into ${st.live}, and ${failed.host} is its ${own[0]} boot; switch with: fleet switch ${name} --to ${own[0]} (status: fleet boot ${name})`;
+    if (!st.live)
+      return `${name} answers on none of its boots (${Object.keys(m.boots).join(", ")}); it may be powered off or mid-reboot (status: fleet boot ${name})`;
+    return undefined;
+  }
+  return undefined;
+}
+
 /** Probe every boot of a machine — all boots and both transports CONCURRENTLY.
  *  Boots are mutually exclusive, so at most one is live; first by config order wins. */
 export async function bootState(

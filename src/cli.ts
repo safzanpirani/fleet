@@ -43,7 +43,7 @@ import {
   pullFlag, pullVal, parseFlags, parseLeadingFlags, lsHosts, runExec, runScript, rebootRefusal, droppedStdinCheck, readScriptSource, editRemoteFile,
   pushFile, pullFile, parseRemoteSpec, restartService, serviceLogs, svcStatus,
   gpuRows, diskRows, fetchDashboard, hostStatus, runRecipe, captureScreenshot, rebootHosts,
-  cuInstall, cuRun, cuTools, cuDescribe, cuRecordStart, cuRecordStop, cuRecordStatus, cuRegions, cuPerception,
+  cuInstall, cuRun, cuTools, cuDescribe, cuRecordStart, cuRecordStop, cuRecordStatus, cuRegions, cuPerception, bootMismatchNote,
   cuApps, cuShotWindow, browseHost, preferredImageExt, overlayGrid,
   cuSnapshot, cuResolveTargetFrom, cuResolvePoint, cuAct, cuBatch, cuBlockerNote, cuElements, cuOpen, sameRole, cuVerify,
   cuGridCaption, cuElementSupport, compactCuOutput, briefDescribe,
@@ -429,6 +429,14 @@ function printResult(r: ExecResult) {
   if (r.stderr) console.error(A.d(r.stderr.split("\n").map((l) => "  " + l).join("\n")));
 }
 
+/** A failed connection to one boot of a multi-boot machine says which boot is live. */
+async function printBootMismatch(cfg: FleetConfig, results: ExecResult[]): Promise<void> {
+  for (const r of results) {
+    const note = await bootMismatchNote(cfg, r);
+    if (note) console.error(A.y(`▲ ${note}`));
+  }
+}
+
 function printRaw(r: ExecResult): void {
   process.stdout.write(r.stdout);
   if (r.stderr) process.stderr.write(r.stderr.endsWith("\n") ? r.stderr : r.stderr + "\n");
@@ -600,7 +608,7 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
         const results = await runScript(cfg, await routeSelector(cfg, sel!), script, { wsl, cwd, timeoutMs, interp, sudo, fresh });
         if (json) console.log(JSON.stringify(results, null, 2));
         else if (raw) results.forEach(printRaw);
-        else results.forEach(printResult);
+        else { results.forEach(printResult); await printBootMismatch(cfg, results); }
         return results.some((r) => !r.ok) ? 1 : 0;
       }
       if (interp) die("--interp requires --script");
@@ -627,7 +635,7 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       const results = await runExec(cfg, target, cmd, { wsl, cwd, timeoutMs, sudo, fresh });
       if (json) console.log(JSON.stringify(results, null, 2));
       else if (raw) results.forEach(printRaw);
-      else results.forEach(printResult);
+      else { results.forEach(printResult); await printBootMismatch(cfg, results); }
       return results.some((r) => !r.ok) ? 1 : 0;
     }
 

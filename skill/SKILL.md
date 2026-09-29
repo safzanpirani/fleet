@@ -184,6 +184,8 @@ checks keys strictly under that name and cannot reach the wrong OS.
 - **Never reboot through `exec`.** `exec` and `spawn` refuse reboot-looking commands
   (`reboot`, `shutdown /r`, `systemctl reboot`, `Restart-Computer`, `boot-<os>` helpers)
   without `--confirm-reboot`.
+- A failed `exec` to one boot of a dual-boot machine (a DNS or timeout error) adds a `▲`
+  line naming the OS that is live and the `fleet switch` command for the boot you asked for.
 - `fleet boot <machine> --entries` lists UEFI entries and flags ones off the first EFI
   partition. `fleet hostkey <host> --pin` records a boot's key while that boot is up and
   refuses the wrong boot's key; `fleet switch` pins an unpinned target on arrival when
