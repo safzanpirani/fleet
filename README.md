@@ -395,6 +395,9 @@ fleet cu phone tap settings --label Bluetooth  # TARGET is the package that must
 fleet cu phone type any "hello" --label search # ASCII; the field is read back
 fleet cu phone batch any '[{"action":"key","key":"back"},{"action":"key","key":"home"}]'
 fleet cu phone wait --label "Wi-Fi" --timeout 8000
+fleet cu phone flow '[{"action":"open","what":"com.android.settings"},{"action":"wait","label":"Wi-Fi"},{"action":"tap","label":"Wi-Fi"}]' --target com.android.settings
+                                               # steps run in order, each reading the screen at its turn; the last screen prints
+fleet cu phone tap settings --label Bluetooth --read Bluetooth   # --read FILTER prints the screen after the action
 fleet cu phone open https://example.com --in com.android.chrome
 fleet cu phone shot --width 400                # WebP encoded on the phone
 fleet cu phone swipe2 any 500 1200 800 1200 -400 0   # two fingers, both moved by -400,0
@@ -632,7 +635,7 @@ All prefixed `fleet_`, grouped by access:
 | Group | Tools |
 |---|---|
 | **Read-only** — carry `readOnlyHint`, always registered | `ls` · `logs` · `svc` · `gpu` · `disk` · `status` · `jobs` · `job_log` · `boot` · `session` |
-| **Mutating** — dropped by the read-only kill-switch | `exec` · `cp` · `restart` · `spawn` · `drop` · `job_kill` · `reboot` · `bios` · `switch` · `screenshot` · `cu` · `run` · `android_*` (state, elements, screenshot, act, batch, wait, open, apps, bootstrap, release) |
+| **Mutating** — dropped by the read-only kill-switch | `exec` · `cp` · `restart` · `spawn` · `drop` · `job_kill` · `reboot` · `bios` · `switch` · `screenshot` · `cu` · `run` · `android_*` (state, elements, screenshot, act, batch, flow, wait, open, apps, bootstrap, release) |
 | **Not exposed** | `top` / `ssh` (need a live TTY) · job `tail -f` / `wait` (would block) |
 
 - `screenshot` counts as **mutating** — capturing runs commands on the host (on Windows it registers a one-shot scheduled task).

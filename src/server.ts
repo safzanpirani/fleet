@@ -30,10 +30,10 @@ import { listSandboxes } from "./daytona.ts";
 import { toolsStatus } from "./tools.ts";
 import {
   androidDoctor, androidElementsOf, androidShot, androidAct, androidOpen, androidApps, androidBootstrap,
-  androidBatch, androidWait, androidRelease, androidNotifications,
+  androidBatch, androidFlow, androidInputText, androidKeycode, androidWait, androidRelease, androidNotifications,
   androidRecordStart, androidRecordStatus, androidRecordStop,
 } from "./android.ts";
-import type { AndroidAction, AndroidBatchStep } from "./android.ts";
+import type { AndroidAction, AndroidBatchStep, AndroidElement } from "./android.ts";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -70,6 +70,10 @@ function renderExec(results: ExecResult[]): string {
 }
 const text = (t: string, isError = false) =>
   ({ content: [{ type: "text" as const, text: t || "(no output)" }], isError });
+
+function phoneElementRows(elements: AndroidElement[]) {
+  return elements.map(({ ancestors: _a, bounds: _b, index: _i, ...e }) => e);
+}
 
 function selectorHelp(cfg: FleetConfig): string {
   const hosts = Object.keys(cfg.hosts).join(", ");
@@ -1339,7 +1343,7 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       if (!r.result.ok) return text(r.result.stderr || "uiautomator dump failed", true);
       return text(JSON.stringify({
         state: r.state, total: r.total,
-        elements: r.elements.map(({ ancestors: _a, bounds: _b, index: _i, ...e }) => e),
+        elements: phoneElementRows(r.elements),
         ...(r.state.locked || (r.state.awake && r.state.awake !== "Awake")
           ? { note: "the phone is locked or its screen is off; this is the lock screen, and input is refused" } : {}),
       }));
@@ -1483,6 +1487,79 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
         `${phoneState(r.state)} · ${r.steps.filter((s) => s.status === "done").length}/${r.steps.length} steps`,
         ...r.steps.map((s) => `${s.index + 1}. ${s.status} ${s.summary}${s.detail ? ` — ${s.detail}` : ""}`),
       ].join("\n"), !r.result.ok);
+    } catch (error) { return text(error instanceof Error ? error.message : String(error), true); }
+  });
+
+  const flowString = z.string().regex(/\S/, "Must not be blank");
+  const flowPackage = flowString.regex(/^[A-Za-z][\w]*(\.[\w]+)+$/, "Must be a package name");
+  const flowTarget = flowString.regex(/^[A-Za-z0-9._-]+$/, "Must be a package, a word in one, or any");
+  const flowLocator = {
+    label: flowString.optional(), role: flowString.optional(),
+    nth: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER).optional(),
+  };
+  const hasFlowLocator = (s: { label?: string; role?: string }) => s.label !== undefined || s.role !== undefined;
+  const flowSteps = z.discriminatedUnion("action", [
+    z.object({ action: z.literal("open"), what: flowString, in: flowPackage.optional() }).strict().refine((s) => {
+      const packageName = /^[A-Za-z][\w]*(\.[\w]+)+$/.test(s.what);
+      const url = /^[a-z][a-z0-9+.-]*:\S+$/i.test(s.what) && !packageName;
+      return (packageName || url) && (s.in === undefined || url);
+    }, "open needs a package or URL; in only applies to URLs"),
+    z.object({ action: z.literal("wait"), ...flowLocator, focus: flowTarget.optional(), gone: z.boolean().optional(),
+      timeoutMs: z.number().int().min(0).max(120000).optional(),
+    }).strict().refine((s) => hasFlowLocator(s) !== (s.focus !== undefined) && (s.focus === undefined || s.nth === undefined),
+      "wait needs label/role or focus; nth requires label/role"),
+    z.object({ action: z.literal("expect"), ...flowLocator, text: z.string().optional(), gone: z.boolean().optional(),
+    }).strict().refine(hasFlowLocator, "expect needs label or role")
+      .refine((s) => !s.gone || s.text === undefined, "gone with text is unsupported"),
+    z.object({ action: z.literal("tap"), ...flowLocator }).strict().refine(hasFlowLocator, "tap needs label or role"),
+    z.object({ action: z.literal("long_press"), ...flowLocator, ms: z.number().int().min(1).max(10000).optional(),
+    }).strict().refine(hasFlowLocator, "long_press needs label or role"),
+    z.object({ action: z.literal("type"), ...flowLocator, text: z.string().superRefine((s, ctx) => {
+      try { androidInputText(s); }
+      catch (error) { ctx.addIssue({ code: "custom", message: error instanceof Error ? error.message : String(error) }); }
+    }) }).strict().refine(hasFlowLocator, "type needs label or role"),
+    z.object({ action: z.literal("scroll"), ...flowLocator, direction: z.enum(["up", "down", "left", "right"]),
+      amount: z.number().int().min(1).max(10).optional(),
+    }).strict().refine(hasFlowLocator, "scroll needs label or role"),
+    z.object({ action: z.literal("key"), key: flowString.superRefine((s, ctx) => {
+      try { androidKeycode(s); }
+      catch (error) { ctx.addIssue({ code: "custom", message: error instanceof Error ? error.message : String(error) }); }
+    }) }).strict(),
+    z.object({ action: z.literal("sleep"), ms: z.number().int().min(0).max(10000) }).strict(),
+  ]);
+
+  server.registerTool("fleet_android_flow", {
+    title: "Run a phone flow with current-screen conditions",
+    description: "Send phone input in up to 30 ordered open, wait, expect, tap, long_press, type, scroll, key, or sleep steps. "
+      + "Label inputs resolve against the current screen and can reuse a cached tree after a frame check. "
+      + "The first failure stops the flow; later steps report not_run. Prefer an explicit target: the default any "
+      + "skips the package gate. Each open sets the later target; a package or URL with in must gain focus. "
+      + "A URL without in binds the observed package, which may be Android's chooser; prefer in for URLs. "
+      + "wait's text prefilter can stop before a role or nth condition matches; the full matcher confirms once, "
+      + "so such waits can fail early. expect supports optional text but rejects gone with text. "
+      + "type accepts printable ASCII only. sleep is 0-10000 ms, long_press 1-10000 ms, wait timeoutMs 0-120000, "
+      + "scroll amount 1-10, nth a positive integer. The final screen read runs by default; read filters it, "
+      + "noRead skips it. A readError preserves the flow outcome. " + phoneHelp,
+    inputSchema: z.object({
+      host: z.string().describe("An Android host name or logical route."),
+      steps: z.array(flowSteps).min(1).max(30),
+      target: flowTarget.optional().describe("Initial package focus gate, a word in it, or any (default any; prefer an explicit package)."),
+      read: z.string().optional().describe("Case-insensitive final-screen filter; * reads all elements."),
+      noRead: z.boolean().optional().describe("Skip the final read; cannot combine true with read."),
+      settleMs: z.number().int().min(0).max(10000).optional().describe("Wait before each input's after-hash (default 400)."),
+    }).strict().refine((s) => !s.noRead || s.read === undefined, "read and noRead cannot be combined"),
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+  }, async ({ host, steps, target, read, noRead, settleMs }) => {
+    try {
+      const r = await androidFlow(cfg, await routeSelector(cfg, host), steps,
+        { target, read: noRead ? false : read, settleMs });
+      return text([
+        `flow ${r.ok ? "done" : "stopped"} · ${r.steps.filter((s) => s.status === "done").length}/${r.steps.length} steps`,
+        ...r.steps.map((s) => `${s.index + 1}. ${s.status} ${s.summary}${s.detail ? ` — ${s.detail}` : ""}`),
+        ...(r.state ? [phoneState(r.state)] : []),
+        ...(r.elements ? [`${r.elements.length} of ${r.total} element(s)`, ...phoneElementRows(r.elements).map((e) => JSON.stringify(e))] : []),
+        ...(r.readError ? [`readError: ${r.readError}`] : []),
+      ].join("\n"), !r.ok);
     } catch (error) { return text(error instanceof Error ? error.message : String(error), true); }
   });
 

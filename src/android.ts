@@ -975,15 +975,25 @@ async function sendInput(
   const wake = action.kind === "key" && androidKeycode(action.key) === "KEYCODE_WAKEUP";
   const readBack = action.kind === "type";
   const multi = MULTI_TOUCH.has(action.kind);
+  // Pin each delivery to the package observed before this action, even for any.
+  // A label type must check again after its tap focuses the field.
+  const deliveryGate = [
+    `f=$(dumpsys window 2>/dev/null | grep -m1 'mCurrentFocus='); tok=\${f##* }; tok=\${tok%\\}}; fp=\${tok%%/*}`,
+    `[ -n "$input_pkg" ] && [ "$fp" = "$input_pkg" ] || refuse "focus moved before input delivery"`,
+  ].join("\n");
+  const deliveryCommands = [...cmds];
+  if (readBack && el) deliveryCommands.splice(2, 0, deliveryGate);
   if (expect !== undefined && !/^[0-9a-f]{32}$/.test(expect)) expect = undefined;
   const device = [
     DEVICE_STATE,
     ...(readBack || multi ? [DEVICE_DUMP] : []),
     deviceGates(wake ? undefined : target, { needAwake: !wake, needUnlocked: !wake }),
+    `input_pkg=$pkg`,
     ...checks,
     `HA=$(fh); echo "${P}HA $HA"`,
     ...(expect ? [staleGuard(expect, el)] : []),
-    `iout=$( { ${cmds.join("\n")} ; } 2>&1 ); echo "${P}INPUT $?"`,
+    ...(!wake ? [deliveryGate] : []),
+    `iout=$( { ${deliveryCommands.join("\n")} ; } 2>&1 ); echo "${P}INPUT $?"`,
     `[ -n "$iout" ] && echo "${P}INPUTOUT $(printf '%s' "$iout" | tr '\\n' ' ' | cut -c1-300)"`,
     `sleep ${seconds(settle)}; HB=$(fh); echo "${P}HB $HB"`,
     // Android animates nearly every action (flings, page transitions), so one
@@ -1045,18 +1055,23 @@ async function sendInput(
 
 export interface AndroidOpenResult { host: string; result: ExecResult; state: AndroidState; what: string; refusal?: string }
 
+const isAndroidPackage = (v: string) => /^[A-Za-z][\w]*(\.[\w]+)+$/.test(v);
+function validateAndroidOpen(what: string, inPackage?: string): boolean {
+  const url = /^[a-z][a-z0-9+.-]*:\S+$/i.test(what) && !isAndroidPackage(what);
+  if (!url && !isAndroidPackage(what))
+    throw new Error(`open takes a package name (com.android.chrome) or a URL (got '${what}'); list packages with: apps`);
+  if (inPackage !== undefined && (!url || !isAndroidPackage(inPackage)))
+    throw new Error(url ? `--in takes a package name (got '${inPackage}')` : "--in names the app for a URL; a package opens itself");
+  return url;
+}
+
 /** Launch a package, or open a URL with a VIEW intent, then wait for focus to move. */
 export async function androidOpen(
   cfg: FleetConfig, sel: string, what: string, opts: { waitMs?: number; inPackage?: string } = {},
   deps: AndroidDeps = {},
 ): Promise<AndroidOpenResult> {
   const { host } = androidHost(cfg, sel);
-  const isPackage = (v: string) => /^[A-Za-z][\w]*(\.[\w]+)+$/.test(v);
-  const url = /^[a-z][a-z0-9+.-]*:\S+$/i.test(what) && !isPackage(what);
-  if (!url && !isPackage(what))
-    throw new Error(`open takes a package name (com.android.chrome) or a URL (got '${what}'); list packages with: apps`);
-  if (opts.inPackage !== undefined && (!url || !isPackage(opts.inPackage)))
-    throw new Error(url ? `--in takes a package name (got '${opts.inPackage}')` : "--in names the app for a URL; a package opens itself");
+  const url = validateAndroidOpen(what, opts.inPackage);
   const waitMs = opts.waitMs ?? 5000;
   // Naming the package skips Android's "open with" chooser when several apps
   // handle the link.
@@ -1365,7 +1380,7 @@ export interface AndroidWaitResult {
  *  a label action, not just the phone's text search. */
 export async function androidWait(
   cfg: FleetConfig, sel: string,
-  opts: { label?: string; role?: string; gone?: boolean; focus?: string; timeoutMs?: number },
+  opts: { label?: string; role?: string; nth?: number; gone?: boolean; focus?: string; timeoutMs?: number },
   deps: AndroidDeps = {},
 ): Promise<AndroidWaitResult> {
   const { host } = androidHost(cfg, sel);
@@ -1373,6 +1388,8 @@ export async function androidWait(
   if (!Number.isInteger(timeout) || timeout < 0 || timeout > 120_000) throw new Error("--timeout must be 0–120000 ms");
   if ((opts.label === undefined && opts.role === undefined) === (opts.focus === undefined))
     throw new Error("wait needs either --label/--role or --focus");
+  if (opts.nth !== undefined && (!Number.isInteger(opts.nth) || opts.nth < 1 || opts.focus !== undefined))
+    throw new Error("wait nth must be a positive integer with label/role");
   const deadline = `$(( $(date +%s) + ${Math.ceil(timeout / 1000)} ))`;
   let loop: string[];
   if (opts.focus !== undefined) {
@@ -1404,7 +1421,9 @@ export async function androidWait(
     { deviceTimeoutS: Math.ceil(timeout / 1000) + 30 }, deps.exec);
   if (r.lines.has("UIJAR")) await installUiHelper(cfg, sel, deps);
   const elapsedMs = Date.now() - started;
-  if (r.error && !r.xml) return { host: host.name, result: failed(r, r.error), state: r.state, satisfied: false, elapsedMs };
+  if (!r.result.ok || r.error || (opts.focus === undefined && !r.xml))
+    return { host: host.name, result: failed(r, r.error ?? "the wait did not return a readable screen"),
+      state: r.state, satisfied: false, elapsedMs };
   if (opts.focus !== undefined) {
     const met = r.lines.has("MET");
     const now = r.lines.get("MET")?.at(-1) ?? r.lines.get("TIMEOUT")?.at(-1) ?? "";
@@ -1414,20 +1433,202 @@ export async function androidWait(
   }
   let element: AndroidElement | undefined;
   let found = false;
+  let invalidSelection = false;
   if (r.xml) {
     try {
       element = androidPick(androidElements(parseUiDump(r.xml), { width: r.state.width, height: r.state.height }),
-        { label: opts.label, role: opts.role });
+        { label: opts.label, role: opts.role, nth: opts.nth });
       found = true;
-    } catch (error) { found = /elements match/.test(String(error)); }
+    } catch (error) {
+      found = /elements match/.test(String(error));
+      invalidSelection = !found && !String(error).includes("no element with ");
+    }
   }
-  const satisfied = opts.gone ? !found : found;
+  // TODO(review): Poll role/nth with the full matcher on the phone; the grep prefilter can stop early.
+  const satisfied = !r.lines.has("TIMEOUT") && !invalidSelection && (opts.gone ? !found : found);
   const what = [opts.role && `role ${opts.role}`, opts.label !== undefined && `label "${opts.label}"`].filter(Boolean).join(" and ");
   const reason = satisfied ? undefined
     : r.lines.has("TIMEOUT") ? `after ${timeout} ms ${what} is ${opts.gone ? "still there" : "not there"}`
     : `the phone's text search matched, but no element with ${what} ${opts.gone ? "is gone" : "exists"}`;
   return { host: host.name, state: r.state, satisfied, elapsedMs, ...(element && !opts.gone ? { element } : {}),
     ...(reason ? { reason } : {}), result: satisfied ? r.result : failed(r, reason!) };
+}
+
+// ── flow ─────────────────────────────────────────────────────────────────────
+
+export interface AndroidFlowStep {
+  action: "open" | "wait" | "expect" | "tap" | "long_press" | "type" | "scroll" | "key" | "sleep";
+  /** open: a package or URL. */
+  what?: string; in?: string;
+  label?: string; role?: string; nth?: number;
+  /** wait: a package that must hold focus; gone flips wait and expect. */
+  focus?: string; gone?: boolean; timeoutMs?: number;
+  /** expect: the matched element must contain this text. */
+  text?: string;
+  key?: string; direction?: "up" | "down" | "left" | "right"; amount?: number; ms?: number;
+}
+export interface AndroidFlowStepResult { index: number; summary: string; status: "done" | "failed" | "not_run"; detail?: string }
+export interface AndroidFlowResult {
+  host: string; ok: boolean; state?: AndroidState;
+  steps: AndroidFlowStepResult[];
+  elements?: AndroidElement[]; total?: number;
+  readError?: string;
+}
+
+const FLOW_LIMITS = { steps: 30, sleepMs: 10_000 };
+
+/** Run steps one after another on the phone, each reading the screen as it is
+ *  when its turn comes, so a label on a screen an earlier step opened resolves.
+ *  `open` sets the target package for the steps after it. `wait` holds until a
+ *  label or focus appears; `expect` reads the screen and fails unless a label
+ *  (and optionally its text) is there, before any later input goes out. The
+ *  first failure stops the flow. After the last step the screen is read once
+ *  more and returned, so the caller needs no separate `elements` call. */
+export async function androidFlow(
+  cfg: FleetConfig, sel: string, steps: AndroidFlowStep[],
+  opts: { target?: string; read?: string | false; settleMs?: number } = {},
+  deps: AndroidDeps = {},
+): Promise<AndroidFlowResult> {
+  const { host } = androidHost(cfg, sel);
+  if (!Array.isArray(steps) || !steps.length) throw new Error("flow needs a non-empty array of steps");
+  if (steps.length > FLOW_LIMITS.steps) throw new Error(`flow takes at most ${FLOW_LIMITS.steps} steps`);
+  const allowed: Record<AndroidFlowStep["action"], string[]> = {
+    open: ["what", "in"], wait: ["label", "role", "nth", "focus", "gone", "timeoutMs"],
+    expect: ["label", "role", "nth", "text", "gone"], tap: ["label", "role", "nth"],
+    long_press: ["label", "role", "nth", "ms"], type: ["label", "role", "nth", "text"],
+    scroll: ["label", "role", "nth", "direction", "amount"], key: ["key"], sleep: ["ms"],
+  };
+  const integer = (v: number | undefined, min: number, max: number, name: string) => {
+    if (v !== undefined && (!Number.isInteger(v) || v < min || v > max))
+      throw new Error(`${name} must be an integer from ${min} to ${max}`);
+  };
+  if (opts.target !== undefined && typeof opts.target !== "string") throw new Error("target must be a string");
+  if (opts.read !== undefined && opts.read !== false && typeof opts.read !== "string") throw new Error("read must be a filter string or false");
+  integer(opts.settleMs, 0, 10_000, "settleMs");
+  const summaries = steps.map((s, i) => {
+    if (!s || typeof s !== "object" || Array.isArray(s)) throw new Error(`step ${i + 1} must be an object`);
+    const at = `step ${i + 1} (${s.action})`;
+    if (!Object.hasOwn(allowed, s.action)) throw new Error(`${at}: unknown action; use open, wait, expect, tap, long_press, type, scroll, key, or sleep`);
+    for (const field of Object.keys(s)) {
+      if (field !== "action" && !allowed[s.action].includes(field)) throw new Error(`${at}: ${field} does not apply`);
+    }
+    for (const field of ["what", "in", "label", "role", "focus", "key", "direction"] as const) {
+      if (s[field] !== undefined && (typeof s[field] !== "string" || !s[field]!.trim()))
+        throw new Error(`${at}: ${field} must be a non-empty string`);
+    }
+    if (s.text !== undefined && typeof s.text !== "string") throw new Error(`${at}: text must be a string`);
+    if (s.gone !== undefined && typeof s.gone !== "boolean") throw new Error(`${at}: gone must be boolean`);
+    integer(s.nth, 1, Number.MAX_SAFE_INTEGER, `${at}: nth`);
+    integer(s.amount, 1, 10, `${at}: amount`);
+    integer(s.timeoutMs, 0, 120_000, `${at}: timeoutMs`);
+    if (s.action === "long_press") integer(s.ms, 1, 10_000, `${at}: ms`);
+    const locator = s.label !== undefined || s.role !== undefined;
+    switch (s.action) {
+      case "open":
+        if (!s.what) throw new Error(`${at} needs what`);
+        validateAndroidOpen(s.what, s.in);
+        return `open ${s.what}${s.in ? ` in ${s.in}` : ""}`;
+      case "wait":
+        if (locator === (s.focus !== undefined)) throw new Error(`${at} needs label/role or focus`);
+        if (s.focus !== undefined) {
+          androidTargetPattern(s.focus);
+          if (s.nth !== undefined) throw new Error(`${at}: nth needs label/role`);
+        }
+        return `wait ${s.focus !== undefined ? `focus ${s.focus}` : JSON.stringify(s.label ?? s.role)}${s.gone ? " gone" : ""}`;
+      case "expect":
+        if (!locator) throw new Error(`${at} needs label or role`);
+        // TODO(review): Define whether gone+text negates the text predicate or requires the whole label to disappear.
+        if (s.gone && s.text !== undefined) throw new Error(`${at}: gone with text is unsupported`);
+        return `expect ${JSON.stringify(s.label ?? s.role)}${s.text ? ` contains ${JSON.stringify(s.text)}` : ""}${s.gone ? " absent" : ""}`;
+      case "tap": case "long_press": case "type": case "scroll":
+        if (!locator) throw new Error(`${at} needs label or role`);
+        if (s.action === "type" && s.text === undefined) throw new Error(`${at} needs text`);
+        if (s.action === "type") androidInputText(s.text!);
+        if (s.action === "scroll" && !["up", "down", "left", "right"].includes(s.direction!)) throw new Error(`${at} needs direction: up, down, left, or right`);
+        return `${s.action} ${JSON.stringify(s.label ?? s.role)}${s.action === "type" ? ` ${JSON.stringify(String(s.text).slice(0, 40))}` : ""}`;
+      case "key":
+        if (!s.key) throw new Error(`${at} needs key`);
+        androidKeycode(s.key);
+        return `key ${s.key}`;
+      case "sleep":
+        if (!Number.isInteger(s.ms) || s.ms! < 0 || s.ms! > FLOW_LIMITS.sleepMs) throw new Error(`${at}: ms must be 0–${FLOW_LIMITS.sleepMs}`);
+        return `sleep ${s.ms}ms`;
+      default: throw new Error(`${at}: unknown action; use open, wait, expect, tap, long_press, type, scroll, key, or sleep`);
+    }
+  });
+  // TODO(review): Decide whether flows without open or --target should pin the initial package; any skips app confinement.
+  const target0 = opts.target ?? "any";
+  androidTargetPattern(target0);
+  const results: AndroidFlowStepResult[] = summaries.map((summary, index) => ({ index, summary, status: "not_run" as const }));
+  let target = target0;
+  let state: AndroidState | undefined;
+  let ok = true;
+  const fail = (i: number, detail: string) => { results[i] = { ...results[i]!, status: "failed", detail }; ok = false; };
+  for (let i = 0; i < steps.length && ok; i++) {
+    const s = steps[i]!;
+    const loc: AndroidLocator = { label: s.label, role: s.role, nth: s.nth };
+    const done = (detail?: string) => { results[i] = { ...results[i]!, status: "done", ...(detail ? { detail } : {}) }; };
+    try {
+      if (s.action === "sleep") { await new Promise((r) => setTimeout(r, s.ms)); done(); continue; }
+      if (s.action === "open") {
+        const r = await androidOpen(cfg, sel, s.what!, { inPackage: s.in }, deps);
+        state = r.state;
+        if (r.refusal || !r.result.ok) { fail(i, r.refusal ?? (r.result.stderr || "open failed")); break; }
+        const next = s.in ?? (isAndroidPackage(s.what!) ? s.what! : r.state.pkg);
+        if (!next || !isAndroidPackage(next) || r.state.pkg !== next) {
+          fail(i, `open did not focus ${next || "a package"}; focus is on ${r.state.pkg || "nothing"}`); break;
+        }
+        // TODO(review): A URL without in can focus Android's chooser; require in when the destination app matters.
+        target = next;
+        done(`${r.state.pkg || "nothing"} focused`);
+        continue;
+      }
+      if (s.action === "wait") {
+        const r = await androidWait(cfg, sel, { label: s.label, role: s.role, nth: s.nth, focus: s.focus, gone: s.gone, timeoutMs: s.timeoutMs }, deps);
+        state = r.state;
+        if (!r.satisfied || !r.result.ok) { fail(i, r.reason ?? (r.result.stderr || "timed out")); break; }
+        done(`${r.elapsedMs} ms`);
+        continue;
+      }
+      if (s.action === "expect") {
+        const r = await androidElementsOf(cfg, sel, {}, deps);
+        state = r.state;
+        if (!r.result.ok) { fail(i, r.result.stderr || "the screen could not be read"); break; }
+        let el: AndroidElement | undefined;
+        let why = "";
+        try { el = androidPick(r.elements, loc); } catch (error) { why = String(error instanceof Error ? error.message : error).split("\n")[0]!; }
+        if (s.gone) {
+          if (el) fail(i, `${el.role} ${JSON.stringify(el.label)} is still there`);
+          else if (why.startsWith("no element with ")) done();
+          else fail(i, why);
+          continue;
+        }
+        if (!el) { fail(i, why); break; }
+        if (s.text !== undefined && ![el.label, el.text, el.desc].some((f) => f.toLowerCase().includes(s.text!.toLowerCase())))
+          { fail(i, `${el.role} reads ${JSON.stringify(el.label)}, not ${JSON.stringify(s.text)}`); break; }
+        done(`${el.role} ${JSON.stringify(el.label)}`);
+        continue;
+      }
+      const action: AndroidAction = s.action === "key" ? { kind: "key", key: s.key! }
+        : s.action === "type" ? { kind: "type", text: s.text! }
+        : s.action === "scroll" ? { kind: "scroll", direction: s.direction!, amount: s.amount }
+        : s.action === "long_press" ? { kind: "long_press", ms: s.ms }
+        : { kind: "tap" };
+      const r = await androidAct(cfg, sel, target, action,
+        { settleMs: opts.settleMs, ...(s.action === "key" ? {} : { element: loc }) }, deps);
+      state = r.state;
+      if (r.refusal || !r.result.ok) { fail(i, r.refusal ?? (r.result.stderr.split("\n")[0] || "input failed")); break; }
+      done(`${r.effect}${r.element ? ` → ${r.element.role} ${JSON.stringify(r.element.label)}` : ""}`);
+    } catch (error) { fail(i, error instanceof Error ? error.message : String(error)); }
+  }
+  const out: AndroidFlowResult = { host: host.name, ok, steps: results, ...(state ? { state } : {}) };
+  if (opts.read === false) return out;
+  const filter = opts.read && opts.read !== "*" ? opts.read : undefined;
+  try {
+    const last = await androidElementsOf(cfg, sel, { filter }, deps);
+    if (last.result.ok) return { ...out, state: last.state, elements: last.elements, total: last.total };
+    return { ...out, readError: last.result.stderr || "the final screen could not be read" };
+  } catch (error) { return { ...out, readError: error instanceof Error ? error.message : String(error) }; }
 }
 
 // ── the UI helper ────────────────────────────────────────────────────────────

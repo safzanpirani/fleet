@@ -64,10 +64,10 @@ import type { ServiceAction, CuTarget, GridOptions, CuElementLocator } from "./c
 import type { CuRegionLocator } from "./perception.ts";
 import {
   isAndroidHost, androidState, androidDoctor, androidElementsOf, androidShot, androidAct, androidOpen, androidApps,
-  androidBootstrap, androidBatch, androidWait, androidRelease, androidNotifications,
+  androidBootstrap, androidBatch, androidFlow, androidWait, androidRelease, androidNotifications,
   androidRecordStart, androidRecordStatus, androidRecordStop, androidRevive, androidWatch,
 } from "./android.ts";
-import type { AndroidAction, AndroidBatchStep, AndroidLocator, AndroidState } from "./android.ts";
+import type { AndroidAction, AndroidBatchStep, AndroidDeps, AndroidElement, AndroidFlowStep, AndroidLocator, AndroidState } from "./android.ts";
 
 /** Colour only for a person at a terminal. Output piped to an agent or a file
  *  is data, and escape codes inside it are noise every reader has to strip.
@@ -154,6 +154,8 @@ const ANDROID_USAGE = `usage (Android host):
   fleet cu <phone> key <TARGET> <KEY> | type <TARGET> <TEXT> [--label TEXT]
   fleet cu <phone> batch <TARGET> <JSON-array|-> | batch <TARGET> --file FILE [--gap MS]
   fleet cu <phone> wait --label TEXT [--role R] [--gone] | wait --focus PACKAGE [--gone] [--timeout MS]
+  fleet cu <phone> flow <JSON-array|-> | flow --file FILE [--target PACKAGE] [--read FILTER | --no-read]
+    open and input verbs accept trailing --read FILTER (or '*') after their operands; --json includes the read
     TARGET is the package that must hold focus (a word in it matches), or "any".
     input flags: [--settle MS] [--shot] [--out FILE] [--json]`;
 
@@ -163,10 +165,11 @@ const androidStateLine = (s: AndroidState) =>
 
 /** `fleet cu` on a host with an "android" block: the phone's own verbs, with the
  *  desktop contracts — explicit target, refusal before input, effect from pixels. */
-async function androidCu(
+export async function androidCu(
   cfg: FleetConfig, target: string, sel: string, rest: string[],
   o: { grid: boolean; gridStep: number; out?: string; noOpen: boolean; settle: number; wantShot: boolean;
        label?: string; role?: string; nth?: string },
+  deps: AndroidDeps = {},
 ): Promise<number> {
   const json = pullFlag(rest, "--json");
   const all = pullFlag(rest, "--all");
@@ -182,6 +185,24 @@ async function androidCu(
   const gone = pullFlag(rest, "--gone");
   const maxArg = pullVal(rest, "--max");
   const verb = rest[0];
+  const inputVerbs = ["tap", "click", "long-press", "swipe", "swipe2", "zoom", "gesture", "scroll", "key", "type"];
+  // New options follow the operands. Preserve option-looking literal text and
+  // filters, and leave other verbs' arguments untouched.
+  const operandCount = verb === "flow" ? (fileArg ? 0 : 1) : verb === "open" ? 1
+    : verb === "type" || verb === "key" ? 2
+    : ["tap", "click", "long-press"].includes(verb ?? "") ? (o.label !== undefined || o.role !== undefined ? 1 : 3)
+    : verb === "swipe" ? 5 : verb === "swipe2" ? 7
+    : verb === "zoom" ? (rest[3] && !rest[3].startsWith("--") ? 4 : 2)
+    : verb === "scroll" ? (rest[3] && !rest[3].startsWith("--") ? 3 : 2)
+    : verb === "gesture" ? rest.findIndex((v, i) => i > 1 && v.startsWith("--")) - 1 : 0;
+  const takesRead = verb === "flow" || verb === "open" || inputVerbs.includes(verb ?? "");
+  const optionStart = verb === "gesture" && operandCount < 0 ? rest.length : 1 + operandCount;
+  const readOptions = takesRead ? rest.slice(optionStart) : [];
+  const readArg = pullVal(readOptions, "--read");
+  const noRead = pullFlag(readOptions, "--no-read");
+  const targetArg = verb === "flow" ? pullVal(readOptions, "--target") : undefined;
+  if (takesRead) rest.splice(optionStart, rest.length - optionStart, ...readOptions);
+  if (readArg !== undefined && noRead) die("--read and --no-read cannot be combined");
   const args = rest.slice(1);
   const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
   const open = (p?: string) => {
@@ -200,6 +221,37 @@ async function androidCu(
     const n = Number(v);
     if (v === undefined || !Number.isFinite(n)) die(`${what} must be a number (got '${v}')`);
     return n;
+  };
+
+  const printElements = (elements: AndroidElement[], hideWithin: boolean) => {
+    for (const e of elements) {
+      const indent = "  ".repeat(Math.min(6, Math.max(0, e.depth - 1)));
+      console.log(`${A.d(`@${e.center.x},${e.center.y}`.padEnd(11))} ${indent}${A.b(e.role)} ${JSON.stringify(e.label)}`
+        + (e.derived ? A.d(" (from children)") : "")
+        + (e.id ? A.d(` #${e.id}`) : "")
+        + (e.actions.length ? A.g(` [${e.actions.join(",")}]`) : "")
+        + (e.checked !== undefined ? (e.checked ? A.g(" checked") : A.d(" unchecked")) : "")
+        + (e.enabled ? "" : A.y(" disabled"))
+        + (e.focused ? A.c(" focused") : "")
+        + (e.selected ? A.g(" selected") : "")
+        + (e.within && !hideWithin ? A.d(` in ${e.within}`) : ""));
+    }
+  };
+  /** --read FILTER: print the screen after an action, in the same call. */
+  const readAfter = async () => {
+    if (readArg === undefined || noRead) return {};
+    try {
+      const r = await androidElementsOf(cfg, target, { filter: readArg === "*" ? undefined : readArg }, deps);
+      if (!r.result.ok) return { readError: r.result.stderr || "the read after the action failed" };
+      return { read: { state: r.state, elements: r.elements, total: r.total } };
+    } catch (error) { return { readError: error instanceof Error ? error.message : String(error) }; }
+  };
+  const printRead = (r: Awaited<ReturnType<typeof readAfter>>) => {
+    if (r.readError) console.error(A.y(`▲ read failed: ${r.readError}`));
+    if (r.read) {
+      console.log(A.d(`${androidStateLine(r.read.state)} · ${r.read.elements.length} of ${r.read.total} element(s)`));
+      printElements(r.read.elements, readArg === "*");
+    }
   };
 
   if (verb === "doctor") {
@@ -264,24 +316,13 @@ async function androidCu(
   }
   if (verb === "elements") {
     if (args.length > 1) die(`usage: fleet cu ${sel} elements [FILTER] [--role R] [--all] [--json]`);
-    const r = await androidElementsOf(cfg, target, { all, filter: args[0] ?? o.label, role: o.role });
+    const r = await androidElementsOf(cfg, target, { all, filter: args[0] ?? o.label, role: o.role }, deps);
     if (json) { console.log(JSON.stringify(r)); return r.result.ok ? 0 : 1; }
     if (!r.result.ok) { printResult(r.result); return 1; }
     console.log(A.d(`${androidStateLine(r.state)} · ${r.elements.length} of ${r.total} element(s)` + (r.via ? ` · via ${r.via}` : "")));
     if (r.state.locked || (r.state.awake && r.state.awake !== "Awake"))
       console.error(A.y("▲ the phone is locked or its screen is off; this is the lock screen, and input is refused"));
-    for (const e of r.elements) {
-      const indent = "  ".repeat(Math.min(6, Math.max(0, e.depth - 1)));
-      console.log(`${A.d(`@${e.center.x},${e.center.y}`.padEnd(11))} ${indent}${A.b(e.role)} ${JSON.stringify(e.label)}`
-        + (e.derived ? A.d(" (from children)") : "")
-        + (e.id ? A.d(` #${e.id}`) : "")
-        + (e.actions.length ? A.g(` [${e.actions.join(",")}]`) : "")
-        + (e.checked !== undefined ? (e.checked ? A.g(" checked") : A.d(" unchecked")) : "")
-        + (e.enabled ? "" : A.y(" disabled"))
-        + (e.focused ? A.c(" focused") : "")
-        + (e.selected ? A.g(" selected") : "")
-        + (e.within && o.label === undefined && args[0] === undefined ? "" : e.within ? A.d(` in ${e.within}`) : ""));
-    }
+    printElements(r.elements, o.label === undefined && args[0] === undefined);
     if (!r.total) console.error(A.y("▲ uiautomator found no elements; this screen needs pixels (shot)"));
     return 0;
   }
@@ -309,12 +350,14 @@ async function androidCu(
     need(1, "open <PACKAGE|URL> [--in PACKAGE] [--wait MS]");
     let r;
     try {
-      r = await androidOpen(cfg, target, args[0]!, { waitMs: wait === undefined ? undefined : posInt(wait, "--wait", 60000), inPackage });
+      r = await androidOpen(cfg, target, args[0]!, { waitMs: wait === undefined ? undefined : posInt(wait, "--wait", 60000), inPackage }, deps);
     } catch (error) { die(error instanceof Error ? error.message : String(error)); }
-    if (json) { console.log(JSON.stringify(r)); return r.result.ok ? 0 : 1; }
+    const reading = r.result.ok && !r.refusal ? await readAfter() : {};
+    if (json) { console.log(JSON.stringify({ ...r, ...reading })); return r.result.ok ? 0 : 1; }
     if (r.refusal) { console.log(`${A.r("✗ refused")} ${A.d(r.refusal)}`); return 1; }
     if (!r.result.ok) { printResult(r.result); return 1; }
     console.log(`${A.g("●")} opened ${r.what}: ${A.b(r.state.pkg || "nothing")} ${A.d("focused")}`);
+    printRead(reading);
     return 0;
   }
 
@@ -323,7 +366,7 @@ async function androidCu(
     let r;
     try {
       r = await androidWait(cfg, target, { label: o.label, role: o.role, gone, focus: focusArg,
-        timeoutMs: timeoutArg === undefined ? undefined : posInt(timeoutArg, "--timeout", 120000) });
+        timeoutMs: timeoutArg === undefined ? undefined : posInt(timeoutArg, "--timeout", 120000) }, deps);
     } catch (error) { die(error instanceof Error ? error.message : String(error)); }
     if (json) { console.log(JSON.stringify(r)); return r.satisfied ? 0 : 1; }
     const what = focusArg !== undefined ? `focus ${gone ? "left" : "on"} ${focusArg}`
@@ -332,6 +375,30 @@ async function androidCu(
       + A.d(` · ${r.elapsedMs} ms`) + (r.element ? A.d(` · @${r.element.center.x},${r.element.center.y}`) : ""));
     if (r.reason) console.log(A.d(`  ${r.reason}`));
     return r.satisfied ? 0 : 1;
+  }
+  if (verb === "flow") {
+    if (fileArg ? args.length !== 0 : args.length !== 1)
+      die(`usage: fleet cu ${sel} flow <JSON-array|-> | flow --file FILE [--target PACKAGE] [--read FILTER | --no-read]`);
+    const source = fileArg ? await readFile(fileArg, "utf8") : args[0] === "-" ? await Bun.stdin.text() : args[0]!;
+    let steps: AndroidFlowStep[];
+    try { steps = JSON.parse(source); } catch { die("flow needs a valid JSON array of steps"); }
+    let r;
+    try {
+      r = await androidFlow(cfg, target, steps!, { target: targetArg, settleMs: o.settle,
+        read: noRead ? false : readArg }, deps);
+    } catch (error) { die(error instanceof Error ? error.message : String(error)); }
+    if (json) { console.log(JSON.stringify(r)); return r.ok ? 0 : 1; }
+    const ran = r.steps.filter((s) => s.status === "done").length;
+    console.log(`${r.ok ? A.g("● done") : A.r("✗ stopped")} ${A.b(r.state?.pkg || "nothing")} ${A.d("·")} flow ${ran}/${r.steps.length} steps`);
+    for (const s of r.steps)
+      console.log(`  ${s.index + 1}. ${s.status === "done" ? A.g("done   ") : s.status === "failed" ? A.r("failed ") : A.d("not run")} ${s.summary}`
+        + (s.detail ? (s.status === "failed" ? A.r(` — ${s.detail}`) : A.d(` — ${s.detail}`)) : ""));
+    if (r.elements) {
+      console.log(A.d(`${r.state ? androidStateLine(r.state) + " · " : ""}${r.elements.length} of ${r.total} element(s)`));
+      printElements(r.elements, readArg === undefined || readArg === "*");
+    }
+    if (r.readError) console.error(A.y(`▲ read failed: ${r.readError}`));
+    return r.ok ? 0 : 1;
   }
   if (verb === "batch") {
     const app = args[0];
@@ -359,7 +426,7 @@ async function androidCu(
     return r.result.ok ? 0 : 1;
   }
 
-  const INPUT = ["tap", "click", "long-press", "swipe", "swipe2", "zoom", "gesture", "scroll", "key", "type"];
+  const INPUT = inputVerbs;
   if (!verb || !INPUT.includes(verb)) die(verb ? `'${verb}' is not an Android verb\n${ANDROID_USAGE}` : ANDROID_USAGE);
   const app = args[0] ?? die(`usage: fleet cu ${sel} ${verb} <TARGET> …  (TARGET: a package, a word in one, or "any")`);
   const p = args.slice(1);
@@ -406,9 +473,10 @@ async function androidCu(
   const shotPath = o.wantShot || o.out ? (o.out ?? `${sel}-after-${stamp}.webp`) : undefined;
   let r;
   try {
-    r = await androidAct(cfg, target, app, action, { settleMs: o.settle, imageOut: shotPath, element: locator });
+    r = await androidAct(cfg, target, app, action, { settleMs: o.settle, imageOut: shotPath, element: locator }, deps);
   } catch (error) { die(error instanceof Error ? error.message : String(error)); }
-  if (json) { console.log(JSON.stringify(r)); return r.result.ok ? 0 : 1; }
+  const reading = r.result.ok && !r.refusal ? await readAfter() : {};
+  if (json) { console.log(JSON.stringify({ ...r, ...reading })); return r.result.ok ? 0 : 1; }
   const badge = r.refusal ? A.r("✗ refused")
     : !r.result.ok ? A.r(`✗ failed (${r.effect})`)
     : r.effect === "changed" ? A.g("● changed")
@@ -419,6 +487,7 @@ async function androidCu(
   if (r.reason) console.log(A.d(`  ${r.reason}`));
   if (!r.refusal && r.result.stderr) console.error(A.d(r.result.stderr.split("\n").map((l) => "  " + l).join("\n")));
   if (r.localImage) { console.log(`after → ${r.localImage}`); open(r.localImage); }
+  printRead(reading);
   return r.result.ok ? 0 : 1;
 }
 

@@ -1,10 +1,10 @@
-import { describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { describe, expect, spyOn, test } from "bun:test";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { mkdtempSync } from "node:fs";
 import {
-  androidAct, androidBatch, androidBootstrap, androidElements, androidOpen, androidRelease, androidWait, androidElementsOf, androidInputText, androidKeycode, androidPick, androidShot,
+  androidAct, androidBatch, androidFlow, androidBootstrap, androidElements, androidOpen, androidRelease, androidWait, androidElementsOf, androidInputText, androidKeycode, androidPick, androidShot,
   androidState, androidTargetPattern, parseUiDump, unpackReply, parseNotifications, androidNotifications,
   androidRecordStart, androidRecordStatus, androidRecordStop, androidRevive, androidWatch, androidZoomPlan,
 } from "../src/android.ts";
@@ -12,6 +12,8 @@ import type { FleetConfig, Host } from "../src/config.ts";
 import { UI_JAR_MD5 } from "../src/android-ui-jar.ts";
 import { validateConfig } from "../src/config.ts";
 import type { ExecResult } from "../src/ssh.ts";
+import { androidCu } from "../src/cli.ts";
+import type { AndroidFlowStep } from "../src/android.ts";
 
 const phone: Host = { name: "phone", ssh: "phone", os: "linux", android: { serial: "127.0.0.1:5555" } };
 const cfg: FleetConfig = { hosts: { phone, box: { name: "box", ssh: "box", os: "linux" } } };
@@ -528,6 +530,363 @@ describe("androidBatch", () => {
     await expect(androidBatch(cfg, "phone", "any", [{ action: "sleep", ms: 20000 }])).rejects.toThrow(/0–10000/);
     await expect(androidBatch(cfg, "phone", "any", [{ action: "swipe", x: 1, y: 1 }])).rejects.toThrow(/step 1 \(swipe\) needs x2/);
     await expect(androidBatch(cfg, "phone", "any", [{ action: "key", key: "back", label: "x" }])).rejects.toThrow(/label does not apply/);
+  });
+});
+
+describe("androidFlow", () => {
+  const H = "0123456789abcdef0123456789abcdef";
+  const screen = [...STATE, "__FA__XML", XML, "__FA__XMLEND", "__FA__FRAME " + H];
+  test("each label step reads the screen when its turn comes, then the last screen is returned", async () => {
+    const f = fake({ stdout: screen },
+      { stdout: [...STATE, "__FA__HA a", "__FA__INPUT 0", "__FA__HB b", "__FA__HC b"] },
+      { stdout: screen });
+    const r = await androidFlow(cfg, "phone", [
+      { action: "expect", label: "Wi-Fi" }, { action: "tap", label: "Wi-Fi" },
+    ], { target: "com.example" }, deps(f));
+    expect(r.ok).toBe(true);
+    expect(r.steps.map((s) => s.status)).toEqual(["done", "done"]);
+    expect(f.scripts.length).toBe(3);
+    expect(deviceScript(f.scripts[1]!)).toContain("input tap 500 250");
+    expect(deviceScript(f.scripts[1]!)).toContain(`case "$pkg" in com.example)`);
+    expect(r.elements?.length).toBeGreaterThan(0);
+  });
+  test("a failed expect stops the flow before any input goes out", async () => {
+    const f = fake({ stdout: screen }, { stdout: screen });
+    const r = await androidFlow(cfg, "phone", [
+      { action: "expect", label: "Wi-Fi", text: "Bluetooth" }, { action: "type", label: "search", text: "hi" },
+    ], {}, deps(f));
+    expect(r.ok).toBe(false);
+    expect(r.steps.map((s) => s.status)).toEqual(["failed", "not_run"]);
+    expect(r.steps[0]!.detail).toMatch(/not "Bluetooth"/);
+    expect(f.scripts.length).toBe(2);
+    expect(f.scripts.some((x) => deviceScript(x).includes("input text"))).toBe(false);
+    expect(r.elements).toBeDefined();
+  });
+  test("gone expects an absent label; --no-read skips the final read", async () => {
+    const f = fake({ stdout: screen });
+    const r = await androidFlow(cfg, "phone", [{ action: "expect", label: "Bluetooth", gone: true }], { read: false }, deps(f));
+    expect(r.ok).toBe(true);
+    expect(r.elements).toBeUndefined();
+    expect(f.scripts.length).toBe(1);
+  });
+  test("a wait that times out fails the flow", async () => {
+    const f = fake({ stdout: [...STATE, "__FA__XML", XML, "__FA__XMLEND", "__FA__TIMEOUT"] });
+    const r = await androidFlow(cfg, "phone", [{ action: "wait", label: "Bluetooth", timeoutMs: 1000 }, { action: "key", key: "back" }],
+      { read: false }, deps(f));
+    expect(r.ok).toBe(false);
+    expect(r.steps.map((s) => s.status)).toEqual(["failed", "not_run"]);
+    expect(r.steps[0]!.detail).toMatch(/not there/);
+    expect(f.scripts.some((x) => /input (?:tap|text|keyevent|swipe)/.test(deviceScript(x)))).toBe(false);
+  });
+  test("invalid later steps refuse before the earlier input can run", async () => {
+    const invalid: unknown[] = [
+      null, [], {}, { action: "constructor" }, { action: "open", what: 42 },
+      { action: "open", what: "invalid" }, { action: "open", what: "com.example", in: "com.other" },
+      { action: "open", what: "https://example.com", in: "bad" },
+      { action: "tap", label: " " }, { action: "tap", label: 3 }, { action: "tap", role: false },
+      { action: "tap", label: "Save", nth: 0 }, { action: "tap", label: "Save", nth: 1.5 },
+      { action: "tap", label: "Save", nth: "2" }, { action: "tap", label: "Save", typo: true },
+      { action: "type", label: "search", text: "" }, { action: "type", label: "search", text: 42 },
+      { action: "type", label: "search", text: "héllo" }, { action: "type", label: "search", text: "100%s" },
+      { action: "scroll", label: "x", direction: "diagonal" },
+      ...[0, 11, 1.5, "2"].map((amount) => ({ action: "scroll", label: "x", direction: "down", amount })),
+      ...[0, 10001, -1, 1.5, "800"].map((ms) => ({ action: "long_press", label: "x", ms })),
+      { action: "key", key: "power" }, { action: "key", key: "KEYCODE_SLEEP" }, { action: "key", key: "unknown" },
+      { action: "wait", focus: "x;bad" }, { action: "wait", focus: "chrome", nth: 1 },
+      ...[-1, 120001, 0.5, "1000"].map((timeoutMs) => ({ action: "wait", label: "x", timeoutMs })),
+      { action: "expect", label: "x", gone: "false" }, { action: "expect", label: "x", text: 1 },
+      { action: "expect", label: "x", gone: true, text: "y" },
+      { action: "sleep" }, { action: "sleep", ms: -1 }, { action: "sleep", ms: 0.5 },
+    ];
+    for (const step of invalid) {
+      const f = fake();
+      await expect(androidFlow(cfg, "phone", [{ action: "key", key: "back" }, step] as AndroidFlowStep[], {}, deps(f)))
+        .rejects.toThrow();
+      expect(f.scripts).toEqual([]);
+    }
+  });
+  test("ambiguous or out-of-range gone expectations stop before input", async () => {
+    for (const nth of [undefined, 3]) {
+      const f = fake({ stdout: screen });
+      const r = await androidFlow(cfg, "phone", [
+        { action: "expect", label: "Save", gone: true, nth }, { action: "key", key: "back" },
+      ], { read: false }, deps(f));
+      expect(r.steps.map((s) => s.status)).toEqual(["failed", "not_run"]);
+      expect(f.scripts.some((x) => deviceScript(x).includes("input keyevent"))).toBe(false);
+    }
+  });
+  test("expect checks text case-insensitively and nth selects the intended match", async () => {
+    const f = fake({ stdout: screen }, { stdout: screen });
+    const r = await androidFlow(cfg, "phone", [
+      { action: "expect", label: "Wi-Fi", text: "WI-FI" }, { action: "expect", label: "Save", nth: 2 },
+    ], { read: false }, deps(f));
+    expect(r.ok).toBe(true);
+    expect(r.steps.map((s) => s.status)).toEqual(["done", "done"]);
+  });
+  test("a thrown step error retains earlier results and does not retry input", async () => {
+    const f = fake({ stdout: [...STATE, "__FA__HA a", "__FA__INPUT 0", "__FA__HB a"] });
+    const d = deps(f);
+    let calls = 0;
+    d.exec = async (...args: Parameters<typeof f.run>) => {
+      const reply = await f.run(...args);
+      if (++calls === 2) throw new Error("connection lost after send");
+      return reply;
+    };
+    const r = await androidFlow(cfg, "phone", [
+      { action: "key", key: "back" }, { action: "key", key: "enter" }, { action: "key", key: "home" },
+    ], { read: false }, d);
+    expect(r.ok).toBe(false);
+    expect(r.steps.map((s) => s.status)).toEqual(["done", "failed", "not_run"]);
+    expect(r.steps[1]!.detail).toBe("connection lost after send");
+    expect(calls).toBe(2);
+    expect(f.scripts.filter((x) => deviceScript(x).includes("KEYCODE_ENTER"))).toHaveLength(1);
+    expect(f.scripts.some((x) => deviceScript(x).includes("KEYCODE_HOME"))).toBe(false);
+  });
+  test("a later label resolves from the new screen after an earlier tap changes it", async () => {
+    const nextXml = XML.replace('text="Wi-Fi"', 'text="Opened"').replace('text="Save"', 'text="Next"');
+    const nextScreen = [...STATE, "__FA__XML", nextXml, "__FA__XMLEND", "__FA__FRAME " + H];
+    const changed = { stdout: [...STATE, "__FA__HA a", "__FA__INPUT 0", "__FA__HB b", "__FA__HC b"] };
+    const f = fake({ stdout: screen }, changed, { stdout: nextScreen }, changed, { stdout: nextScreen });
+    const r = await androidFlow(cfg, "phone", [
+      { action: "tap", label: "Wi-Fi" }, { action: "tap", label: "Next" },
+    ], { target: "chrome" }, deps(f));
+    expect(r.ok).toBe(true);
+    expect(deviceScript(f.scripts[1]!)).toContain("input tap 500 250");
+    expect(deviceScript(f.scripts[3]!)).toContain("input tap 250 850");
+    expect(r.elements?.some((e) => e.label === "Next")).toBe(true);
+  });
+  test("a refused input stops every subsequent step without a retry", async () => {
+    const f = fake({ stdout: [...STATE, "__FA__REFUSE focus moved before input delivery"], code: 3 });
+    const r = await androidFlow(cfg, "phone", [
+      { action: "key", key: "enter" }, { action: "key", key: "home" }, { action: "expect", label: "Wi-Fi" },
+    ], { read: false }, deps(f));
+    expect(r.steps.map((s) => s.status)).toEqual(["failed", "not_run", "not_run"]);
+    expect(f.scripts.filter((x) => deviceScript(x).includes("KEYCODE_ENTER"))).toHaveLength(1);
+    expect(f.scripts.some((x) => deviceScript(x).includes("KEYCODE_HOME"))).toBe(false);
+  });
+  test("a missing input label becomes a failed step with a final read", async () => {
+    const f = fake({ stdout: screen }, { stdout: screen });
+    const r = await androidFlow(cfg, "phone", [
+      { action: "tap", label: "missing" }, { action: "key", key: "back" },
+    ], {}, deps(f));
+    expect(r.steps.map((s) => s.status)).toEqual(["failed", "not_run"]);
+    expect(r.elements).toBeDefined();
+    expect(f.scripts.some((x) => /input (?:tap|keyevent)/.test(deviceScript(x)))).toBe(false);
+  });
+  test("failed or thrown final reads preserve both successful and failed flow outcomes", async () => {
+    for (const ok of [true, false]) for (const throws of [true, false]) {
+      const f = fake({ stdout: screen }, { stdout: [], code: 1 });
+      const d = deps(f);
+      let calls = 0;
+      d.exec = async (...args: Parameters<typeof f.run>) => {
+        if (++calls === 2 && throws) throw new Error("final read disconnected");
+        return f.run(...args);
+      };
+      const r = await androidFlow(cfg, "phone", [{ action: "expect", label: ok ? "Wi-Fi" : "missing" }], {}, d);
+      expect(r.ok).toBe(ok);
+      expect(r.steps[0]!.status).toBe(ok ? "done" : "failed");
+      expect(r.readError).toBeDefined();
+      expect(r.elements).toBeUndefined();
+    }
+  });
+  test("every open updates the input target, including URLs without in", async () => {
+    for (const opening of [
+      { action: "open" as const, what: "com.android.chrome" },
+      { action: "open" as const, what: "https://example.com", in: "com.android.chrome" },
+      { action: "open" as const, what: "https://example.com" },
+    ]) {
+      const f = fake({ stdout: [...STATE, "__FA__PKG com.old"] }, { stdout: STATE },
+        { stdout: screen }, { stdout: [...STATE, "__FA__HA a", "__FA__INPUT 0", "__FA__HB a"] });
+      const r = await androidFlow(cfg, "phone", [
+        { action: "open", what: "com.old" }, opening, { action: "tap", label: "Wi-Fi" },
+      ], { read: false }, deps(f));
+      expect(r.ok).toBe(true);
+      const dev = deviceScript(f.scripts[3]!);
+      expect(dev).toContain('case "$pkg" in com.android.chrome)');
+      expect(dev.indexOf('case "$pkg"')).toBeLessThan(dev.indexOf("input tap"));
+    }
+  });
+  test("open refuses later inputs when the named package never gains focus", async () => {
+    for (const opening of [
+      { action: "open" as const, what: "com.other" },
+      { action: "open" as const, what: "https://example.com", in: "com.other" },
+    ]) {
+      const f = fake({ stdout: STATE });
+      const r = await androidFlow(cfg, "phone", [opening, { action: "key", key: "back" }], { read: false }, deps(f));
+      expect(r.ok).toBe(false);
+      expect(r.steps.map((s) => s.status)).toEqual(["failed", "not_run"]);
+      expect(f.scripts.some((x) => deviceScript(x).includes("input keyevent"))).toBe(false);
+    }
+  });
+  test("wait honors nth and never accepts a timeout or failed dump as absence", async () => {
+    const nth = fake({ stdout: screen });
+    const selected = await androidWait(cfg, "phone", { label: "Save", nth: 2 }, deps(nth));
+    expect(selected.satisfied).toBe(true);
+    expect(selected.element?.center).toEqual({ x: 750, y: 850 });
+    for (const reply of [
+      { stdout: [...screen, "__FA__TIMEOUT"] },
+      { stdout: screen, code: 1 }, { stdout: STATE },
+    ]) {
+      const f = fake(reply);
+      const r = await androidFlow(cfg, "phone", [
+        { action: "wait", label: "missing", gone: true }, { action: "key", key: "back" },
+      ], { read: false }, deps(f));
+      expect(r.steps.map((s) => s.status)).toEqual(["failed", "not_run"]);
+      expect(f.scripts.some((x) => deviceScript(x).includes("input keyevent"))).toBe(false);
+    }
+  });
+  test("the device script withholds input on wrong focus and text after its tap changes apps", async () => {
+    for (const target of ["com.example", "any"]) for (const mode of ["wrong", "before", "after"]) {
+      if (target === "any" && mode === "wrong") continue; // any has no expected app; see the flow policy TODO.
+      const root = await mkdtemp(join(tmpdir(), "fleet-device-gate-"));
+      const focusFile = join(root, "focus");
+      const eventsFile = join(root, "events");
+      await writeFile(focusFile, mode === "wrong" ? "com.other" : "com.example");
+      await writeFile(eventsFile, "");
+      const f = fake({ stdout: screen });
+      const d = deps(f);
+      d.exec = async (h: Host, script: string): Promise<ExecResult> => {
+        if (!deviceScript(script).includes("input text")) return f.run(h, script);
+        const mocks = `
+dumpsys() {
+  if [ "$1" = window ]; then
+    printf 'mCurrentFocus=Window{1 u0 %s/Main}\\ncur=1000x2000\\nisKeyguardShowing=false\\n' "$(cat "$FOCUS_FILE")"
+  else printf 'mWakefulness=Awake\\n'; fi
+}
+screencap() { [ "$MODE" != before ] || printf com.other > "$FOCUS_FILE"; printf frame; }
+md5sum() { cat >/dev/null; printf '${H}  -\\n'; }
+input() { printf '%s\\n' "$*" >> "$EVENTS_FILE"; [ "$1" != tap ] || printf com.other > "$FOCUS_FILE"; }
+`;
+        const proc = Bun.spawn(["/bin/bash", "-s"], { stdin: "pipe", stdout: "pipe", stderr: "pipe",
+          env: { ...process.env, FOCUS_FILE: focusFile, EVENTS_FILE: eventsFile, MODE: mode } });
+        proc.stdin.write(mocks + deviceScript(script));
+        proc.stdin.end();
+        const [stdout, stderr, code] = await Promise.all([
+          new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited,
+        ]);
+        return { host: h.name, stdout, stderr, code, ok: code === 0 };
+      };
+      try {
+        const r = await androidFlow(cfg, "phone", [
+          { action: "type", label: "search", text: "hi" }, { action: "key", key: "back" },
+        ], { target, settleMs: 0, read: false }, d);
+        expect(r.steps.map((s) => s.status)).toEqual(["failed", "not_run"]);
+        const events = await readFile(eventsFile, "utf8");
+        expect(events).not.toContain("text");
+        expect(events).not.toContain("keyevent");
+        if (mode === "after") expect(events, r.steps[0]!.detail).toContain("tap");
+        else expect(events).toBe("");
+      } finally { await rm(root, { recursive: true, force: true }); }
+    }
+  });
+  test("malformed steps refuse before anything runs", async () => {
+    await expect(androidFlow(cfg, "phone", [])).rejects.toThrow(/non-empty/);
+    await expect(androidFlow(cfg, "phone", Array.from({ length: 31 }, () => ({ action: "key" as const, key: "back" })))).rejects.toThrow(/at most 30/);
+    await expect(androidFlow(cfg, "phone", [{ action: "open" }])).rejects.toThrow(/needs what/);
+    await expect(androidFlow(cfg, "phone", [{ action: "tap" }])).rejects.toThrow(/needs label or role/);
+    await expect(androidFlow(cfg, "phone", [{ action: "type", label: "x" }])).rejects.toThrow(/needs text/);
+    await expect(androidFlow(cfg, "phone", [{ action: "wait", label: "x", focus: "y" }])).rejects.toThrow(/label\/role or focus/);
+    await expect(androidFlow(cfg, "phone", [{ action: "sleep", ms: 20000 }])).rejects.toThrow(/0–10000/);
+  });
+});
+
+describe("Android CLI flow and reads", () => {
+  const screen = [...STATE, "__FA__XML", XML, "__FA__XMLEND"];
+  const input = [...STATE, "__FA__HA a", "__FA__INPUT 0", "__FA__HB a"];
+  const options = { grid: false, gridStep: 100, noOpen: true, settle: 0, wantShot: false };
+  const invoke = async (args: string[], f: ReturnType<typeof fake>, extra = {}, d = deps(f)) => {
+    const stdout: string[] = [], stderr: string[] = [];
+    const log = spyOn(console, "log").mockImplementation((s) => { stdout.push(String(s)); });
+    const error = spyOn(console, "error").mockImplementation((s) => { stderr.push(String(s)); });
+    const exit = spyOn(process, "exit").mockImplementation(() => { throw new Error("CLI refused"); });
+    try {
+      const code = await androidCu(cfg, "phone", "phone", [...args], { ...options, ...extra }, d);
+      return { code, stdout, stderr };
+    } finally { log.mockRestore(); error.mockRestore(); exit.mockRestore(); }
+  };
+  test("flow emits one JSON result with its filtered final read", async () => {
+    const f = fake({ stdout: screen }, { stdout: screen });
+    const r = await invoke(["flow", '[{"action":"expect","label":"Wi-Fi"}]', "--read", "Wi-Fi", "--target", "chrome", "--json"], f);
+    expect(r.code).toBe(0);
+    expect(r.stdout).toHaveLength(1);
+    const body = JSON.parse(r.stdout[0]!);
+    expect(body.ok).toBe(true);
+    expect(body.elements.every((e: any) => e.label.includes("Wi-Fi"))).toBe(true);
+  });
+  test("open and act read only after success and emit a single JSON value", async () => {
+    for (const args of [["open", "com.android.chrome"], ["key", "chrome", "back"]]) for (const ok of [true, false]) {
+      const first = args[0] === "open" ? STATE : input;
+      const f = fake({ stdout: ok ? first : [...STATE, "__FA__REFUSE wrong focus"], code: ok ? 0 : 3 }, { stdout: screen });
+      const r = await invoke([...args, "--read", "*", "--json"], f);
+      expect(r.code).toBe(ok ? 0 : 1);
+      expect(r.stdout).toHaveLength(1);
+      const body = JSON.parse(r.stdout[0]!);
+      expect(body.result.ok).toBe(ok);
+      expect(body.read !== undefined).toBe(ok);
+      expect(f.scripts.length).toBe(ok ? 2 : 1);
+      if (ok) expect(body.read.elements.length).toBeGreaterThan(0);
+    }
+  });
+  test("a read exception preserves a successful action's exit and JSON report", async () => {
+    const f = fake({ stdout: input });
+    const d = deps(f);
+    let calls = 0;
+    d.exec = async (...args: Parameters<typeof f.run>) => {
+      if (++calls === 2) throw new Error("read disconnected");
+      return f.run(...args);
+    };
+    const r = await invoke(["key", "chrome", "back", "--read", "*", "--json"], f, {}, d);
+    expect(r.code).toBe(0);
+    expect(r.stdout).toHaveLength(1);
+    expect(JSON.parse(r.stdout[0]!).readError).toBe("read disconnected");
+  });
+  test("the new flags preserve literal type text and element filters", async () => {
+    for (const literal of ["--read", "--target", "--no-read"]) {
+      const typed = fake({ stdout: input });
+      const r = await invoke(["type", "chrome", literal, "--json"], typed);
+      expect(r.code).toBe(0);
+      expect(deviceScript(typed.scripts[0]!)).toContain(`input text '${literal}'`);
+      const elements = fake({ stdout: screen });
+      const filtered = await invoke(["elements", literal, "--json"], elements);
+      expect(filtered.code).toBe(0);
+      expect(JSON.parse(filtered.stdout[0]!).elements).toEqual([]);
+    }
+  });
+  test("malformed flags refuse before any device script is submitted", async () => {
+    for (const flags of [["--read"], ["--target"], ["--no-read", "--read", "*"], ["--read", "--target", "chrome"]]) {
+      const f = fake();
+      await expect(invoke(["flow", '[{"action":"key","key":"back"}]', ...flags], f)).rejects.toThrow();
+      expect(f.scripts).toEqual([]);
+    }
+    const unrelated = fake();
+    await expect(invoke(["state", "--target", "chrome"], unrelated)).rejects.toThrow();
+    expect(unrelated.scripts).toEqual([]);
+  });
+  test("no-read skips flow's final screen", async () => {
+    const f = fake({ stdout: input });
+    const r = await invoke(["flow", '[{"action":"key","key":"back"}]', "--no-read", "--json"], f);
+    expect(r.code).toBe(0);
+    expect(JSON.parse(r.stdout[0]!).elements).toBeUndefined();
+    expect(f.scripts.length).toBe(1);
+  });
+  test("elements preserves every legacy field and the within suffix rule", async () => {
+    const oldLines = (hideWithin: boolean) => androidElements(parseUiDump(XML), { width: 1000, height: 2000 }).map((e) =>
+      `@${e.center.x},${e.center.y}`.padEnd(11) + " " + "  ".repeat(Math.min(6, Math.max(0, e.depth - 1)))
+      + e.role + " " + JSON.stringify(e.label) + (e.derived ? " (from children)" : "")
+      + (e.id ? ` #${e.id}` : "") + (e.actions.length ? ` [${e.actions.join(",")}]` : "")
+      + (e.checked !== undefined ? (e.checked ? " checked" : " unchecked") : "")
+      + (e.enabled ? "" : " disabled") + (e.focused ? " focused" : "") + (e.selected ? " selected" : "")
+      + (!hideWithin && e.within ? ` in ${e.within}` : ""));
+    const strip = (lines: string[]) => lines.map((s) => s.replace(/\x1b\[[0-9;]*m/g, ""));
+    for (const [args, extra, hideWithin] of [
+      [["elements"], {}, true], [["elements", "Wi-Fi"], {}, false], [["elements"], { label: "Wi-Fi" }, false],
+      [["elements"], { role: "TextView" }, true],
+    ] as const) {
+      const r = await invoke([...args], fake({ stdout: screen }), extra);
+      const expected = oldLines(hideWithin).filter((s) => args[1] || "label" in extra ? s.includes('"Wi-Fi"')
+        : "role" in extra ? s.includes("TextView") : true);
+      expect(strip(r.stdout.slice(1))).toEqual(expected);
+    }
   });
 });
 

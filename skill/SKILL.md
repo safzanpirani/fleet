@@ -375,6 +375,13 @@ desktop ones; `fleet help cu` lists them.
   TARGET is the package that must hold focus or `any`. Input is refused before delivery
   when another package has focus, the screen is off, or the phone is locked. Never try
   to unlock it: ask the user.
+- **Several steps in one call.** `fleet cu <phone> flow '[{"action":"open","what":"PKG"},{"action":"wait","label":"X"},{"action":"tap","label":"X"},{"action":"expect","label":"Header","text":"X"},{"action":"type","label":"field","text":"hi"}]' --target PKG`
+  runs steps in order (open, wait, expect, tap, long_press, type, scroll, key, sleep), each
+  reading the screen at its turn, and stops at the first failure. `expect` fails unless the
+  label (and its optional text) is on screen, so put it before any input that must not land
+  in the wrong place. The default target `any` skips the package check: pass `--target`.
+  The final screen prints; `--read FILTER` narrows it and `--no-read` skips it. `--read`
+  on `open`, `tap`, `type`, `key` and `scroll` prints the screen after that one action.
 - **Read the effect line.** `changed` / `no_change` / `indeterminate` come from frame
   hashes on the phone. Animated screens and blinking cursors give `indeterminate`;
   confirm with `wait --focus PKG` or `wait --label TEXT`.

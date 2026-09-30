@@ -8,6 +8,7 @@ import * as jobs from "../src/jobs.ts";
 import * as tools from "../src/tools.ts";
 import * as core from "../src/core.ts";
 import * as ssh from "../src/ssh.ts";
+import * as android from "../src/android.ts";
 import { existsSync } from "node:fs";
 import { dirname } from "node:path";
 
@@ -44,6 +45,7 @@ const MUTATING_TOOLS = [
   "fleet_android_batch",
   "fleet_android_bootstrap",
   "fleet_android_elements",
+  "fleet_android_flow",
   "fleet_android_notifications",
   "fleet_android_open",
   "fleet_android_record",
@@ -106,6 +108,150 @@ function toolByName(tools: Tool[], name: string): Tool {
 }
 
 describe("Fleet MCP parity", () => {
+  test("Android flow is registered as mutating and disappears in read-only mode", async () => {
+    const flow = spyOn(android, "androidFlow");
+    try {
+      await withClient(false, async (client) => {
+        const { tools } = await client.listTools();
+        const tool = toolByName(tools, "fleet_android_flow");
+        expect(tool.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true });
+        expect(tool.inputSchema.required).toEqual(["host", "steps"]);
+        expect(tool.inputSchema.properties).toHaveProperty("target");
+        expect(tool.inputSchema.properties).toHaveProperty("read");
+        expect(tool.inputSchema.properties).toHaveProperty("noRead");
+        expect(tool.inputSchema.properties).toHaveProperty("settleMs");
+        const steps = tool.inputSchema.properties!.steps as { minItems: number; maxItems: number; items: { oneOf?: any[]; anyOf?: any[] } };
+        expect(steps.minItems).toBe(1);
+        expect(steps.maxItems).toBe(30);
+        const variants = steps.items.oneOf ?? steps.items.anyOf;
+        expect(variants).toHaveLength(9);
+        expect(variants!.every((v) => v.additionalProperties === false)).toBe(true);
+        expect(tool.description).toContain("default any");
+        expect(tool.description).toContain("fail early");
+      });
+      await withClient(true, async (client) => {
+        const { tools } = await client.listTools();
+        expect(tools.some((tool) => tool.name === "fleet_android_flow")).toBe(false);
+        const denied = await client.callTool({ name: "fleet_android_flow", arguments: { host: "local", steps: [{ action: "key", key: "back" }] } });
+        expect(denied.isError).toBe(true);
+      });
+      expect(flow).not.toHaveBeenCalled();
+    } finally { flow.mockRestore(); }
+  });
+
+  test("Android flow rejects malformed steps and flags before routing or input", async () => {
+    const flow = spyOn(android, "androidFlow");
+    const route = spyOn(core, "routeSelector");
+    try {
+      await withClient(false, async (client) => {
+        const invalid = [
+          { steps: [] }, { steps: Array.from({ length: 31 }, () => ({ action: "sleep", ms: 0 })) },
+          ...[
+            null, { action: "tap" }, { action: "tap", label: "Save", unknown: true },
+            { action: "tap", label: "Save", what: "com.example" }, { action: "tap", label: " " },
+            { action: "tap", label: "Save", nth: 0 }, { action: "tap", label: "Save", nth: 1.5 },
+            { action: "open" }, { action: "open", what: "bad" },
+            { action: "open", what: "com.example", in: "com.other" },
+            { action: "open", what: "https://example.com", in: "bad" },
+            { action: "wait", label: "Save", focus: "example" }, { action: "wait", focus: "example", nth: 1 },
+            { action: "wait", label: "Save", timeoutMs: 120001 },
+            { action: "expect", label: "Save", gone: true, text: "saved" },
+            { action: "expect", label: "Save", gone: "false" },
+            { action: "type", label: "search" }, { action: "type", label: "search", text: "héllo" },
+            { action: "type", label: "search", text: "100%s" },
+            { action: "scroll", label: "list", direction: "diagonal" },
+            { action: "scroll", label: "list", direction: "down", amount: 11 },
+            { action: "long_press", label: "Save", ms: 0 },
+            { action: "key", key: "KEYCODE_SLEEP" }, { action: "sleep", ms: 10001 },
+          ].map((step) => ({ steps: [{ action: "key", key: "back" }, step] })),
+          { steps: [{ action: "sleep", ms: 0 }], read: "*", noRead: true },
+          { steps: [{ action: "sleep", ms: 0 }], target: "x;bad" },
+          { steps: [{ action: "sleep", ms: 0 }], settleMs: -1 },
+        ];
+        for (const args of invalid) {
+          const result = await client.callTool({ name: "fleet_android_flow", arguments: { host: "local", ...args } });
+          expect(result.isError).toBe(true);
+        }
+      });
+      expect(route).not.toHaveBeenCalled();
+      expect(flow).not.toHaveBeenCalled();
+    } finally { flow.mockRestore(); route.mockRestore(); }
+  });
+
+  test("Android flow routes the host, forwards every action, and shares element rows", async () => {
+    const elements = android.androidElements(android.parseUiDump('<hierarchy><node text="Save" class="android.widget.Button" '
+      + 'package="com.example" clickable="true" enabled="true" bounds="[0,0][100,100]" /></hierarchy>'));
+    const state = { pkg: "com.example", width: 100, height: 100, awake: "Awake", locked: false };
+    const route = spyOn(core, "routeSelector").mockResolvedValue("resolved-phone");
+    const flow = spyOn(android, "androidFlow").mockResolvedValue({ host: "resolved-phone", ok: true, state,
+      steps: [{ index: 0, status: "done", summary: "tap Save", detail: "changed" }], elements, total: 1 });
+    const listed = spyOn(android, "androidElementsOf").mockResolvedValue({ host: "resolved-phone", state, elements, total: 1,
+      result: { host: "resolved-phone", ok: true, code: 0, stdout: "", stderr: "" } });
+    const steps: android.AndroidFlowStep[] = [
+      { action: "open", what: "https://example.com", in: "com.example" },
+      { action: "wait", label: "Save", nth: 1, timeoutMs: 1000 },
+      { action: "expect", label: "Save", text: "Save" }, { action: "tap", label: "Save" },
+      { action: "long_press", role: "Button", ms: 800 }, { action: "type", label: "search", text: "hi" },
+      { action: "scroll", label: "list", direction: "down", amount: 2 },
+      { action: "key", key: "back" }, { action: "sleep", ms: 0 },
+    ];
+    try {
+      await withClient(false, async (client) => {
+        const result = await client.callTool({ name: "fleet_android_flow", arguments: {
+          host: "phone-route", steps, target: "example", read: "*", settleMs: 0,
+        } });
+        expect(result.isError).toBe(false);
+        expect(route.mock.calls[0]).toEqual([cfg, "phone-route"]);
+        expect(flow.mock.calls[0]).toEqual([cfg, "resolved-phone", steps, { target: "example", read: "*", settleMs: 0 }]);
+        const body = (result.content as { type: string; text: string }[])[0]!.text;
+        expect(body).toContain("1. done tap Save — changed");
+        expect(body).toContain("com.example focused · 100x100");
+        const rows = body.split("\n").filter((s) => s.startsWith("{")).map((s) => JSON.parse(s));
+        const existing = await client.callTool({ name: "fleet_android_elements", arguments: { host: "phone-route" } });
+        const existingBody = JSON.parse((existing.content as { text: string }[])[0]!.text);
+        expect(rows).toEqual(existingBody.elements);
+        expect(rows[0]).toHaveProperty("center", { x: 50, y: 50 });
+        expect(rows[0]).not.toHaveProperty("bounds");
+        expect(rows[0]).not.toHaveProperty("ancestors");
+        expect(rows[0]).not.toHaveProperty("index");
+        for (const args of [{ noRead: true }, { read: "Save", noRead: false }, {}]) {
+          await client.callTool({ name: "fleet_android_flow", arguments: { host: "phone-route", steps: [{ action: "sleep", ms: 0 }], ...args } });
+          expect(flow.mock.calls.at(-1)![3]!.read).toBe("noRead" in args && args.noRead ? false : "read" in args ? args.read : undefined);
+        }
+      });
+    } finally { flow.mockRestore(); listed.mockRestore(); route.mockRestore(); }
+  });
+
+  test("Android flow reports failures, not_run steps, and readError without changing outcomes", async () => {
+    const route = spyOn(core, "routeSelector").mockResolvedValue("resolved-phone");
+    const flow = spyOn(android, "androidFlow");
+    try {
+      await withClient(false, async (client) => {
+        for (const ok of [true, false]) {
+          flow.mockResolvedValue({ host: "resolved-phone", ok, state: { pkg: "com.example", awake: "Asleep", locked: true },
+            steps: ok ? [{ index: 0, status: "done", summary: "expect Save" }] : [
+              { index: 0, status: "failed", summary: "expect Save", detail: "no element with label Save" },
+              { index: 1, status: "not_run", summary: "tap Next" },
+            ], readError: "final read disconnected" });
+          const result = await client.callTool({ name: "fleet_android_flow", arguments: { host: "phone-route", steps: [{ action: "expect", label: "Save" }] } });
+          expect(result.isError).toBe(!ok);
+          const body = (result.content as { text: string }[])[0]!.text;
+          expect(body).toContain("readError: final read disconnected");
+          expect(body).toContain("com.example focused · screen Asleep · locked");
+          if (!ok) {
+            expect(body).toContain("1. failed expect Save — no element with label Save");
+            expect(body).toContain("2. not_run tap Next");
+          }
+        }
+        flow.mockRejectedValue(new Error("connection lost after send"));
+        const failed = await client.callTool({ name: "fleet_android_flow", arguments: { host: "phone-route", steps: [{ action: "key", key: "back" }] } });
+        expect(failed.isError).toBe(true);
+        expect(JSON.stringify(failed.content)).toContain("connection lost after send");
+        expect(flow.mock.calls).toHaveLength(3);
+      });
+    } finally { flow.mockRestore(); route.mockRestore(); }
+  });
+
   test("MCP batches forward ordered input and expose partial failure as an error", async () => {
     const batch = spyOn(core, "cuBatch").mockImplementation(async (_cfg, host, app, actions, opts) => {
       expect(host).toBe("local");
