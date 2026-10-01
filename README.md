@@ -184,8 +184,14 @@ or passing `--new ""` deletes the match. A present `--new` without a value fails
 Use `--old=--flag` for option-looking text. Edit diffs omit unchanged context and
 return a content-free summary when line alignment exceeds its work limit. Fleet never turns the two
 characters `\n` into a newline. Pass multi-line text with `--old-file` or
-`--new-file`, which read a local file or `-` for stdin. `--sudo` edits a
-root-owned file through passwordless `sudo -n` on POSIX hosts.
+`--new-file`, which read a local file or `-` for stdin. In a file that uses CRLF
+or LF throughout, newlines in `--old` and `--new` are converted to match it.
+`--edits <file|->` takes a JSON array of `{"old", "new", "all"}` objects and
+applies them in order to one file with a single read and write. If any edit
+fails, nothing is written. A miss reports the likely cause by line number
+(line endings, whitespace, letter case, or the first diverging line) without
+quoting file content. `--sudo` edits a root-owned file through passwordless
+`sudo -n` on POSIX hosts.
 
 Screenshot commands require a local PNG/WebP artifact before reporting success.
 Transfers use temporary files and preserve existing output on failure. Windows

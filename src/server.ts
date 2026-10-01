@@ -545,24 +545,37 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       + "pull → edit → push: it refuses when `old` is not found, refuses an ambiguous match "
       + "unless `all` is set, and aborts if the file changed between read and write, so it "
       + "cannot silently clobber a concurrent change. Omit `new` to delete the matched text. "
+      + "For several changes to one file, pass `edits` instead of `old`/`new`/`all`: they apply "
+      + "in order with one read and one write, and if any edit fails nothing is written. In a file "
+      + "that uses CRLF (or LF) throughout, newlines in `old`/`new` are converted to match it. "
+      + "A miss explains itself: line endings, whitespace, case, or the first line that diverges. "
       + "Set `dryRun` to see the diff without writing. " + sel,
-    inputSchema: {
+    inputSchema: z.object({
       selector: z.string().describe("Host selector."),
       path: z.string().describe("Absolute path of the remote file."),
-      old: z.string().min(1).describe("Exact text to find. Must be unique unless `all` is true."),
+      old: z.string().min(1).optional().describe("Exact text to find. Must be unique unless `all` is true. Give this or `edits`."),
       new: z.string().optional().describe("Replacement text. Omit to delete the matched text."),
       all: z.boolean().optional().describe("Replace every occurrence instead of failing on multiple."),
+      edits: z.array(z.object({
+        old: z.string().min(1).describe("Exact text to find, after the earlier edits in this list applied."),
+        new: z.string().optional().describe("Replacement text. Omit to delete the matched text."),
+        all: z.boolean().optional().describe("Replace every occurrence of this edit's `old`."),
+      }).strict()).min(1).optional().describe("Several find-and-replace edits applied in order, all or nothing. Use instead of `old`/`new`/`all`."),
       dryRun: z.boolean().optional().describe("Show the diff without writing anything."),
       wsl: z.boolean().optional().describe("Edit inside WSL on a Windows host."),
       sudo: z.boolean().optional().describe("Read and write as root (POSIX only): passwordless sudo, or the host's configured sudo password."),
-    },
+    }).strict(),
     annotations: { openWorldHint: true },
-  }, async ({ selector, path, old, new: neu, all, dryRun, wsl, sudo }) => {
-    const results = await editRemoteFile(
-      cfg, await routeSelector(cfg, selector), path, old, neu ?? "", { all, dryRun, wsl, sudo });
+  }, async ({ selector, path, old, new: neu, all, edits, dryRun, wsl, sudo }) => {
+    if (edits && (old !== undefined || neu !== undefined || all !== undefined))
+      return text("`edits` replaces `old`, `new` and `all`; put them inside each edit.", true);
+    if (!edits && old === undefined) return text("Give `old` (with optional `new`/`all`) or `edits`.", true);
+    const results = await editRemoteFile(cfg, await routeSelector(cfg, selector), path,
+      edits ?? [{ old: old!, new: neu ?? "", all }], { dryRun, wsl, sudo });
     const out = results.map((r) => {
       if (!r.ok) return `✗ ${r.host} ${r.path} · ${r.error ?? "edit failed"}`;
       const what = `${r.replacements} replacement${r.replacements === 1 ? "" : "s"}`
+        + (r.lineEndings ? ` · newlines written as ${r.lineEndings.toUpperCase()} to match the file` : "")
         + (dryRun ? " (dry run — nothing written)" : "");
       return `✓ ${r.host} ${r.path} · ${what}${r.diff ? "\n" + indent(r.diff) : ""}`;
     }).join("\n\n");

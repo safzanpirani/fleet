@@ -37,7 +37,7 @@ fleet exec win-box "nvidia-smi"
 | `fleet jobs kill <host:id>` | TERM the verified job process tree and escalate against surviving descendants. |
 | `fleet jobs prune [<sel>] [--all]` | Remove finished job spools (`--all` also drops dead ones; never touches running). |
 | `fleet cp [-r] [--resume] <local> <sel>:<remote>` | Copy a file to host(s); fan-out across a group. `--resume` copies with rsync `--partial`, so rerunning after a drop continues the partial file (POSIX hosts only). A single-host copy on a terminal shows a progress meter. |
-| `fleet edit <sel>:<path> --old S --new S` | Edit a remote file in place, reject ambiguous matches, and print the diff. `--old-file`/`--new-file <file or ->` read multi-line text from a file or stdin; fleet never unescapes `\n`. `--sudo` edits root-owned files as root (POSIX; passwordless sudo or the host's configured sudo password). |
+| `fleet edit <sel>:<path> --old S --new S` | Edit a remote file in place, reject ambiguous matches, and print the diff. `--old-file`/`--new-file <file or ->` read multi-line text from a file or stdin; fleet never unescapes `\n`. `--edits <file or ->` applies a JSON array of `{"old","new","all"}` to one file: one read, one write, nothing written if any edit fails. In a file that is CRLF (or LF) throughout, newlines in `--old`/`--new` are converted to match it. A miss names its likely cause by line number. `--sudo` edits root-owned files as root (POSIX; passwordless sudo or the host's configured sudo password). |
 | `fleet shot <host> [--output NAME\|main\|N] [--region top-right\|…\|X,Y,W,H] [--wake] [--out f] [--grid] [--no-open]` | Screenshot the remote desktop → local image (webp default; `--grid` overlays a coord ruler). `--output` captures one monitor and `--region` part of it (the main monitor when `--output` is omitted); `--list` shows the layout. `--wake` switches powered-off Wayland monitors on for the capture. Alias: `fleet screenshot`. |
 | `fleet session <sel>` | Logged in, **locked**, or at the login screen; idle time where the desktop reports it; which displays are off. Check it before `cu` or `shot`. |
 | `fleet drop <sel>` | Close the shared ssh connection (and a Windows host's kept-open session) so the next call logs in fresh, e.g. after `usermod -aG docker`. |
@@ -94,7 +94,8 @@ Anywhere `<sel>` appears: a hostname, logical route, group, `all`, Daytona
   one-shot output (use `fleet status <host>` for that).
 - A non-zero exit on any host makes `exec`/`cp` exit non-zero (good for scripting).
 - **Use `--script` for stdin programs and quote-heavy PowerShell.** Fleet accepts a supported shebang or an explicit `--interp`. It rejects untyped stdin.
-- **Use real newlines with `fleet edit`.** The CLI preserves argument bytes and does not translate the characters `\\n`. A leading `~` in Unix edit paths expands safely.
+- **Use real newlines with `fleet edit`.** The CLI preserves argument bytes and does not translate the characters `\\n`. A leading `~` in Unix edit paths expands safely. Type `\n` newlines even for a Windows CRLF file; fleet converts them to the file's style.
+- **Several changes to one file? One `fleet edit --edits -` call.** Pipe a JSON array such as `[{"old":"a","new":"b"},{"old":"x","new":"y","all":true}]`. Edits apply in order, and if any edit misses, the file is left unchanged. MCP: the `edits` array on `fleet_edit`.
 - **Sync paired skills to every agent root.** `fleet tools sync` installs `SKILL.md` under `~/.claude/skills`, `~/.agents/skills`, and `~/.openclaw/skills`.
 - **Windows shell:** fleet uses a host's configured `winShell` (`pwsh` or `powershell`)
   without an extra discovery round-trip. When omitted, it auto-prefers **PowerShell 7

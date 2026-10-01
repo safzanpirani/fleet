@@ -632,13 +632,181 @@ export interface EditResult {
   host: string; ok: boolean; path: string;
   replacements: number;
   diff: string;
+  /** Set when fleet rewrote the newlines in old/new to match the file's style. */
+  lineEndings?: "crlf" | "lf";
   error?: string;
+}
+
+/** One find-and-replace. `new` defaults to "" (delete the match). */
+export interface EditSpec { old: string; new?: string; all?: boolean }
+
+export type EditPlan =
+  | { ok: true; next: string; replacements: number; lineEndings?: "crlf" | "lf" }
+  | { ok: false; error: string };
+
+/** The file's newline style: "mixed" when it has both CRLF and bare LF. */
+export function lineStyle(text: string): "crlf" | "lf" | "mixed" | "none" {
+  const crlf = text.includes("\r\n"), lf = /(^|[^\r])\n/.test(text);
+  return crlf && lf ? "mixed" : crlf ? "crlf" : lf ? "lf" : "none";
+}
+
+const lineAt = (text: string, index: number): number => {
+  let n = 1;
+  for (let i = text.indexOf("\n"); i !== -1 && i < index; i = text.indexOf("\n", i + 1)) n++;
+  return n;
+};
+/** Explain a miss without quoting file content. Diagnostics share a work budget
+ *  so repeated prefixes cannot block the long-lived MCP process. */
+function explainMiss(text: string, old: string): string {
+  if (text.length > 4_000_000 || old.length > 64_000) return "";
+  const t = text.replace(/\r\n/g, "\n"), o = old.replace(/\r\n/g, "\n");
+  const at = t.indexOf(o);
+  if (at !== -1)
+    return ` — it matches at line ${lineAt(t, at)} once line endings are ignored; --old must copy that region's exact endings`;
+
+  let budget = 8_000_000;
+  // A null token consumes spaces/tabs. Literal tokens contain no spaces/tabs,
+  // so consuming a whitespace run never needs backtracking.
+  const tokens: (string | null)[] = [];
+  for (const [k, part] of o.split(/([ \t\n]+)/).entries()) {
+    if (k % 2 === 0) { if (part) tokens.push(part); }
+    else {
+      part.split("\n").forEach((_, i) => {
+        if (i) tokens.push("\n");
+        tokens.push(null);
+      });
+    }
+  }
+  if (tokens[0] === null) tokens.shift(); // A leading run may match zero bytes.
+  for (const insensitive of [false, true]) {
+    const hay = insensitive ? t.toLowerCase() : t;
+    const parts = tokens.map((token) => insensitive ? token?.toLowerCase() ?? null : token);
+    const anchor = parts[0];
+    if (!anchor) continue;
+    let from = 0;
+    while (budget > 0) {
+      const start = hay.indexOf(anchor, from);
+      budget -= (start === -1 ? hay.length : start) - from + anchor.length;
+      if (start === -1 || budget <= 0) break;
+      let pos = start, matched = true;
+      for (const token of parts) {
+        if (token === null) {
+          while (hay[pos] === " " || hay[pos] === "\t") {
+            if (--budget <= 0) return "";
+            pos++;
+          }
+        } else {
+          budget -= token.length;
+          if (budget <= 0) return "";
+          if (!hay.startsWith(token, pos)) { matched = false; break; }
+          pos += token.length;
+        }
+      }
+      if (matched) {
+        const what = insensitive ? "whitespace and letter case are" : "whitespace is";
+        return ` — it matches at line ${lineAt(hay, start)} once ${what} ignored`;
+      }
+      from = start + 1;
+    }
+  }
+
+  const want = o.split("\n");
+  if (want.length < 2 || !want[0]!.trim()) return "";
+  const lines = t.split("\n");
+  let best = { i: -1, k: 0 };
+  for (let i = 0; i < lines.length; i++) {
+    budget -= want[0]!.length;
+    if (budget <= 0) return "";
+    if (!lines[i]!.endsWith(want[0]!)) continue;
+    let k = 1;
+    while (k < want.length && i + k < lines.length) {
+      budget -= want[k]!.length + 1;
+      if (budget <= 0) return "";
+      if (!(k === want.length - 1 ? lines[i + k]!.startsWith(want[k]!) : lines[i + k] === want[k])) break;
+      k++;
+    }
+    if (k > best.k) best = { i, k };
+  }
+  if (best.i === -1) return " — its first line does not appear in the file either";
+  const { i, k } = best;
+  const span = k === 1 ? `--old line 1 matches line ${i + 1}` : `--old lines 1-${k} match lines ${i + 1}-${i + k}`;
+  if (i + k >= lines.length) return ` — ${span}, then the file ends`;
+  return ` — ${span}, then --old line ${k + 1} differs at file line ${i + k + 1}`;
+}
+
+const fitLineEndings = (s: string, style: ReturnType<typeof lineStyle>): string =>
+  style === "crlf" ? s.replace(/\r?\n/g, "\r\n")
+    : style === "lf" ? s.replace(/\r\n/g, "\n") : s;
+
+/** Parse an `--edits` list: a JSON array of {old, new?, all?}. Unknown keys
+ *  are refused, so a typo such as "replace" cannot become a silent deletion. */
+export function parseEditList(json: string, source: string): EditSpec[] {
+  let value: unknown;
+  try { value = JSON.parse(json); }
+  catch (e) { throw new Error(`fleet edit: --edits ${source} is not valid JSON: ${e instanceof Error ? e.message : String(e)}`); }
+  if (!Array.isArray(value) || value.length === 0)
+    throw new Error(`fleet edit: --edits ${source} must be a non-empty JSON array of {"old", "new", "all"} objects`);
+  return value.map((item, k): EditSpec => {
+    const where = `fleet edit: --edits ${source} item ${k + 1}`;
+    if (typeof item !== "object" || item === null || Array.isArray(item)) throw new Error(`${where} is not an object`);
+    const extra = Object.keys(item).filter((key) => !["old", "new", "all"].includes(key));
+    if (extra.length) throw new Error(`${where} has unknown key ${extra.map((key) => `"${key}"`).join(", ")}; use "old", "new" and "all"`);
+    const { old, new: neu, all } = item as Record<string, unknown>;
+    if (typeof old !== "string" || !old) throw new Error(`${where} needs a non-empty string "old"`);
+    if (neu !== undefined && typeof neu !== "string") throw new Error(`${where} has a non-string "new"`);
+    if (all !== undefined && typeof all !== "boolean") throw new Error(`${where} has a non-boolean "all"`);
+    return { old, ...(neu === undefined ? {} : { new: neu }), ...(all === undefined ? {} : { all }) };
+  });
+}
+
+/** Apply edits in order to `text`. Pure: the remote read and write live in
+ *  `editRemoteFile`. When the file uses one newline style throughout, the
+ *  newlines in old/new are rewritten to that style first. Without it, a
+ *  multi-line --old typed with \n never matches a CRLF file, and a multi-line
+ *  --new writes bare LF lines into it. Fails on the first edit that is missing
+ *  or ambiguous, so a partial list is never applied. */
+export function planEdits(text: string, edits: EditSpec[], path: string): EditPlan {
+  if (edits.length === 0) return { ok: false, error: "no edits given" };
+  let cur = text, total = 0;
+  let lineEndings: "crlf" | "lf" | undefined;
+  for (const [k, e] of edits.entries()) {
+    const tag = edits.length > 1 ? `edit ${k + 1} of ${edits.length}: ` : "";
+    if (!e.old) return { ok: false, error: `${tag}--old cannot be empty` };
+    const style = lineStyle(cur);
+    const old = fitLineEndings(e.old, style), neu = fitLineEndings(e.new ?? "", style);
+    if ((style === "crlf" || style === "lf") && (old !== e.old || neu !== (e.new ?? ""))) lineEndings = style;
+    const parts = cur.split(old), n = parts.length - 1;
+    if (n === 0) {
+      const why = k > 0 && text.includes(fitLineEndings(e.old, lineStyle(text)))
+        ? " — an earlier edit in this list changed that text (edits apply in order)"
+        : explainMiss(cur, old);
+      return { ok: false, error: `${tag}--old not found in ${path}${why}` };
+    }
+    if (n > 1 && !e.all) {
+      const at: number[] = [];
+      for (let i = cur.indexOf(old); i !== -1 && at.length < 6; i = cur.indexOf(old, i + old.length)) at.push(lineAt(cur, i));
+      const lines = at.slice(0, 5).join(", ") + (n > 5 ? ", …" : "");
+      const hint = edits.length > 1 ? `set "all": true on this edit` : "pass --all";
+      return { ok: false, error: `${tag}--old matches ${n} times in ${path} (lines ${lines}) — ${hint} to replace every one, or extend --old until it is unique` };
+    }
+    cur = e.all ? parts.join(neu) : cur.replace(old, () => neu);
+    total += n;
+  }
+  return { ok: true, next: cur, replacements: total, ...(lineEndings ? { lineEndings } : {}) };
 }
 
 /** Unified-ish diff of just the changed regions, with `ctx` lines of context. */
 export function diffLines(before: string, after: string, ctx = 2): string {
   if (before === after) return "";
   const a = before.split("\n"), b = after.split("\n");
+  // Drop the CR of a CRLF file so it does not reach the terminal. In any other
+  // file a trailing CR is worth seeing, so it renders as a visible mark.
+  const crlf = lineStyle(before) === "crlf" && lineStyle(after) === "crlf";
+  const show = (lines: string[], index: number) => {
+    const line = lines[index] ?? "";
+    const content = crlf && index < lines.length - 1 ? line.replace(/\r$/, "") : line;
+    return content.replace(/\r/g, "␍");
+  };
   const context = Number.isFinite(ctx) ? Math.max(0, Math.floor(ctx)) : 0;
   let start = 0;
   while (start < a.length && start < b.length && a[start] === b[start]) start++;
@@ -660,23 +828,23 @@ export function diffLines(before: string, after: string, ctx = 2): string {
 
   const rows: { changed: boolean; text: string }[] = [];
   for (let i = Math.max(0, start - context); i < start; i++)
-    rows.push({ changed: false, text: `  ${i + 1} ${a[i]}` });
+    rows.push({ changed: false, text: `  ${i + 1} ${show(a, i)}` });
   let i = start, j = start;
   while (i < endA || j < endB) {
     if (i < endA && j < endB && a[i] === b[j]) {
-      rows.push({ changed: false, text: `  ${i + 1} ${a[i]}` });
+      rows.push({ changed: false, text: `  ${i + 1} ${show(a, i)}` });
       i++; j++;
     } else if (i < endA && (j === endB ||
         lcs[(i - start + 1) * stride + j - start]! >= lcs[(i - start) * stride + j - start + 1]!)) {
-      rows.push({ changed: true, text: `- ${i + 1} ${a[i]}` });
+      rows.push({ changed: true, text: `- ${i + 1} ${show(a, i)}` });
       i++;
     } else {
-      rows.push({ changed: true, text: `+ ${j + 1} ${b[j]}` });
+      rows.push({ changed: true, text: `+ ${j + 1} ${show(b, j)}` });
       j++;
     }
   }
   for (let k = endA; k < Math.min(a.length, endA + context); k++)
-    rows.push({ changed: false, text: `  ${k + 1} ${a[k]}` });
+    rows.push({ changed: false, text: `  ${k + 1} ${show(a, k)}` });
 
   // Merge context windows in linear time even when ctx covers the whole file.
   const ranges: { from: number; to: number }[] = [];
@@ -693,32 +861,36 @@ export function diffLines(before: string, after: string, ctx = 2): string {
   return output.join("\n");
 }
 
-/** Replace `oldStr` with `newStr` in a remote file on every selected host.
- *  Fails loudly on zero matches, and on multiple matches unless `all` is set —
- *  a silent no-op is the exact failure mode this command exists to prevent. */
+/** Apply `edits` to a remote file on every selected host: one read, one
+ *  checked write. Fails loudly on zero matches, and on multiple matches unless
+ *  that edit sets `all` — a silent no-op is the exact failure mode this command
+ *  exists to prevent. Any failing edit means nothing is written. */
 export async function editRemoteFile(
-  cfg: FleetConfig, sel: string, path: string, oldStr: string, newStr: string,
-  opts: { wsl?: boolean; all?: boolean; dryRun?: boolean; sudo?: boolean } = {},
+  cfg: FleetConfig, sel: string, path: string, edits: EditSpec[],
+  opts: { wsl?: boolean; dryRun?: boolean; sudo?: boolean } = {},
 ): Promise<EditResult[]> {
-  if (!oldStr) throw new Error("fleet edit: --old cannot be empty");
+  if (edits.length === 0) throw new Error("fleet edit: no edits given");
+  edits.forEach((e, k) => {
+    if (!e.old) throw new Error(edits.length > 1 ? `fleet edit: edit ${k + 1} has an empty "old"` : "fleet edit: --old cannot be empty");
+  });
   const hosts = resolveHosts(cfg, sel);
   const shell: Shell = opts.wsl ? "wsl" : "auto";
   return Promise.all(hosts.map(async (h): Promise<EditResult> => {
     const base = { host: h.name, path, replacements: 0, diff: "" };
     try {
       const { text, b64 } = await readRemoteFile(h, path, shell, { sudo: opts.sudo });
-      const n = text.split(oldStr).length - 1;
-      if (n === 0) return { ...base, ok: false, error: `--old not found in ${path}` };
-      if (n > 1 && !opts.all)
-        return { ...base, ok: false, error: `--old matches ${n} times in ${path} — pass --all to replace every one, or extend --old until it is unique` };
-      const next = opts.all ? text.split(oldStr).join(newStr) : text.replace(oldStr, () => newStr);
+      const plan = planEdits(text, edits, path);
+      if (!plan.ok) return { ...base, ok: false, error: plan.error };
       // Remote edits commonly target env/config files. Unchanged neighbors can
       // contain credentials, so show only the lines that will change.
-      const diff = diffLines(text, next, 0);
-      if (opts.dryRun) return { ...base, ok: true, replacements: n, diff };
-      const w = await writeRemoteFile(h, path, next, b64, shell, { sudo: opts.sudo });
+      const done: EditResult = {
+        ...base, ok: true, replacements: plan.replacements, diff: diffLines(text, plan.next, 0),
+        ...(plan.lineEndings ? { lineEndings: plan.lineEndings } : {}),
+      };
+      if (opts.dryRun) return done;
+      const w = await writeRemoteFile(h, path, plan.next, b64, shell, { sudo: opts.sudo });
       if (!w.ok) return { ...base, ok: false, error: w.stderr.trim() || `write failed (exit ${w.code})` };
-      return { ...base, ok: true, replacements: n, diff };
+      return done;
     } catch (e) {
       return { ...base, ok: false, error: e instanceof Error ? e.message : String(e) };
     }

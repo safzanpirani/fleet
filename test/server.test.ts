@@ -417,7 +417,9 @@ describe("Fleet MCP parity", () => {
       const edit = toolByName(tools, "fleet_edit");
       expect(edit.inputSchema.properties).toHaveProperty("dryRun");
       expect(edit.inputSchema.properties).toHaveProperty("all");
-      expect(edit.inputSchema.required).toEqual(["selector", "path", "old"]);
+      // `old` or `edits` supplies the change, so neither is required on its own.
+      expect(edit.inputSchema.properties).toHaveProperty("edits");
+      expect(edit.inputSchema.required).toEqual(["selector", "path"]);
       // fleet_script takes a local file OR inline text; neither may be required.
       const script = toolByName(tools, "fleet_script");
       expect(script.inputSchema.properties).toHaveProperty("path");
@@ -483,5 +485,40 @@ describe("Fleet MCP parity", () => {
     } finally {
       httpServer.stop(true);
     }
+  });
+});
+
+
+describe("fleet_edit input contracts", () => {
+  test("rejects unknown fields and mode clashes before routing; accepts existing old callers and edit lists", async () => {
+    const route = spyOn(core, "routeSelector").mockResolvedValue("local");
+    const edit = spyOn(core, "editRemoteFile").mockResolvedValue([{
+      host: "local", path: "f", ok: true, replacements: 1, diff: "", lineEndings: "crlf",
+    }]);
+    try {
+      await withClient(false, async (client) => {
+        const base = { selector: "local", path: "f" };
+        for (const args of [
+          {}, { new: "x" }, { old: "a", edits: [{ old: "a" }] },
+          { new: "x", edits: [{ old: "a" }] }, { all: false, edits: [{ old: "a" }] },
+          { old: "a", replacement: "x" }, { edits: [{ old: "a", replacement: "x" }] },
+          { edits: [] }, { edits: [{ old: "" }] }, { edits: [{ old: "a", all: "true" }] },
+        ]) {
+          const result = await client.callTool({ name: "fleet_edit", arguments: { ...base, ...args } });
+          expect(result.isError).toBe(true);
+        }
+        expect(route).not.toHaveBeenCalled();
+        expect(edit).not.toHaveBeenCalled();
+        const legacy = await client.callTool({ name: "fleet_edit", arguments: { ...base, old: "a", new: "$&", all: true } });
+        expect(legacy.isError).not.toBe(true);
+        expect(edit.mock.calls[0]![3]).toEqual([{ old: "a", new: "$&", all: true }]);
+        const edits = [{ old: "a", new: "b" }, { old: "b" }];
+        const listed = await client.callTool({ name: "fleet_edit", arguments: { ...base, edits, dryRun: true } });
+        expect(listed.isError).not.toBe(true);
+        expect(JSON.stringify(listed.content)).toContain("CRLF");
+        expect(edit.mock.calls[1]![3]).toEqual(edits);
+        expect(edit.mock.calls[1]![4]).toMatchObject({ dryRun: true });
+      });
+    } finally { route.mockRestore(); edit.mockRestore(); }
   });
 });

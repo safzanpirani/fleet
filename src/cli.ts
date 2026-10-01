@@ -40,7 +40,7 @@ import {
 } from "./jobs.ts";
 import type { JobRow } from "./jobs.ts";
 import {
-  pullFlag, pullVal, parseFlags, parseLeadingFlags, lsHosts, runExec, runScript, rebootRefusal, droppedStdinCheck, readScriptSource, editRemoteFile,
+  pullFlag, pullVal, parseFlags, parseLeadingFlags, lsHosts, runExec, runScript, rebootRefusal, droppedStdinCheck, readScriptSource, editRemoteFile, parseEditList,
   pushFile, pullFile, parseRemoteSpec, restartService, serviceLogs, svcStatus,
   gpuRows, diskRows, fetchDashboard, hostStatus, runRecipe, captureScreenshot, rebootHosts,
   cuInstall, cuRun, cuTools, cuDescribe, cuRecordStart, cuRecordStop, cuRecordStatus, cuRegions, cuPerception, bootMismatchNote,
@@ -60,7 +60,7 @@ import {
   toolSyncParallelism,
   stampSkill,
 } from "./tools.ts";
-import type { ServiceAction, CuTarget, GridOptions, CuElementLocator } from "./core.ts";
+import type { ServiceAction, CuTarget, GridOptions, CuElementLocator, EditSpec } from "./core.ts";
 import type { CuRegionLocator } from "./perception.ts";
 import {
   isAndroidHost, androidState, androidDoctor, androidElementsOf, androidShot, androidAct, androidOpen, androidApps,
@@ -883,7 +883,7 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       // to accept anywhere — `fleet edit host:/path --old X --new Y` reads best.
       const { flags, rest: pos } = parseFlags(rest,
         ["--json", "--wsl", "--all", "--dry-run", "--sudo"],
-        ["--old", "--new", "--old-file", "--new-file"], false, ["--new"]);
+        ["--old", "--new", "--old-file", "--new-file", "--edits"], false, ["--new"]);
       const json = flags["--json"] === true;
       const wsl = flags["--wsl"] === true;
       const all = flags["--all"] === true;
@@ -894,23 +894,38 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       const fromFile = async (flag: "--old-file" | "--new-file", inline: "--old" | "--new") => {
         const src = flags[flag] as string | undefined;
         if (src === undefined) return flags[inline] as string | undefined;
-        if (flags[inline] !== undefined) die(`fleet edit: pass ${inline} or ${flag}, not both`);
         return src === "-" ? await Bun.stdin.text() : await readFile(src, "utf8");
       };
-      if (flags["--old-file"] === "-" && flags["--new-file"] === "-") die("fleet edit: only one of --old-file/--new-file can read stdin");
-      const old = await fromFile("--old-file", "--old");
-      const neu = (await fromFile("--new-file", "--new")) ?? "";
+      const usage = "usage: fleet edit [--all] [--dry-run] [--sudo] [--wsl] [--json] <sel>:<path> --old <str>|--old-file <file|-> [--new <str>|--new-file <file|->]\n"
+        + "       fleet edit [--dry-run] [--sudo] [--wsl] [--json] <sel>:<path> --edits <file|->";
       const [target] = pos;
-      if (!target || old === undefined || pos.length !== 1)
-        die("usage: fleet edit [--all] [--dry-run] [--sudo] [--wsl] [--json] <sel>:<path> --old <str>|--old-file <file|-> [--new <str>|--new-file <file|->]");
+      if (!target || pos.length !== 1) die(usage);
+      for (const [inline, file] of [["--old", "--old-file"], ["--new", "--new-file"]] as const)
+        if (flags[inline] !== undefined && flags[file] !== undefined)
+          die(`fleet edit: pass ${inline} or ${file}, not both`);
+      let edits: EditSpec[];
+      if (flags["--edits"] !== undefined) {
+        const clash = ["--old", "--new", "--old-file", "--new-file", "--all"].filter((f) => flags[f] !== undefined);
+        if (clash.length) die(`fleet edit: --edits replaces ${clash.join(", ")}; put old, new and all inside each edit`);
+        const src = flags["--edits"] as string;
+        edits = parseEditList(src === "-" ? await Bun.stdin.text() : await readFile(src, "utf8"), src === "-" ? "stdin" : src);
+      } else {
+        if (flags["--old-file"] === "-" && flags["--new-file"] === "-") die("fleet edit: only one of --old-file/--new-file can read stdin");
+        const old = await fromFile("--old-file", "--old");
+        if (old === undefined) die(usage);
+        if (!old) die("fleet edit: --old cannot be empty");
+        edits = [{ old: old!, new: (await fromFile("--new-file", "--new")) ?? "", all }];
+      }
       const spec = parseRemoteSpec(cfg, target!);
       if (!spec) die(`fleet edit needs a <sel>:<path> target (got '${target}')`);
       const results = await editRemoteFile(
-        cfg, await routeSelector(cfg, spec!.sel), spec!.path, old!, neu, { wsl, all, dryRun, sudo });
+        cfg, await routeSelector(cfg, spec!.sel), spec!.path, edits, { wsl, dryRun, sudo });
       if (json) { console.log(JSON.stringify(results, null, 2)); return results.some((r) => !r.ok) ? 1 : 0; }
       for (const r of results) {
         if (!r.ok) { console.log(`${A.r("●")} ${A.b(r.host)} ${A.d(r.path)}  ${A.y(r.error ?? "edit failed")}`); continue; }
-        const what = `${r.replacements} replacement${r.replacements === 1 ? "" : "s"}${dryRun ? A.y(" (dry run — nothing written)") : ""}`;
+        const what = `${r.replacements} replacement${r.replacements === 1 ? "" : "s"}`
+          + (r.lineEndings ? A.d(` · newlines written as ${r.lineEndings.toUpperCase()} to match the file`) : "")
+          + (dryRun ? A.y(" (dry run — nothing written)") : "");
         console.log(`${A.g("●")} ${A.b(r.host)} ${A.d(r.path)}  ${what}`);
         // always show what landed: a remote edit is the case you can least easily eyeball afterwards
         for (const line of r.diff.split("\n").filter(Boolean))
