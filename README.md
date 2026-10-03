@@ -55,6 +55,7 @@ fleet exec --wsl win-box "uname -a"  # run inside WSL on a windows box
 fleet dt                            # list Daytona sandboxes (DAYTONA_API_KEY)
 fleet exec --cwd /srv/app web "./build.sh"   # run in a dir; fails fast if missing
 fleet exec --timeout 60 vps "slow-thing"        # wall-clock cap; a hung command exits 124
+fleet exec --script ./deploy.sh web v2 --dry    # a local script; tokens after the host are its $1 $2
 fleet exec --sudo web "systemctl restart nginx"  # as root; a sudo password comes from a 0600 file
 fleet exec --fresh web "id -Gn"    # new ssh login (after usermod -aG); `fleet drop web` closes shared ones
 # a timeout returns within a second and keeps the output printed so far
@@ -176,10 +177,20 @@ rejected for Daytona and only disables the cap for SSH.
 
 Help works without configuration or network access: `fleet help exec`,
 `fleet jobs --help`, and `fleet help tools`. Fleet validates its own flags before
-contacting a host. Flags inside an opaque remote command remain command payload.
-Value flags support `--flag=value`; integer timeouts reject fractional values.
-`exec` and `spawn` accept `--` immediately after the selector. Everything after
-that separator belongs to the remote command, including flags such as `--json`.
+contacting a host. They go before the selector or directly after it
+(`fleet exec web --cwd /srv ls`); once the remote command starts, fleet reads no more
+flags. A fleet flag at the end of the command, or one given twice, is refused. Value
+flags support `--flag=value`; integer timeouts reject fractional values. `exec` and
+`spawn` accept `--` after the selector, and everything after it belongs to the remote
+command, including flags such as `--json`. An unquoted `--cwd ~/x` that the local
+shell expanded to this machine's home is sent as `~/x`. `fleet push` and `fleet pull`
+are aliases of `fleet cp`.
+
+`exec --script` passes the tokens after the selector to the script: `$1…` in shells,
+`$args` or `param()` in PowerShell, and argv for Python, Node, Bun and the rest. A
+Windows command wrapped in `powershell -Command "…"` or `wsl bash -c "…"` gets a note:
+fleet already runs PowerShell there, and the outer session expands `$variables` in the
+double quotes first.
 
 `fleet edit` treats replacement text literally, including `$&`. Omitting `--new`
 or passing `--new ""` deletes the match. A present `--new` without a value fails.
@@ -214,12 +225,11 @@ Wait timeouts and Ctrl-C stop observation without cancelling the job. Resume
 with the same reference. Unconfirmed launches retain their attempted ID and are
 never retried automatically. Inspect their existing spool before resubmitting.
 
-`exec` is **foreground**: it blocks, streams nothing, and returns the remote exit
-code. `spawn` is **fire-and-track**: it launches a job that *outlives the SSH
-session* and hands back a job id. The controller stays stateless — the only state
-lives on the host, under a per-host spool (`~/.fleet/jobs/<id>/`: `cmd`, `cwd`,
-`pid`, `out`, `exit`) — and every `jobs` verb is a thin read over the same
-quoting-proof `exec`. Jobs are addressed as `host:id`.
+`exec` blocks, streams nothing and returns the remote exit code. `spawn` launches
+a job that outlives the SSH session and returns a job id, addressed as `host:id`.
+The controller keeps no state. Each host keeps its jobs in a spool at
+`~/.fleet/jobs/<id>/` (`cmd`, `cwd`, `pid`, `out`, `exit`), and every `jobs` verb
+reads that spool through the same `exec`.
 
 ```sh
 fleet spawn --cwd /srv/app --label train web "long-running-thing"  # -> host:id, detaches
@@ -237,25 +247,24 @@ waits up to five seconds, then escalates against surviving tracked descendants.
 It publishes a sentinel exit code only after those processes are gone. Windows
 uses `taskkill /T /F` and confirms that the owned runner has stopped.
 
-`wait` is scriptable: it exits with the job's own code on completion, `0` on a
-`--until` match, `124` on timeout — so `fleet jobs wait web:<id> && deploy`
-works. `--label` prefixes a readable slug onto the job id.
+`wait` exits with the job's own code on completion, `0` on a `--until` match and
+`124` on timeout, so `fleet jobs wait web:<id> && deploy` works. `--label` prefixes a readable slug onto the job id.
 
-Works on **every OS**: Linux/mac launch via `setsid` (no privilege, survives
-disconnect); **Windows** launches via a Scheduled Task with an *interactive*
-logon principal, so the job lands in the logged-in console session and can see
-the GPU/OpenCL — the task definition is unregistered once the runner records its
-pid (the running instance survives), and `taskkill /T` reaps the tree. A Windows
-job needs a user logged on at the console to host the interactive session.
+Jobs run on every OS. Linux launches them with `setsid`. macOS has no `setsid`,
+so it uses `nohup`. Neither needs privilege, and both survive a disconnect.
+Windows launches a Scheduled Task with an interactive logon principal, so the job
+runs in the logged-in console session and can use the GPU and OpenCL. Fleet
+unregisters the task once the runner records its pid; the running instance
+survives, and `taskkill /T` stops its tree. A Windows job needs a user logged on
+at the console.
 
 ## Computer use (`fleet cu`)
 
-`fleet shot` gets you a picture of a remote desktop. `fleet cu` lets something
-*act* on it — click, type, read window state — by driving
-[cua-driver](https://github.com/trycua/cua) on the host: a self-contained binary
-that runs a background `serve` daemon inside the interactive session and exposes
-computer-use tools. Same requirement as `fleet shot`: a **logged-in interactive
-desktop**. Nothing can drive a lock screen.
+`fleet shot` captures a remote desktop. `fleet cu` clicks, types and reads window
+state on it by driving [cua-driver](https://github.com/trycua/cua) on the host.
+cua-driver is a self-contained binary that runs a `serve` daemon inside the
+interactive session and exposes computer-use tools. Like `fleet shot`, it needs a
+logged-in desktop; nothing can drive a lock screen.
 
 ### Install it everywhere in one command
 
@@ -307,7 +316,7 @@ pass to every later verb. MCP: `fleet_cu_open`.
 ### Input you can trust
 
 `click`, `key`, `type` and `act` resolve the target, address it explicitly, and
-report what the window's pixels **actually did**:
+report what the window's pixels did:
 
 ```sh
 fleet cu web click firefox 166 447      # ● changed / ○ no_change / ? indeterminate
@@ -316,18 +325,17 @@ fleet cu web type firefox "hello"
 fleet cu web act firefox scroll '{"direction":"down"}'
 ```
 
-This exists because cua-driver's own `effect` field returns `"unverifiable"` for
-input that worked and input that silently did nothing, alike. Fleet hashes the
+cua-driver's own `effect` field returns `"unverifiable"` both for input that worked
+and for input that did nothing. Fleet hashes the
 window bitmap before and after the action instead, and takes a third capture when
 they differ so a window that repaints on its own (a clock, a spinner, video) is
-not reported as a false change. A failed settling capture reports `indeterminate`.
+not reported as a change. A failed settling capture reports `indeterminate`.
 Driver errors and missing requested images return failure. A title match selects
 that window, including dialogs. `act` JSON must omit `pid` and `window_id`; Fleet
 supplies them and validates `x,y`. Raw `click {JSON}` remains a driver passthrough.
 
-The immediate payoff: a background click that reports `no_change` tells you the
-target's input stack dropped it, and `--foreground` is the fix — a decision that
-otherwise costs a screenshot after every single action.
+A background click that reports `no_change` means the target dropped it; retry with
+`--foreground`. No screenshot is needed to tell.
 
 Shared flags: `--space window|screen`, `--button`, `--count`, `--foreground`,
 `--settle MS`, and `--shot [--grid]` to pull the after-image.
@@ -340,32 +348,30 @@ fleet cu web get_screen_size
 fleet cu web click '{"pid":3848,"window_id":66756,"x":100,"y":200}'
 ```
 
-- **Always send `window_id`.** Omitted, cua-driver targets the process's
-  *frontmost* window — which is the modal dialog whenever one is open, so
-  window-local coordinates get anchored to the dialog's frame and the click lands
-  somewhere unrelated, often in another application. The verbs above always send
-  it; raw passthrough is on you.
-- **A capture of one window is not the whole truth.** A modal dialog over a window
-  swallows all input while the window underneath still looks entirely normal.
+- **Always send `window_id`.** Without it, cua-driver targets the process's
+  frontmost window, which is the modal dialog whenever one is open. Window-local
+  coordinates then anchor to the dialog's frame, and the click lands somewhere
+  unrelated, often in another application. The verbs above always send it; a raw
+  passthrough must send it itself.
+- **One window's capture can hide a blocker.** A modal dialog over a window swallows
+  all input while the window underneath looks normal.
   `shot-window` captures the process's owned popups too, composites them onto the
   result, and prints a `BLOCKED?` warning naming them. For anything it cannot see,
   verify with a full `fleet shot <host>`.
-- **Coordinates are window-local pixels**, not screen-global. Add `--grid`
+- **Coordinates are window-local pixels**, not screen coordinates. Add `--grid`
   (`--grid-step N`) to any capture for a labeled coordinate ruler; on
   `shot-window` the image also carries a caption strip stating the exact frame
   (pid, window_id, origin) the numbers are in. `--probe X,Y` draws a crosshair
   where a click would land without clicking, and a point that resolves outside the
   target window is refused rather than delivered to whatever is underneath it.
 - **Empty accessibility trees.** `get_window_state` on a WPF, canvas or
-  custom-drawn window returns `degraded: true, element_count: 0` and still ships
-  its entire envelope — megabytes of nothing. Fleet collapses that to the
-  diagnostic plus the fact the payload never states: element addressing is
-  unavailable there, use pixels. `--full` restores the raw body, and
+  custom-drawn window returns `degraded: true, element_count: 0` and still ships its
+  whole envelope, which can be megabytes. Fleet collapses that to the diagnostic and
+  says that element addressing is unavailable there, so use pixels. `--full` restores the raw body, and
   `describe <tool> --brief --for <target>` probes the real window and drops the
   "prefer element_index" advice when that window has no tree to index.
-- **JSON args are piped over stdin**, not passed as argv — Windows PowerShell 5.1
-  strips the quotes around JSON field names on native-command args, and piping
-  preserves them.
+- **JSON arguments travel on stdin**, not in argv, because Windows PowerShell 5.1
+  strips the quotes around JSON field names in native-command arguments.
 - **Refusals fail.** cua-driver's own CLI exits 0 even when it refuses. Fleet exits
   1 when a reply is a refusal, an `isError`, a failed delivery, or a lookup error such
   as `window_id_not_found`, so an agent's shell sees the failure without parsing it.
@@ -447,28 +453,25 @@ The desktop contracts carry over:
   It leaves other accessibility services running, answers only a token that only
   adb's shell can read, and exits after 2 idle minutes.
 
-Measured on a test phone: over Wi-Fi, `elements` takes ~1 s and an input ~2–3 s.
-Over Tailscale's relay on mobile data (~10–15 KB/s) replies are gzipped: `elements`
-~1.7 s, an input ~2 s, and a screenshot 8 s at 400 px wide.
+On a test phone over Wi-Fi, `elements` takes about 1 s and an input 2 to 3 s.
+Over Tailscale's relay on mobile data (10 to 15 KB/s), replies are gzipped:
+`elements` takes about 1.7 s, an input 2 s, and a screenshot 8 s at 400 px wide.
 
 ## Agent setup
 
-Fleet is built to be driven by a coding agent as much as by a human. For most
-setups that's two things: the **CLI** on PATH, and the **skill** that teaches the
-agent when to reach for it. Steps 3 and 4 are optional.
+Fleet is built for coding agents. Most setups need two things: the CLI on PATH,
+and the skill that tells the agent when to use it. Steps 3 and 4 are optional.
 
-**Prefer the CLI to the MCP server.** Any agent that can run shell commands can
-already run `fleet` — one install serves every agent on the box, and each new
-one works the day you install it with no extra wiring. Registering the MCP server
-means a per-client config entry in Claude Code *and* Codex *and* Cursor *and* the
-desktop app, each with its own file, syntax, and restart, all pointing at the
-same binary the shell already has. That's N configs to keep in sync for
-capability you get once from `bun link`. The CLI is also the fuller surface:
-`top`, `ssh`, and `jobs tail -f` need a TTY and are deliberately absent from MCP.
+**Prefer the CLI to the MCP server.** Any agent that can run shell commands can run
+`fleet`, so one install serves every agent on the machine, including agents you
+install later. The MCP server needs its own config entry in each client (Claude
+Code, Codex, Cursor, the desktop app), each with its own file format and restart.
+The CLI also has more commands: `top`, `ssh` and `jobs tail -f` need a TTY and have
+no MCP tool.
 
-Reach for MCP when the agent **can't** shell out — a sandboxed or remote client,
-a hosted assistant — or when you specifically want tool-level gating, since
-`FLEET_MCP_READONLY=1` can drop every mutating tool in a way a shell can't.
+Use MCP when the agent cannot run shell commands, as in a sandboxed or hosted
+client, or when you want tool-level gating: `FLEET_MCP_READONLY=1` drops every
+mutating tool.
 
 ### 1. Install the CLI and describe your machines
 
@@ -480,25 +483,23 @@ $EDITOR fleet.config.json          # your ssh aliases, OSes, services, groups
 fleet ls                           # every host should answer
 ```
 
-Each host key is an **ssh alias**, so whatever `ssh <alias>` already does — keys,
-jump hosts, Tailscale names — fleet inherits. Get `fleet ls` green before wiring
-up any agent: everything below is a thin layer over the same config, and a host
-that fails here fails there too.
+Each host key is an ssh alias, so fleet inherits whatever `ssh <alias>` does: keys,
+jump hosts and Tailscale names. Make `fleet ls` pass before you set up an agent; the
+steps below use the same config, and a host that fails here fails there too.
 
-Strongly recommended before an agent touches it:
+Run these before an agent uses it:
 
 ```sh
 fleet doctor <host>                # explains an unreachable host (ssh -vv + health)
-fleet exec all 'echo ok'           # proves fan-out and auth on every box at once
+fleet exec all 'echo ok'           # checks fan-out and auth on every machine at once
 ```
 
 ### 2. Install the skill
 
-An agent with the CLI on PATH still has to know it's there. The skill is what
-tells it *when to reach for fleet at all* — without one, agents fall back to
-hand-rolled `ssh host "…"` and rediscover the quoting problem fleet exists to
-delete. This is the step that does the most work, and it applies whether or not
-you register the MCP server.
+An agent with the CLI on PATH still has to know it is there. The skill tells it when
+to use fleet. Without the skill, agents write `ssh host "…"` by hand and hit the
+quoting problems fleet avoids. Install it whether or not you register the MCP
+server.
 
 `skill/SKILL.md` is a ready-made [Agent Skill](https://code.claude.com/docs/en/skills)
 covering the commands, selector syntax (`host`, `a,b`, `@group`, `all`), the
@@ -512,8 +513,8 @@ npx skills add safzanpirani/fleet           # …or scoped to the current projec
 ```
 
 It installs as `fleet`; `--list` shows what's in the repo, `-a claude-code`
-targets one agent, and `npx skills update fleet` pulls later changes. Prefer to
-do it by hand? Copy the folder in:
+targets one agent, and `npx skills update fleet` pulls later changes. To install it
+by hand, copy the folder:
 
 ```sh
 cp -R ~/fleet/skill ~/.claude/skills/fleet      # Claude Code
@@ -524,25 +525,22 @@ cp -R ~/fleet/skill ~/.factory/skills/fleet     # Factory Droid
 `~/.agents/skills/`, so a copy there serves Droid and other agents that read
 that path.
 
-**Install it wherever the `fleet` CLI is reachable.** The skill is only useful to
-an agent that can actually run `fleet` — so put it in every context you drive the
-fleet from: your global agent config, any project whose agent does remote ops,
-and, if you run agents *on* your boxes (a coding agent on the GPU machine, a
-cloud session), the skill and a working `fleet` install belong on those too.
-Installed where the CLI is missing, it just teaches the agent commands it can't
-call.
+**Install it wherever the `fleet` CLI is reachable.** The skill helps only an agent
+that can run `fleet`. Put it in your global agent config and in any project whose
+agent does remote work. If you run agents on your machines (a coding agent on the
+GPU machine, a cloud session), install the skill and `fleet` there too. Without the
+CLI, the skill teaches commands the agent cannot call.
 
-Then edit the installed copy's frontmatter `description` to name **your** hosts
-and groups. That line is what the agent matches against, so "run something on
-gpu-box / all my servers" is far more likely to trigger it than the generic
-wording shipped here.
+Then edit the installed copy's frontmatter `description` to name your hosts and
+groups. The agent matches requests against that line, so "run something on gpu-box"
+triggers it more reliably than the generic wording shipped here.
 
-### 3. Register the MCP server — only if you need it
+### 3. Register the MCP server if you need it
 
-Skip this if steps 1 and 2 already gave your agent what it needs. If a client
-can't run shell commands, or you want the read-only kill-switch, the same config,
-selectors, and quoting-proof exec are exposed over
-[MCP](https://modelcontextprotocol.io) on stdio — register it per client:
+Skip this if steps 1 and 2 cover your agent. For a client that cannot run shell
+commands, or to use the read-only kill switch, fleet serves the same config,
+selectors and exec over [MCP](https://modelcontextprotocol.io) on stdio. Register it
+per client:
 
 ```sh
 bun run src/mcp.ts            # or: bun run mcp   (FLEET_CONFIG honoured)
@@ -577,19 +575,19 @@ command = "bun"
 args = ["run", "/path/to/fleet/src/mcp.ts"]
 ```
 
-Use an **absolute path** — the server resolves `fleet.config.json` from the repo
-root, and MCP clients rarely launch from a predictable cwd. To point one client
+Use an absolute path. The server resolves `fleet.config.json` from the repo root,
+and MCP clients rarely launch from a predictable cwd. To point one client
 at a different fleet, add `"env": { "FLEET_CONFIG": "/path/to/other.json" }`.
 
-Restart the client, then ask it to list tools; you should see 20 named `fleet_*`.
+Restart the client and ask it to list tools; it should show 60 named `fleet_*`
+(18 with `FLEET_MCP_READONLY=1`).
 
 ### 4. If the agent doesn't run on this machine
 
 A cloud agent, a phone client, or a teammate's session can't spawn a local stdio
 process. For those, run the [HTTP endpoint](#remote-mcp-endpoint-http) instead
 and register `https://<your-fleet-host>/mcp` with the token as the API key. The
-token is a root credential for every machine in the config — treat it that way,
-and start read-only:
+token can run commands on every machine in the config, so start read-only:
 
 ```sh
 FLEET_MCP_READONLY=1 FLEET_MCP_TOKEN=<long-random> bun run serve
@@ -598,8 +596,8 @@ FLEET_MCP_READONLY=1 FLEET_MCP_TOKEN=<long-random> bun run serve
 ### 5. Optional: let the agent use a desktop
 
 Everything above gives an agent a shell on your machines. If you also want it
-clicking and typing in GUI apps, install [cua-driver](https://github.com/trycua/cua)
-— one command, and a selector installs it everywhere at once:
+clicking and typing in GUI apps, install [cua-driver](https://github.com/trycua/cua).
+One command with a selector installs it everywhere:
 
 ```sh
 fleet cu @windows install       # …or a single host, or `all`
@@ -612,16 +610,11 @@ with it, and skip this entirely if your agents only need a shell.
 
 ### Give the agent room to work
 
-Two habits make the difference between an agent that uses fleet well and one that
-fights it:
-
-- **Let it fan out.** `fleet exec @linux 'uptime'` is one call that runs in
-  parallel; a loop over hosts is N calls and N round-trips. The selector is the
-  parallelism.
-- **Never let it sleep-poll.** For anything long-running, `fleet spawn` returns a
-  job id immediately, and `fleet jobs wait <id> --until '<regex>'` blocks until
-  the output matches — no blind `sleep 60`, no lost work when the SSH session
-  drops. See [Detached jobs](#detached-jobs).
+- **Let it fan out.** `fleet exec @linux 'uptime'` is one call that runs in parallel;
+  a loop over hosts costs a round trip per host.
+- **Do not let it sleep-poll.** For long work, `fleet spawn` returns a job id at once,
+  and `fleet jobs wait <id> --until '<regex>'` blocks until the output matches. The
+  job keeps running if the SSH session drops. See [Detached jobs](#detached-jobs).
 
 ### Verify the whole path
 
@@ -632,9 +625,9 @@ bun run scripts/smoke-http.ts             # HTTP transport + auth
 FLEET_MCP_READONLY=1 bun run scripts/smoke-http.ts   # kill-switch drops mutating tools
 ```
 
-Then ask the agent something it can only answer by actually calling out — *"how
-much disk is free on every machine?"* — and confirm it comes back with your real
-hosts rather than a plausible guess.
+Then ask the agent a question it can answer only by calling fleet, such as "how
+much disk is free on every machine?", and check that the answer names your real
+hosts.
 
 ### MCP tools
 
@@ -642,19 +635,18 @@ All prefixed `fleet_`, grouped by access:
 
 | Group | Tools |
 |---|---|
-| **Read-only** — carry `readOnlyHint`, always registered | `ls` · `logs` · `svc` · `gpu` · `disk` · `status` · `jobs` · `job_log` · `boot` · `session` · `ps` |
-| **Mutating** — dropped by the read-only kill-switch | `exec` · `cp` · `restart` · `spawn` · `drop` · `job_kill` · `reboot` · `bios` · `switch` · `screenshot` · `cu` · `run` · `android_*` (state, elements, screenshot, act, batch, flow, wait, open, apps, bootstrap, release) · `kill` |
+| **Read-only**: carry `readOnlyHint`, always registered | `ls` · `logs` · `svc` · `gpu` · `disk` · `status` · `jobs` · `job_log` · `boot` · `session` · `ps` · `dt` · `doctor` · `wait` · `job_wait` · `tools_status` · `cu_tools` · `cu_describe` |
+| **Mutating**: dropped by the read-only kill switch | `exec` · `cp` · `restart` · `spawn` · `drop` · `job_kill` · `reboot` · `bios` · `switch` · `screenshot` · `cu` · `run` · `android_*` (state, elements, screenshot, act, batch, flow, wait, open, apps, bootstrap, release) · `kill` |
 | **Not exposed** | `top` / `ssh` (need a live TTY) · job `tail -f` / `wait` (would block) |
 
-- `screenshot` counts as **mutating** — capturing runs commands on the host (on Windows it registers a one-shot scheduled task).
+- `screenshot` counts as mutating, because capturing runs commands on the host (on Windows it registers a one-shot scheduled task).
 - `exec` accepts an optional `timeout` (seconds); a hung remote command returns exit **124** instead of blocking the server.
-- Host, group, and recipe names are **baked into the tool descriptions**, so an agent sees valid selectors without a round-trip.
+- Host, group and recipe names are written into the tool descriptions, so an agent sees valid selectors without a round trip.
 - Smoke-test end-to-end: `bun run scripts/smoke.ts`.
 
-The tool set is defined once in `server.ts` (`buildServer`) and shared by the
-stdio server (`mcp.ts`) and the remote HTTP server (`http.ts`). All of them —
-plus the CLI (`cli.ts`) — are thin frontends over the `core.ts` action layer, so
-the quoting-proof shell construction lives in exactly one place.
+`server.ts` (`buildServer`) defines the tools once for the stdio server (`mcp.ts`)
+and the remote HTTP server (`http.ts`). Both servers and the CLI (`cli.ts`) call the
+`core.ts` action layer, so the shell construction lives in one place.
 
 ### Computer-use controls and batches
 
@@ -738,29 +730,29 @@ and schemas. The Fleet skill's Computer Use section catalogs every raw tool in
 the published platform registries, including platform-specific controls.
 
 ## Remote MCP endpoint (HTTP)
-For remote clients (e.g. Poke) the server also speaks **HTTP** — modern Streamable
-HTTP at `POST /mcp` and legacy SSE at `GET /sse` + `POST /messages`. It is meant
-to sit behind a Cloudflare tunnel on a hostname you control.
+For remote clients such as Poke, the server also speaks Streamable HTTP at
+`POST /mcp`. Put it behind a Cloudflare tunnel on a hostname you control. The SSE
+paths (`GET /sse`, `POST /messages`) answer `410`, since MCP 2026-07-28 deprecated
+that transport.
 
 ```sh
 FLEET_MCP_TOKEN=<long-random> bun run src/http.ts     # or: bun run serve
 ```
 
 - **Auth is mandatory.** Every MCP request needs `Authorization: Bearer <FLEET_MCP_TOKEN>`
-  (or `X-API-Key`); without it you get `401`. The token is effectively a root
-  credential for the whole fleet — keep it long, random, and out of git. `GET /health`
-  is the only unauthenticated route (returns just host count + read-only flag).
-- **Kill-switch:** `FLEET_MCP_READONLY=1` drops every mutating tool (including
-  `screenshot`/`cu`, which execute on the host) so only
-  `ls`/`status`/`svc`/`gpu`/`logs`/`jobs`/`job_log`/`boot` are exposed.
-- **Binding:** defaults to `127.0.0.1:8787` (`FLEET_MCP_HOST` / `FLEET_MCP_PORT`) —
-  only the local cloudflared should reach it; the token is the public gate.
+  (or `X-API-Key`); without it the answer is `401`. The token can run commands on
+  every host, so keep it long, random and out of git. `GET /health` is the only
+  unauthenticated route, and it returns only the host count and the read-only flag.
+- **Kill switch.** `FLEET_MCP_READONLY=1` drops every mutating tool, including
+  `screenshot` and `cu`, which execute on the host. The 18 read-only tools remain.
+- **Binding.** The default is `127.0.0.1:8787` (`FLEET_MCP_HOST`, `FLEET_MCP_PORT`).
+  Only the local cloudflared should reach it, and the token guards the public side.
 - Register in an MCP client with URL `https://<your-fleet-host>/mcp` and the
   token as the API key. For Factory Droid:
   `droid mcp add fleet https://<your-fleet-host>/mcp --type http --header "Authorization: Bearer $FLEET_MCP_TOKEN"`. Smoke-test locally with `bun run scripts/smoke-http.ts`
   (and `FLEET_MCP_READONLY=1 bun run scripts/smoke-http.ts` for the kill-switch).
 
-## Config — `fleet.config.json`
+## Config (`fleet.config.json`)
 Each host has an `ssh` alias, `os` (`linux|windows|mac`), optional `wsl` distro,
 optional `winShell` (`pwsh|powershell`), optional `hostKeyAlias`, optional `sudo`
 (`passwordFile`, a 0600 file whose first line is the password, or `passwordEnv`),
@@ -776,10 +768,10 @@ Top-level `routes` map logical names to ordered, same-OS host lists. Service
 | `winservice` / `nssm` | `Restart-Service` | `Get-Service … \| Format-List` |
 | `schtask` | `schtasks /End` + `/Run` | `schtasks /Query /V` |
 
-The config is **validated at load** — unknown OSes, bad service types, groups or
-machine boots that reference non-existent hosts, and malformed recipes all fail
-fast with the offending key named (a typo'd group member must error, not
-silently shrink a `reboot @group` fan-out). Group members are also re-checked at
+fleet validates the config at load. Unknown OSes, bad service types, groups or
+machine boots that name missing hosts, and malformed recipes all fail with the
+offending key named, so a misspelled group member cannot silently shrink a
+`reboot @group` fan-out. Group members are also re-checked at
 resolve time.
 
 A source checkout also accepts `fleet.config.example.json` when its main config
@@ -803,7 +795,7 @@ carries the same route: `exec`, `spawn`/`jobs`, `cp`, `edit`, `restart`,
       "port": 1080,
       "user": "optional",
       "passwordEnv": "VPN_PROXY_PW", // or "passwordFile": "~/.fleet/proxies/vpn.pw"
-      "dns": "remote",               // remote (default) — the PROXY resolves the target
+      "dns": "remote",               // remote (default): the proxy resolves the target
       "verify": { "url": "https://api.ipify.org", "expect": "198.51.100.7" }
     }
   },
@@ -815,8 +807,8 @@ carries the same route: `exec`, `spawn`/`jobs`, `cp`, `edit`, `restart`,
 ```
 
 `"proxy"` takes a `proxies` key or an inline URL
-(`"socks5h://user:pass@host:1080"`). The inline form is a convenience only — the
-password then lives in `fleet.config.json`.
+(`"socks5h://user:pass@host:1080"`). The inline form keeps the password in
+`fleet.config.json`.
 
 Resolution, first match wins: `--proxy NAME|URL` → `FLEET_NO_PROXY=1` →
 `FLEET_PROXY` → `hosts.<h>.proxy` → `defaultProxy` → direct.
@@ -829,12 +821,11 @@ fleet doctor <host>          # resolved proxy, the exact ProxyCommand, the verif
 fleet exec --no-proxy <host> 'echo $SSH_CLIENT'   # compare against the direct route
 ```
 
-Fleet does **not** shell out to `nc`/`ncat`/`socat`: it speaks SOCKS5 itself via a
-hidden `fleet __proxy-connect <name> %h %p` that ssh runs as its `ProxyCommand`.
-That keeps the dependency set empty, makes remote DNS a deliberate choice rather
-than an implementation accident, and keeps credentials out of the process table —
-only the proxy *name* reaches ssh's argv; the secret is read in-process from
-`passwordEnv`/`passwordFile`. A failed connection names the leg that broke
+Fleet does not call `nc`, `ncat` or `socat`. It speaks SOCKS5 and HTTP CONNECT itself
+in a hidden `fleet __proxy-connect <name> %h %p` that ssh runs as its `ProxyCommand`.
+That adds no dependencies, makes remote DNS an explicit setting, and keeps
+credentials out of the process table: only the proxy name reaches ssh's argv, and
+fleet reads the secret from `passwordEnv` or `passwordFile` in-process. A failed connection names the leg that broke
 (proxy unreachable, auth rejected, DNS, destination refused) instead of blaming
 the host.
 
@@ -846,14 +837,14 @@ OpenSSH has no `ProxyUseFdpass`.
 
 Two things to know:
 
-- Fleet's explicit `-o ProxyCommand=…` **overrides** any `ProxyCommand` in
+- Fleet's explicit `-o ProxyCommand=…` overrides any `ProxyCommand` in
   `~/.ssh/config` for that host. Delete hand-written blocks for hosts that now
   carry `"proxy"` in fleet config, or raw `ssh` and `fleet` will disagree.
-- Changing a host's proxy does not re-route a **live** control master; it keeps
+- Changing a host's proxy does not re-route a live control master, which keeps
   the old path until `ControlPersist` expires. Run `fleet proxy drop <host>`
   (or `ssh -O exit <host>`) after a route change. Fleet mixes the route into the
-  control-socket name, so a proxied and a direct host that share a `HostName` no
-  longer collide — but a master created before the route changed is still stale.
+  control-socket name, so a proxied and a direct host that share a `HostName` do
+  not collide. A master created before the route change is still stale.
 
 Daytona (`dt:`) hosts speak HTTP, not ssh; a proxy configured for one is ignored.
 
@@ -869,7 +860,7 @@ git-ignored `fleet.config.local.json` if you don't want hosts in git.
 | `FLEET_DONE_GRACE_MS` | after a remote script reports it finished, how long to wait for its output to drain before returning (default 1500). Stops a remote child that keeps stdout open from hanging the call |
 | `FLEET_PROBE_TIMEOUT_MS` | reachability-probe cap (default 4000; a proxied host gets +2000 unless this is set) |
 | `FLEET_PROXY` | default proxy (name or URL) for every host with no `proxy` of its own |
-| `FLEET_NO_PROXY` | `1` routes every connection directly — the kill switch for a wedged proxy. `--proxy` still wins |
+| `FLEET_NO_PROXY` | `1` routes every connection directly, which bypasses a wedged proxy. `--proxy` still wins |
 | `FLEET_WIN_SHELL` | force `pwsh` or `powershell` on every Windows host (overrides per-host `winShell`) |
 | `NO_COLOR` / `FORCE_COLOR` | output is uncoloured unless stdout is a terminal; `NO_COLOR` always disables colour, `FORCE_COLOR=1` forces it |
 | `FLEET_WIN_SESSION` | `0` turns off the kept-open PowerShell session that makes repeat Windows execs take ~50-250 ms instead of ~0.6 s |

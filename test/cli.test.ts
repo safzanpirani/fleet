@@ -472,12 +472,101 @@ describe("machine-readable CLI output", () => {
     }
   });
 
-  test("spawn rejects Fleet flags after the selector", async () => {
+  test("Fleet flags written right after the selector still apply", async () => {
+    const { root, bin, config } = fixture();
+    try {
+      const program = join(root, "program");
+      executable(join(bin, "ssh"), `#!/bin/sh\ncat > '${program}'\nexit 0\n`);
+      const r = await runCli(["exec", "local", "--cwd", "/srv/app", "--timeout", "30", "echo ok"], config, bin);
+      expect(r.code, r.stderr).toBe(0);
+      const sent = await Bun.file(program).text();
+      expect(sent).toContain("/srv/app");
+      expect(sent).toContain("echo ok");
+      expect(sent).not.toContain("--timeout");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("a flag given before and after the selector, or at the end of the command, is refused", async () => {
+    const { root, bin, config } = fixture();
+    try {
+      const marker = join(root, "ssh-called");
+      executable(join(bin, "ssh"), `#!/bin/sh\ntouch '${marker}'\nexit 99\n`);
+      const twice = await runCli(["exec", "--cwd", "/a", "local", "--cwd", "/b", "pwd"], config, bin);
+      expect(twice.code).toBe(1);
+      expect(twice.stderr).toContain("duplicate option: --cwd");
+      const trailing = await runCli(["spawn", "local", "echo", "ok", "--cwd", "/tmp"], config, bin);
+      expect(trailing.code).toBe(1);
+      expect(trailing.stderr).toContain("must come BEFORE the host selector");
+      expect(await Bun.file(marker).exists()).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("--script passes the tokens after the selector to the script", async () => {
+    const { root, bin, config } = fixture();
+    try {
+      const program = join(root, "program");
+      executable(join(bin, "ssh"), `#!/bin/sh\ncat > '${program}'\nexit 0\n`);
+      const script = join(root, "s.sh");
+      writeFileSync(script, 'printf "[%s]" "$@"\n');
+      const r = await runCli(["exec", "--script", script, "local", "one", "two words"], config, bin);
+      expect(r.code, r.stderr).toBe(0);
+      expect(await Bun.file(program).text()).toContain("set -- 'one' 'two words'");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("a --cwd the local shell expanded to this machine's home is sent relative to home", async () => {
+    const { root, bin, config } = fixture();
+    try {
+      const program = join(root, "program");
+      executable(join(bin, "ssh"), `#!/bin/sh\ncat > '${program}'\nexit 0\n`);
+      const r = await runCli(["exec", "--cwd", join(root, "proj"), "local", "pwd"], config, bin, { HOME: root });
+      expect(r.code, r.stderr).toBe(0);
+      expect(r.stderr).toContain("sending it as ~/proj");
+      const sent = await Bun.file(program).text();
+      expect(sent).not.toContain(join(root, "proj"));
+      expect(sent).toContain("proj");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("push and pull are cp, and script points at exec --script", async () => {
     const { root, config } = fixture();
     try {
-      const result = await runCli(["spawn", "local", "--cwd", "/tmp", "echo ok"], config);
-      expect(result.code).toBe(1);
-      expect(result.stderr).toContain("must come BEFORE the host selector");
+      for (const verb of ["push", "pull"]) {
+        const r = await runCli([verb, "only-one-arg"], config);
+        expect(r.code).toBe(1);
+        expect(r.stderr).toContain("usage: fleet cp");
+      }
+      const s = await runCli(["script", "local", "x.sh"], config);
+      expect(s.code).toBe(1);
+      expect(s.stderr).toContain("fleet exec --script");
+      const h = await runCli(["pull", "--help"], config);
+      expect(h.code, h.stderr).toBe(0);
+      expect(h.stdout).toContain("push and pull are aliases of cp");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("a PowerShell or wsl bash -c wrapper on a Windows host gets a note", async () => {
+    const { root, bin, config } = fixture();
+    try {
+      writeFileSync(config, JSON.stringify({ hosts: { win: { ssh: "win", os: "windows", winShell: "pwsh" } } }));
+      executable(join(bin, "ssh"), "#!/bin/sh\ncat >/dev/null\nexit 0\n");
+      const env = { FLEET_WIN_SESSION: "0" };
+      const ps = await runCli(["exec", "win", 'powershell -NoProfile -Command "$x = 1"'], config, bin, env);
+      expect(ps.stderr).toContain("already runs PowerShell");
+      const wsl = await runCli(["exec", "win", 'wsl bash -lc "echo $HOME"'], config, bin, env);
+      expect(wsl.stderr).toContain("fleet exec --wsl");
+      const plain = await runCli(["exec", "win", "Get-Date"], config, bin, env);
+      expect(plain.stderr).not.toContain("note:");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

@@ -27,6 +27,7 @@
  */
 import { readFile } from "node:fs/promises";
 import { writeSync } from "node:fs";
+import { homedir } from "node:os";
 import { processList, processKill } from "./procs.ts";
 import type { KillResult } from "./procs.ts";
 import { format } from "node:util";
@@ -44,7 +45,7 @@ import {
 } from "./jobs.ts";
 import type { JobRow } from "./jobs.ts";
 import {
-  pullFlag, pullVal, parseFlags, parseLeadingFlags, lsHosts, runExec, runScript, rebootRefusal, droppedStdinCheck, readScriptSource, editRemoteFile, parseEditList,
+  pullFlag, pullVal, parseFlags, parseLeadingFlags, lsHosts, runExec, runScript, rebootRefusal, droppedStdinCheck, nestedShellNote, readScriptSource, editRemoteFile, parseEditList,
   pushFile, pullFile, parseRemoteSpec, restartService, serviceLogs, svcStatus,
   gpuRows, diskRows, sudoWrap, fetchDashboard, hostStatus, runRecipe, captureScreenshot, rebootHosts,
   cuInstall, cuRun, cuTools, cuDescribe, cuRecordStart, cuRecordStop, cuRecordStatus, cuRegions, cuPerception, bootMismatchNote,
@@ -134,6 +135,41 @@ export function trailingFleetFlag(pos: string[], bools: string[], valued: string
   const beforeLast = pos.length >= 3 ? pos[pos.length - 2]! : "";
   if (valued.includes(beforeLast) && !last.startsWith("--")) return beforeLast;
   return undefined;
+}
+
+/** Fleet's own flags written right after <sel> (`fleet exec web --cwd /srv ls`).
+ *  A remote command never starts with one of them, so take the leading run as
+ *  flags, as if it came before <sel>. A repeat of an earlier flag is an error. */
+export function hoistFlags(
+  flags: Record<string, string | true>, pos: string[], bools: string[], valued: string[],
+): { pos: string[]; separated: boolean } {
+  let k = 0;
+  while (k < pos.length) {
+    const tok = pos[k]!;
+    const name = tok.startsWith("--") && tok.includes("=") ? tok.slice(0, tok.indexOf("=")) : tok;
+    if (bools.includes(name)) k += 1;
+    else if (valued.includes(name)) k += tok.includes("=") ? 1 : 2;
+    else break;
+  }
+  if (k > pos.length) die(`${pos[pos.length - 1]} requires a value`);
+  const late = parseFlags(pos.slice(0, k), bools, valued).flags;
+  for (const [f, v] of Object.entries(late)) {
+    if (Object.hasOwn(flags, f)) die(`duplicate option: ${f}`);
+    flags[f] = v;
+  }
+  const rest = pos.slice(k);
+  const separated = rest[0] === "--";
+  return { pos: separated ? rest.slice(1) : rest, separated };
+}
+
+/** A --cwd that the local shell already expanded: `--cwd ~/x` unquoted reaches
+ *  fleet as /Users/me/x, which a remote host does not have. Send it as ~/x,
+ *  which names the same directory when the target is this machine. */
+export function homeRelativeCwd(cwd: string | undefined, home = homedir()): string | undefined {
+  if (!cwd || !home || home === "/" || (cwd !== home && !cwd.startsWith(home + "/"))) return cwd;
+  const rel = "~" + cwd.slice(home.length);
+  console.error(A.d(`fleet: --cwd ${cwd} is under this machine's home; sending it as ${rel}`));
+  return rel;
 }
 
 /** Same strictness as numVal, but over a parseLeadingFlags result. */
@@ -673,7 +709,9 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       // the remote command is passed through verbatim instead of being hijacked.
       const EXEC_BOOLS = ["--json", "--wsl", "--raw", "--sudo", "--confirm-reboot", "--fresh"];
       const EXEC_VALUES = ["--cwd", "--timeout", "--script", "--interp"];
-      const { flags, rest: pos } = parseLeadingFlags(rest, EXEC_BOOLS, EXEC_VALUES);
+      const { flags, rest: lead } = parseLeadingFlags(rest, EXEC_BOOLS, EXEC_VALUES);
+      const sel = lead.shift();
+      const { pos, separated } = hoistFlags(flags, lead, EXEC_BOOLS, EXEC_VALUES);
       const json = flags["--json"] === true;
       const wsl = flags["--wsl"] === true;
       const sudo = flags["--sudo"] === true;          // run as root; a password comes from hosts.<h>.sudo
@@ -681,24 +719,20 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       const fresh = flags["--fresh"] === true;        // a new ssh login: no shared master, no kept-open session
       const raw = flags["--raw"] === true; // print ONLY remote stdout — no header, no indent (for piping/backup)
       if (raw && json) die("choose either --raw or --json");
-      const cwd = typeof flags["--cwd"] === "string" && flags["--cwd"] ? flags["--cwd"] : undefined; // run in this dir (fails fast if missing)
+      const cwd = homeRelativeCwd(typeof flags["--cwd"] === "string" && flags["--cwd"] ? flags["--cwd"] : undefined); // run in this dir (fails fast if missing)
       const timeout = numFlag(flags, "--timeout", 0, 0);  // wall-clock cap in seconds; 0 = none (FLEET_EXEC_TIMEOUT env also works)
       const timeoutMs = flags["--timeout"] === undefined ? undefined : timeout * 1000;
       // --script ships a LOCAL file (or stdin) as the program: no cp to /tmp, no
       // remote leftovers, and the source never touches a shell command line.
       const scriptPath = typeof flags["--script"] === "string" && flags["--script"] ? flags["--script"] : undefined;
       const interp = typeof flags["--interp"] === "string" && flags["--interp"] ? flags["--interp"] : undefined;
-      const sel = pos.shift();
-      const separated = pos[0] === "--";
-      if (separated) pos.shift();
       const cmd = pos.join(" ");
       if (scriptPath) {
-        if (!sel) die("usage: fleet exec --script <file|-> [--interp cmd] [--cwd dir] [--timeout S] [--wsl] [--sudo] [--raw] [--json] <sel>");
-        if (cmd) die(`fleet exec --script takes no command after <sel> (got '${cmd}') — the script IS the command`);
+        if (!sel) die("usage: fleet exec --script <file|-> [--interp cmd] [--cwd dir] [--timeout S] [--wsl] [--sudo] [--raw] [--json] <sel> [--] [ARG…]");
         const script = await readScriptSource(scriptPath);
         const refusal = confirmReboot ? null : rebootRefusal(script.source, "--confirm-reboot");
         if (refusal) die(refusal);
-        const results = await runScript(cfg, await routeSelector(cfg, sel!), script, { wsl, cwd, timeoutMs, interp, sudo, fresh });
+        const results = await runScript(cfg, await routeSelector(cfg, sel!), script, { wsl, cwd, timeoutMs, interp, sudo, fresh, args: pos });
         if (json) console.log(JSON.stringify(results, null, 2));
         else if (raw) results.forEach(printRaw);
         else { results.forEach(printResult); await printBootMismatch(cfg, results); }
@@ -713,8 +747,6 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       const strayFlag = !separated && pos[0]?.startsWith("--") ? pos[0] : undefined;
       if (strayFlag === "--shell")
         die(`there is no --shell flag; use --wsl, and put it BEFORE the host: fleet exec --wsl ${sel} <cmd…>`);
-      if (strayFlag && [...EXEC_BOOLS, ...EXEC_VALUES].includes(strayFlag))
-        die(`'${strayFlag}' must come BEFORE the host selector: fleet exec ${strayFlag} ${sel} <cmd…>`);
       const trailing = separated ? undefined : trailingFleetFlag(pos, EXEC_BOOLS, EXEC_VALUES);
       if (trailing)
         die(`'${trailing}' must come BEFORE the host selector: fleet exec ${trailing} ${sel} <cmd…>  (quote the whole command if it really ends in ${trailing})`);
@@ -725,6 +757,8 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       if (dropped.refuse) die(dropped.refuse);
       if (dropped.warn) console.error(A.y(dropped.warn));
       const target = await routeSelector(cfg, sel!);
+      const nested = nestedShellNote(cmd, resolveHosts(cfg, target), wsl);
+      if (nested) console.error(A.y(nested));
       const results = await runExec(cfg, target, cmd, { wsl, cwd, timeoutMs, sudo, fresh });
       if (json) console.log(JSON.stringify(results, null, 2));
       else if (raw) results.forEach(printRaw);
@@ -733,19 +767,20 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
     }
 
     case "spawn": {
-      const { flags, rest: pos } = parseLeadingFlags(rest, ["--json", "--wsl", "--elevated", "--confirm-reboot", "--fresh"], ["--cwd", "--label"]);
+      const SPAWN_BOOLS = ["--json", "--wsl", "--elevated", "--confirm-reboot", "--fresh"];
+      const SPAWN_VALUES = ["--cwd", "--label"];
+      const { flags, rest: lead } = parseLeadingFlags(rest, SPAWN_BOOLS, SPAWN_VALUES);
+      const sel = lead.shift();
+      const { pos, separated } = hoistFlags(flags, lead, SPAWN_BOOLS, SPAWN_VALUES);
       const json = flags["--json"] === true;
       const wsl = flags["--wsl"] === true;
       const elevated = flags["--elevated"] === true;
-      const cwd = typeof flags["--cwd"] === "string" && flags["--cwd"] ? flags["--cwd"] : undefined;
+      const cwd = homeRelativeCwd(typeof flags["--cwd"] === "string" && flags["--cwd"] ? flags["--cwd"] : undefined);
       const label = typeof flags["--label"] === "string" && flags["--label"] ? flags["--label"] : undefined;
-      const sel = pos.shift();
-      const separated = pos[0] === "--";
-      if (separated) pos.shift();
       const cmd = pos.join(" ");
       if (!sel || !cmd) die("usage: fleet spawn [--wsl] [--elevated] [--fresh] [--cwd dir] [--label name] [--json] <sel> <cmd…>");
-      const misplaced = separated ? undefined : ["--cwd", "--label", "--json", "--wsl", "--elevated", "--confirm-reboot", "--fresh", "--name"].includes(pos[0] ?? "") ? pos[0]
-        : trailingFleetFlag(pos, ["--json", "--wsl", "--elevated", "--confirm-reboot", "--fresh"], ["--cwd", "--label", "--name"]);
+      const misplaced = separated ? undefined : pos[0] === "--name" ? pos[0]
+        : trailingFleetFlag(pos, SPAWN_BOOLS, [...SPAWN_VALUES, "--name"]);
       if (misplaced === "--name")
         die("there is no --name flag; use --label, and put it BEFORE the host: fleet spawn --label <name> " + sel + " <cmd…>");
       if (misplaced)
@@ -861,7 +896,7 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       return listErrors.length ? 1 : 0;
     }
 
-    case "cp": {
+    case "cp": case "push": case "pull": {
       const parsed = parseFlags(rest, ["--json", "-r", "--recursive", "--resume"], []);
       rest = parsed.rest;
       const json = parsed.flags["--json"] === true;
@@ -2191,6 +2226,8 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       return await sshInteractive(resolveHosts(cfg, await routeSelector(cfg, sel))[0]!);
     }
 
+    case "script": return die("there is no fleet script; run a local file with fleet exec --script <file|-> <sel> [ARG…]");
+    case "job": return dispatch("jobs", rest, cfg);
     default: return die(`unknown command: ${command} (try: fleet help)`);
   }
 }

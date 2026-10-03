@@ -84,6 +84,43 @@ describe("buildScriptCommand", () => {
   });
 });
 
+describe("buildScriptCommand arguments", () => {
+  const args = ["a", "b c", "it's", "$HOME"];
+  const run = async (cmd: string) => {
+    const p = Bun.spawn(["bash", "-c", cmd], { stdout: "pipe", stderr: "pipe" });
+    const [out, err, code] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited]);
+    expect(code, err).toBe(0);
+    return out.trim();
+  };
+
+  test("a native shell script sees them as $1… byte for byte", async () => {
+    const cmd = buildScriptCommand(`printf '[%s]' "$@"`, null, "linux", "auto", args);
+    expect(await run(cmd)).toBe("[a][b c][it's][$HOME]");
+  });
+
+  test("stdin interpreters get them after their stdin marker", async () => {
+    expect(await run(buildScriptCommand("import sys; print(sys.argv[1:])", "python3", "linux", "auto", args)))
+      .toBe(`['a', 'b c', "it's", '$HOME']`);
+    expect(await run(buildScriptCommand("console.log(JSON.stringify(process.argv.slice(2)))", "bun", "linux", "auto", args)))
+      .toBe(JSON.stringify(args));
+    expect(await run(buildScriptCommand(`printf '[%s]' "$@"`, "bash", "linux", "auto", args))).toBe("[a][b c][it's][$HOME]");
+  });
+
+  test("PowerShell targets quote each one for PowerShell", () => {
+    const native = buildScriptCommand("param($x) $x", null, "windows", "auto", args);
+    expect(native).toContain(`try { & $fleetPs 'a' 'b c' 'it''s' '$HOME'; $fleetPsCode = $LASTEXITCODE }`);
+    expect(buildScriptCommand("print(1)", "python", "windows", "auto", ["it's"])).toContain(`| & python - 'it''s'`);
+    expect(buildScriptCommand("echo $1", "bash", "windows", "auto", ["x"])).toContain(`| & bash -s 'x'`);
+    expect(buildScriptCommand("$args", "pwsh", "linux", "auto", ["x"])).toContain(`-File "$fleet_ps_dir/script.ps1" 'x'`);
+  });
+
+  test("no arguments keeps every form unchanged", () => {
+    expect(buildScriptCommand("echo hi\n", null, "linux", "auto", [])).toBe("echo hi\n");
+    expect(buildScriptCommand("$x = 1\n", null, "windows", "auto")).toBe("$x = 1\n");
+    expect(buildScriptCommand("x", "bun", "linux", "auto")).toContain("| bun -");
+  });
+});
+
 describe("readScriptSource", () => {
   test("derives the extension from the path, not from a dot in a directory", () => {
     const dir = mkdtempSync(join(tmpdir(), "fleet-script-"));

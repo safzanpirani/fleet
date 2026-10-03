@@ -330,6 +330,24 @@ export function droppedStdinCheck(cmd: string, kind: LocalStdin = localStdin()):
   return {};
 }
 
+/** A Windows command that starts another shell around its real program. Fleet
+ *  already runs PowerShell there, so `powershell -Command "…"` parses the text
+ *  twice: the outer session expands `$vars` inside the double quotes before the
+ *  inner one starts. `wsl bash -c "…"` loses `$` the same way. Returns a note
+ *  for the caller to show, or undefined. */
+export function nestedShellNote(cmd: string, hosts: Host[], wsl = false): string | undefined {
+  if (wsl || !hosts.some((h) => h.os === "windows")) return undefined;
+  const head = cmd.trimStart();
+  if (/^(&\s*)?["']?(powershell|pwsh)(\.exe)?["']?\s+(-\w+\s+)*-(c|command|encodedcommand)\b/i.test(head))
+    return "fleet: note: fleet exec already runs PowerShell on Windows. The powershell -Command wrapper parses the "
+      + "command a second time, and $variables inside its double quotes expand too early. Pass the PowerShell "
+      + "directly, or use --script file.ps1.";
+  if (/^wsl(\.exe)?\s+(-\S+\s+)*(-e\s+|--\s+)?(ba|z)?sh\s+(-\w*c\w*)\b/i.test(head))
+    return "fleet: note: PowerShell parses this wsl bash -c string before bash sees it, so $ and quotes can break. "
+      + "Use fleet exec --wsl <host> '<bash command>' instead.";
+  return undefined;
+}
+
 // ── exec --script ─────────────────────────────────────────────────────────────
 // Run a LOCAL script file (or stdin) on remote hosts without ever creating a
 // remote file. The old shape of this was: write the script locally, `fleet cp`
@@ -355,34 +373,55 @@ export function interpreterFor(ext: string, os: string): string | null {
 
 /** Wrap script source into a single command string for `exec`. When an
  *  interpreter is needed the source is base64'd and decoded remotely, so the
- *  script's own quotes/newlines/heredocs never meet a shell parser. */
-export function buildScriptCommand(source: string, interp: string | null, os: string, shell: Shell): string {
-  if (!interp) return source;                       // native to the target shell
-  const b64 = Buffer.from(source, "utf8").toString("base64");
+ *  script's own quotes/newlines/heredocs never meet a shell parser. `args`
+ *  become the script's positional arguments ($1… in shells, $args or param()
+ *  in PowerShell, argv elsewhere), each quoted for the target shell. */
+export function buildScriptCommand(source: string, interp: string | null, os: string, shell: Shell, args: string[] = []): string {
   const psTarget = os === "windows" && shell !== "wsl" && shell !== "bash";
+  const q = (a: string) => psTarget ? `'${psEsc(a)}'` : `'${bashEsc(a)}'`;
+  const argv = args.map(q).join(" ");
+  if (!interp) {                                    // native to the target shell
+    if (!args.length) return source;
+    if (!psTarget) return `set -- ${argv}\n${source}`;
+  }
+  const b64 = Buffer.from(source, "utf8").toString("base64");
   // `pwsh -` reads stdin as an interactive session and echoes every line back,
   // secrets included, and `-Command -` runs it line by line. PowerShell gets a
-  // private temp .ps1 and -File instead, removed whatever the script does.
-  if (isPowerShell(interp)) {
-    const run = `${interp} -NoProfile -NonInteractive -File`;
+  // private temp .ps1 and -File instead, removed whatever the script does. A
+  // native PowerShell program with arguments runs the same .ps1 in-process, so
+  // a param() block at its top still binds them.
+  if (!interp || isPowerShell(interp)) {
+    const run = interp ? `${interp} -NoProfile -NonInteractive -File` : "";
+    const tail = argv ? " " + argv : "";
     if (psTarget) return [
       `$fleetPs = Join-Path $env:TEMP ('fleet_' + [guid]::NewGuid().ToString('N') + '.ps1')`,
       `[IO.File]::WriteAllText($fleetPs, [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${b64}')), (New-Object Text.UTF8Encoding $true))`,
-      `try { & ${run} $fleetPs; $fleetPsCode = $LASTEXITCODE } finally { Remove-Item -LiteralPath $fleetPs -Force -EA SilentlyContinue }`,
+      `try { & ${run ? run + " " : ""}$fleetPs${tail}; $fleetPsCode = $LASTEXITCODE } finally { Remove-Item -LiteralPath $fleetPs -Force -EA SilentlyContinue }`,
       `exit $fleetPsCode`,
     ].join("\n");
     return [
       `fleet_ps_dir="$(mktemp -d)" || exit 1`,
       `trap 'rm -rf "$fleet_ps_dir"' EXIT`,
       `printf %s '${b64}' | base64 -d > "$fleet_ps_dir/script.ps1"`,
-      `${run} "$fleet_ps_dir/script.ps1"`,
+      `${run} "$fleet_ps_dir/script.ps1"${tail}`,
     ].join("\n");
   }
+  const run = `${interp} ${stdinFlag(interp, args.length > 0)}${argv ? " " + argv : ""}`;
   // PowerShell target: decode in-process, pipe the text to the interpreter's stdin
   if (psTarget)
-    return `[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${b64}')) | & ${interp} -`;
+    return `[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${b64}')) | & ${run}`;
   // bash target (linux/mac/wsl): decode with base64(1), pipe to stdin
-  return `printf %s '${b64}' | base64 -d | ${interp} -`;
+  return `printf %s '${b64}' | base64 -d | ${run}`;
+}
+
+/** How an interpreter reads its program from stdin. `bash - a` and `bun - a`
+ *  treat `a` as a file or a subcommand, so shells take -s and bun takes run -. */
+function stdinFlag(interp: string, withArgs: boolean): string {
+  const bin = interp.trim().split(/\s+/, 1)[0]!.replace(/^["']|["']$/g, "").split(/[\\/]/).pop()!.replace(/\.exe$/i, "");
+  if (!withArgs) return "-";
+  if (/^(ba|z|k|da)?sh$/.test(bin)) return "-s";
+  if (bin === "bun") return "run -";
+  return "-";
 }
 
 /** True when an --interp command runs PowerShell (`pwsh`, `powershell.exe`, a full path). */
@@ -429,7 +468,7 @@ export async function readScriptSource(path: string): Promise<ScriptSource> {
  *  extension-derived interpreter; "-" as `path` reads stdin. */
 export async function runScript(
   cfg: FleetConfig, sel: string, script: ScriptSource,
-  opts: { wsl?: boolean; cwd?: string; timeoutMs?: number; interp?: string; sudo?: boolean; fresh?: boolean } = {},
+  opts: { wsl?: boolean; cwd?: string; timeoutMs?: number; interp?: string; sudo?: boolean; fresh?: boolean; args?: string[] } = {},
 ): Promise<ExecResult[]> {
   if (script.label === "<stdin>" && !script.ext && !opts.interp)
     throw new Error("fleet: --script - needs --interp <command> unless stdin starts with a supported shebang");
@@ -439,7 +478,7 @@ export async function runScript(
     // a WSL target is a linux box wearing a Windows host entry — pick its interpreter as such
     const os = opts.wsl ? "linux" : h.os;
     const interp = opts.interp ?? interpreterFor(script.ext, os);
-    const cmd = buildScriptCommand(script.source, interp, os, shell);
+    const cmd = buildScriptCommand(script.source, interp, os, shell, opts.args);
     const eo = { cwd: opts.cwd, timeoutMs: opts.timeoutMs, fresh: opts.fresh };
     if (!opts.sudo) return exec(h, cmd, shell, eo);
     return sudoWrap(h, cmd, !!opts.wsl).then((sudo) => "error" in sudo ? sudo.error : exec(h, sudo.cmd, shell, eo));

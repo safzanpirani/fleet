@@ -1,25 +1,25 @@
 ---
 name: fleet
-description: Run commands, launch detached background jobs, restart services, push files, screenshot desktops, and read live status across a fleet of machines (Linux, Windows, and Mac boxes) over SSH with zero quoting pain, via the `fleet` CLI or its MCP server. Use when the user wants to exec/run something on one or many of their boxes, spawn a long-running job that outlives the SSH session (and tail/wait/kill it), restart or tail logs for a service, copy a file to host(s), screenshot a remote machine, check fleet/host/GPU status or the status dashboard, register/use the fleet MCP server (Claude Code, Factory Droid, Codex), drive a remote desktop with `fleet cu`, or mentions fleet, @linux/@windows/@gpu, or "all my machines / servers".
+description: Run commands, launch detached background jobs, restart services, push files, screenshot desktops, and read live status across a fleet of machines (Linux, Windows, and Mac boxes) over SSH without quoting problems, through the `fleet` CLI or its MCP server. Use when the user wants to exec/run something on one or many of their boxes, spawn a long-running job that outlives the SSH session (and tail/wait/kill it), restart or tail logs for a service, copy a file to host(s), screenshot a remote machine, check fleet/host/GPU status or the status dashboard, register/use the fleet MCP server (Claude Code, Factory Droid, Codex), drive a remote desktop with `fleet cu`, or mentions fleet, @linux/@windows/@gpu, or "all my machines / servers".
 ---
 
 # fleet
 
 `fleet` is a global CLI (installed from the repo, on PATH via `bun link`) that drives a
-whole machine fleet over SSH. Every exec is **quoting-proof**: `bash -ls` over
-stdin on Linux and PowerShell `-Command -` over stdin on Windows — so **never escape anything**,
-just pass the command. Prefer `fleet exec` over raw `ssh` for these boxes. The same
-actions are also exposed as an **MCP server** (see below) for MCP clients/agents.
+set of machines over SSH. It sends each program over stdin to `bash -ls` on Linux and
+macOS and to PowerShell `-Command -` on Windows, so pass commands as they are and never
+escape them. Prefer `fleet exec` over raw `ssh` for these machines. The same actions are
+also available as an MCP server (see below).
 
 Host names, groups, and recipes come from `fleet.config.json`; the examples below use the
 placeholder hosts from `fleet.config.example.json` (`web`, `gpu-box`, `win-box`, `vps`,
-`laptop`) — substitute your own.
+`laptop`). Substitute your own.
 
 ## Quick start
 
 ```sh
-fleet ls                      # every host: reachability + configured services  (alias: fleet hosts)
-fleet status                  # live CPU/mem/disk/gpu table (from the dashboard)
+fleet ls                      # every host: reachability and configured services (alias: fleet hosts)
+fleet status                  # live CPU, memory, disk and GPU table (from the dashboard)
 fleet exec win-box "nvidia-smi"
 ```
 
@@ -27,8 +27,8 @@ fleet exec win-box "nvidia-smi"
 
 | Command | Use |
 |---|---|
-| `fleet exec [--cwd dir] [--wsl] [--sudo] [--fresh] [--confirm-reboot] [--raw] [--json] <sel> "<cmd>"` | Run a command on host(s), **blocking** (returns exit code). `--cwd` expands a leading `~` and fails fast (exit 127) if the directory is missing. `--wsl` runs inside WSL on Windows boxes. `--raw` prints only remote stdout. `--sudo` runs it as root on POSIX hosts (passwordless sudo, or `hosts.<h>.sudo.passwordFile` sent over ssh stdin). `--fresh` logs in again instead of reusing the shared connection. Reboot-looking commands need `--confirm-reboot`. |
-| `fleet exec --script <file\|-> [--interp cmd] <sel>` | Run a local script file or stdin on host(s). Fleet infers file extensions and supported stdin shebangs. Untyped stdin requires `--interp`. |
+| `fleet exec [--cwd dir] [--wsl] [--sudo] [--fresh] [--confirm-reboot] [--raw] [--json] <sel> "<cmd>"` | Run a command on host(s) and wait for it (returns the exit code). `--cwd` expands a leading `~` and fails fast (exit 127) if the directory is missing. `--wsl` runs inside WSL on Windows boxes. `--raw` prints only remote stdout. `--sudo` runs it as root on POSIX hosts (passwordless sudo, or `hosts.<h>.sudo.passwordFile` sent over ssh stdin). `--fresh` logs in again instead of reusing the shared connection. Reboot-looking commands need `--confirm-reboot`. |
+| `fleet exec --script <file\|-> [--interp cmd] <sel> [ARG…]` | Run a local script file or stdin on host(s). Fleet infers file extensions and supported stdin shebangs. Untyped stdin requires `--interp`. Tokens after `<sel>` reach the script as `$1…`, PowerShell `$args`/`param()`, or argv. |
 | `fleet spawn [--wsl] [--elevated] [--fresh] [--cwd dir] [--json] <sel> "<cmd>"` | Launch a detached job that outlives the SSH session and returns a `host:id`. `--wsl` runs it under `bash -l` in a Windows box's WSL distro, so `> /tmp/x` lands in WSL. `--elevated` gives a Windows job the administrator token (storage/CIM cmdlets need it). |
 | `fleet jobs [<sel>]` | List detached jobs across the fleet (running ● / exited ○ / dead ✗). |
 | `fleet jobs log <host:id>` | Full captured output of a job. |
@@ -36,15 +36,15 @@ fleet exec win-box "nvidia-smi"
 | `fleet jobs wait <host:id> [--until <regex>] [--timeout S]` | Block until the job exits (or its output matches `--until`). Scriptable exit code: job's own code on exit, `0` on match, `124` on timeout. |
 | `fleet jobs kill <host:id>` | TERM the verified job process tree and escalate against surviving descendants. |
 | `fleet jobs prune [<sel>] [--all]` | Remove finished job spools (`--all` also drops dead ones; never touches running). |
-| `fleet cp [-r] [--resume] <local> <sel>:<remote>` | Copy a file to host(s); fan-out across a group. `--resume` copies with rsync `--partial`, so rerunning after a drop continues the partial file (POSIX hosts only). A single-host copy on a terminal shows a progress meter. |
+| `fleet cp [-r] [--resume] <local> <sel>:<remote>` | Copy a file to host(s), fanning out across a group. `fleet push` and `fleet pull` are aliases of `cp`. `--resume` copies with rsync `--partial`, so rerunning after a drop continues the partial file (POSIX hosts only). A single-host copy on a terminal shows a progress meter. |
 | `fleet edit <sel>:<path> --old S --new S` | Edit a remote file in place, reject ambiguous matches, and print the diff. `--old-file`/`--new-file <file or ->` read multi-line text from a file or stdin; fleet never unescapes `\n`. `--edits <file or ->` applies a JSON array of `{"old","new","all"}` to one file: one read, one write, nothing written if any edit fails. In a file that is CRLF (or LF) throughout, newlines in `--old`/`--new` are converted to match it. A miss names its likely cause by line number. `--sudo` edits root-owned files as root (POSIX; passwordless sudo or the host's configured sudo password). |
-| `fleet shot <host> [--output NAME\|main\|N] [--region top-right\|…\|X,Y,W,H] [--wake] [--out f] [--grid] [--no-open]` | Screenshot the remote desktop → local image (webp default; `--grid` overlays a coord ruler). `--output` captures one monitor and `--region` part of it (the main monitor when `--output` is omitted); `--list` shows the layout. `--wake` switches powered-off Wayland monitors on for the capture. Alias: `fleet screenshot`. |
+| `fleet shot <host> [--output NAME\|main\|N] [--region top-right\|…\|X,Y,W,H] [--wake] [--out f] [--grid] [--no-open]` | Screenshot the remote desktop to a local image (WebP by default; `--grid` overlays a coordinate ruler). `--output` captures one monitor and `--region` part of it (the main monitor when `--output` is omitted); `--list` shows the layout. `--wake` switches powered-off Wayland monitors on for the capture. Alias: `fleet screenshot`. |
 | `fleet session <sel>` | Logged in, **locked**, or at the login screen; idle time where the desktop reports it; which displays are off. Check it before `cu` or `shot`. Several hosts take one comma selector (`fleet session web,laptop`); a second positional is a usage error. |
 | `fleet drop <sel>` | Close the shared ssh connection (and a Windows host's kept-open session) so the next call logs in fresh, e.g. after `usermod -aG docker`. |
 | `fleet boot <machine> [--entries]` · `fleet switch <machine> --to <os> [--dry-run] [--yes]` | Which boot of a dual-boot machine is live, its UEFI entries, and reboot into another boot with every phase printed (see **Dual-boot machines**). |
 | `fleet hostkey <host> [--pin]` · `fleet find <machine\|mac> [--from <host>]` | Pin a boot's host key under its `hostKeyAlias`; find a machine's LAN address by MAC. |
-| `fleet cu <host> <args…> [--out f.png]` | Computer-use via [cua-driver](https://github.com/trycua/cua): `install`, or pass a tool + JSON (`click`, `type_text`, `get_window_state`…). |
-| `fleet cu <host> click\|key\|type\|act <target> …` | Verified input: resolves the target, sends an explicit `window_id`, reports `changed` / `no_change` / `indeterminate`. |
+| `fleet cu <host> <args…> [--out f.png]` | Computer use through [cua-driver](https://github.com/trycua/cua): `install`, or pass a tool + JSON (`click`, `type_text`, `get_window_state`…). |
+| `fleet cu <host> click\|key\|type\|act <target> …` | Verified input: resolves the target, sends an explicit `window_id`, and reports `changed`, `no_change` or `indeterminate`. |
 | `fleet cu <host> windows [target]` · `shot-window <target>` | List windows (blockers flagged) or capture one, with owned popups composited in. |
 | `fleet cu <host> elements <target> [filter]` · `verify <target> …` | List a window's controls with tokens (no screenshot), or check its state with `verify_state`. |
 | `fleet cu <host> click\|set\|type <target> --label TEXT` · `menu <target> <item…>` | Act on a control by label or `--element TOKEN` instead of x,y; invoke a native menu path. |
@@ -56,7 +56,7 @@ fleet exec win-box "nvidia-smi"
 | `fleet gpu [--json]` | Every GPU: util · free VRAM · temp · loaded model. |
 | `fleet disk [sel] [--json]` | Live free space on every mounted volume. |
 | `fleet ps <sel> [filter] [--sort cpu\|mem] [-n N] [--json]` | Processes, the same columns on Linux, macOS and Windows: pid, parent, cpu, memory, age, owner, command line. Marks rows a fleet job started (`job:ID`) and rows `kill` refuses (`protected`). The filter matches names (or a pid), never command lines. |
-| `fleet kill <sel> <pid[,pid…]\|name> [--tree] [--force] [--all] [--system] [--grace S] [--dry-run] [--sudo] [--yes] [--json]` | **Stop processes safely.** Shows the plan, then asks politely (SIGTERM / taskkill), waits, and `--force` kills survivors. A name matching several processes is refused with the list unless `--all`. Never touches fleet's own session. System processes (sshd, launchd, svchost, explorer…) need `--system`. Anything no fleet job started needs `--yes` non-interactively. Each pid's name is re-checked before its signal. **Use this instead of `pkill`/`taskkill`/`Stop-Process` through `exec`.** |
+| `fleet kill <sel> <pid[,pid…]\|name> [--tree] [--force] [--all] [--system] [--grace S] [--dry-run] [--sudo] [--yes] [--json]` | Stop processes. Shows the plan, sends SIGTERM (taskkill on Windows), waits, and with `--force` kills survivors. A name matching several processes is refused with the list unless `--all`. Never touches fleet's own session. System processes (sshd, launchd, svchost, explorer…) need `--system`. Anything no fleet job started needs `--yes` non-interactively. Each pid's name is checked again before its signal. Use this instead of `pkill`, `taskkill` or `Stop-Process` through `exec`. |
 | `fleet status [host] [--json]` | Live stats pulled from the dashboard API. |
 | `fleet top <host>` | Live terminal btop for one host (interactive; runs until Ctrl-C). |
 | `fleet run <recipe>` | Run a saved playbook from config (stops on first failure). |
@@ -67,8 +67,8 @@ fleet exec win-box "nvidia-smi"
 ## Prefer the LAN entry over the Tailscale one
 
 A machine can appear in `fleet.config.json` twice: once on the local network and once over
-Tailscale. Reach for the LAN entry — tailnet traffic can leave the network and come back,
-so copying anything large over the remote entry burns bandwidth for no gain.
+Tailscale. Use the LAN entry. Tailnet traffic can leave the network and come back, so a
+large copy over the Tailscale entry wastes bandwidth.
 
 Name them so the transport is obvious: the plain name for the LAN box and a `-ts` suffix
 for its Tailscale twin (`lan-host` / `lan-host-ts`). `fleet ls` shows the ssh alias for
@@ -84,17 +84,18 @@ Anywhere `<sel>` appears: a hostname, logical route, group, `all`, Daytona
 
 ## Critical rules
 
-- **Don't escape commands.** `fleet exec vps 'echo "a & b | c"'` round-trips verbatim.
-- **Put Fleet flags before the selector.** Use `fleet exec web -- program --json` or the same separator with `spawn` to keep all following flags in the remote command.
+- **Don't escape commands.** `fleet exec vps 'echo "a & b | c"'` arrives unchanged.
+- **Fleet flags go before the selector or directly after it.** `fleet exec --cwd /srv web ls` and `fleet exec web --cwd /srv ls` do the same thing. A fleet flag at the end of the command, or one given twice, is refused. Use `fleet exec web -- program --json` (or the same separator with `spawn`) to keep every following token in the remote command. An unquoted `--cwd ~/x` that the local shell expanded to this machine's home is sent as `~/x`.
+- **Never wrap a Windows program in `powershell -Command "…"`.** `fleet exec` already runs PowerShell. The outer session expands `$variables` inside the double quotes first, so the error (`The term '=' is not recognized`) does not mention quoting. Fleet prints a note when it sees the wrapper, and the same for `wsl bash -c "…"`: use `fleet exec --wsl <host> '…'`.
 - **Command syntax is the target's native shell**: bash for Linux hosts, **PowerShell**
   for Windows hosts. So `fleet exec all "uptime"` works on Linux but fails on Windows
   (no native `uptime`). For cross-OS, pick portable commands or scope by group
   (`fleet exec @linux ...`).
-- `restart`/`logs` need a service **defined in config** — run `fleet ls` to see each
-  host's known services. Unknown name → it prints the valid ones.
-- `fleet top` is a foreground live loop — only run it interactively, never to capture
-  one-shot output (use `fleet status <host>` for that).
-- A non-zero exit on any host makes `exec`/`cp` exit non-zero (good for scripting).
+- `restart` and `logs` need a service defined in config. Run `fleet ls` to see each
+  host's services; an unknown name prints the valid ones.
+- `fleet top` is a live foreground loop. Run it only interactively; use
+  `fleet status <host>` for one-shot output.
+- A non-zero exit on any host makes `exec` and `cp` exit non-zero.
 - **Use `--script` for stdin programs and quote-heavy PowerShell.** Fleet accepts a supported shebang or an explicit `--interp`. It rejects untyped stdin.
 - **Use real newlines with `fleet edit`.** The CLI preserves argument bytes and does not translate the characters `\\n`. A leading `~` in Unix edit paths expands safely. Type `\n` newlines even for a Windows CRLF file; fleet converts them to the file's style.
 - **Several changes to one file? One `fleet edit --edits -` call.** Pipe a JSON array such as `[{"old":"a","new":"b"},{"old":"x","new":"y","all":true}]`. Edits apply in order, and if any edit misses, the file is left unchanged. MCP: the `edits` array on `fleet_edit`.
@@ -115,34 +116,33 @@ Anywhere `<sel>` appears: a hostname, logical route, group, `all`, Daytona
 
 ## Detached jobs (`fleet spawn` / `fleet jobs`)
 
-`exec` is **foreground** (blocks, returns the exit code). `spawn` is **fire-and-track**:
-it launches a job that *outlives the SSH session* and hands back a `host:id`. Use `spawn`
-for anything long-running (training runs, builds, 8h jobs) — never hold an `exec` /
-harness-backgrounded SSH session open for it.
+`exec` blocks and returns the exit code. `spawn` launches a job that outlives the SSH
+session and returns a `host:id`. Use `spawn` for long work (training runs, builds, 8 h
+jobs) instead of holding an `exec` or a backgrounded SSH session open.
 
-- **State lives on the host, not the controller**: a per-host spool `~/.fleet/jobs/<id>/`
-  (`cmd`, `cwd`, `pid`, `out`, `exit`). Every `jobs` verb is a thin read over the same
-  quoting-proof `exec`. Jobs are addressed as **`host:id`** (e.g. `gpu-box:mqtn19dk-96px`).
+- **State lives on the host.** Each host keeps a spool at `~/.fleet/jobs/<id>/` (`cmd`,
+  `cwd`, `pid`, `out`, `exit`), and every `jobs` verb reads it through the same `exec`.
+  Jobs are addressed as `host:id` (for example `gpu-box:mqtn19dk-96px`).
 - **Linux** uses `setsid`, **macOS** uses `nohup`, and **Windows** uses an interactive Scheduled Task.
 - Linux runners carry an ownership marker. The marker keeps a live job visible when its child process changes the runner command line.
 - `jobs wait` retries brief SSH failures and spool-visibility delays. Three consecutive failures stop the waiter with the underlying error.
-- `wait --until '<regex>'` returns as soon as output matches (e.g. detect an autotune /
-  "Recovered.*1/1" marker) — beats `sleep`-and-hope. Plain `wait` blocks until exit and
-  propagates the job's code, so `fleet jobs wait gpu-box:<id> && deploy` works.
-- Typical flow: `fleet spawn --cwd /srv/app gpu-box "./train.sh"` → `fleet jobs` to find it
-  → `fleet jobs tail gpu-box:<id> -f` or `fleet jobs wait gpu-box:<id> --until '<rx>'` →
+- `wait --until '<regex>'` returns as soon as the output matches (for example a
+  "Recovered.*1/1" marker). Plain `wait` blocks until exit and returns the job's code,
+  so `fleet jobs wait gpu-box:<id> && deploy` works.
+- A typical flow: `fleet spawn --cwd /srv/app gpu-box "./train.sh"`, then `fleet jobs`,
+  then `fleet jobs tail gpu-box:<id> -f` or `fleet jobs wait gpu-box:<id> --until '<rx>'`, then
   `fleet jobs prune` when done. MCP exposes bounded job waits and inspection; live tailing stays CLI-only.
 
 ## Exec behavior you can rely on
 
-- **Exit codes are real on Windows.** A PowerShell program stops at its first terminating
+- **Windows exit codes are accurate.** A PowerShell program stops at its first terminating
   error (`throw`, a cmdlet under `-ErrorAction Stop`) and exits 1; a failing native command
   as the last statement reports its own code (`cmd /c exit 3` → 3). `exit N` above 1
   reports N through the kept-open session (below); only the one-shot fallback collapses it to 1.
-- **Unicode survives both ways** on Windows: the program is shipped base64-encoded and
-  output is UTF-8. Detached Windows jobs get `PYTHONUTF8=1`, so Python tools that print
-  ✓ or emoji no longer die with a cp1252 codec error.
-- **A remote command that runs ssh/scp itself, or leaves `cmd &` behind, no longer hangs**
+- **Unicode survives both ways on Windows.** The program travels base64-encoded and the
+  output is UTF-8. Detached Windows jobs get `PYTHONUTF8=1`, so a Python tool that prints
+  ✓ or emoji does not fail with a cp1252 codec error.
+- **A remote command that runs ssh or scp itself, or leaves `cmd &` behind, does not hang**
   `fleet exec`. The script reports its own completion; fleet waits `FLEET_DONE_GRACE_MS`
   (default 1500) for output to drain, then returns with the reported exit code.
 - **Windows exec reuses a kept-open pwsh.** After the first call to a Windows host, a
@@ -167,10 +167,10 @@ harness-backgrounded SSH session open for it.
 - **Formatted objects print normally on Windows.** `Select-Object`/`Format-Table` output
   used to arrive after the completion marker and be reported as lost; each program now
   flushes its own formatter.
-- **Commands that read stdin get an empty one.** Scripts arrive over stdin, so a
-  command that reads stdin used to swallow the rest of the script. Now it sees EOF.
-- **Output is plain text when piped** (no ANSI); `FORCE_COLOR=1` restores colour, and
-  `| head` no longer crashes fleet with a stack trace.
+- **Commands that read stdin see EOF.** Scripts arrive over stdin, and fleet keeps a
+  command that reads stdin from swallowing the rest of the script.
+- **Output is plain text when piped**, with no ANSI codes. `FORCE_COLOR=1` restores
+  colour, and `| head` exits cleanly.
 
 ## Dual-boot machines
 
@@ -197,10 +197,10 @@ checks keys strictly under that name and cannot reach the wrong OS.
 
 ## Computer use (`fleet cu`)
 
-`fleet cu <host> …` drives a host's desktop through **cua-driver** (trycua/cua) — a
-self-contained binary that runs a background `serve` daemon in the interactive session
-and exposes computer-use tools. Same interactive-desktop requirement as `fleet shot`
-(a Windows box needs a real or virtual display + a logged-in session).
+`fleet cu <host> …` drives a host's desktop through cua-driver (trycua/cua), a
+self-contained binary that runs a `serve` daemon in the interactive session and exposes
+computer-use tools. Like `fleet shot`, it needs a logged-in desktop; a Windows machine
+also needs a real or virtual display.
 
 - **Install or update:** `fleet cu <selector> install` runs each host's official
   current-release installer. Windows registers the `cua-driver-serve` autostart task
@@ -286,15 +286,15 @@ and exposes computer-use tools. Same interactive-desktop requirement as `fleet s
     under AGPL-3.0; a `not_installed` reply never justifies installing it without the
     user's go-ahead.
   - MCP: `fleet_cu_regions`, and `fleet_cu_act` with `region: {text | at: {x, y}, kind?, nth?}`.
-- **Convenience verbs** (resolve the pid/window_id loop for you):
-  - `fleet cu <host> apps [name]` — compact `pid  name` table (optional name filter).
-  - `fleet cu <host> windows [target]` — every top-level window, or one process's
-    windows with the one Fleet targets marked and anything **above** it flagged.
-  - `fleet cu <host> shot-window <target> [--out f.png] [--grid] [--probe X,Y]` —
-    resolve target + window + capture in one call (auto-opens on Mac).
-- **Verified input** — `click`, `key`, `type`, and generic `act` resolve the target,
-  send an explicit `window_id`, and report what the window's pixels **actually did**:
-  - `fleet cu win-box click firefox 166 447` → `● changed` / `○ no_change` / `? indeterminate`
+- **Lookup verbs** resolve the pid and window_id for you:
+  - `fleet cu <host> apps [name]` prints a `pid  name` table, optionally filtered by name.
+  - `fleet cu <host> windows [target]` lists every top-level window, or one process's
+    windows with the one Fleet targets marked and any window above it flagged.
+  - `fleet cu <host> shot-window <target> [--out f.png] [--grid] [--probe X,Y]` resolves
+    the target and window and captures it in one call (and opens the image on a Mac).
+- **Verified input.** `click`, `key`, `type` and `act` resolve the target, send an
+  explicit `window_id`, and report what the window's pixels did:
+  - `fleet cu win-box click firefox 166 447` prints `● changed`, `○ no_change` or `? indeterminate`.
   - A refused or undelivered action prints `✗ refused (<effect>)` and exits 1.
   - `fleet cu win-box key firefox escape` · `fleet cu win-box type firefox "hello"`
   - `fleet cu win-box act firefox <tool> '{…}'` for any other input tool
@@ -305,38 +305,37 @@ and exposes computer-use tools. Same interactive-desktop requirement as `fleet s
   missing requested images return failure. A title match selects that window,
   including dialogs. `act` JSON must omit `pid` and `window_id`; Fleet supplies
   them and validates `x,y`.
-- **Traps that cost whole sessions.** The verbs above handle each one; they still bite
-  raw passthrough:
+- **Raw passthrough traps.** The verbs above handle each of these; raw calls do not:
   1. **Omitting `window_id` does not mean "the main window".** cua-driver targets the
-     process's **frontmost** window instead — the modal dialog whenever one is open — so
-     window-local coordinates get anchored to the dialog's frame and the click lands
+     process's frontmost window instead, which is the modal dialog whenever one is open.
+     Window-local coordinates then anchor to the dialog's frame, and the click lands
      somewhere unrelated, often in another application. With no `pid` either, `x,y` are
      desktop coordinates. Always send both.
   2. **`shot-window` alone can hide a blocker.** A window with a modal over it captures
-     completely normally, and `windows <target>` reporting one window does not prove
-     nothing else is up. Fleet composites owned popups onto the capture and prints
-     `BLOCKED? …` naming them. For anything it cannot see — another app's overlay, a
-     system dialog — verify with a full `fleet shot <host>`, not `shot-window`.
+     normally, and `windows <target>` reporting one window does not prove nothing else is
+     up. Fleet composites owned popups onto the capture and prints `BLOCKED? …` naming
+     them. For what it cannot see, such as another app's overlay or a system dialog,
+     verify with a full `fleet shot <host>`.
   3. **`effect: "unverifiable"` is not a result.** cua-driver returns it for successful
-     input, for input that silently no-ops, and for hotkeys alike. Infer nothing from it;
-     read Fleet's `changed` / `no_change` verdict instead.
+     input, for input that does nothing, and for hotkeys. Infer nothing from it; read
+     Fleet's `changed` or `no_change` verdict instead.
   4. **On Windows, `window_id` is a real HWND you cannot use over ssh.** Window handles
      are per-session, and the ssh shell runs in session 0 while the desktop is session 1,
-     so `IsWindow()` from `fleet exec` returns false on a perfectly valid handle. Drive
+     so `IsWindow()` from `fleet exec` returns false on a valid handle. Drive
      the window through cua-driver, or run user32 calls inside the interactive session.
-  5. **Launching a GUI app over ssh puts it in session 0, with no window.** cua-driver
-     will never see it. Relaunch it in the interactive session — on Windows,
-     `schtasks /create /sc once /ru <user> /it /rl LIMITED …` then `schtasks /run`.
-     `/rl LIMITED` is not optional: without it the app runs elevated, which makes some
-     apps throw a modal that blocks all input, and anything it launches inherits admin.
-- **Coordinates survive only until the next capture of the same pid.** cua-driver stores
-  its downscale ratio per **pid**, not per window, and rescales every incoming `x,y` by
+  5. **A GUI app launched over ssh runs in session 0, with no window.** cua-driver never
+     sees it. Relaunch it in the interactive session; on Windows, run
+     `schtasks /create /sc once /ru <user> /it /rl LIMITED …` and then `schtasks /run`.
+     Keep `/rl LIMITED`. Without it the app runs elevated, some apps open a modal that
+     blocks all input, and anything it launches inherits admin rights.
+- **Coordinates hold only until the next capture of the same pid.** cua-driver stores
+  its downscale ratio per pid, not per window, and rescales every incoming `x,y` by
   whatever the last capture set. Read coordinates off the most recent capture of the
   window you are clicking. The verbs capture immediately before acting; a hand-rolled
   sequence of raw `cu` calls does not.
 - **Empty accessibility trees.** `get_window_state` on a WPF/canvas/custom-drawn window
-  returns `degraded: true`, `element_count: 0` — and still ships its whole envelope,
-  megabytes of it. Fleet collapses that to the diagnostic plus "use pixels"; `--full`
+  returns `degraded: true` and `element_count: 0`, and still ships its whole envelope,
+  which can be megabytes. Fleet collapses that to the diagnostic plus "use pixels"; `--full`
   restores the raw body. `element_index` cannot resolve at all on such a window, so the
   tool's own "prefer element_index" advice does not apply:
   `fleet cu <host> describe click --brief --for <target>` probes the real window and says
@@ -354,8 +353,8 @@ and exposes computer-use tools. Same interactive-desktop requirement as `fleet s
   stdout, so a capture costs one round trip. Measured on a Windows host: a verified click
   went from ~4.6 s to ~2.9 s, and `shot-window` on a window with owned popups from ~10 s
   to ~3.8 s.
-- **Driver traps worth knowing before raw calls:**
-  - `move_cursor` with `scope:"desktop"` moves the user's REAL mouse pointer. Only
+- **Driver traps for raw calls:**
+  - `move_cursor` with `scope:"desktop"` moves the user's real mouse pointer. Only
     `scope:"window"` (with `pid` and `window_id`) moves the agent overlay cursor.
   - The agent overlay moves only toward a screen point; accessibility input has none.
     Its default motion makes short glides loop; straight lines need `arc_size:0`,
@@ -398,7 +397,7 @@ desktop ones; `fleet help cu` lists them.
   says what it picked. `gesture <TARGET> X1,Y1,X2,Y2 …` sends 1-5 fingers, one straight
   stroke each. Batch takes `swipe2` and `gesture` steps.
 - **Watch, record, notifications:** `watch [--view-only]` opens a live scrcpy window
-  here; `record start [--out F.mp4]` / `record stop` writes an MP4 here;
+  here; `record start [--out F.mp4]` and `record stop` write an MP4 here;
   `notifications [pkg]` lists the shade (private: read it only when asked).
 - **SSH to Termux down?** `revive` opens Termux through this machine's adb so its shell
   setup starts sshd; `--restart` force-stops Termux first.
@@ -410,7 +409,7 @@ desktop ones; `fleet help cu` lists them.
 - **After a reboot** every call says adbd is not listening. Ask the user to turn on
   Wireless debugging (it needs Wi-Fi), then run `fleet cu <phone> bootstrap`.
 - **Slow links:** over a relayed mobile connection prefer `elements` and
-  `shot --width 400`; a full screenshot can take 15–25 s.
+  `shot --width 400`; a full screenshot can take 15 to 25 s.
 - **It is a person's phone.** Check `state` first. Send messages, post, pay, or change
   settings only when asked, and verify each step by label: confirm the chat header
   before typing, the field's read-back and the Send button before sending, and the new
@@ -529,47 +528,45 @@ Codex's native computer-use API, over Fleet's remote transport.
 ### Raw examples and operational contracts
 
 - **Raw passthrough:** `fleet cu <host> <cua-driver args…>` for anything else:
-  - `fleet cu win-box list-tools` — every tool + description (authoritative per version).
+  - `fleet cu win-box list-tools` lists every tool with its description for the installed version.
   - `fleet cu win-box get_screen_size` / `list_apps` / `list_windows '{"pid":3848}'`
   - `fleet cu win-box get_window_state '{"pid":3848,"window_id":66756,"include_accessibility_tree":false}' --out win.png`
   - `fleet cu win-box click '{"pid":3848,"window_id":66756,"x":100,"y":200}'`
   - `fleet cu win-box type_text '{"text":"hello"}'` · `press_key` · `scroll` · `move_cursor`
   - `fleet cu win-box hotkey '{"pid":3848,"window_id":66756,"keys":["alt","f4"]}'` (close window)
   - `fleet cu win-box kill_app '{"pid":3848}'` (quit an app entirely)
-- **Manual loop** (what the verbs automate): `list_apps` → `list_windows {pid}` →
-  `get_window_state {pid,window_id}` (perceive; `--out` pulls the window PNG) →
-  `click`/`type_text` (act). Coords are **window-local** screenshot pixels, not global.
-- An image is pulled back **only when `--out` is passed** (or via the `shot-window` verb);
-  if a call errors, cua-driver's own message is surfaced (e.g. "Missing window_id — use
-  list_windows"), not a misleading scp error.
+- **The manual loop the verbs automate:** `list_apps`, then `list_windows {pid}`, then
+  `get_window_state {pid,window_id}` (`--out` pulls the window PNG), then `click` or
+  `type_text`. Coordinates are window-local screenshot pixels.
+- An image comes back only with `--out` or the `shot-window` verb. When a call fails,
+  fleet shows cua-driver's own message (such as "Missing window_id"), not an scp error.
 - `shot-window` reads the desktop snapshot, captures the selected windows, then
   transfers and cleans up images. Raw `click {JSON}` bypasses Fleet target
   resolution, coordinate checks, and effect verification.
-- **`--grid` [--grid-step N]** overlays a labeled pixel-coordinate grid (default 100px) on
-  any capture (`shot`, `cu --out`, `shot-window`) — read off x,y before a click, since cua
-  coords are **window-local pixels**. On `shot-window` the image also carries a caption
+- **`--grid` [--grid-step N]** overlays a labeled pixel-coordinate grid (default 100 px) on
+  any capture (`shot`, `cu --out`, `shot-window`). Read x,y off it before a click; cua
+  coordinates are window-local pixels. On `shot-window` the image also carries a caption
   strip stating the exact frame (`pid`, `window_id`, origin, and the capture's own size),
   a red banner when something owns a window above the target, minor ticks every 25px for
   small toolbar icons, `x,y` labels at interior crossings, and line/label colours picked
   per segment from the underlying luminance so saturated artwork stays readable.
-  Needs python3 + Pillow locally (best-effort).
+  It needs python3 and Pillow locally, and is skipped without them.
 - **`--probe X,Y`** draws a crosshair where a click at those coordinates would land,
-  resolved through the same conversion the click path uses — aim verification without
-  clicking. **`--space window|screen`** says which frame `X,Y` are in; a point that
-  resolves outside the target window is refused rather than delivered to whatever is
-  underneath it there.
-- **JSON args:** pass the JSON as one arg; fleet pipes it via **stdin** (Windows
-  PowerShell 5.1 strips quotes around JSON field names on native-command args — piping
-  preserves them). `get_window_state` needs `window_id` (from `list_windows`); its image
+  using the same conversion as the click path, without clicking. **`--space window|screen`**
+  says which frame `X,Y` are in. A point outside the target window is refused, not
+  delivered to whatever lies beneath it.
+- **JSON arguments.** Pass the JSON as one argument; fleet pipes it on stdin, because
+  Windows PowerShell 5.1 strips the quotes around JSON field names in native-command
+  arguments. `get_window_state` needs `window_id` (from `list_windows`); its image
   is base64 inside the JSON. Fleet's `--out` sets cua-driver's `screenshot_out_file`
   JSON field and pulls the resulting image locally.
 - Exposed as MCP tool `fleet_cu` (`{host, args[], image?}`; returns the PNG when `image:true`).
 
 ## MCP server
 
-fleet is also a stdio **MCP server** (`src/mcp.ts`, bin `fleet-mcp`) — same config, exec,
-selectors, and recipes, exposed as tools. Use it when an MCP client/agent should drive the
-fleet as tools instead of shelling out to the CLI. Register with Claude Code:
+fleet is also a stdio MCP server (`src/mcp.ts`, bin `fleet-mcp`) with the same config,
+exec, selectors and recipes, exposed as tools. Use it when an MCP client should call
+tools instead of the CLI. Register with Claude Code:
 
 ```sh
 claude mcp add fleet -- bun run /path/to/fleet/src/mcp.ts
@@ -580,7 +577,7 @@ Run standalone with `bun run mcp` (honours `FLEET_CONFIG`); smoke-test end-to-en
 
 | Tool | Args | CLI equivalent |
 |---|---|---|
-| `fleet_ls` | — | `fleet ls` |
+| `fleet_ls` | none | `fleet ls` |
 | `fleet_exec` | `selector`, `command`, `wsl?` | `fleet exec` |
 | `fleet_cp` | `local`, `selector`, `remote` | `fleet cp` |
 | `fleet_screenshot` | `host` | `fleet shot` (returns the PNG as an image) |
@@ -588,21 +585,21 @@ Run standalone with `bun run mcp` (honours `FLEET_CONFIG`); smoke-test end-to-en
 | `fleet_cu_act` | `host`, `app`, `tool`, `x?`, `y?`, `space?` | verified input; returns `changed` / `no_change` / `indeterminate` |
 | `fleet_restart` | `host`, `service` | `fleet restart` |
 | `fleet_logs` | `host`, `service`, `lines?` | `fleet logs` |
-| `fleet_gpu` | — | `fleet gpu` |
+| `fleet_gpu` | none | `fleet gpu` |
 | `fleet_disk` | `selector?` | `fleet disk [selector]` |
 | `fleet_status` | `host?` | `fleet status` |
 | `fleet_bios` | `selector` | `fleet bios <selector> --yes` |
 | `fleet_run` | `recipe` | `fleet run` |
 
-- `top`, `ssh`, and live `jobs tail -f` remain CLI-only. Detached jobs and bounded waits are available over MCP.
-- Same rules as the CLI: pass `command` verbatim (don't escape), syntax is the target's
-  native shell, and `restart`/`logs` services must be config-defined.
+- `top`, `ssh` and live `jobs tail -f` are CLI only. Detached jobs and bounded waits are available over MCP.
+- The CLI rules apply: pass `command` unescaped, write it in the target's shell, and
+  name only services defined in config for `restart` and `logs`.
 - `fleet_restart` and `fleet_bios` are annotated `destructive`; `ls`/`logs`/`gpu`/`disk`/`status` are
   `readOnly` where they only inspect state. Screenshot and computer-use tools execute on hosts and are hidden in read-only mode.
-  Host, group, and recipe names are baked into the tool descriptions, so an agent sees
-  valid selectors without a round-trip.
-- The CLI (`cli.ts`) and MCP server (`mcp.ts`) are both thin frontends over `src/core.ts`
-  — one source of truth for the quoting-proof exec.
+  Host, group and recipe names are written into the tool descriptions, so an agent sees
+  valid selectors without a round trip.
+- The CLI (`cli.ts`) and the MCP server (`mcp.ts`) both call `src/core.ts`, so the exec
+  path lives in one place.
 
 **Remote endpoint:** fleet can also be deployed as a public HTTP MCP server (Streamable
 HTTP at `/mcp`; legacy `/sse` returns 410) for remote clients. It runs on one host as a service
@@ -640,7 +637,7 @@ Config lives under a top-level `proxies` map plus `"proxy": "<name>"` on a host 
   (chmod 600).
 - **Daytona (`dt:`) hosts are HTTP, not ssh**, so a proxy configured for one is ignored.
 
-## Config & extending
+## Config and extending
 
 Hosts, logical routes, groups, and recipes live in `fleet.config.json` (override path
 with `FLEET_CONFIG`; copy `fleet.config.example.json` to start). A host has `ssh`, `os`,
@@ -648,7 +645,7 @@ optional `gpu`, `wsl`, `winShell`, `proxy`, and a `services` map; each service `
 (`systemd` / `systemd-user` / `winservice` / `schtask`) decides how restart/logs run.
 A route has an ordered `prefer` list of same-OS host entries.
 
-## When NOT to use
+## When not to use fleet
 
 For one-off work on the local machine, or hosts not in `fleet.config.json`, use plain
 `ssh`/shell. `fleet` is for the configured fleet.

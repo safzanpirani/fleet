@@ -10,12 +10,12 @@
  */
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import type { FleetConfig } from "./config.ts";
+import { resolveHosts, type FleetConfig } from "./config.ts";
 import type { ExecResult } from "./ssh.ts";
 import { focusElements } from "./focus.ts";
 import { formatIdle, sessionStates } from "./session.ts";
 import {
-  lsHosts, runExec, runScript, rebootRefusal, readScriptSource, editRemoteFile, pushFile, pullFile, restartService, serviceLogs,
+  lsHosts, runExec, runScript, rebootRefusal, nestedShellNote, readScriptSource, editRemoteFile, pushFile, pullFile, restartService, serviceLogs,
   gpuRows, diskRows, hostStatus, runRecipe, captureScreenshot, overlayGrid, cuRun,
   cuInstall, cuTools, cuDescribe, cuRecordStart, cuRecordStop, cuRecordStatus,
   cuApps, cuShotWindow, browseHost, deployHosts, diagnose,
@@ -541,9 +541,11 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
   }, async ({ selector, command, wsl, cwd, timeout, sudo, confirmReboot, fresh }) => {
     const refusal = confirmReboot ? null : rebootRefusal(command, "confirmReboot: true");
     if (refusal) return text(refusal, true);
-    const results = await runExec(cfg, await routeSelector(cfg, selector), command,
+    const target = await routeSelector(cfg, selector);
+    const nested = nestedShellNote(command, resolveHosts(cfg, target), wsl);
+    const results = await runExec(cfg, target, command,
       { wsl, cwd, sudo, fresh, timeoutMs: timeout ? timeout * 1000 : undefined });
-    return text(renderExec(results), results.some((r) => !r.ok));
+    return text((nested ? nested + "\n" : "") + renderExec(results), results.some((r) => !r.ok));
   });
 
   server.registerTool("fleet_drop", {
@@ -623,9 +625,10 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       sudo: z.boolean().optional().describe("Run as root (POSIX only). Passwordless sudo is used when it works; otherwise the password comes from the host's sudo.passwordFile/passwordEnv, sent over ssh stdin."),
       confirmReboot: z.boolean().optional().describe("Required when the command looks like a reboot or power-off. Prefer fleet_switch or fleet_reboot."),
       fresh: z.boolean().optional().describe("Open a new ssh login instead of reusing a shared connection (and skip the kept-open Windows session), e.g. after a group change such as usermod -aG docker."),
+      args: z.array(z.string()).optional().describe("Positional arguments for the script: $1… in shells, $args or param() in PowerShell, argv elsewhere."),
     },
     annotations: { openWorldHint: true },
-  }, async ({ selector, path, source, ext, interp, cwd, wsl, timeoutSeconds, sudo, confirmReboot, fresh }) => {
+  }, async ({ selector, path, source, ext, interp, cwd, wsl, timeoutSeconds, sudo, confirmReboot, fresh, args }) => {
     if (!path && source === undefined) return text("give either `path` or `source`", true);
     if (path && source !== undefined) return text("give `path` or `source`, not both", true);
     try {
@@ -638,7 +641,7 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       const refusal = confirmReboot ? null : rebootRefusal(script.source, "confirmReboot: true");
       if (refusal) return text(refusal, true);
       const results = await runScript(cfg, await routeSelector(cfg, selector), script, {
-        wsl, cwd, interp, sudo, fresh, timeoutMs: timeoutSeconds ? timeoutSeconds * 1000 : undefined,
+        wsl, cwd, interp, sudo, fresh, args, timeoutMs: timeoutSeconds ? timeoutSeconds * 1000 : undefined,
       });
       return text(renderExec(results), results.some((r) => !r.ok));
     } catch (e) {
