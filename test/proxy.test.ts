@@ -14,6 +14,7 @@ import {
   argQuote, isCompiledBinary, proxyControlKey, proxyOpts, proxyPassword, proxyReachable, shQuote,
 } from "../src/proxy.ts";
 import { applyProxyFlags } from "../src/cli.ts";
+import { fdpassSupported } from "../src/fdpass.ts";
 
 const socks: ProxySpec = { type: "socks5", host: "192.0.2.10", port: 1080 };
 const cfg: FleetConfig = {
@@ -184,6 +185,7 @@ describe("proxyOpts — the ssh argv", () => {
   test("a proxied host gets a ProxyCommand naming this same fleet", () => {
     const cmd = optVal(proxyOpts(h("viaVpn")), "ProxyCommand=")!;
     expect(cmd).toContain("__proxy-connect");
+    expect(cmd.includes(argQuote("--fdpass"))).toBe(fdpassSupported());
     expect(cmd).toContain(argQuote("vpn"));
     expect(cmd.endsWith(" %h %p")).toBe(true);
   });
@@ -208,6 +210,14 @@ describe("proxyOpts — the ssh argv", () => {
     expect(isCompiledBinary("C:\\Tools\\fleet\\fleet.exe", "B:/~BUN/root/fleet.exe")).toBe(true);
     expect(isCompiledBinary("/Users/x/.bun/bin/bun", "/Users/x/fleet/src/cli.ts")).toBe(false);
     expect(isCompiledBinary("C:\\Users\\x\\.bun\\bin\\bun.exe", "C:\\fleet\\src\\cli.ts")).toBe(false);
+  });
+
+  test("macOS and Linux hand ssh the socket; a Windows controller keeps splicing", () => {
+    expect(fdpassSupported("darwin")).toBe(true);
+    expect(fdpassSupported("linux")).toBe(true);
+    expect(fdpassSupported("win32")).toBe(false);
+    const opts = proxyOpts(h("viaVpn"));
+    expect(opts.includes("ProxyUseFdpass=yes")).toBe(fdpassSupported());
   });
 
   test("daytona hosts get no ProxyCommand", () =>
@@ -317,7 +327,7 @@ describe("proxyPassword", () => {
 
 interface FakeProxy { port: number; requests: { host: string; port: number }[]; close: () => void }
 /** Minimal RFC 1928 server: optional user/pass auth, CONNECT to an echo target. */
-function startSocks5(opts: { user?: string; pass?: string; replyCode?: number; echo?: boolean } = {}): Promise<FakeProxy> {
+function startSocks5(opts: { user?: string; pass?: string; replyCode?: number; echo?: boolean; banner?: string } = {}): Promise<FakeProxy> {
   const requests: { host: string; port: number }[] = [];
   const server = net.createServer((sock) => {
     let stage: "greet" | "auth" | "request" | "tunnel" = "greet";
@@ -360,7 +370,9 @@ function startSocks5(opts: { user?: string; pass?: string; replyCode?: number; e
         requests.push({ host: addr, port: buf.readUInt16BE(start + alen) });
         buf = buf.subarray(start + alen + 2);
         const code = opts.replyCode ?? 0;
-        sock.write(Buffer.concat([Buffer.from([5, code, 0, 1, 0, 0, 0, 0]), Buffer.from([0, 0])]));
+        // A banner rides in the same segment as the reply, as a busy proxy may send it.
+        sock.write(Buffer.concat([Buffer.from([5, code, 0, 1, 0, 0, 0, 0]), Buffer.from([0, 0]),
+          Buffer.from(code === 0 ? opts.banner ?? "" : "")]));
         if (code !== 0) { sock.end(); return; }
         stage = "tunnel";
       }
@@ -513,5 +525,81 @@ describe("inline proxy credentials stay out of argv", () => {
   test("curl config values escape quotes and backslashes", async () => {
     const { curlQuote } = await import("../src/proxy.ts");
     expect(curlQuote('a"b\\c\nd')).toBe('a\\"b\\\\c\\nd');
+  });
+});
+
+// ── ProxyUseFdpass: hand ssh the socket and exit ─────────────────────────────
+
+/** Plays ssh's side of ProxyUseFdpass: a socketpair as the ProxyCommand's
+ *  stdin and stdout, then one descriptor received over it. The received socket
+ *  then reads the banner the proxy packed with its reply and echoes a line. */
+const FDPASS_SSH = String.raw`
+import json, socket, subprocess, sys
+ours, theirs = socket.socketpair()
+child = subprocess.Popen(sys.argv[1:], stdin=theirs, stdout=theirs)
+theirs.close()
+msg, fds, flags, addr = socket.recv_fds(ours, 1, 1)
+out = {"byte": len(msg), "fds": len(fds)}
+if fds:
+    tunnel = socket.socket(fileno=fds[0])
+    tunnel.settimeout(5)
+    banner = b""
+    while not banner.endswith(b"\n"): banner += tunnel.recv(64)
+    tunnel.sendall(b"SSH-2.0-fleet\n")
+    echo = b""
+    while not echo.endswith(b"\n"): echo += tunnel.recv(64)
+    out.update(banner=banner.decode(), echo=echo.decode())
+out["code"] = child.wait(timeout=10)
+print(json.dumps(out))
+`;
+
+describe.skipIf(!fdpassSupported())("__proxy-connect --fdpass", () => {
+  const fleet = [process.execPath, join(import.meta.dir, "..", "src", "cli.ts")];
+
+  test("hands ssh a tunnel with the banner still unread, then exits", async () => {
+    const proxy = await startSocks5({ banner: "SSH-2.0-server\n" });
+    try {
+      const child = Bun.spawn(["python3", "-c", FDPASS_SSH, ...fleet, "__proxy-connect", "--fdpass", "local", "example.test", "22"], {
+        env: { ...process.env, FLEET_CONFIG: writeConfig(proxy.port) }, stdout: "pipe", stderr: "pipe",
+      });
+      const [out, err] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text()]);
+      expect(await child.exited, err).toBe(0);
+      expect(JSON.parse(out)).toEqual({ byte: 1, fds: 1, banner: "SSH-2.0-server\n", echo: "SSH-2.0-fleet\n", code: 0 });
+      expect(proxy.requests[0]).toEqual({ host: "example.test", port: 22 });
+    } finally { proxy.close(); }
+  });
+
+  // A child process, not proxyHandOff in this one: the handshake blocks in
+  // poll(), which would starve the fake proxy sharing this event loop.
+  test("a failed handshake keeps its exit code and sends nothing", async () => {
+    const run = async (port: number) => {
+      const child = Bun.spawn(["python3", "-c", FDPASS_SSH, ...fleet, "__proxy-connect", "--fdpass", "local", "example.test", "22"], {
+        env: { ...process.env, FLEET_CONFIG: writeConfig(port) }, stdout: "pipe", stderr: "pipe",
+      });
+      const [out, err] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text()]);
+      return { ...JSON.parse(out), err };
+    };
+    const refusing = await startSocks5({ replyCode: 5 });
+    try {
+      const refused = await run(refusing.port);
+      expect(refused).toMatchObject({ fds: 0, code: PROXY_EXIT.refused });
+      expect(refused.err).toContain("the destination refused the connection");
+    } finally { refusing.close(); }
+    expect(await run(1)).toMatchObject({ fds: 0, code: PROXY_EXIT.unreachable });
+  });
+
+  test("run without ProxyUseFdpass, it says what is missing", async () => {
+    const proxy = await startSocks5();
+    try {
+      // A file, not "pipe": Bun's subprocess pipes are socketpairs, which
+      // would accept the descriptor.
+      const child = Bun.spawn([...fleet, "__proxy-connect", "--fdpass", "local", "example.test", "22"], {
+        env: { ...process.env, FLEET_CONFIG: writeConfig(proxy.port) },
+        stdin: "ignore", stdout: Bun.file(join(cfgDir!, "stdout")), stderr: "pipe",
+      });
+      const err = await new Response(child.stderr).text();
+      expect(await child.exited).toBe(PROXY_EXIT.protocol);
+      expect(err).toContain("needs ssh -o ProxyUseFdpass=yes");
+    } finally { proxy.close(); }
   });
 });

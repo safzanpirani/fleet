@@ -379,3 +379,36 @@ describe("probe deadline cleanup", () => {
     }
   });
 });
+
+describe("ssh children see the environment as fleet left it", () => {
+  // Bun.spawn hands a child the environment fleet started with. argvRef sets
+  // an inline proxy URL's password in process.env later, for the ProxyCommand
+  // ssh runs, so a spawn without env: sshEnv() leaves that command without it.
+  test("an inline proxy password reaches the ssh exec spawns", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "fleet-ssh-env-"));
+    try {
+      const fakeSsh = join(dir, "ssh");
+      writeFileSync(fakeSsh, `#!/bin/sh\nenv | grep '^FLEET_PROXY_PW_' | cut -d= -f2\n`);
+      chmodSync(fakeSsh, 0o755);
+      const snippet = `
+        import { exec } from "${import.meta.dir}/../src/ssh.ts";
+        process.env.FLEET_PROXY_OVERRIDE = "socks5h://alice:s3cr%40t@127.0.0.1:1";
+        const host = { name: "h", ssh: "h", os: "linux" };
+        const run = await exec(host, "true");
+        console.log(JSON.stringify({ exec: run.stdout.trim() }));
+      `;
+      const proc = Bun.spawn(["bun", "-e", snippet], {
+        env: { ...process.env, PATH: dir + delimiter + (process.env.PATH ?? ""), FLEET_NO_SSH_MUX: "1" },
+        stdout: "pipe", stderr: "pipe",
+      });
+      const [stdout, stderr, code] = await Promise.all([
+        new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited,
+      ]);
+      expect(code, stderr).toBe(0);
+      const out = JSON.parse(stdout);
+      expect(out.exec).toBe("s3cr@t");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

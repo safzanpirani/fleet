@@ -61,6 +61,12 @@ export function muxOpts(host: Host): string[] {
     "-o", `ControlPersist=${muxPersist()}`];
 }
 
+/** The environment for any ssh, scp or rsync that may run fleet's
+ *  ProxyCommand. Bun.spawn hands a child the environment fleet started with
+ *  and ignores later process.env changes, and argvRef publishes an inline
+ *  proxy URL's password in process.env for that ProxyCommand. Pass it. */
+export const sshEnv = (): Record<string, string | undefined> => process.env;
+
 /** Every connection option fleet adds to an ssh/scp argv, in one place: the
  *  route first, then the host key identity, then the control socket that
  *  belongs to that route. */
@@ -239,7 +245,7 @@ async function resolveWinBin(host: Host, timeoutMs = 0): Promise<WinBin> {
     const inner = `if (Get-Command pwsh -EA SilentlyContinue) { 'pwsh' } else { 'powershell' }`;
     const proc = Bun.spawn(["ssh", ...connOpts(host), "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", host.ssh,
       "powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand", b64utf16le(inner)],
-      { stdout: "pipe", stderr: "ignore" });
+      { stdout: "pipe", stderr: "ignore", env: sshEnv() });
     let timedOut = false;
     const timer = timeoutMs > 0
       ? setTimeout(() => { timedOut = true; proc.kill("SIGKILL"); }, timeoutMs)
@@ -360,6 +366,7 @@ export async function exec(
     stdin: stdin ?? "ignore",
     stdout: "pipe",
     stderr: "pipe",
+    env: sshEnv(),
   });
   // Both streams are read incrementally. An ssh multiplexing client hands its
   // stdio to the control master, so killing the client does not close these
@@ -435,7 +442,7 @@ export async function probeDetail(host: Host, capMs?: number): Promise<ProbeResu
   }
   const connectTimeout = Math.max(1, Math.ceil(cap / 1000));
   const proc = Bun.spawn(["ssh", ...connOpts(host), "-o", "BatchMode=yes", "-o", `ConnectTimeout=${connectTimeout}`,
-    host.ssh, "echo ok"], { stdin: "ignore", stdout: "pipe", stderr: "ignore" });
+    host.ssh, "echo ok"], { stdin: "ignore", stdout: "pipe", stderr: "ignore", env: sshEnv() });
   const ran = (async () => {
     const [out, code] = await Promise.all([
       new Response(proc.stdout).text(),
@@ -467,7 +474,7 @@ export async function probe(host: Host, capMs?: number): Promise<boolean> {
 export function execStream(host: Host, command: string): Promise<number> {
   const proc = Bun.spawn(["ssh", "-tt", ...connOpts(host), "-o", "BatchMode=yes", "-o", "ConnectTimeout=15",
     host.ssh, "bash", "-lc", `'${bashEsc(command)}'`],
-    { stdin: "inherit", stdout: "inherit", stderr: "inherit" });
+    { stdin: "inherit", stdout: "inherit", stderr: "inherit", env: sshEnv() });
   return proc.exited;
 }
 
@@ -480,7 +487,7 @@ export async function sshDiagnose(host: Host, timeoutS = 8): Promise<{ ok: boole
   // Override config-defined masters too: doctor must test a fresh connection.
   const proc = Bun.spawn(["ssh", "-vv", ...freshConnOpts(host),
     "-o", "BatchMode=yes", "-o", `ConnectTimeout=${Math.max(1, Math.ceil(timeoutS))}`,
-    host.ssh, "echo fleet-ok"], { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+    host.ssh, "echo fleet-ok"], { stdin: "ignore", stdout: "pipe", stderr: "pipe", env: sshEnv() });
   const readers = [proc.stdout.getReader(), proc.stderr.getReader()];
   const read = async (reader: (typeof readers)[number]) => {
     const decoder = new TextDecoder();
@@ -524,14 +531,14 @@ export async function sshDiagnose(host: Host, timeoutS = 8): Promise<{ ok: boole
 export function execStreamWin(host: Host, psCommand: string): Promise<number> {
   const proc = Bun.spawn(["ssh", "-tt", ...connOpts(host), "-o", "BatchMode=yes", "-o", "ConnectTimeout=15",
     host.ssh, "powershell", "-NoProfile", "-NonInteractive", "-Command", psCommand],
-    { stdin: "inherit", stdout: "inherit", stderr: "inherit" });
+    { stdin: "inherit", stdout: "inherit", stderr: "inherit", env: sshEnv() });
   return proc.exited;
 }
 
 /** Interactive ssh with inherited stdio (for `fleet ssh <host>`). */
 export function sshInteractive(host: Host): Promise<number> {
   const proc = Bun.spawn(["ssh", ...connOpts(host), host.ssh], {
-    stdin: "inherit", stdout: "inherit", stderr: "inherit",
+    stdin: "inherit", stdout: "inherit", stderr: "inherit", env: sshEnv(),
   });
   return proc.exited;
 }
@@ -545,7 +552,7 @@ export interface TransferOptions {
 
 async function runCopier(host: Host, argv: string[], progress?: boolean): Promise<ExecResult> {
   // scp and rsync draw their meters on stdout, and only when it is a terminal.
-  const proc = Bun.spawn(argv, { stdout: progress ? "inherit" : "pipe", stderr: "pipe" });
+  const proc = Bun.spawn(argv, { stdout: progress ? "inherit" : "pipe", stderr: "pipe", env: sshEnv() });
   const [stdout, stderr, code] = await Promise.all([
     proc.stdout ? new Response(proc.stdout).text() : "",
     new Response(proc.stderr).text(),

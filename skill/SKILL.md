@@ -39,7 +39,7 @@ fleet exec win-box "nvidia-smi"
 | `fleet cp [-r] [--resume] <local> <sel>:<remote>` | Copy a file to host(s); fan-out across a group. `--resume` copies with rsync `--partial`, so rerunning after a drop continues the partial file (POSIX hosts only). A single-host copy on a terminal shows a progress meter. |
 | `fleet edit <sel>:<path> --old S --new S` | Edit a remote file in place, reject ambiguous matches, and print the diff. `--old-file`/`--new-file <file or ->` read multi-line text from a file or stdin; fleet never unescapes `\n`. `--edits <file or ->` applies a JSON array of `{"old","new","all"}` to one file: one read, one write, nothing written if any edit fails. In a file that is CRLF (or LF) throughout, newlines in `--old`/`--new` are converted to match it. A miss names its likely cause by line number. `--sudo` edits root-owned files as root (POSIX; passwordless sudo or the host's configured sudo password). |
 | `fleet shot <host> [--output NAME\|main\|N] [--region top-right\|…\|X,Y,W,H] [--wake] [--out f] [--grid] [--no-open]` | Screenshot the remote desktop → local image (webp default; `--grid` overlays a coord ruler). `--output` captures one monitor and `--region` part of it (the main monitor when `--output` is omitted); `--list` shows the layout. `--wake` switches powered-off Wayland monitors on for the capture. Alias: `fleet screenshot`. |
-| `fleet session <sel>` | Logged in, **locked**, or at the login screen; idle time where the desktop reports it; which displays are off. Check it before `cu` or `shot`. |
+| `fleet session <sel>` | Logged in, **locked**, or at the login screen; idle time where the desktop reports it; which displays are off. Check it before `cu` or `shot`. Several hosts take one comma selector (`fleet session web,laptop`); a second positional is a usage error. |
 | `fleet drop <sel>` | Close the shared ssh connection (and a Windows host's kept-open session) so the next call logs in fresh, e.g. after `usermod -aG docker`. |
 | `fleet boot <machine> [--entries]` · `fleet switch <machine> --to <os> [--dry-run] [--yes]` | Which boot of a dual-boot machine is live, its UEFI entries, and reboot into another boot with every phase printed (see **Dual-boot machines**). |
 | `fleet hostkey <host> [--pin]` · `fleet find <machine\|mac> [--from <host>]` | Pin a boot's host key under its `hostKeyAlias`; find a machine's LAN address by MAC. |
@@ -55,6 +55,8 @@ fleet exec win-box "nvidia-smi"
 | `fleet logs <host> <service> [-n N]` | Recent logs / status for a service. |
 | `fleet gpu [--json]` | Every GPU: util · free VRAM · temp · loaded model. |
 | `fleet disk [sel] [--json]` | Live free space on every mounted volume. |
+| `fleet ps <sel> [filter] [--sort cpu\|mem] [-n N] [--json]` | Processes, the same columns on Linux, macOS and Windows: pid, parent, cpu, memory, age, owner, command line. Marks rows a fleet job started (`job:ID`) and rows `kill` refuses (`protected`). The filter matches names (or a pid), never command lines. |
+| `fleet kill <sel> <pid[,pid…]\|name> [--tree] [--force] [--all] [--system] [--grace S] [--dry-run] [--sudo] [--yes] [--json]` | **Stop processes safely.** Shows the plan, then asks politely (SIGTERM / taskkill), waits, and `--force` kills survivors. A name matching several processes is refused with the list unless `--all`. Never touches fleet's own session. System processes (sshd, launchd, svchost, explorer…) need `--system`. Anything no fleet job started needs `--yes` non-interactively. Each pid's name is re-checked before its signal. **Use this instead of `pkill`/`taskkill`/`Stop-Process` through `exec`.** |
 | `fleet status [host] [--json]` | Live stats pulled from the dashboard API. |
 | `fleet top <host>` | Live terminal btop for one host (interactive; runs until Ctrl-C). |
 | `fleet run <recipe>` | Run a saved playbook from config (stops on first failure). |
@@ -362,6 +364,38 @@ and exposes computer-use tools. Same interactive-desktop requirement as `fleet s
   - Foreground input lands on whatever window is on top at that point. `bring_to_front`
     the target first; maximizing through accessibility does not raise a window.
 
+### Games (`fleet game`)
+
+`fleet cu` input reaches apps, not games. cua-driver sends `PostMessage` keys that Raw
+Input and DirectInput games ignore, and it has no key holds, relative mouse or pad. Use
+`fleet game <windows-host> …` for games. `fleet help game` has the full step reference.
+
+- **Helper:** one process per host in the console session (installed under
+  `%LOCALAPPDATA%\fleet\game`), started by `fleet game <host> start`. The first start
+  installs pillow and vgamepad with uv. Later input calls restart a stopped or older
+  helper themselves and never install it. `status` shows the helper version, the
+  foreground window, held inputs, whether the pad is plugged in, and the current or last run.
+- **Targets:** an exe name, a title substring, `exe:`, `title:`, `pid:N` or `hwnd:N`.
+  `windows [FILTER]` lists the candidates. A name matching several processes is refused.
+  Within one process the largest window wins.
+- **Steps:** `do <TARGET|-> '<json>'` or `do [TARGET] --file macro.json`, plus the one-line
+  verbs `tap`, `hold`, `look`, `click`, `type`, `pad`, `stick` and `trigger`. `--shot`
+  returns a frame after the run. Points are frame pixels at the same `--max` (default 1280).
+- **Safety:**
+  - Keyboard and mouse events go only to the target in the foreground. A lost foreground
+    aborts the run and releases everything held.
+  - A click is refused outside the target or over another process's window.
+  - Held inputs auto-release after 10 s unless the next call starts.
+  - `release [--unplug]` always works, on any helper version.
+  - Pad, stick and trigger steps need no target.
+- **Macros:** `--detach` runs the steps on the host with exact timing, and `--repeat 0`
+  loops until `release`. A detached run releases everything when it ends.
+- **Ask before live input on a machine someone is using.** A run takes the foreground from
+  whoever sits there. `status`, `windows` and `frame` send no input.
+- Frames come from the composed desktop. A black frame means exclusive fullscreen;
+  switch the game to borderless windowed.
+- Injected input and ViGEm pads can trip anti-cheat. Keep this to offline games.
+
 ### Android phones
 
 A host with an `"android"` block is a phone reached over SSH into Termux. Termux's own
@@ -591,6 +625,11 @@ Run standalone with `bun run mcp` (honours `FLEET_CONFIG`); smoke-test end-to-en
 | `fleet_status` | `host?` | `fleet status` |
 | `fleet_bios` | `selector` | `fleet bios <selector> --yes` |
 | `fleet_run` | `recipe` | `fleet run` |
+| `fleet_game_status` | `host` | `fleet game <host> status` (read-only; starts nothing) |
+| `fleet_game_windows` | `host`, `filter?` | `fleet game <host> windows` |
+| `fleet_game_frame` | `host`, `target?`, `max?`, `quality?` | `fleet game <host> frame` (returns a JPEG image) |
+| `fleet_game_do` | `host`, `steps[]`, `target?`, `repeat?`, `detach?`, `shot?`, `max?` | `fleet game <host> do`; returns frames when `shot` or a `shot` step asks |
+| `fleet_game_control` | `host`, `action` (start\|stop\|release\|focus), `target?`, `force?`, `unplug?` | `fleet game <host> start\|stop\|release\|focus` |
 
 - `top`, `ssh`, and live `jobs tail -f` remain CLI-only. Detached jobs and bounded waits are available over MCP.
 - Same rules as the CLI: pass `command` verbatim (don't escape), syntax is the target's

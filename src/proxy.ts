@@ -23,6 +23,7 @@ import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import type { Host, ProxySpec, ResolvedProxy } from "./config.ts";
 import { lookupProxy, normalizeProxy, proxyIdentity, redactProxy, resolveProxy } from "./config.ts";
+import { FdError, adoptSocket, closeFd, fdIO, fdpassSupported, sendFd } from "./fdpass.ts";
 
 /** Distinct exit codes so a failed connection names the leg that broke. */
 export const PROXY_EXIT = {
@@ -167,14 +168,21 @@ const SOCKS_REPLY: Record<number, [string, number]> = {
   8: ["the proxy does not support this address type", PROXY_EXIT.protocol],
 };
 
+/** What the handshakes read from and write to: a Bun socket with its
+ *  HandshakeReader, or a raw descriptor (fdpass.ts). */
+interface HandshakeIO {
+  read(n: number, timeoutMs: number): Promise<Buffer>;
+  write(data: Buffer | string): void;
+}
+
 async function socks5Handshake(
-  socket: net.Socket, reader: HandshakeReader, spec: ProxySpec, target: string, port: number, timeoutMs: number,
+  io: HandshakeIO, spec: ProxySpec, target: string, port: number, timeoutMs: number,
 ): Promise<void> {
   const n = normalizeProxy(spec);
   const password = await proxyPassword(spec);
   const canAuth = !!n.user;
-  socket.write(canAuth ? Buffer.from([5, 2, 0, 2]) : Buffer.from([5, 1, 0]));
-  const greeting = await reader.read(2, timeoutMs);
+  io.write(canAuth ? Buffer.from([5, 2, 0, 2]) : Buffer.from([5, 1, 0]));
+  const greeting = await io.read(2, timeoutMs);
   if (greeting[0] !== 5) throw new ProxyError(
     `${n.host}:${n.port} is not a SOCKS5 proxy (it replied with version ${greeting[0]})`, PROXY_EXIT.protocol);
   const method = greeting[1]!;
@@ -186,8 +194,8 @@ async function socks5Handshake(
     const user = Buffer.from(n.user, "utf8");
     const pass = Buffer.from(password ?? "", "utf8");
     if (user.length > 255 || pass.length > 255) throw new ProxyError("proxy username/password must be ≤255 bytes", PROXY_EXIT.usage);
-    socket.write(Buffer.concat([Buffer.from([1, user.length]), user, Buffer.from([pass.length]), pass]));
-    const reply = await reader.read(2, timeoutMs);
+    io.write(Buffer.concat([Buffer.from([1, user.length]), user, Buffer.from([pass.length]), pass]));
+    const reply = await io.read(2, timeoutMs);
     if (reply[1] !== 0) throw new ProxyError("the proxy rejected the username/password", PROXY_EXIT.auth);
   } else if (method !== 0) {
     throw new ProxyError(`the proxy chose an unsupported auth method (0x${method.toString(16)})`, PROXY_EXIT.protocol);
@@ -209,17 +217,17 @@ async function socks5Handshake(
     })();
   }
   const portBuf = Buffer.alloc(2); portBuf.writeUInt16BE(port);
-  socket.write(Buffer.concat([Buffer.from([5, 1, 0]), addr, portBuf]));
+  io.write(Buffer.concat([Buffer.from([5, 1, 0]), addr, portBuf]));
 
-  const head = await reader.read(4, timeoutMs);
+  const head = await io.read(4, timeoutMs);
   if (head[1] !== 0) {
     const [why, code] = SOCKS_REPLY[head[1]!] ?? [`the proxy refused with code ${head[1]}`, PROXY_EXIT.refused];
     throw new ProxyError(`${target}:${port} — ${why}`, code);
   }
   const atyp = head[3];
-  const bndLen = atyp === 1 ? 4 : atyp === 4 ? 16 : atyp === 3 ? (await reader.read(1, timeoutMs))[0]! : -1;
+  const bndLen = atyp === 1 ? 4 : atyp === 4 ? 16 : atyp === 3 ? (await io.read(1, timeoutMs))[0]! : -1;
   if (bndLen < 0) throw new ProxyError(`the proxy replied with an unknown address type (${atyp})`, PROXY_EXIT.protocol);
-  await reader.read(bndLen + 2, timeoutMs);   // bound address + port, discarded
+  await io.read(bndLen + 2, timeoutMs);   // bound address + port, discarded
 }
 
 function ipAddrBuffer(ip: string): Buffer {
@@ -238,17 +246,17 @@ function expandIPv6(ip: string): Buffer {
 }
 
 async function httpConnect(
-  socket: net.Socket, reader: HandshakeReader, spec: ProxySpec, target: string, port: number, timeoutMs: number,
+  io: HandshakeIO, spec: ProxySpec, target: string, port: number, timeoutMs: number,
 ): Promise<void> {
   const password = await proxyPassword(spec);
   const authority = net.isIPv6(target) ? `[${target}]:${port}` : `${target}:${port}`;
   const headers = [`CONNECT ${authority} HTTP/1.1`, `Host: ${authority}`];
   if (spec.user) headers.push(`Proxy-Authorization: Basic ${Buffer.from(`${spec.user}:${password ?? ""}`).toString("base64")}`);
-  socket.write(headers.join("\r\n") + "\r\n\r\n");
+  io.write(headers.join("\r\n") + "\r\n\r\n");
   // Read byte-wise to the end of the header block so the tunnel body stays intact.
   let head = "";
   for (;;) {
-    head += (await reader.read(1, timeoutMs)).toString("latin1");
+    head += (await io.read(1, timeoutMs)).toString("latin1");
     if (head.endsWith("\r\n\r\n")) break;
     if (head.length > 16384) throw new ProxyError("the HTTP proxy sent an oversized response header", PROXY_EXIT.protocol);
   }
@@ -266,13 +274,39 @@ export async function proxyConnect(
   const n = normalizeProxy(spec);
   const socket = await connectTcp(n.host, n.port, timeoutMs);
   const reader = new HandshakeReader(socket);
+  const io: HandshakeIO = { read: (n, ms) => reader.read(n, ms), write: (data) => { socket.write(data); } };
   try {
-    if (n.type === "http") await httpConnect(socket, reader, spec, target, port, timeoutMs);
-    else await socks5Handshake(socket, reader, spec, target, port, timeoutMs);
+    await handshake(io, spec, target, port, timeoutMs);
   } catch (e) { reader.release(); socket.destroy(); throw e; }
   reader.release();
   return socket;
 }
+
+function handshake(io: HandshakeIO, spec: ProxySpec, target: string, port: number, timeoutMs: number): Promise<void> {
+  return normalizeProxy(spec).type === "http"
+    ? httpConnect(io, spec, target, port, timeoutMs)
+    : socks5Handshake(io, spec, target, port, timeoutMs);
+}
+
+/** Open the tunnel and hand it to ssh over `channel` (ProxyUseFdpass), so no
+ *  process stays behind to copy bytes. See fdpass.ts. */
+export async function proxyHandOff(
+  spec: ProxySpec, target: string, port: number, channel = 1, timeoutMs = 15000,
+): Promise<void> {
+  const n = normalizeProxy(spec);
+  // Nothing has been sent, so the proxy has sent nothing for Bun to read yet.
+  let fd: number;
+  try { fd = adoptSocket(await connectTcp(n.host, n.port, timeoutMs)); }
+  catch (e) { throw asProxyError(e); }
+  try {
+    await handshake(fdIO(fd), spec, target, port, timeoutMs);
+    sendFd(channel, fd);
+  } catch (e) { throw asProxyError(e); }
+  finally { closeFd(fd); }
+}
+
+const asProxyError = (e: unknown): unknown =>
+  e instanceof FdError ? new ProxyError(e.message, PROXY_EXIT[e.kind]) : e;
 
 /** Is the proxy endpoint itself alive? Used to attribute a failed connection to
  *  the right leg before blaming the host. */
@@ -329,17 +363,20 @@ export function argQuote(s: string, platform: string = process.platform): string
   return platform === "win32" ? cmdQuote(s) : shQuote(s);
 }
 
-/** The `-o ProxyCommand=…` (plus a matching ProxyUseFdpass=no) for a host, or []
+/** The `-o ProxyCommand=…` (with ProxyUseFdpass=yes where supported) for a host, or []
  *  when nothing is proxied. Only the proxy NAME crosses the process table. */
 export function proxyOpts(host: Host): string[] {
   const resolved = resolveProxy(host);
   if (!resolved) return [];
   if (host.transport === "daytona") return [];
+  // ProxyUseFdpass: the ProxyCommand hands ssh the connected socket and
+  // exits, instead of staying resident to copy every byte (fdpass.ts).
+  const fdpass = fdpassSupported();
   // %h/%p are ssh's own tokens, expanded before the string reaches the shell —
   // they must NOT go through cmd.exe's %-doubling.
-  const cmd = [...[...fleetReinvocation(), "__proxy-connect", argvRef(resolved.ref)].map((a) => argQuote(a)),
-    "%h", "%p"].join(" ");
-  return ["-o", `ProxyCommand=${cmd}`];
+  const cmd = [...[...fleetReinvocation(), "__proxy-connect", ...(fdpass ? ["--fdpass"] : []), argvRef(resolved.ref)]
+    .map((a) => argQuote(a)), "%h", "%p"].join(" ");
+  return [...(fdpass ? ["-o", "ProxyUseFdpass=yes"] : []), "-o", `ProxyCommand=${cmd}`];
 }
 
 /** The proxy reference as it may appear in argv. A named proxy is its name. An
@@ -370,12 +407,14 @@ export function proxyControlKey(host: Host): string {
 
 // ── the hidden subcommand ssh runs ───────────────────────────────────────────
 
-/** `fleet __proxy-connect <proxy-name|url> <host> <port>` — splice stdio to a
- *  tunnel. Returns the process exit code; never throws. */
+/** `fleet __proxy-connect [--fdpass] <proxy-name|url> <host> <port>` — splice
+ *  stdio to a tunnel, or with --fdpass hand the tunnel to ssh and exit.
+ *  Returns the process exit code; never throws. */
 export async function proxyConnectMain(argv: string[]): Promise<number> {
-  const [ref, target, portArg] = argv;
+  const fdpass = argv[0] === "--fdpass";
+  const [ref, target, portArg] = fdpass ? argv.slice(1) : argv;
   if (!ref || !target || !portArg) {
-    console.error("usage: fleet __proxy-connect <proxy-name|url> <host> <port>");
+    console.error("usage: fleet __proxy-connect [--fdpass] <proxy-name|url> <host> <port>");
     return PROXY_EXIT.usage;
   }
   const port = Number(portArg);
@@ -389,6 +428,7 @@ export async function proxyConnectMain(argv: string[]): Promise<number> {
 
   let socket: net.Socket;
   try {
+    if (fdpass) { await proxyHandOff(resolved.spec, target, port); return 0; }
     socket = await proxyConnect(resolved.spec, target, port);
   } catch (e) {
     const err = e as ProxyError;

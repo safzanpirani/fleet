@@ -130,12 +130,33 @@ describe("machine-readable CLI output", () => {
     try {
       const marker = join(root, "ssh-called");
       executable(join(bin, "ssh"), `#!/bin/sh\ntouch '${marker}'\nexit 99\n`);
-      for (const args of [["--help"], ["exec", "--help"], ["spawn", "--help"], ["jobs", "--help"],
+      for (const args of [["--help"], ["game", "--help"], ["exec", "--help"], ["spawn", "--help"], ["jobs", "--help"],
         ["jobs", "wait", "--help"], ["tools", "sync", "--help"], ["help", "jobs", "tail"]]) {
         const r = await runCli(args, join(root, "absent-config"), bin);
         expect(r.code, r.stderr).toBe(0);
         expect(r.stdout).toContain("fleet");
         expect(r.stderr).toBe("");
+      }
+      expect(await Bun.file(marker).exists()).toBe(false);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test("game validates numeric options and steps before host routing", async () => {
+    const { root, bin, config } = fixture();
+    try {
+      const marker = join(root, "ssh-called");
+      executable(join(bin, "ssh"), `#!/bin/sh\ntouch '${marker}'\nexit 99\n`);
+      writeFileSync(config, JSON.stringify({
+        hosts: { win: { ssh: "win", os: "windows" } }, groups: { test: ["win"] },
+      }));
+      for (const args of [
+        ["game", "test", "frame", "--max", "1.5"],
+        ["game", "test", "tap", "game", "w", "--ms", "-1"],
+        ["game", "test", "do", "game", '[{"hold":"w"}]'],
+      ]) {
+        const r = await runCli(args, config, bin);
+        expect(r.code).toBe(1);
+        expect(r.stderr).not.toContain("ssh");
       }
       expect(await Bun.file(marker).exists()).toBe(false);
     } finally { rmSync(root, { recursive: true, force: true }); }

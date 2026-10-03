@@ -87,7 +87,7 @@ describe("session replies", () => {
     const refused = await cuRun(cfg, "box", ["set_value", "{}"], undefined,
       { exec: reply('{"status":"refused","refusal":{"code":"snapshot_id_required"}}') });
     expect(refused.result).toMatchObject({ ok: false, code: 1 });
-    expect(refused.result.stderr).toContain("fleet: the driver reported status refused");
+    expect(refused.result.stderr).toContain("fleet: the driver refused the input (snapshot_id_required)");
     const fine = await cuRun(cfg, "box", ["list_windows"], undefined, { exec: reply('{"windows":[]}') });
     expect(fine.result.ok).toBe(true);
   });
@@ -262,8 +262,27 @@ describe("element-addressed actions", () => {
       },
       exec: async (h, command) => { script = command; return { ...ok, host: h.name, stdout: "__FLEET_HASH__A|aa\n__FLEET_HASH__B|aa" }; },
     });
-    expect(script).toContain('"element_token":"s0000000c:1","pid":42,"window_id":7');
+    // Off Windows the token is honoured only inside the session that read it,
+    // so the action re-reads the tree and acts in one driver session.
+    expect(script).toContain("_fleet_element");
+    const cfgB64 = script.match(/"\$fcd" '([A-Za-z0-9+/=]+)'/)![1]!;
+    const sent = JSON.parse(Buffer.from(cfgB64, "base64").toString());
+    expect(sent.tool).toBe("click");
+    expect(sent.args).toMatchObject({ element_token: "s0000000c:1", pid: 42, window_id: 7 });
+    expect(sent.element).toMatchObject({ role: r.element!.role, label: "Select" });
     expect(r.element?.label).toBe("Select");
+  });
+
+  test("a control gone by the in-session re-read fails the action", async () => {
+    const gone = JSON.stringify({ status: "refused", refusal: { code: "element_not_found", message: "the control is no longer in the window; nothing was sent" } });
+    const r = await cuAct(cfg, "lin", "Character Map", "click", {}, { element: { label: "Select" } }, {
+      snapshot,
+      elements: async (_c, _s, _q, _o, deps) => ({ host: "lin", result: ok, ...parseCuElements(elementsReply, deps!.target!) }),
+      exec: async (h) => ({ ...ok, host: h.name, stdout: `__FLEET_HASH__A|aa\n__FLEET_CAP__act|\n${gone}\n__FLEET_END__\n__FLEET_HASH__B|aa` }),
+    });
+    expect(r.result.ok).toBe(false);
+    expect(r.refusal).toBeDefined();
+    expect(r.driverOutput).toContain("element_not_found");
   });
 
   test("a token needs no tree read", async () => {

@@ -26,11 +26,15 @@
  * (shared with the MCP server in `mcp.ts`).
  */
 import { readFile } from "node:fs/promises";
+import { writeSync } from "node:fs";
+import { processList, processKill } from "./procs.ts";
+import type { KillResult } from "./procs.ts";
+import { format } from "node:util";
 import { loadConfig, resolveHosts } from "./config.ts";
 import { runWinSessionBroker } from "./winsession.ts";
 import { focusElements } from "./focus.ts";
 import { sessionStates, formatIdle } from "./session.ts";
-import type { FleetConfig } from "./config.ts";
+import type { FleetConfig, Host } from "./config.ts";
 import { helpText } from "./help.ts";
 import { sshInteractive } from "./ssh.ts";
 import { proxyConnectMain } from "./proxy.ts";
@@ -42,7 +46,7 @@ import type { JobRow } from "./jobs.ts";
 import {
   pullFlag, pullVal, parseFlags, parseLeadingFlags, lsHosts, runExec, runScript, rebootRefusal, droppedStdinCheck, readScriptSource, editRemoteFile, parseEditList,
   pushFile, pullFile, parseRemoteSpec, restartService, serviceLogs, svcStatus,
-  gpuRows, diskRows, fetchDashboard, hostStatus, runRecipe, captureScreenshot, rebootHosts,
+  gpuRows, diskRows, sudoWrap, fetchDashboard, hostStatus, runRecipe, captureScreenshot, rebootHosts,
   cuInstall, cuRun, cuTools, cuDescribe, cuRecordStart, cuRecordStop, cuRecordStatus, cuRegions, cuPerception, bootMismatchNote,
   cuApps, cuShotWindow, browseHost, preferredImageExt, overlayGrid,
   cuSnapshot, cuResolveTargetFrom, cuResolvePoint, cuAct, cuBatch, cuBlockerNote, cuElements, cuOpen, sameRole, cuVerify,
@@ -68,6 +72,11 @@ import {
   androidRecordStart, androidRecordStatus, androidRecordStop, androidRevive, androidWatch,
 } from "./android.ts";
 import type { AndroidAction, AndroidBatchStep, AndroidDeps, AndroidElement, AndroidFlowStep, AndroidLocator, AndroidState } from "./android.ts";
+import {
+  gameStart, gameStop, gameStatus, gameWindows, gameFocus, gameFrame, gameDo, gameRelease, gameShorthand,
+  parseGameArgv, parseGameMacro, gameIntFlag, prepareGameDo,
+} from "./game.ts";
+import type { GameDoResult, GameFrame, GameRun, GameWindow } from "./game.ts";
 
 /** Colour only for a person at a terminal. Output piped to an agent or a file
  *  is data, and escape codes inside it are noise every reader has to strip.
@@ -90,6 +99,26 @@ for (const stream of [process.stdout, process.stderr])
     if (error.code === "EPIPE") process.exit(0);
     throw error;
   });
+function ageText(s: number | null): string {
+  if (s === null) return "—";
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h`;
+  return `${Math.floor(s / 86400)}d`;
+}
+
+function renderKill(r: KillResult): void {
+  if (!r.ok && !r.targets.length) { console.log(`${A.r("✗")} ${A.b(r.host)} ${r.error ?? ""}`); return; }
+  const mark: Record<string, string> = { exited: A.g("✓ exited"), killed: A.g("✓ killed"), gone: A.d("○ gone"),
+    planned: A.c("→ would stop"), running: A.r("✗ running"), denied: A.r("✗ denied"), changed: A.y("? changed") };
+  console.log(A.b(r.host));
+  for (const t of r.targets) {
+    const extra = t.cmd ? A.d(` ${t.job ? `job:${t.job} ` : ""}${t.cmd.slice(0, 80)}`) : "";
+    console.log(`  ${mark[t.outcome] ?? t.outcome} ${String(t.pid).padStart(7)} ${t.name}${t.detail ? A.d(` — ${t.detail}`) : ""}${extra}`);
+  }
+  if (r.error && r.targets.length) console.log(`  ${A.d(r.error)}`);
+}
+
 function die(m: string): never { console.error(A.r("✗ " + m)); process.exit(1); }
 /** Pull a numeric flag value, failing LOUDLY on garbage instead of letting a
  *  NaN leak into a remote command (`tail -n NaN`) or a 0ms poll loop. */
@@ -513,7 +542,7 @@ function printRaw(r: ExecResult): void {
 
 const SUBCOMMANDS = [
   "ls", "hosts", "dt", "exec", "spawn", "jobs", "cp", "edit", "restart", "reboot", "bios", "boot", "switch", "wait",
-  "gpu", "disk", "status", "top", "logs", "svc", "shot", "cu", "browse", "run", "deploy", "tools", "proxy", "doctor", "hostkey", "find", "session", "drop", "completion", "ssh", "help",
+  "gpu", "disk", "ps", "kill", "status", "top", "logs", "svc", "shot", "cu", "game", "browse", "run", "deploy", "tools", "proxy", "doctor", "hostkey", "find", "session", "drop", "completion", "ssh", "help",
 ];
 /** Emit a bash/zsh completion script with this config's hosts/groups/recipes/
  *  services baked in. Source it: `eval "$(fleet completion zsh)"`. */
@@ -1032,6 +1061,59 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       return 0;
     }
 
+    case "ps": {
+      const { flags, rest: pos } = parseFlags(rest, ["--json"], ["--sort", "-n"]);
+      if (pos.length < 1 || pos.length > 2) die("usage: fleet ps <sel> [FILTER] [--sort cpu|mem] [-n N] [--json]");
+      const [sel, filter] = pos as [string, string | undefined];
+      const sort = flags["--sort"] as "cpu" | "mem" | undefined;
+      const n = flags["-n"] === undefined ? (filter ? undefined : 20) : Number(flags["-n"]);
+      const lists = await processList(cfg, await routeSelector(cfg, sel), { filter, sort, limit: n });
+      if (flags["--json"] === true) { console.log(JSON.stringify(lists, null, 2)); return lists.some((l) => !l.ok) ? 1 : 0; }
+      for (const l of lists) {
+        if (!l.ok) { console.log(`${A.r("✗")} ${A.b(l.host)} ${A.d(l.error ?? "")}`); continue; }
+        console.log(`${A.b(l.host)} ${A.d(`· ${l.rows.length} process${l.rows.length === 1 ? "" : "es"}`)}`);
+        for (const r of l.rows) {
+          const cpu = r.cpu === null ? "   —" : r.cpu.toFixed(1).padStart(5);
+          const mem = r.mem_mb >= 1024 ? `${(r.mem_mb / 1024).toFixed(1)}g` : `${Math.round(r.mem_mb)}m`;
+          const tags = [r.job ? A.c(`job:${r.job}`) : "", r.protected ? A.y("protected") : "",
+            r.session === 0 ? A.d("session 0") : ""].filter(Boolean).join(" ");
+          console.log(`  ${String(r.pid).padStart(7)} ${A.b(r.name.slice(0, 22).padEnd(22))} ${heat(r.cpu ?? 0, cpu + "%")} ${mem.padStart(6)} ${A.d(ageText(r.age_s).padStart(5))} ${A.d((r.user ?? "").slice(0, 10).padEnd(10))} ${tags ? tags + " " : ""}${A.d(r.cmd.slice(0, 90))}`);
+        }
+      }
+      return lists.some((l) => !l.ok) ? 1 : 0;
+    }
+
+    case "kill": {
+      const { flags, rest: pos } = parseFlags(rest,
+        ["--tree", "--force", "--all", "--system", "--dry-run", "--sudo", "--yes", "-y", "--json"], ["--grace"]);
+      if (pos.length !== 2) die("usage: fleet kill <sel> <PID[,PID…]|NAME> [--tree] [--force] [--all] [--system] [--grace S] [--dry-run] [--sudo] [--yes] [--json]");
+      const [sel, spec] = pos as [string, string];
+      const json = flags["--json"] === true;
+      const opts = { tree: flags["--tree"] === true, force: flags["--force"] === true, all: flags["--all"] === true,
+        system: flags["--system"] === true, graceS: flags["--grace"] === undefined ? undefined : Number(flags["--grace"]) };
+      const routed = await routeSelector(cfg, sel);
+      const wrap = flags["--sudo"] === true ? (h: Host, cmd: string) => sudoWrap(h, cmd, false) : undefined;
+      // Plan first, show it, confirm, then kill exactly the planned pids.
+      const plans = await processKill(cfg, routed, spec, { ...opts, dryRun: true });
+      if (flags["--dry-run"] === true || plans.every((p) => !p.ok)) {
+        if (json) console.log(JSON.stringify(plans, null, 2));
+        else for (const p of plans) renderKill(p);
+        return plans.some((p) => !p.ok) ? 1 : 0;
+      }
+      const foreign = plans.flatMap((p) => p.targets.filter((t) => !t.job));
+      if (!json) for (const p of plans) renderKill(p);
+      if (foreign.length && !await confirm(`kill ${foreign.length} process${foreign.length === 1 ? "" : "es"} no fleet job started`,
+        flags["--yes"] === true || flags["-y"] === true)) return 1;
+      const results = await Promise.all(plans.map(async (p) => {
+        if (!p.ok) return p;
+        const [r] = await processKill(cfg, p.host, p.targets.map((t) => t.pid).join(","), { ...opts, tree: false, all: true }, { wrap });
+        return r!;
+      }));
+      if (json) console.log(JSON.stringify(results, null, 2));
+      else for (const r of results) renderKill(r);
+      return results.some((r) => !r.ok) ? 1 : 0;
+    }
+
     case "status": {
       const { flags, rest: pos } = parseFlags(rest, ["--json"], []);
       if (pos.length > 1) die("usage: fleet status [<host>] [--json]");
@@ -1096,6 +1178,153 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       if (!noOpen && process.platform === "darwin")
         Bun.spawn(["open", r.localPath], { stdout: "ignore", stderr: "ignore" });
       return 0;
+    }
+
+    case "game": {
+      let parsed: ReturnType<typeof parseGameArgv>;
+      try { parsed = parseGameArgv(rest); } catch (error) { die((error as Error).message); }
+      const { flags, pos } = parsed;
+      const [sel, verb, ...ops] = pos;
+      if (!sel || !verb) die("usage: fleet game <host> start|status|windows|focus|frame|do|tap|hold|look|click|type|pad|stick|trigger|release|stop (fleet help game)");
+      const json = flags["--json"] === true;
+      let target: string | undefined;
+      let steps: unknown;
+      let repeat: number | undefined;
+      let doOpts: import("./game.ts").GameDoOptions = {};
+      try {
+        gameIntFlag(flags, "--repeat", undefined, 0, 1_000_000);
+        gameIntFlag(flags, "--max", 1280, 0, 8192);
+        gameIntFlag(flags, "--quality", 80, 10, 95);
+        gameIntFlag(flags, "--ms", undefined, 0, 600_000);
+        gameIntFlag(flags, "--count", undefined, 1, 3);
+        gameIntFlag(flags, "--grid-step", 100, 10, 2000);
+        if (["do", "tap", "hold", "look", "click", "type", "pad", "stick", "trigger"].includes(verb)) {
+          const padVerb = ["pad", "stick", "trigger"].includes(verb);
+          repeat = gameIntFlag(flags, "--repeat", undefined, 0, 1_000_000);
+          if (verb === "do") {
+            const file = flags["--file"] as string | undefined;
+            const wantOps = file ? 1 : 2;
+            if (ops.length > wantOps || (!file && ops.length < 2))
+              die(`usage: fleet game ${sel} do <TARGET|-> <STEPS-JSON|-> | do [TARGET] --file MACRO.json  [--repeat N] [--detach] [--shot] [--max N] [--out FILE]`);
+            const source = file ? await readFile(file, "utf8") : ops[1] === "-" ? await Bun.stdin.text() : ops[1]!;
+            const macro = parseGameMacro(source, file ?? (ops[1] === "-" ? "stdin" : "steps"));
+            steps = macro.steps;
+            target = ops[0] && ops[0] !== "-" ? ops[0] : macro.target;
+            repeat ??= macro.repeat;
+          } else {
+            if (!padVerb) { target = ops.shift(); if (!target) die(`usage: fleet game ${sel} ${verb} <TARGET> …`); }
+            steps = gameShorthand(verb, ops, { ms: gameIntFlag(flags, "--ms", undefined, 0, 600_000),
+              button: flags["--button"] as string | undefined, count: gameIntFlag(flags, "--count", undefined, 1, 3) });
+          }
+          doOpts = { target, repeat, detach: flags["--detach"] === true, shot: flags["--shot"] === true,
+            max: gameIntFlag(flags, "--max", 1280, 0, 8192), quality: gameIntFlag(flags, "--quality", 80, 10, 95) };
+          prepareGameDo(steps, doOpts);
+        }
+      } catch (error) { die(error instanceof Error ? error.message : String(error)); }
+      const routed = await routeSelector(cfg, sel);
+      const host = resolveHosts(cfg, routed)[0]!.name;
+      const win = (w: Pick<GameWindow, "exe" | "title"> & { hwnd: number }) => `${w.exe} ${JSON.stringify(w.title.slice(0, 60))} ${A.d(`hwnd:${w.hwnd}`)}`;
+      const runLine = (r: GameRun) => {
+        const mark = r.state === "done" ? A.g("●") : r.state === "running" ? A.c("●") : A.r("✗");
+        return `${mark} ${A.b(host)} run ${r.id} ${r.state} · ${r.steps} step${r.steps === 1 ? "" : "s"} · loop ${r.loop}${r.repeat ? `/${r.repeat}` : "/∞"} · ${r.seconds}s`
+          + (r.target ? ` · ${win(r.target)}` : "");
+      };
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+      const saveFrames = async (frames: GameFrame[]): Promise<string[]> => {
+        const out = flags["--out"] as string | undefined;
+        const paths: string[] = [];
+        for (const [i, f] of frames.entries()) {
+          const base = out ?? `${host}-game-${stamp}.jpg`;
+          const path = frames.length === 1 ? base : base.replace(/(\.[a-z0-9]+)?$/i, `-${i + 1}$1`);
+          await Bun.write(path, Buffer.from(f.jpeg, "base64"));
+          if (flags["--grid"] === true && !await overlayGrid(path, {
+            step: gameIntFlag(flags, "--grid-step", 100, 10, 2000), caption: `image pixels · ${f.width}x${f.height} · ×${f.scale} = client pixels`,
+          })) console.error(A.y("grid overlay skipped (need python3 + Pillow)"));
+          paths.push(path);
+        }
+        if (paths.length && flags["--no-open"] !== true && !json && process.platform === "darwin")
+          Bun.spawn(["open", ...paths], { stdout: "ignore", stderr: "ignore" });
+        return paths;
+      };
+      const frameNote = (f: GameFrame) => `${f.width}x${f.height}${f.scale !== 1 ? ` (client ${f.client[0]}x${f.client[1]}, ×${f.scale})` : ""} in ${f.ms} ms`
+        + (f.black ? A.y(" · all black: switch the game to borderless windowed") : "");
+      try {
+        switch (verb) {
+          case "start": {
+            if (ops.length) die(`usage: fleet game ${sel} start [--force]`);
+            if (!json) process.stderr.write(A.d(`◎ starting the game helper on ${host} (the first start installs pillow + vgamepad) …\n`));
+            const r = await gameStart(cfg, routed, { force: flags["--force"] === true });
+            if (json) { console.log(JSON.stringify(r)); return 0; }
+            for (const l of r.log) console.log(A.d(l));
+            console.log(`${A.g("●")} ${A.b(host)} game helper ${r.version} ${r.started ? "started" : "already running"} · pid ${r.pid}`);
+            return 0;
+          }
+          case "stop": {
+            const r = await gameStop(cfg, routed);
+            if (json) { console.log(JSON.stringify(r)); return 0; }
+            console.log(r.stopped ? `${A.g("●")} ${A.b(host)} game helper stopped (pid ${r.stopped}); everything held was released and the pad unplugged`
+              : `${A.d("○")} ${A.b(host)} game helper was not running`);
+            return 0;
+          }
+          case "status": {
+            const r = await gameStatus(cfg, routed);
+            if (json) { console.log(JSON.stringify(r)); return 0; }
+            if (!r.running) { console.log(`${A.d("○")} ${A.b(host)} ${r.note}`); return 0; }
+            console.log(`${A.g("●")} ${A.b(host)} game helper ${r.version} · pid ${r.pid}${r.pad ? " · virtual pad plugged in" : ""}`);
+            if (r.note) console.log(A.y(`  ${r.note}`));
+            if (r.foreground) console.log(`  foreground ${win(r.foreground)}`);
+            console.log(`  held ${r.held.length ? r.held.join(", ") + (r.leaseS ? A.d(` (auto-release in ${r.leaseS}s)`) : "") : A.d("nothing")}`);
+            if (r.run) console.log("  " + runLine(r.run) + (r.run.error ? `\n    ${A.r(r.run.error)}` : ""));
+            return 0;
+          }
+          case "release": {
+            const r = await gameRelease(cfg, routed, { unplug: flags["--unplug"] === true });
+            if (json) { console.log(JSON.stringify(r)); return 0; }
+            if (!r.running) { console.log(`${A.d("○")} ${A.b(host)} game helper is not running; nothing is held`); return 0; }
+            console.log(`${A.g("●")} ${A.b(host)} released ${r.released.length ? r.released.join(", ") : "nothing held"}`
+              + (r.halted ? ` · halted run ${r.halted}` : ""));
+            return 0;
+          }
+          case "windows": {
+            if (ops.length > 1) die(`usage: fleet game ${sel} windows [FILTER] [--json]`);
+            const r = await gameWindows(cfg, routed, ops[0]);
+            if (json) { console.log(JSON.stringify(r)); return 0; }
+            for (const w of r) console.log(`${w.foreground ? A.g("●") : w.minimized ? A.d("○") : " "} ${String(w.hwnd).padStart(10)} ${String(w.pid).padStart(6)} ${A.b(w.exe.padEnd(22))} `
+              + `${w.minimized ? A.d("minimized") : `${w.width}x${w.height}@${w.x},${w.y}`}  ${w.title.slice(0, 70)}`);
+            if (!r.length) console.log(A.d("no windows match"));
+            return 0;
+          }
+          case "focus": {
+            if (ops.length !== 1) die(`usage: fleet game ${sel} focus <TARGET>`);
+            const r = await gameFocus(cfg, routed, ops[0]!);
+            if (json) { console.log(JSON.stringify(r)); return 0; }
+            console.log(`${A.g("●")} ${A.b(host)} foreground ${win(r.target)}`);
+            return 0;
+          }
+          case "frame": {
+            if (ops.length > 1) die(`usage: fleet game ${sel} frame [TARGET] [--max N] [--quality Q] [--out FILE] [--grid] [--no-open]`);
+            const r = await gameFrame(cfg, routed, ops[0], {
+              max: gameIntFlag(flags, "--max", 1280, 0, 8192), quality: gameIntFlag(flags, "--quality", 80, 10, 95) });
+            const [path] = await saveFrames([r.frame]);
+            if (json) { console.log(JSON.stringify({ host, target: r.target, path, ...r.frame, jpeg: undefined })); return 0; }
+            console.log(`${A.g("●")} ${A.b(host)} ${r.target ? win(r.target) : "whole primary display"} ${A.d("→")} ${path} ${A.d(frameNote(r.frame))}`);
+            return 0;
+          }
+          case "do": case "tap": case "hold": case "look": case "click": case "type": case "pad": case "stick": case "trigger": {
+            const r: GameDoResult = await gameDo(cfg, routed, steps, doOpts);
+            const paths = await saveFrames(r.frames);
+            if (json) { console.log(JSON.stringify({ ...r, frames: r.frames.map((f, i) => ({ ...f, jpeg: undefined, path: paths[i] })) })); return r.ok ? 0 : 1; }
+            console.log(runLine(r.run));
+            if (r.error) console.log(`  ${A.r(r.error)}`);
+            if (r.run.detached) console.log(A.d(`  runs on ${host}; fleet game ${sel} status follows it, fleet game ${sel} release halts it`));
+            if (r.held.length) console.log(`  held ${r.held.join(", ")} ${A.d(`(auto-release in ${r.leaseS}s unless the next call continues)`)}`);
+            r.frames.forEach((f, i) => console.log(`  frame ${A.d("→")} ${paths[i]} ${A.d(frameNote(f))}`));
+            return r.ok ? 0 : 1;
+          }
+          default:
+            die(`unknown game verb: ${verb} (fleet help game)`);
+        }
+      } catch (error) { die(error instanceof Error ? error.message : String(error)); }
     }
 
     case "browse": {
@@ -2151,8 +2380,36 @@ async function topLoop(cfg: FleetConfig, host: string): Promise<number> {
   }
 }
 
+/** Bun 1.4 cuts piped `console.log` output at 64 KiB once anything has touched
+ *  `process.stdout` (reading `isTTY`, adding an error listener), and a buffered
+ *  `process.stdout.write` can land after a later sync write. Send both through
+ *  one blocking writer on fd 1 so piped `--json` arrives whole and in order. */
+export function installSyncStdout(): void {
+  const out = (chunk: string | Uint8Array): void => {
+    const buf = typeof chunk === "string" ? Buffer.from(chunk) : Buffer.from(chunk);
+    for (let off = 0; off < buf.length;) {
+      try { off += writeSync(1, buf, off); }
+      catch (e) {
+        const code = (e as NodeJS.ErrnoException).code;
+        if (code === "EAGAIN") { Bun.sleepSync(1); continue; }
+        if (code === "EPIPE") process.exit(0);
+        throw e;
+      }
+    }
+  };
+  console.log = (...args: unknown[]) => out(format(...args) + "\n");
+  process.stdout.write = ((chunk: string | Uint8Array, enc?: unknown, cb?: unknown) => {
+    out(chunk);
+    const done = typeof enc === "function" ? enc : cb;
+    if (typeof done === "function") done();
+    return true;
+  }) as typeof process.stdout.write;
+}
+
 if (import.meta.main) {
   const [, , command, ...rest] = process.argv;
+  // Internal byte pipes (ssh ProxyCommand, the Windows session broker) keep the stream.
+  if (!command?.startsWith("__")) installSyncStdout();
   Promise.resolve().then(async () => {
     const help = helpText(command ? [command, ...rest] : []);
     if (help !== undefined) { console.log(help); return 0; }

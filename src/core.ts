@@ -244,7 +244,7 @@ export async function runExec(
 }
 
 /** Wrap a POSIX command to run as root, or explain per host why it cannot. */
-async function sudoWrap(h: Host, cmd: string, wsl: boolean): Promise<{ cmd: string } | { error: ExecResult }> {
+export async function sudoWrap(h: Host, cmd: string, wsl: boolean): Promise<{ cmd: string } | { error: ExecResult }> {
   const fail = (stderr: string) => ({ error: { host: h.name, ok: false, code: 1, stdout: "", stderr } });
   if (h.os === "windows" && !wsl)
     return fail(`${h.name}: --sudo needs a POSIX shell; an elevated Windows session is already what fleet exec runs as an administrator`);
@@ -3929,10 +3929,80 @@ export async function cuAct(
     payload = { ...payload, element_token: element.token };
   }
   const full = cuInputPayload(target, payload, opts);
-  let result = await cuActOnTarget(host, target, tool, full, opts, deps);
+  let result = await cuActOnTarget(host, target, tool, full, opts, deps,
+    element && element.index >= 0 && host.os !== "windows" ? elementSessionInput(tool, full, element) : undefined);
   result = await cuConfirmClosed(cfg, sel, result, deps);
   if (!element || element.index < 0) return result;
   return cuConfirmByValue(cfg, sel, query, tool, payload, { ...result, element }, opts.element!, deps.elements);
+}
+
+/** On macOS (and Linux) the driver honours an element token only inside the
+ *  session that read it: a token from a separate `get_window_state` call comes
+ *  back `stale_element_token`, even straight from the newest snapshot. So a
+ *  label-addressed action re-reads the tree and acts in ONE `cua-driver mcp`
+ *  session, picking the control with the same role and label nearest to where
+ *  the resolve found it. It prints the tool's JSON-RPC reply as-is; a control
+ *  that is gone comes back as a refusal and nothing is sent. */
+const ELEMENT_PY = String.raw`
+import base64, json, subprocess, sys
+fcd, cfg = sys.argv[1], json.loads(base64.b64decode(sys.argv[2]).decode())
+def refuse(code, message):
+    print(json.dumps({"status": "refused", "refusal": {"code": code, "message": message}})); sys.exit(1)
+sock = None
+try:
+    for line in subprocess.run([fcd, "status"], capture_output=True, text=True, timeout=20).stdout.splitlines():
+        if line.strip().startswith("socket:"): sock = line.split(":", 1)[1].strip(); break
+except Exception: pass
+argv = [fcd, "mcp"] + (["--socket", sock] if sock else [])
+p = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+n = [0]
+def call(method, params):
+    n[0] += 1
+    p.stdin.write((json.dumps({"jsonrpc": "2.0", "id": n[0], "method": method, "params": params}) + "\n").encode()); p.stdin.flush()
+    while True:
+        line = p.stdout.readline()
+        if not line: return None, None
+        try: m = json.loads(line)
+        except ValueError: continue
+        if m.get("id") == n[0]: return m, line.decode().strip()
+init, _ = call("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "fleet", "version": "1"}})
+if not init or "result" not in init: p.kill(); refuse("session_unavailable", "cua-driver mcp did not initialize")
+p.stdin.write(b'{"jsonrpc":"2.0","method":"notifications/initialized"}\n'); p.stdin.flush()
+want = cfg["element"]
+read = {"pid": cfg["args"]["pid"], "window_id": cfg["args"]["window_id"], "include_screenshot": False}
+if want.get("label"): read["query"] = want["label"]
+state, _ = call("tools/call", {"name": "get_window_state", "arguments": read})
+sc = ((state or {}).get("result") or {}).get("structuredContent") or {}
+def center(e):
+    f = e.get("frame") or {}
+    return (f.get("x", 0) + f.get("w", 0) / 2, f.get("y", 0) + f.get("h", 0) / 2)
+wc = center(want)
+same = [e for e in sc.get("elements") or [] if e.get("role") == want.get("role") and (e.get("label") or "") == (want.get("label") or "")]
+if not same or not sc.get("snapshot_id"): p.kill(); refuse("element_not_found", "the control is no longer in the window; nothing was sent")
+pick = min(same, key=lambda e: (center(e)[0] - wc[0]) ** 2 + (center(e)[1] - wc[1]) ** 2)
+args = {k: v for k, v in cfg["args"].items() if k != "element_token"}
+args.update({"element_index": pick["element_index"], "snapshot_id": sc["snapshot_id"]})
+reply, raw = call("tools/call", {"name": cfg["tool"], "arguments": args})
+try: p.stdin.close(); p.wait(3)
+except Exception: pass
+if raw is None: refuse("session_unavailable", "the session closed during the action; its outcome is unknown")
+print(raw)
+sys.exit(1 if (reply.get("result") or {}).get("isError") else 0)
+`;
+
+function elementSessionInput(tool: string, full: Record<string, unknown>, element: CuElement): { prelude: string; invoke: string; single: boolean } {
+  const cfg = Buffer.from(JSON.stringify({ tool, args: full,
+    element: { role: element.role, label: element.label, frame: element.frame } })).toString("base64");
+  return {
+    prelude: [
+      `_fleet_element() {`,
+      `  command -v python3 >/dev/null 2>&1 || { echo '{"status":"refused","refusal":{"code":"python3_missing","message":"python3 is required for a label-addressed action"}}'; return 1; }`,
+      `  python3 -c ${shellQuote(ELEMENT_PY, "linux")} "$fcd" '${cfg}'`,
+      `}`,
+    ].join("\n"),
+    invoke: "_fleet_element",
+    single: true,
+  };
 }
 
 /** A click addressed by a perception region. Capture, parse, pick and click run
@@ -4254,7 +4324,7 @@ async function cuActOnTarget(
   host: Host, target: CuTarget, tool: string, full: Record<string, unknown>,
   opts: CuInputOptions,
   deps: { exec?: typeof exec; deliver?: typeof deliverImage },
-  input?: { prelude: string; invoke: string },
+  input?: { prelude: string; invoke: string; single?: boolean },
 ): Promise<CuActResult> {
   const run = deps.exec ?? exec;
   const { prelude, invoke } = cuaBin(host.os);
@@ -4332,7 +4402,7 @@ async function cuActOnTarget(
   const blocks = parseCaptureBlocks(raw.stdout);
   const body = (blocks.find((b) => !b.remotePath) ?? blocks[0])?.body.trim() ?? "";
   // A batch frames each step's reply itself and unwraps them per step.
-  const driverOutput = input ? body : cuReplyText(body).trim();
+  const driverOutput = input && !input.single ? body : cuReplyText(body).trim();
 
   let effect: CuEffect = "indeterminate";
   let reason: string | undefined;
@@ -4352,7 +4422,7 @@ async function cuActOnTarget(
   // An exit code of 0 is not delivery: the driver reports a background input
   // the app dropped as `escalation: delivery_failed` in an otherwise normal
   // reply. Batch already stops on that; a single action fails on it too.
-  const refusal = input ? undefined : cuReplyRefusal(driverOutput);
+  const refusal = input && !input.single ? undefined : cuReplyRefusal(driverOutput);
   const base: CuActResult = {
     host: host.name, target, effect, reason, driverOutput,
     ...(refusal ? { refusal } : {}),
@@ -4756,8 +4826,13 @@ export function cuReplyRefusal(text: string): string | undefined {
   try { reply = extractJson(text); } catch { return undefined; }
   if (!reply || typeof reply !== "object" || Array.isArray(reply)) return undefined;
   if (reply.isError === true) return "the driver returned an error";
+  if (reply.refusal) {
+    const r = reply.refusal;
+    if (typeof r === "string") return `the driver refused the input: ${r}`;
+    if (typeof r?.code === "string") return `the driver refused the input (${r.code})${typeof r.message === "string" ? `: ${r.message}` : ""}`;
+    return `the driver refused the input: ${JSON.stringify(r)}`;
+  }
   if (["refused", "error", "failed"].includes(reply.status)) return `the driver reported status ${reply.status}`;
-  if (reply.refusal) return `the driver refused the input: ${typeof reply.refusal === "string" ? reply.refusal : JSON.stringify(reply.refusal)}`;
   // A capture-bound click the driver would not admit: stale, reused, moved.
   if (reply.effect === "refused") return `the driver refused the input${typeof reply.code === "string" ? ` (${reply.code})` : ""}`;
   const reason = reply.escalation?.reason;

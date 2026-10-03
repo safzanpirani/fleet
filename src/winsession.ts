@@ -23,6 +23,7 @@ import { mkdirSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { hostKeyOpts, type Host } from "./config.ts";
+import { sshEnv } from "./ssh.ts";
 import { fleetReinvocation, proxyOpts } from "./proxy.ts";
 
 const READY = "__FLEET_SESSION_READY__";
@@ -354,7 +355,7 @@ class Session {
     const proc = Bun.spawn(["ssh", ...proxyOpts(host), ...hostKeyOpts(host), "-o", "ControlMaster=no", "-o", "ControlPath=none",
       "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=30", host.ssh,
       "pwsh", "-NoProfile", "-NonInteractive", "-OutputFormat", "Text", "-EncodedCommand", encoded],
-      { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+      { stdin: "pipe", stdout: "pipe", stderr: "pipe", env: sshEnv() });
     const s = new Session(proc);
     s.pump(proc.stdout as ReadableStream<Uint8Array>, "out");
     s.pump(proc.stderr as ReadableStream<Uint8Array>, "err");

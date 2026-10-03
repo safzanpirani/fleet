@@ -72,6 +72,8 @@ fleet svc cloudflared              # up/down of one service on every host that h
 fleet deploy gpu-box              # ship fleet source -> host, bun install, restart fleet-mcp
 fleet status                        # live CPU/mem/disk/gpu from your status dashboard
 fleet disk                          # live free space on every mounted volume
+fleet ps web python --sort cpu     # processes, the same columns on every OS
+fleet kill web 4242 --dry-run      # show the stop plan; --tree, --force, --all
 fleet status vps                    # one host
 fleet logs web cloudflared -n 50
 fleet shot web                 # screenshot the remote desktop -> local PNG
@@ -449,6 +451,40 @@ Measured on a test phone: over Wi-Fi, `elements` takes ~1 s and an input ~2–3 
 Over Tailscale's relay on mobile data (~10–15 KB/s) replies are gzipped: `elements`
 ~1.7 s, an input ~2 s, and a screenshot 8 s at 400 px wide.
 
+### Games (`fleet game`)
+
+cua-driver sends keys with `PostMessage` to a background window. Most games read Raw Input
+or DirectInput and never see those keys, and cua-driver has no key holds, relative mouse or
+gamepad. `fleet game <windows-host> …` covers that. A resident helper in the logged-in
+console session sends scan-code keys and relative mouse moves through `SendInput`, plugs in
+a ViGEmBus virtual Xbox 360 pad, and copies window frames:
+
+```sh
+fleet game win-box start                       # first start installs pillow + vgamepad in a uv venv
+fleet game win-box windows                     # what a TARGET can name: exe, title, pid:N, hwnd:N
+fleet game win-box hold eldenring w 1500 --shot
+fleet game win-box look eldenring -300 0 --ms 200
+fleet game win-box pad a                       # no target needed for pad input
+fleet game win-box do --file farm.json --detach   # a macro, run on the host with exact timing
+fleet game win-box status                      # held inputs, the running macro
+fleet game win-box release                     # halt it and release everything
+```
+
+- One step language serves agents and macro files: tap, hold, down, up, type, look,
+  move, click, wheel, stick, trigger, wait, wait_pixel, shot, focus and repeat.
+  `fleet help game` lists them. A macro file is a step array or `{target, repeat, steps}`.
+- Keyboard and mouse events require the target in the foreground. A run brings it forward
+  first. If it loses the foreground mid-run (an alt-tab), the run aborts and releases every
+  held key, button, stick and trigger. A click is refused when its point lies outside the
+  target or over another process's window.
+- Anything still held after a call auto-releases 10 s later unless the next call
+  continues. A detached macro releases everything when it ends.
+- Frames come from the composed desktop: an exclusive-fullscreen game captures as black,
+  so run it borderless windowed.
+- MCP: `fleet_game_status` (read-only), `fleet_game_windows`, `fleet_game_frame`,
+  `fleet_game_do` and `fleet_game_control`.
+- Injected input and virtual pads can trip anti-cheat. Keep this to offline games.
+
 ## Agent setup
 
 Fleet is built to be driven by a coding agent as much as by a human. For most
@@ -640,8 +676,8 @@ All prefixed `fleet_`, grouped by access:
 
 | Group | Tools |
 |---|---|
-| **Read-only** — carry `readOnlyHint`, always registered | `ls` · `logs` · `svc` · `gpu` · `disk` · `status` · `jobs` · `job_log` · `boot` · `session` |
-| **Mutating** — dropped by the read-only kill-switch | `exec` · `cp` · `restart` · `spawn` · `drop` · `job_kill` · `reboot` · `bios` · `switch` · `screenshot` · `cu` · `run` · `android_*` (state, elements, screenshot, act, batch, flow, wait, open, apps, bootstrap, release) |
+| **Read-only** — carry `readOnlyHint`, always registered | `ls` · `logs` · `svc` · `gpu` · `disk` · `status` · `jobs` · `job_log` · `boot` · `session` · `ps` · `game_status` |
+| **Mutating** — dropped by the read-only kill-switch | `exec` · `cp` · `restart` · `spawn` · `drop` · `job_kill` · `reboot` · `bios` · `switch` · `screenshot` · `cu` · `run` · `android_*` (state, elements, screenshot, act, batch, flow, wait, open, apps, bootstrap, release) · `kill` · `game_*` (windows, frame, do, control) |
 | **Not exposed** | `top` / `ssh` (need a live TTY) · job `tail -f` / `wait` (would block) |
 
 - `screenshot` counts as **mutating** — capturing runs commands on the host (on Windows it registers a one-shot scheduled task).
@@ -835,6 +871,12 @@ only the proxy *name* reaches ssh's argv; the secret is read in-process from
 `passwordEnv`/`passwordFile`. A failed connection names the leg that broke
 (proxy unreachable, auth rejected, DNS, destination refused) instead of blaming
 the host.
+
+On macOS and Linux, fleet also passes `-o ProxyUseFdpass=yes` and runs
+`__proxy-connect --fdpass`: it completes the proxy handshake, hands the connected
+socket to ssh, and exits, so no fleet process stays behind for the life of the
+connection. A Windows controller keeps the copying ProxyCommand, because Win32
+OpenSSH has no `ProxyUseFdpass`.
 
 Two things to know:
 
