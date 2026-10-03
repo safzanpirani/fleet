@@ -397,8 +397,10 @@ describe("ssh children see the environment as fleet left it", () => {
         const run = await exec(host, "true");
         console.log(JSON.stringify({ exec: run.stdout.trim() }));
       `;
+      // Earlier tests in this process may leave their own FLEET_PROXY_* values behind.
+      const inherited = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith("FLEET_PROXY")));
       const proc = Bun.spawn(["bun", "-e", snippet], {
-        env: { ...process.env, PATH: dir + delimiter + (process.env.PATH ?? ""), FLEET_NO_SSH_MUX: "1" },
+        env: { ...inherited, PATH: dir + delimiter + (process.env.PATH ?? ""), FLEET_NO_SSH_MUX: "1" },
         stdout: "pipe", stderr: "pipe",
       });
       const [stdout, stderr, code] = await Promise.all([
