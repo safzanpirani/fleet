@@ -364,38 +364,6 @@ and exposes computer-use tools. Same interactive-desktop requirement as `fleet s
   - Foreground input lands on whatever window is on top at that point. `bring_to_front`
     the target first; maximizing through accessibility does not raise a window.
 
-### Games (`fleet game`)
-
-`fleet cu` input reaches apps, not games. cua-driver sends `PostMessage` keys that Raw
-Input and DirectInput games ignore, and it has no key holds, relative mouse or pad. Use
-`fleet game <windows-host> …` for games. `fleet help game` has the full step reference.
-
-- **Helper:** one process per host in the console session (installed under
-  `%LOCALAPPDATA%\fleet\game`), started by `fleet game <host> start`. The first start
-  installs pillow and vgamepad with uv. Later input calls restart a stopped or older
-  helper themselves and never install it. `status` shows the helper version, the
-  foreground window, held inputs, whether the pad is plugged in, and the current or last run.
-- **Targets:** an exe name, a title substring, `exe:`, `title:`, `pid:N` or `hwnd:N`.
-  `windows [FILTER]` lists the candidates. A name matching several processes is refused.
-  Within one process the largest window wins.
-- **Steps:** `do <TARGET|-> '<json>'` or `do [TARGET] --file macro.json`, plus the one-line
-  verbs `tap`, `hold`, `look`, `click`, `type`, `pad`, `stick` and `trigger`. `--shot`
-  returns a frame after the run. Points are frame pixels at the same `--max` (default 1280).
-- **Safety:**
-  - Keyboard and mouse events go only to the target in the foreground. A lost foreground
-    aborts the run and releases everything held.
-  - A click is refused outside the target or over another process's window.
-  - Held inputs auto-release after 10 s unless the next call starts.
-  - `release [--unplug]` always works, on any helper version.
-  - Pad, stick and trigger steps need no target.
-- **Macros:** `--detach` runs the steps on the host with exact timing, and `--repeat 0`
-  loops until `release`. A detached run releases everything when it ends.
-- **Ask before live input on a machine someone is using.** A run takes the foreground from
-  whoever sits there. `status`, `windows` and `frame` send no input.
-- Frames come from the composed desktop. A black frame means exclusive fullscreen;
-  switch the game to borderless windowed.
-- Injected input and ViGEm pads can trip anti-cheat. Keep this to offline games.
-
 ### Android phones
 
 A host with an `"android"` block is a phone reached over SSH into Termux. Termux's own
@@ -625,11 +593,6 @@ Run standalone with `bun run mcp` (honours `FLEET_CONFIG`); smoke-test end-to-en
 | `fleet_status` | `host?` | `fleet status` |
 | `fleet_bios` | `selector` | `fleet bios <selector> --yes` |
 | `fleet_run` | `recipe` | `fleet run` |
-| `fleet_game_status` | `host` | `fleet game <host> status` (read-only; starts nothing) |
-| `fleet_game_windows` | `host`, `filter?` | `fleet game <host> windows` |
-| `fleet_game_frame` | `host`, `target?`, `max?`, `quality?` | `fleet game <host> frame` (returns a JPEG image) |
-| `fleet_game_do` | `host`, `steps[]`, `target?`, `repeat?`, `detach?`, `shot?`, `max?` | `fleet game <host> do`; returns frames when `shot` or a `shot` step asks |
-| `fleet_game_control` | `host`, `action` (start\|stop\|release\|focus), `target?`, `force?`, `unplug?` | `fleet game <host> start\|stop\|release\|focus` |
 
 - `top`, `ssh`, and live `jobs tail -f` remain CLI-only. Detached jobs and bounded waits are available over MCP.
 - Same rules as the CLI: pass `command` verbatim (don't escape), syntax is the target's

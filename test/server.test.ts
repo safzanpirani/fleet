@@ -26,7 +26,6 @@ const READ_TOOLS = [
   "fleet_disk",
   "fleet_doctor",
   "fleet_dt",
-  "fleet_game_status",
   "fleet_gpu",
   "fleet_job_log",
   "fleet_job_wait",
@@ -73,10 +72,6 @@ const MUTATING_TOOLS = [
   "fleet_drop",
   "fleet_edit",
   "fleet_exec",
-  "fleet_game_control",
-  "fleet_game_do",
-  "fleet_game_frame",
-  "fleet_game_windows",
   "fleet_job_kill",
   "fleet_jobs_prune",
   "fleet_kill",
@@ -115,27 +110,6 @@ function toolByName(tools: Tool[], name: string): Tool {
 }
 
 describe("Fleet MCP parity", () => {
-  test("game input advertises mutation and validates before host routing", async () => {
-    const route = spyOn(core, "routeSelector");
-    try {
-      await withClient(false, async (client) => {
-        const { tools } = await client.listTools();
-        expect(toolByName(tools, "fleet_game_do").annotations).toMatchObject({
-          readOnlyHint: false, destructiveHint: true, idempotentHint: false,
-        });
-        for (const args of [
-          { target: "game", steps: [{ tap: "w", ms: -1 }] },
-          { steps: [{ tap: "w" }] },
-          { steps: [{ wait: 3_600_000 }], repeat: 1000 },
-        ]) {
-          const result = await client.callTool({ name: "fleet_game_do", arguments: { host: "local", ...args } });
-          expect(result.isError).toBe(true);
-        }
-      });
-      expect(route).not.toHaveBeenCalled();
-    } finally { route.mockRestore(); }
-  });
-
   test("Android flow is registered as mutating and disappears in read-only mode", async () => {
     const flow = spyOn(android, "androidFlow");
     try {

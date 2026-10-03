@@ -72,11 +72,6 @@ import {
   androidRecordStart, androidRecordStatus, androidRecordStop, androidRevive, androidWatch,
 } from "./android.ts";
 import type { AndroidAction, AndroidBatchStep, AndroidDeps, AndroidElement, AndroidFlowStep, AndroidLocator, AndroidState } from "./android.ts";
-import {
-  gameStart, gameStop, gameStatus, gameWindows, gameFocus, gameFrame, gameDo, gameRelease, gameShorthand,
-  parseGameArgv, parseGameMacro, gameIntFlag, prepareGameDo,
-} from "./game.ts";
-import type { GameDoResult, GameFrame, GameRun, GameWindow } from "./game.ts";
 
 /** Colour only for a person at a terminal. Output piped to an agent or a file
  *  is data, and escape codes inside it are noise every reader has to strip.
@@ -542,7 +537,7 @@ function printRaw(r: ExecResult): void {
 
 const SUBCOMMANDS = [
   "ls", "hosts", "dt", "exec", "spawn", "jobs", "cp", "edit", "restart", "reboot", "bios", "boot", "switch", "wait",
-  "gpu", "disk", "ps", "kill", "status", "top", "logs", "svc", "shot", "cu", "game", "browse", "run", "deploy", "tools", "proxy", "doctor", "hostkey", "find", "session", "drop", "completion", "ssh", "help",
+  "gpu", "disk", "ps", "kill", "status", "top", "logs", "svc", "shot", "cu", "browse", "run", "deploy", "tools", "proxy", "doctor", "hostkey", "find", "session", "drop", "completion", "ssh", "help",
 ];
 /** Emit a bash/zsh completion script with this config's hosts/groups/recipes/
  *  services baked in. Source it: `eval "$(fleet completion zsh)"`. */
@@ -1178,153 +1173,6 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       if (!noOpen && process.platform === "darwin")
         Bun.spawn(["open", r.localPath], { stdout: "ignore", stderr: "ignore" });
       return 0;
-    }
-
-    case "game": {
-      let parsed: ReturnType<typeof parseGameArgv>;
-      try { parsed = parseGameArgv(rest); } catch (error) { die((error as Error).message); }
-      const { flags, pos } = parsed;
-      const [sel, verb, ...ops] = pos;
-      if (!sel || !verb) die("usage: fleet game <host> start|status|windows|focus|frame|do|tap|hold|look|click|type|pad|stick|trigger|release|stop (fleet help game)");
-      const json = flags["--json"] === true;
-      let target: string | undefined;
-      let steps: unknown;
-      let repeat: number | undefined;
-      let doOpts: import("./game.ts").GameDoOptions = {};
-      try {
-        gameIntFlag(flags, "--repeat", undefined, 0, 1_000_000);
-        gameIntFlag(flags, "--max", 1280, 0, 8192);
-        gameIntFlag(flags, "--quality", 80, 10, 95);
-        gameIntFlag(flags, "--ms", undefined, 0, 600_000);
-        gameIntFlag(flags, "--count", undefined, 1, 3);
-        gameIntFlag(flags, "--grid-step", 100, 10, 2000);
-        if (["do", "tap", "hold", "look", "click", "type", "pad", "stick", "trigger"].includes(verb)) {
-          const padVerb = ["pad", "stick", "trigger"].includes(verb);
-          repeat = gameIntFlag(flags, "--repeat", undefined, 0, 1_000_000);
-          if (verb === "do") {
-            const file = flags["--file"] as string | undefined;
-            const wantOps = file ? 1 : 2;
-            if (ops.length > wantOps || (!file && ops.length < 2))
-              die(`usage: fleet game ${sel} do <TARGET|-> <STEPS-JSON|-> | do [TARGET] --file MACRO.json  [--repeat N] [--detach] [--shot] [--max N] [--out FILE]`);
-            const source = file ? await readFile(file, "utf8") : ops[1] === "-" ? await Bun.stdin.text() : ops[1]!;
-            const macro = parseGameMacro(source, file ?? (ops[1] === "-" ? "stdin" : "steps"));
-            steps = macro.steps;
-            target = ops[0] && ops[0] !== "-" ? ops[0] : macro.target;
-            repeat ??= macro.repeat;
-          } else {
-            if (!padVerb) { target = ops.shift(); if (!target) die(`usage: fleet game ${sel} ${verb} <TARGET> …`); }
-            steps = gameShorthand(verb, ops, { ms: gameIntFlag(flags, "--ms", undefined, 0, 600_000),
-              button: flags["--button"] as string | undefined, count: gameIntFlag(flags, "--count", undefined, 1, 3) });
-          }
-          doOpts = { target, repeat, detach: flags["--detach"] === true, shot: flags["--shot"] === true,
-            max: gameIntFlag(flags, "--max", 1280, 0, 8192), quality: gameIntFlag(flags, "--quality", 80, 10, 95) };
-          prepareGameDo(steps, doOpts);
-        }
-      } catch (error) { die(error instanceof Error ? error.message : String(error)); }
-      const routed = await routeSelector(cfg, sel);
-      const host = resolveHosts(cfg, routed)[0]!.name;
-      const win = (w: Pick<GameWindow, "exe" | "title"> & { hwnd: number }) => `${w.exe} ${JSON.stringify(w.title.slice(0, 60))} ${A.d(`hwnd:${w.hwnd}`)}`;
-      const runLine = (r: GameRun) => {
-        const mark = r.state === "done" ? A.g("●") : r.state === "running" ? A.c("●") : A.r("✗");
-        return `${mark} ${A.b(host)} run ${r.id} ${r.state} · ${r.steps} step${r.steps === 1 ? "" : "s"} · loop ${r.loop}${r.repeat ? `/${r.repeat}` : "/∞"} · ${r.seconds}s`
-          + (r.target ? ` · ${win(r.target)}` : "");
-      };
-      const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-      const saveFrames = async (frames: GameFrame[]): Promise<string[]> => {
-        const out = flags["--out"] as string | undefined;
-        const paths: string[] = [];
-        for (const [i, f] of frames.entries()) {
-          const base = out ?? `${host}-game-${stamp}.jpg`;
-          const path = frames.length === 1 ? base : base.replace(/(\.[a-z0-9]+)?$/i, `-${i + 1}$1`);
-          await Bun.write(path, Buffer.from(f.jpeg, "base64"));
-          if (flags["--grid"] === true && !await overlayGrid(path, {
-            step: gameIntFlag(flags, "--grid-step", 100, 10, 2000), caption: `image pixels · ${f.width}x${f.height} · ×${f.scale} = client pixels`,
-          })) console.error(A.y("grid overlay skipped (need python3 + Pillow)"));
-          paths.push(path);
-        }
-        if (paths.length && flags["--no-open"] !== true && !json && process.platform === "darwin")
-          Bun.spawn(["open", ...paths], { stdout: "ignore", stderr: "ignore" });
-        return paths;
-      };
-      const frameNote = (f: GameFrame) => `${f.width}x${f.height}${f.scale !== 1 ? ` (client ${f.client[0]}x${f.client[1]}, ×${f.scale})` : ""} in ${f.ms} ms`
-        + (f.black ? A.y(" · all black: switch the game to borderless windowed") : "");
-      try {
-        switch (verb) {
-          case "start": {
-            if (ops.length) die(`usage: fleet game ${sel} start [--force]`);
-            if (!json) process.stderr.write(A.d(`◎ starting the game helper on ${host} (the first start installs pillow + vgamepad) …\n`));
-            const r = await gameStart(cfg, routed, { force: flags["--force"] === true });
-            if (json) { console.log(JSON.stringify(r)); return 0; }
-            for (const l of r.log) console.log(A.d(l));
-            console.log(`${A.g("●")} ${A.b(host)} game helper ${r.version} ${r.started ? "started" : "already running"} · pid ${r.pid}`);
-            return 0;
-          }
-          case "stop": {
-            const r = await gameStop(cfg, routed);
-            if (json) { console.log(JSON.stringify(r)); return 0; }
-            console.log(r.stopped ? `${A.g("●")} ${A.b(host)} game helper stopped (pid ${r.stopped}); everything held was released and the pad unplugged`
-              : `${A.d("○")} ${A.b(host)} game helper was not running`);
-            return 0;
-          }
-          case "status": {
-            const r = await gameStatus(cfg, routed);
-            if (json) { console.log(JSON.stringify(r)); return 0; }
-            if (!r.running) { console.log(`${A.d("○")} ${A.b(host)} ${r.note}`); return 0; }
-            console.log(`${A.g("●")} ${A.b(host)} game helper ${r.version} · pid ${r.pid}${r.pad ? " · virtual pad plugged in" : ""}`);
-            if (r.note) console.log(A.y(`  ${r.note}`));
-            if (r.foreground) console.log(`  foreground ${win(r.foreground)}`);
-            console.log(`  held ${r.held.length ? r.held.join(", ") + (r.leaseS ? A.d(` (auto-release in ${r.leaseS}s)`) : "") : A.d("nothing")}`);
-            if (r.run) console.log("  " + runLine(r.run) + (r.run.error ? `\n    ${A.r(r.run.error)}` : ""));
-            return 0;
-          }
-          case "release": {
-            const r = await gameRelease(cfg, routed, { unplug: flags["--unplug"] === true });
-            if (json) { console.log(JSON.stringify(r)); return 0; }
-            if (!r.running) { console.log(`${A.d("○")} ${A.b(host)} game helper is not running; nothing is held`); return 0; }
-            console.log(`${A.g("●")} ${A.b(host)} released ${r.released.length ? r.released.join(", ") : "nothing held"}`
-              + (r.halted ? ` · halted run ${r.halted}` : ""));
-            return 0;
-          }
-          case "windows": {
-            if (ops.length > 1) die(`usage: fleet game ${sel} windows [FILTER] [--json]`);
-            const r = await gameWindows(cfg, routed, ops[0]);
-            if (json) { console.log(JSON.stringify(r)); return 0; }
-            for (const w of r) console.log(`${w.foreground ? A.g("●") : w.minimized ? A.d("○") : " "} ${String(w.hwnd).padStart(10)} ${String(w.pid).padStart(6)} ${A.b(w.exe.padEnd(22))} `
-              + `${w.minimized ? A.d("minimized") : `${w.width}x${w.height}@${w.x},${w.y}`}  ${w.title.slice(0, 70)}`);
-            if (!r.length) console.log(A.d("no windows match"));
-            return 0;
-          }
-          case "focus": {
-            if (ops.length !== 1) die(`usage: fleet game ${sel} focus <TARGET>`);
-            const r = await gameFocus(cfg, routed, ops[0]!);
-            if (json) { console.log(JSON.stringify(r)); return 0; }
-            console.log(`${A.g("●")} ${A.b(host)} foreground ${win(r.target)}`);
-            return 0;
-          }
-          case "frame": {
-            if (ops.length > 1) die(`usage: fleet game ${sel} frame [TARGET] [--max N] [--quality Q] [--out FILE] [--grid] [--no-open]`);
-            const r = await gameFrame(cfg, routed, ops[0], {
-              max: gameIntFlag(flags, "--max", 1280, 0, 8192), quality: gameIntFlag(flags, "--quality", 80, 10, 95) });
-            const [path] = await saveFrames([r.frame]);
-            if (json) { console.log(JSON.stringify({ host, target: r.target, path, ...r.frame, jpeg: undefined })); return 0; }
-            console.log(`${A.g("●")} ${A.b(host)} ${r.target ? win(r.target) : "whole primary display"} ${A.d("→")} ${path} ${A.d(frameNote(r.frame))}`);
-            return 0;
-          }
-          case "do": case "tap": case "hold": case "look": case "click": case "type": case "pad": case "stick": case "trigger": {
-            const r: GameDoResult = await gameDo(cfg, routed, steps, doOpts);
-            const paths = await saveFrames(r.frames);
-            if (json) { console.log(JSON.stringify({ ...r, frames: r.frames.map((f, i) => ({ ...f, jpeg: undefined, path: paths[i] })) })); return r.ok ? 0 : 1; }
-            console.log(runLine(r.run));
-            if (r.error) console.log(`  ${A.r(r.error)}`);
-            if (r.run.detached) console.log(A.d(`  runs on ${host}; fleet game ${sel} status follows it, fleet game ${sel} release halts it`));
-            if (r.held.length) console.log(`  held ${r.held.join(", ")} ${A.d(`(auto-release in ${r.leaseS}s unless the next call continues)`)}`);
-            r.frames.forEach((f, i) => console.log(`  frame ${A.d("→")} ${paths[i]} ${A.d(frameNote(f))}`));
-            return r.ok ? 0 : 1;
-          }
-          default:
-            die(`unknown game verb: ${verb} (fleet help game)`);
-        }
-      } catch (error) { die(error instanceof Error ? error.message : String(error)); }
     }
 
     case "browse": {

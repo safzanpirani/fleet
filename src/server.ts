@@ -36,10 +36,6 @@ import {
   androidRecordStart, androidRecordStatus, androidRecordStop,
 } from "./android.ts";
 import type { AndroidAction, AndroidBatchStep, AndroidElement } from "./android.ts";
-import {
-  gameStatus, gameWindows, gameFrame, gameDo, gameStart, gameStop, gameRelease, gameFocus, GAME_STEP_ACTIONS, prepareGameDo,
-} from "./game.ts";
-import type { GameDoResult, GameFrame, GameRun, GameWindow } from "./game.ts";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -76,19 +72,6 @@ function renderExec(results: ExecResult[]): string {
 }
 const text = (t: string, isError = false) =>
   ({ content: [{ type: "text" as const, text: t || "(no output)" }], isError });
-
-const gameWin = (w: Pick<GameWindow, "exe" | "title" | "hwnd">) => `${w.exe} ${JSON.stringify(w.title.slice(0, 60))} hwnd:${w.hwnd}`;
-const gameRunLine = (r: GameRun) => `run ${r.id} ${r.state} · ${r.steps} steps · loop ${r.loop}/${r.repeat || "∞"} · ${r.seconds}s`
-  + (r.target ? ` · ${gameWin(r.target)}` : "") + (r.error ? `\n${r.error}` : "");
-const gameFrameLine = (f: GameFrame) => `frame ${f.width}x${f.height}, client ${f.client[0]}x${f.client[1]}, scale ${f.scale} `
-  + `(points in steps are these image pixels at the same max)` + (f.black ? " · ALL BLACK: the game is likely in exclusive fullscreen; switch it to borderless windowed" : "");
-const GAME_STEPS_DOC = "Steps run on the host in order, one action per step: "
-  + "{tap:KEY|[KEYS],ms?} {hold:KEY|[KEYS],ms} {down:KEY} {up:KEY} {type:TEXT} {look:[dx,dy],ms?} (relative mouse, for camera) "
-  + "{move:[x,y]} {click:left|right|middle,at?:[x,y],count?} {wheel:N} {stick:left|right,xy:[x,y],ms?} (-1..1, +y up) "
-  + "{trigger:lt|rt,value?:0..1,ms?} {wait:MS} {wait_pixel:[x,y],rgb:[r,g,b],tol?,timeout,gone?} {shot:true} {focus:true} "
-  + "{repeat:N,steps:[…]}. Keys are scan-code positions: a-z 0-9 f1-f24 space enter esc tab shift ctrl alt up down left right "
-  + "…; mouse buttons lmb rmb mmb mb4 mb5; pad buttons pad.a pad.b pad.x pad.y pad.lb pad.rb pad.lt pad.rt pad.ls pad.rs "
-  + "pad.start pad.back pad.guide pad.up pad.down pad.left pad.right.";
 
 function phoneElementRows(elements: AndroidElement[]) {
   return elements.map(({ ancestors: _a, bounds: _b, index: _i, ...e }) => e);
@@ -499,27 +482,6 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     if (!r.result.ok) return text([...prefix, renderExec([r.result])].join("\n"), true);
     return text([...prefix,
       brief ? briefDescribe(r.result.stdout, { elementsAvailable }) : r.result.stdout].join("\n"));
-  });
-
-  server.registerTool("fleet_game_status", {
-    title: "Game helper status",
-    description: "Read the Windows game helper's state: running or not, its version, the foreground window, what "
-      + "keys, buttons, sticks and triggers are held (and when they auto-release), whether the virtual pad is "
-      + "plugged in, and the current or last run, including a detached macro's progress. Starts nothing. " + sel,
-    inputSchema: { host: z.string().describe("A Windows host name.") },
-    annotations: { readOnlyHint: true, openWorldHint: true },
-  }, async ({ host }) => {
-    try {
-      const r = await gameStatus(cfg, await routeSelector(cfg, host));
-      if (!r.running) return text(r.note ?? "not running");
-      return text([
-        `helper ${r.version} · pid ${r.pid}${r.pad ? " · virtual pad plugged in" : ""}`,
-        ...(r.note ? [r.note] : []),
-        `foreground: ${r.foreground ? gameWin(r.foreground) : "none"}`,
-        `held: ${r.held.length ? r.held.join(", ") + (r.leaseS ? ` (auto-release in ${r.leaseS}s)` : "") : "nothing"}`,
-        ...(r.run ? [gameRunLine(r.run)] : []),
-      ].join("\n"));
-    } catch (error) { return text(error instanceof Error ? error.message : String(error), true); }
   });
 
   // ── mutating tools (skipped when readOnly — the kill-switch) ─────────────────
@@ -1785,123 +1747,6 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       const r = await androidApps(cfg, await routeSelector(cfg, host), { filter, all });
       if (!r.result.ok) return text(r.result.stderr || "pm list packages failed", true);
       return text(r.packages.join("\n") || "no packages match");
-    } catch (error) { return text(error instanceof Error ? error.message : String(error), true); }
-  });
-
-  // ── games (Windows): SendInput keys + relative mouse, ViGEm pad, frames ─────
-  server.registerTool("fleet_game_windows", {
-    title: "List windows a game step can target",
-    description: "List visible top-level windows on a Windows host with hwnd, pid, exe, title, client rectangle and "
-      + "which one has the foreground. A target is an exe name (eldenring), a title substring, exe:NAME, title:TEXT, "
-      + "pid:N or hwnd:N; a name matching several processes is refused with the candidates. Starts the game "
-      + "helper when it is not running (`fleet game <host> start` installs it once). " + sel,
-    inputSchema: {
-      host: z.string().describe("A Windows host name."),
-      filter: z.string().optional().describe("Case-insensitive substring of the title or exe."),
-    },
-    annotations: { openWorldHint: true },
-  }, async ({ host, filter }) => {
-    try {
-      const r = await gameWindows(cfg, await routeSelector(cfg, host), filter);
-      return text(r.map((w) => `${w.foreground ? "* " : "  "}${gameWin(w)} pid:${w.pid} `
-        + (w.minimized ? "minimized" : `${w.width}x${w.height}@${w.x},${w.y}`)).join("\n") || "no windows match");
-    } catch (error) { return text(error instanceof Error ? error.message : String(error), true); }
-  });
-
-  server.registerTool("fleet_game_frame", {
-    title: "Capture a game frame",
-    description: "Copy the target window's client area (or the whole primary display) as a JPEG, fast enough to "
-      + "look after every move. Coordinates in game steps (at, move, wait_pixel) are pixels of this image when the "
-      + "step call uses the same max. A frame that is all black means exclusive fullscreen: switch the game to "
-      + "borderless windowed. " + sel,
-    inputSchema: {
-      host: z.string().describe("A Windows host name."),
-      target: z.string().optional().describe("Window: exe name, title substring, exe:/title:/pid:/hwnd:. Omit for the primary display."),
-      max: z.number().int().min(0).max(8192).optional().describe("Longest image side (default 1280; 0 = native)."),
-      quality: z.number().int().min(10).max(95).optional().describe("JPEG quality (default 80)."),
-    },
-    annotations: { openWorldHint: true },
-  }, async ({ host, target, max, quality }) => {
-    try {
-      const r = await gameFrame(cfg, await routeSelector(cfg, host), target, { max, quality });
-      return { content: [
-        { type: "text" as const, text: `${r.target ? gameWin(r.target) : "primary display"} · ${gameFrameLine(r.frame)}` },
-        { type: "image" as const, data: r.frame.jpeg, mimeType: "image/jpeg" },
-      ] };
-    } catch (error) { return text(error instanceof Error ? error.message : String(error), true); }
-  });
-
-  server.registerTool("fleet_game_do", {
-    title: "Play: send game input steps",
-    description: "Send keyboard, mouse and gamepad input to a game on a Windows host and optionally get a frame back. "
-      + "Keys go out as SendInput scan codes and the mouse moves relatively, which games reading Raw Input see "
-      + "(cua-driver's PostMessage input is ignored by most games). Pad steps drive a virtual Xbox 360 controller. "
-      + "Keyboard and mouse events require the target foreground: the run brings it to the front, and if it loses the "
-      + "foreground mid-run the run aborts and everything held is released. Timing runs on the host, so holds and "
-      + "combos are exact. Keys still held when a call ends auto-release 10 s later unless the next call starts, "
-      + "so an agent can keep W held across calls. detach runs the steps as a macro on the host (repeat 0 loops "
-      + "until fleet_game_control release) and returns at once; fleet_game_status follows it. "
-      + GAME_STEPS_DOC + " " + sel,
-    inputSchema: {
-      host: z.string().describe("A Windows host name."),
-      target: z.string().optional().describe("Game window: exe name, title substring, exe:/title:/pid:/hwnd:. Required for keyboard, mouse and pixel steps."),
-      steps: z.array(z.record(z.string(), z.any())).min(1).describe(`Step objects; actions: ${GAME_STEP_ACTIONS.join(", ")}.`),
-      repeat: z.number().int().min(0).max(1_000_000).optional().describe("Passes over the steps (default 1; 0 = until released, needs detach)."),
-      detach: z.boolean().optional().describe("Run on the host as a macro and return immediately."),
-      shot: z.boolean().optional().describe("Return a frame after the last step."),
-      max: z.number().int().min(0).max(8192).optional().describe("Frame size cap and the coordinate space of points (default 1280)."),
-    },
-    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
-  }, async ({ host, target, steps, repeat, detach, shot, max }) => {
-    try {
-      prepareGameDo(steps, { target, repeat, detach, shot, max });
-      const r: GameDoResult = await gameDo(cfg, await routeSelector(cfg, host), steps, { target, repeat, detach, shot, max });
-      const lines = [gameRunLine(r.run)];
-      if (r.run.detached) lines.push("running on the host; fleet_game_status follows it, fleet_game_control release halts it");
-      if (r.held.length) lines.push(`held: ${r.held.join(", ")} (auto-release in ${r.leaseS}s unless the next call starts)`);
-      if (r.foreground && r.run.target && r.foreground.pid !== r.run.target.pid) lines.push(`foreground now: ${gameWin(r.foreground)}`);
-      const content: any[] = [{ type: "text" as const, text: lines.join("\n") }];
-      for (const f of r.frames) {
-        content.push({ type: "text" as const, text: gameFrameLine(f) });
-        content.push({ type: "image" as const, data: f.jpeg, mimeType: "image/jpeg" });
-      }
-      return { content, isError: !r.ok };
-    } catch (error) { return text(error instanceof Error ? error.message : String(error), true); }
-  });
-
-  server.registerTool("fleet_game_control", {
-    title: "Start, stop or release the game helper",
-    description: "start: install (first time: pillow + vgamepad into a uv venv) and launch the helper in the console "
-      + "session; force replaces an older helper that is running a macro. release: halt any running macro and "
-      + "release every key, button, stick and trigger (unplug also removes the virtual pad). focus: bring a window "
-      + "to the foreground. stop: release everything and exit the helper. " + sel,
-    inputSchema: {
-      host: z.string().describe("A Windows host name."),
-      action: z.enum(["start", "stop", "release", "focus"]),
-      target: z.string().optional().describe("focus: the window to bring forward."),
-      force: z.boolean().optional().describe("start: replace an older helper even while it runs a macro."),
-      unplug: z.boolean().optional().describe("release: also unplug the virtual pad."),
-    },
-    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
-  }, async ({ host, action, target, force, unplug }) => {
-    try {
-      const routed = await routeSelector(cfg, host);
-      if (action === "start") {
-        const r = await gameStart(cfg, routed, { force });
-        return text([...r.log, `helper ${r.version} ${r.started ? "started" : "already running"} · pid ${r.pid}`].join("\n"));
-      }
-      if (action === "stop") {
-        const r = await gameStop(cfg, routed);
-        return text(r.stopped ? `helper stopped (pid ${r.stopped})` : "helper was not running");
-      }
-      if (action === "release") {
-        const r = await gameRelease(cfg, routed, { unplug });
-        return text(!r.running ? "helper is not running; nothing is held"
-          : `released ${r.released.length ? r.released.join(", ") : "nothing held"}${r.halted ? ` · halted run ${r.halted}` : ""}`);
-      }
-      if (!target) return text("focus needs target", true);
-      const r = await gameFocus(cfg, routed, target);
-      return text(`foreground: ${gameWin(r.target)}`);
     } catch (error) { return text(error instanceof Error ? error.message : String(error), true); }
   });
 
