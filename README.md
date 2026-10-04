@@ -234,7 +234,7 @@ reads that spool through the same `exec`.
 ```sh
 fleet spawn --cwd /srv/app --label train web "long-running-thing"  # -> host:id, detaches
 fleet spawn --wsl win-box "python3 job.py > /tmp/job.log"   # Windows host: runs inside WSL
-fleet jobs                              # list (running ● / exited ○ / dead ✗) across the fleet
+fleet jobs                              # list (starting ○ / running ● / exited ○ / dead ✗) across the fleet
 fleet jobs log  web:<id>             # full output
 fleet jobs tail web:<id> -n 40 -f    # last N lines, optionally follow live
 fleet jobs wait web:<id> --until '<regex>' [--timeout S]   # block on match or exit
@@ -247,8 +247,17 @@ waits up to five seconds, then escalates against surviving tracked descendants.
 It publishes a sentinel exit code only after those processes are gone. Windows
 uses `taskkill /T /F` and confirms that the owned runner has stopped.
 
-`wait` exits with the job's own code on completion, `0` on a `--until` match and
-`124` on timeout, so `fleet jobs wait web:<id> && deploy` works. `--label` prefixes a readable slug onto the job id.
+`wait` exits with the job's own code on completion, `0` on a `--until` match,
+`124` on timeout, and `1` for a dead runner or an unconfirmed launch.
+`--label` prefixes a readable slug onto the job id.
+
+A spool without a PID or valid exit record has status `starting`. After a
+120-second startup grace, three consecutive successful no-PID observations end
+the wait with outcome `launch-unconfirmed` and CLI exit code `1`. The grace uses
+the spool age when available; otherwise it starts at the first observation. The
+scheduler may still start the job. Inspect the existing job before submitting
+another launch. A valid exit record takes precedence over a missing PID.
+Inspection failures reset the observation count. Polling never writes to the spool.
 
 Jobs run on every OS. Linux launches them with `setsid`. macOS has no `setsid`,
 so it uses `nohup`. Neither needs privilege, and both survive a disconnect.

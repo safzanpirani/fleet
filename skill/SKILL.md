@@ -30,10 +30,10 @@ fleet exec win-box "nvidia-smi"
 | `fleet exec [--cwd dir] [--wsl] [--sudo] [--fresh] [--confirm-reboot] [--raw] [--json] <sel> "<cmd>"` | Run a command on host(s) and wait for it (returns the exit code). `--cwd` expands a leading `~` and fails fast (exit 127) if the directory is missing. `--wsl` runs inside WSL on Windows boxes. `--raw` prints only remote stdout. `--sudo` runs it as root on POSIX hosts (passwordless sudo, or `hosts.<h>.sudo.passwordFile` sent over ssh stdin). `--fresh` logs in again instead of reusing the shared connection. Reboot-looking commands need `--confirm-reboot`. |
 | `fleet exec --script <file\|-> [--interp cmd] <sel> [ARG…]` | Run a local script file or stdin on host(s). Fleet infers file extensions and supported stdin shebangs. Untyped stdin requires `--interp`. Tokens after `<sel>` reach the script as `$1…`, PowerShell `$args`/`param()`, or argv. |
 | `fleet spawn [--wsl] [--elevated] [--fresh] [--cwd dir] [--json] <sel> "<cmd>"` | Launch a detached job that outlives the SSH session and returns a `host:id`. `--wsl` runs it under `bash -l` in a Windows box's WSL distro, so `> /tmp/x` lands in WSL. `--elevated` gives a Windows job the administrator token (storage/CIM cmdlets need it). |
-| `fleet jobs [<sel>]` | List detached jobs across the fleet (running ● / exited ○ / dead ✗). |
+| `fleet jobs [<sel>]` | List detached jobs across the fleet (starting ○ / running ● / exited ○ / dead ✗). |
 | `fleet jobs log <host:id>` | Full captured output of a job. |
 | `fleet jobs tail <host:id> [-n N] [-f]` | Last N lines; `-f` streams live (foreground until Ctrl-C). |
-| `fleet jobs wait <host:id> [--until <regex>] [--timeout S]` | Block until the job exits (or its output matches `--until`). Scriptable exit code: job's own code on exit, `0` on match, `124` on timeout. |
+| `fleet jobs wait <host:id> [--until <regex>] [--timeout S]` | Block until the job exits (or its output matches `--until`). Scriptable exit code: job's own code on exit, `0` on match, `124` on timeout, `1` for a dead runner or `launch-unconfirmed`. |
 | `fleet jobs kill <host:id>` | TERM the verified job process tree and escalate against surviving descendants. |
 | `fleet jobs prune [<sel>] [--all]` | Remove finished job spools (`--all` also drops dead ones; never touches running). |
 | `fleet cp [-r] [--resume] <local> <sel>:<remote>` | Copy a file to host(s), fanning out across a group. `fleet push` and `fleet pull` are aliases of `cp`. `--resume` copies with rsync `--partial`, so rerunning after a drop continues the partial file (POSIX hosts only). A single-host copy on a terminal shows a progress meter. |
@@ -126,6 +126,7 @@ jobs) instead of holding an `exec` or a backgrounded SSH session open.
 - **Linux** uses `setsid`, **macOS** uses `nohup`, and **Windows** uses an interactive Scheduled Task.
 - Linux runners carry an ownership marker. The marker keeps a live job visible when its child process changes the runner command line.
 - `jobs wait` retries brief SSH failures and spool-visibility delays. Three consecutive failures stop the waiter with the underlying error.
+- A spool without a PID or valid exit record is `starting`. After a 120-second startup grace, three consecutive successful no-PID observations end the wait as `launch-unconfirmed` with CLI exit code `1`. The grace uses the spool age when available; otherwise it starts at the first observation. The scheduler may still start the job. Inspect the existing job before submitting another launch. A valid exit record wins over a missing PID. Inspection failures reset the observation count. Polling never writes to the spool.
 - `wait --until '<regex>'` returns as soon as the output matches (for example a
   "Recovered.*1/1" marker). Plain `wait` blocks until exit and returns the job's code,
   so `fleet jobs wait gpu-box:<id> && deploy` works.
