@@ -284,7 +284,7 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     annotations: { readOnlyHint: true, openWorldHint: true },
   }, async ({ selector, filter, sort, limit }) => {
     const lists = await processList(cfg, await routeSelector(cfg, selector), { filter, sort, limit: limit ?? (filter ? undefined : 20) });
-    return text(JSON.stringify(lists, null, 2));
+    return text(JSON.stringify(lists, null, 2), lists.some((r) => !r.ok));
   });
 
   server.registerTool("fleet_status", {
@@ -721,14 +721,14 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     const routed = await routeSelector(cfg, selector);
     const plans = await processKill(cfg, routed, target, { ...opts, dryRun: true });
     const foreign = plans.flatMap((p) => p.targets.filter((t) => !t.job).map((t) => `${p.host}:${t.pid} ${t.name}`));
-    if (dry_run || plans.every((p) => !p.ok)) return text(JSON.stringify(plans, null, 2));
+    if (dry_run || plans.every((p) => !p.ok)) return text(JSON.stringify(plans, null, 2), plans.some((p) => !p.ok));
     if (foreign.length && !confirm_foreign)
       return text(`refusing: no fleet job started ${foreign.join(", ")}. Ask the user, then pass confirm_foreign.\n`
-        + JSON.stringify(plans, null, 2));
+        + JSON.stringify(plans, null, 2), true);
     const results: KillResult[] = await Promise.all(plans.map(async (p) => p.ok
       ? (await processKill(cfg, p.host, p.targets.map((t) => t.pid).join(","), { ...opts, tree: false, all: true }))[0]!
       : p));
-    return text(JSON.stringify(results, null, 2));
+    return text(JSON.stringify(results, null, 2), results.some((r) => !r.ok));
   });
 
   server.registerTool("fleet_restart", {

@@ -523,6 +523,44 @@ describe("androidBatch", () => {
     expect(dev).toContain("OFF=$((16 + 600 * W * 4 + 1))");
     expect(r.effect).toBe("no_change");
   });
+  test.each(["key", "sleep"] as const)("the first labelled step rechecks rows after an unlabelled %s", async (first) => {
+    const dir = await mkdtemp(join(tmpdir(), "fleet-android-batch-"));
+    const frame = join(dir, "saved.raw"), changed = join(dir, "changed.raw");
+    try {
+      const xml = '<hierarchy><node text="Submit" class="android.widget.Button" enabled="true" clickable="true" bounds="[0,0][10,10]" /></hierarchy>';
+      await writeFile(join(dir, "android-phone.json"), JSON.stringify({ hash: H, xml, width: 10, height: 20 }));
+      await writeFile(frame, Buffer.alloc(816, 1));
+      await writeFile(changed, Buffer.alloc(816, 2));
+      let output = "";
+      const r = await androidBatch(cfg, "phone", "any", [
+        first === "key" ? { action: "key", key: "back" } : { action: "sleep", ms: 1 },
+        { action: "tap", label: "Submit" }, { action: "key", key: "enter" },
+      ], { gapMs: 0, settleMs: 0 }, { cacheDir: dir, exec: async (_h, script) => {
+        const device = deviceScript(script);
+        const start = device.indexOf('echo "__FA__STEP 0 start"');
+        const end = device.indexOf("sleep 0.000; HB=$(fh)", start);
+        expect(start).toBeGreaterThan(-1);
+        expect(end).toBeGreaterThan(start);
+        const body = device.slice(start, end).replaceAll("/data/local/tmp/fleet-ui-frame.raw", JSON.stringify(frame));
+        const mocks = [
+          "exec 3>&1", "W=10; H=20",
+          "input() { printf 'DELIVERED %s\\n' \"$*\" >&3; }",
+          "sleep() { :; }",
+          `screencap() { cat ${JSON.stringify(changed)}; }`,
+          "md5sum() { cksum; }",
+        ].join("\n");
+        const proc = Bun.spawn(["/bin/sh", "-s"], { stdin: new TextEncoder().encode(mocks + "\n" + body), stdout: "pipe", stderr: "pipe" });
+        const [code, stdout, stderr] = await Promise.all([proc.exited, new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+        output = stdout;
+        return { host: "phone", ok: code === 0, code, stdout, stderr };
+      } });
+      expect(r.result.ok).toBe(false);
+      expect(r.steps.map((s) => s.status)).toEqual(["done", "failed", "not_run"]);
+      expect(r.steps[1]!.detail).toContain("changed since the elements were read");
+      expect(output).not.toContain("DELIVERED tap");
+      expect(output).not.toContain("KEYCODE_ENTER");
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
   test("limits and malformed steps refuse before anything runs", async () => {
     await expect(androidBatch(cfg, "phone", "any", [])).rejects.toThrow(/non-empty/);
     await expect(androidBatch(cfg, "phone", "any", Array.from({ length: 51 }, () => ({ action: "key" as const, key: "back" }))))

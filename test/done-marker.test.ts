@@ -1,5 +1,5 @@
-import { describe, expect, test } from "bun:test";
-import { doneMarker, takeDoneMarker, withDoneMarker } from "../src/ssh.ts";
+import { describe, expect, spyOn, test } from "bun:test";
+import { doneMarker, exec, takeDoneMarker, withDoneMarker } from "../src/ssh.ts";
 import { useColor } from "../src/cli.ts";
 
 describe("completion marker", () => {
@@ -14,6 +14,58 @@ describe("completion marker", () => {
     expect(takeDoneMarker(`\r\n${m}?\r\n`, m)).toEqual({ stderr: "", code: null });
     expect(takeDoneMarker("plain error", m)).toEqual({ stderr: "plain error" });
   });
+
+  for (const scenario of [
+    { name: "successful completion", status: 0, timing: "complete", expected: 0 },
+    { name: "failed completion", status: 7, timing: "complete", expected: 7 },
+    { name: "an incomplete marker", status: 0, timing: "partial", expected: 124 },
+    { name: "a late marker", status: 0, timing: "late", expected: 124 },
+  ]) {
+    test(`exec handles ${scenario.name} while inherited pipes remain open`, async () => {
+      const timers: ReturnType<typeof setTimeout>[] = [];
+      let finish = () => {};
+      const spawn = spyOn(Bun, "spawn").mockImplementation((...args: unknown[]) => {
+        const options = args[1] as { stdin: Uint8Array };
+        const script = new TextDecoder().decode(options.stdin);
+        const marker = /__FLEET_DONE_[0-9a-f]+__/.exec(script)![0];
+        let output: ReadableStreamDefaultController<Uint8Array>;
+        let error: ReadableStreamDefaultController<Uint8Array>;
+        const stdout = new ReadableStream<Uint8Array>({ start(c) { output = c; } });
+        const stderr = new ReadableStream<Uint8Array>({ start(c) { error = c; } });
+        const encode = (s: string) => new TextEncoder().encode(s);
+        output!.enqueue(encode("body-finished\n"));
+        const line = `\n${marker}${scenario.status}\n`;
+        if (scenario.timing === "complete") error!.enqueue(encode(line));
+        else {
+          if (scenario.timing === "partial") error!.enqueue(encode(line.slice(0, -1)));
+          timers.push(setTimeout(() => {
+            error!.enqueue(encode(scenario.timing === "partial" ? "\n" : line));
+          }, 250));
+        }
+        let closed = false;
+        finish = () => {
+          if (closed) return;
+          closed = true;
+          output!.close(); error!.close();
+        };
+        timers.push(setTimeout(finish, 300));
+        // A master or child can retain these pipes after the SSH client exits.
+        return { stdout, stderr, exited: Promise.resolve(0), exitCode: 0, kill() {} } as unknown as ReturnType<typeof Bun.spawn>;
+      });
+      try {
+        const result = await exec({ name: "fixture", ssh: "fixture", os: "linux" }, "true", "bash", { timeoutMs: 200 });
+        expect(result.code).toBe(scenario.expected);
+        expect(result.ok).toBe(scenario.expected === 0);
+        expect(result.stdout).toBe("body-finished\n");
+        if (scenario.expected === 124) expect(result.stderr).toContain("command timed out");
+        else expect(result.stderr).toBe("");
+      } finally {
+        spawn.mockRestore();
+        for (const timer of timers) clearTimeout(timer);
+        finish();
+      }
+    });
+  }
 
   test("a real bash script reports its exit status even when a child keeps stdout open", async () => {
     const m = doneMarker();

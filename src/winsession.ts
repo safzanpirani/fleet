@@ -24,7 +24,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { hostKeyOpts, type Host } from "./config.ts";
 import { sshEnv } from "./ssh.ts";
-import { fleetReinvocation, proxyOpts } from "./proxy.ts";
+import { fleetReinvocation, proxyControlKey, proxyOpts } from "./proxy.ts";
 
 const READY = "__FLEET_SESSION_READY__";
 const PIPE_PROBE = "__FLEET_PIPE__";
@@ -115,11 +115,11 @@ export function winSessionEnabled(host: Host, env: NodeJS.ProcessEnv = process.e
   return host.os === "windows" && host.transport !== "daytona";
 }
 
-/** One socket per host route and per session program, so a fleet upgrade that
- *  changes the program never talks to an old broker. */
+/** One socket per host identity, resolved route and session program, so a fleet
+ *  upgrade or connection change never talks to an incompatible broker. */
 export function winSessionSocket(host: Host): string {
   const key = createHash("sha256")
-    .update(JSON.stringify([host.ssh, host.proxy ?? null, sessionLoopScript()]))
+    .update(JSON.stringify([host.ssh, proxyControlKey(host), host.hostKeyAlias ?? null, sessionLoopScript()]))
     .digest("hex").slice(0, 16);
   return join(homedir(), ".fleet", `ws-${key}.sock`);
 }

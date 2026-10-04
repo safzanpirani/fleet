@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { sessionLoopScript, takePipeProbe, trySessionExec, winSessionEnabled, winSessionSocket } from "../src/winsession.ts";
-import type { Host } from "../src/config.ts";
+import { activeConfig, setActiveConfig, type FleetConfig, type Host } from "../src/config.ts";
 
 const win: Host = { name: "w", ssh: "w", os: "windows" };
 
@@ -36,6 +36,49 @@ test("children get NUL as stdin, and each call starts from the session's first d
 test("each host route gets its own socket", () => {
   expect(winSessionSocket(win)).not.toBe(winSessionSocket({ ...win, ssh: "other" }));
   expect(winSessionSocket(win)).toMatch(/\.fleet\/ws-[0-9a-f]{16}\.sock$/);
+});
+
+test("broker sockets follow resolved proxy routes and pinned host identities", () => {
+  const keys = ["FLEET_PROXY_OVERRIDE", "FLEET_NO_PROXY", "FLEET_PROXY"];
+  const saved = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  const previousConfig = activeConfig();
+  try {
+    for (const key of keys) delete process.env[key];
+    setActiveConfig(null);
+    const direct = winSessionSocket(win);
+    const proxy = "socks5h://proxy.test:1080";
+    process.env.FLEET_PROXY_OVERRIDE = proxy;
+    const proxied = winSessionSocket(win);
+    expect(proxied).not.toBe(direct);
+    delete process.env.FLEET_PROXY_OVERRIDE;
+    process.env.FLEET_PROXY = proxy;
+    expect(winSessionSocket(win)).toBe(proxied);
+    delete process.env.FLEET_PROXY;
+    expect(winSessionSocket({ ...win, proxy })).toBe(proxied);
+
+    const cfg: FleetConfig = {
+      hosts: { w: win }, defaultProxy: "edge",
+      proxies: { edge: { host: "proxy.test", port: 1080 } },
+    };
+    setActiveConfig(cfg);
+    expect(winSessionSocket(win)).toBe(proxied);
+    cfg.proxies!.edge!.port = 1081;
+    expect(winSessionSocket(win)).not.toBe(proxied);
+    process.env.FLEET_NO_PROXY = "1";
+    expect(winSessionSocket(win)).toBe(direct);
+    process.env.FLEET_PROXY_OVERRIDE = proxy;
+    expect(winSessionSocket(win)).toBe(proxied);
+
+    expect(winSessionSocket({ ...win, hostKeyAlias: "boot-a" }))
+      .not.toBe(winSessionSocket({ ...win, hostKeyAlias: "boot-b" }));
+    expect(winSessionSocket({ ...win, hostKeyAlias: "boot-a" })).not.toBe(proxied);
+  } finally {
+    setActiveConfig(previousConfig);
+    for (const key of keys) {
+      if (saved[key] === undefined) delete process.env[key];
+      else process.env[key] = saved[key];
+    }
+  }
 });
 
 test("a lost reply after the broker accepted a request cannot trigger one-shot replay", async () => {

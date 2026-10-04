@@ -9,6 +9,7 @@ import * as tools from "../src/tools.ts";
 import * as core from "../src/core.ts";
 import * as ssh from "../src/ssh.ts";
 import * as android from "../src/android.ts";
+import * as procs from "../src/procs.ts";
 import { existsSync } from "node:fs";
 import { dirname } from "node:path";
 
@@ -110,6 +111,59 @@ function toolByName(tools: Tool[], name: string): Tool {
 }
 
 describe("Fleet MCP parity", () => {
+  test("process listings expose host failures through isError", async () => {
+    const list = spyOn(procs, "processList");
+    try {
+      await withClient(true, async (client) => {
+        for (const failed of [false, true]) {
+          const rows: procs.ProcList[] = [{ host: "local", ok: true, rows: [] }];
+          if (failed) rows.push({ host: "other", ok: false, error: "SSH unavailable", rows: [] });
+          list.mockResolvedValue(rows);
+          const result = await client.callTool({ name: "fleet_ps", arguments: { selector: "local" } });
+          expect(result.isError).toBe(failed);
+          expect(JSON.parse((result.content as { text: string }[])[0]!.text)).toEqual(rows);
+        }
+      });
+    } finally { list.mockRestore(); }
+  });
+
+  test("process kill reports refused plans, foreign processes, and unsuccessful stops as errors", async () => {
+    const planned: procs.KillResult = { host: "local", ok: true,
+      targets: [{ pid: 123, name: "worker", outcome: "planned", job: "fixture-job" }] };
+    const denied: procs.KillResult = { host: "other", ok: false, error: "ambiguous process name", targets: [] };
+    const stopped: procs.KillResult = { host: "local", ok: true,
+      targets: [{ pid: 123, name: "worker", outcome: "exited" }] };
+    const failed: procs.KillResult = { host: "local", ok: false,
+      targets: [{ pid: 123, name: "worker", outcome: "running" }] };
+    const foreign: procs.KillResult = { host: "local", ok: true,
+      targets: [{ pid: 123, name: "worker", outcome: "planned" }] };
+    const cases: { plans: procs.KillResult[]; args?: Record<string, unknown>; result?: procs.KillResult; error: boolean }[] = [
+      { plans: [denied], error: true },
+      { plans: [planned], args: { dry_run: true }, error: false },
+      { plans: [planned, denied], args: { dry_run: true }, error: true },
+      { plans: [foreign], error: true },
+      { plans: [planned], result: failed, error: true },
+      { plans: [planned, denied], result: stopped, error: true },
+      { plans: [planned], result: stopped, error: false },
+      { plans: [foreign], args: { confirm_foreign: true }, result: stopped, error: false },
+    ];
+    const kill = spyOn(procs, "processKill");
+    try {
+      await withClient(false, async (client) => {
+        for (const c of cases) {
+          kill.mockReset();
+          kill.mockResolvedValueOnce(c.plans);
+          if (c.result) kill.mockResolvedValueOnce([c.result]);
+          const result = await client.callTool({ name: "fleet_kill", arguments: {
+            selector: "local", target: "worker", ...c.args,
+          } });
+          expect(result.isError).toBe(c.error);
+          expect(kill).toHaveBeenCalledTimes(c.result ? 2 : 1);
+        }
+      });
+    } finally { kill.mockRestore(); }
+  });
+
   test("Android flow is registered as mutating and disappears in read-only mode", async () => {
     const flow = spyOn(android, "androidFlow");
     try {

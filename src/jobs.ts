@@ -256,7 +256,10 @@ export function wslJobCommand(cmd: string, distro: string, cwd?: string): string
   const body = cwd
     ? `cd -- ${cwd === "~" ? '"$HOME"' : cwd.startsWith("~/") ? `"$HOME"/'${cwd.slice(2).replace(/'/g, "'\\''")}'` : `'${cwd.replace(/'/g, "'\\''")}'`} || { echo "fleet: cwd not found: ${cwd.replace(/["$`\\]/g, "")}" 1>&2; exit 127; }\n${cmd}`
     : cmd;
-  return `& wsl.exe -d '${distro.replace(/'/g, "''")}' -- bash -c 'printf %s ${b64(body)} | base64 -d | bash -ls'\nexit $LASTEXITCODE`;
+  // Parse the whole program before running stdin readers, and keep its set -e
+  // inside the subshell so login-shell logout hooks cannot replace its status.
+  const program = `(\n${body}\n) </dev/null\nexit $?`;
+  return `& wsl.exe -d '${distro.replace(/'/g, "''")}' -- bash -c 'printf %s ${b64(program)} | base64 -d | bash -ls'\nexit $LASTEXITCODE`;
 }
 
 export async function spawnJob(
@@ -620,7 +623,8 @@ foreach ($d in (Get-ChildItem -Directory $base -EA SilentlyContinue)) {
   if ($null -ne (Get-FleetJobExit $p)) { }
   elseif ($jpid -and (Test-FleetJobProcess ([int]$jpid) "$p\\run.ps1")) { continue }
   elseif ('${all ? "1" : "0"}' -ne '1') { continue }
-  Remove-Item -Recurse -Force $p -EA SilentlyContinue; $n++
+  Remove-Item -Recurse -Force -LiteralPath $p -EA Stop
+  $n++
 }
 "$n"`;
   }
@@ -637,7 +641,8 @@ for d in "$base"/*/; do
   elif is_owned "$pid" "$d/run"; then continue                       # running — never prune
   elif [ "${all ? "1" : "0"}" != "1" ]; then continue               # dead, but not --all
   fi
-  rm -rf "$d" && n=$((n+1))
+  rm -rf "$d" || exit 1
+  n=$((n+1))
 done
 echo "$n"`;
 }

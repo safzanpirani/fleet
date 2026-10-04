@@ -627,15 +627,38 @@ _fleet() {
 complete -F _fleet fleet`;
 }
 
+const PROXY_LEADING_VALUES: Record<string, readonly string[]> = {
+  exec: ["--cwd", "--timeout", "--script", "--interp"],
+  spawn: ["--cwd", "--label"],
+  jobs: ["-n", "--lines", "--until", "--timeout"],
+  edit: ["--old", "--new", "--old-file", "--new-file", "--edits"],
+  logs: ["-n"],
+  ps: ["--sort", "-n"],
+  kill: ["--grace"],
+  shot: ["--grid-step", "--out", "--output", "--monitor", "--region"],
+  cu: ["--grid-step", "--grid-minor", "--for", "--probe", "--space", "--button", "--count", "--settle",
+    "--out", "--element", "--label", "--role", "--nth", "--region", "--region-at", "--kind"],
+  switch: ["--to", "--timeout"],
+  wait: ["--port", "--http", "--status", "--boot", "--timeout", "--interval"],
+  deploy: ["--restart"],
+  tools: ["--max-parallel"],
+  find: ["--from"],
+};
+
 /**
  * Pull `--proxy NAME|URL` / `--no-proxy` out of the LEADING flag run — the same
  * position every other fleet flag takes — and publish the choice through the
  * environment, which is also how it reaches `fleet __proxy-connect`.
  *
  * `--proxy` uses its own variable rather than FLEET_PROXY so it still wins when
- * FLEET_NO_PROXY=1 is exported in the shell.
+ * FLEET_NO_PROXY=1 is exported in the shell. Only the command's known value
+ * options may consume the next token; an arbitrary option must not hide a selector.
  */
-export function applyProxyFlags(rest: string[], env: Record<string, string | undefined> = process.env): string[] {
+export function applyProxyFlags(
+  rest: string[], env: Record<string, string | undefined> = process.env, command?: string,
+): string[] {
+  const aliases: Record<string, string> = { job: "jobs", screenshot: "shot", computer: "cu" };
+  const valueFlags = PROXY_LEADING_VALUES[aliases[command ?? ""] ?? command ?? ""] ?? [];
   const out: string[] = [];
   let explicit: string | undefined;
   let off = false;
@@ -645,13 +668,23 @@ export function applyProxyFlags(rest: string[], env: Record<string, string | und
     if (token === "--") { out.push(...rest.slice(i)); break; }
     const eq = token.startsWith("--") ? token.indexOf("=") : -1;
     const name = eq > 0 ? token.slice(0, eq) : token;
-    if (name === "--no-proxy") { off = true; continue; }
+    if (name === "--no-proxy") {
+      if (eq > 0) throw new Error("--no-proxy does not take a value");
+      off = true; continue;
+    }
     if (name === "--proxy") {
       const value = eq > 0 ? token.slice(eq + 1) : rest[++i];
       if (!value || value.startsWith("--")) die("--proxy needs a proxy name or URL (or use --no-proxy)");
       explicit = value; continue;
     }
     out.push(token);
+    if (eq < 0 && valueFlags.includes(name)) {
+      const value = rest[i + 1];
+      // Leave a missing value to the command parser, without stealing the next flag.
+      if (value === undefined || value.startsWith("--")) { out.push(...rest.slice(i + 1)); break; }
+      out.push(value);
+      i++;
+    }
   }
   if (explicit && off) die("--proxy and --no-proxy cannot be combined");
   if (explicit) { env.FLEET_PROXY_OVERRIDE = explicit; delete env.FLEET_NO_PROXY; }
@@ -660,7 +693,7 @@ export function applyProxyFlags(rest: string[], env: Record<string, string | und
 }
 
 async function dispatch(command: string | undefined, rest0: string[], cfg: FleetConfig): Promise<number> {
-  let rest = applyProxyFlags(rest0);
+  let rest = applyProxyFlags(rest0, process.env, command);
   switch (command) {
     case undefined: case "help": case "-h": case "--help":
       console.log(helpText(["help", ...rest]));

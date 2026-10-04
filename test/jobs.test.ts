@@ -190,6 +190,43 @@ describe("job log and tail", () => {
 });
 
 describe("detached job lifecycle", () => {
+  test("POSIX prune reports deletion errors instead of successful zero removals", async () => {
+    const home = mkdtempSync(join(tmpdir(), "fleet-job-prune-failed-"));
+    const dir = join(home, ".fleet", "jobs", "failed-prune");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "exit"), "0\n");
+    writeFileSync(join(dir, "out"), "finished\n");
+    const execute = spyOn(ssh, "exec").mockImplementation(async (h, script) => {
+      const r = await runBash(`rm() { printf 'fixture removal denied\\n' >&2; return 1; }\n` + script, home);
+      return { host: h.name, ok: r.code === 0, ...r };
+    });
+    try {
+      expect(await pruneJobs(cfg, "web")).toEqual([
+        { host: "web", removed: 0, error: "fixture removal denied\n" },
+      ]);
+      expect(readFileSync(join(dir, "out"), "utf8")).toBe("finished\n");
+    } finally {
+      execute.mockRestore();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test("Windows prune stops on removal errors before incrementing its count", async () => {
+    const execute = spyOn(ssh, "exec").mockResolvedValue({
+      host: "winbox", ok: false, code: 1, stdout: "", stderr: "fixture removal denied",
+    });
+    try {
+      expect(await pruneJobs(cfg, "winbox")).toEqual([
+        { host: "winbox", removed: 0, error: "fixture removal denied" },
+      ]);
+      expect(execute.mock.calls[0]![1]).toContain(
+        "Remove-Item -Recurse -Force -LiteralPath $p -EA Stop\n  $n++",
+      );
+    } finally {
+      execute.mockRestore();
+    }
+  });
+
   test("list and prune preserve a live macOS job spool", async () => {
     const fixtureHome = mkdtempSync(join(tmpdir(), "fleet-job-live-prune-"));
     const local = host("local", "mac");
@@ -566,9 +603,45 @@ describe("spawn --wsl", () => {
     expect(cmd).not.toContain("/home/u/x.log");
     const b64 = /printf %s (\S+) \|/.exec(cmd)![1]!;
     const body = Buffer.from(b64, "base64").toString("utf8");
+    expect(body).toStartWith("(\n");
     expect(body).toContain(`cd -- "$HOME"/'work dir' || {`);
-    expect(body.endsWith("echo hi > /home/u/x.log | cat")).toBe(true);
+    expect(body).toEndWith("echo hi > /home/u/x.log | cat\n) </dev/null\nexit $?");
     expect(cmd.endsWith("exit $LASTEXITCODE")).toBe(true);
+  });
+
+  test("WSL stdin readers cannot consume later commands or their exit code", async () => {
+    const { wslJobCommand } = await import("../src/jobs.ts");
+    const home = mkdtempSync(join(tmpdir(), "fleet-job-wsl-stdin-"));
+    mkdirSync(join(home, "work dir"));
+    writeFileSync(join(home, "work dir", "cwd-marker"), "");
+    try {
+      const command = wslJobCommand("cat\ntest -f cwd-marker || exit 9\nprintf AFTER\nexit 7", "Ubuntu", "~/work dir");
+      const encoded = /printf %s (\S+) \|/.exec(command)![1]!;
+      const result = await runBash(Buffer.from(encoded, "base64").toString("utf8"), home);
+      expect(result).toEqual({ code: 7, stdout: "AFTER", stderr: "" });
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test("WSL jobs isolate errexit and preserve the program status through shell cleanup", async () => {
+    const { wslJobCommand } = await import("../src/jobs.ts");
+    const home = mkdtempSync(join(tmpdir(), "fleet-job-wsl-exit-"));
+    try {
+      for (const [cmd, code, stdout] of [
+        ["set -e\nprintf done", 0, "done"],
+        ["set -e\nfalse\nprintf unreachable", 1, ""],
+        ["exit 7", 7, ""],
+      ] as const) {
+        const command = wslJobCommand(cmd, "Ubuntu");
+        const encoded = /printf %s (\S+) \|/.exec(command)![1]!;
+        const program = Buffer.from(encoded, "base64").toString("utf8");
+        const result = await runBash("trap 'false' EXIT\n" + program, home);
+        expect(result).toEqual({ code, stdout, stderr: "" });
+      }
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 
   test("--wsl refuses hosts that are not Windows", async () => {

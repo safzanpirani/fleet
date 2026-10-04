@@ -143,6 +143,23 @@ test("a refused capture-bound click fails and is not retried", async () => {
   } finally { await fixture.cleanup(); }
 });
 
+test.each(["linux", "windows"] as const)("a lost %s region click keeps its unknown outcome and is not retried", async (os) => {
+  let calls = 0;
+  const promise = cuAct({ hosts: { local: { ...host, os } } }, "local", "Fixture", "click", {},
+    { region: { text: "Save" } }, { snapshot, exec: async () => {
+      calls++;
+      return { ...ok, ok: false, code: 1, stdout: [
+        "__FLEET_HASH__A|aa", "__FLEET_CAP__act|",
+        '__FLEET_PV__error|{"code":"session_lost","message":"the session closed during the click; its outcome is unknown"}',
+        "__FLEET_END__", "__FLEET_HASH__B|bb", "__FLEET_HASH__C|bb",
+      ].join("\n") };
+    } });
+  const error = await promise.then(() => undefined, (error: Error) => error);
+  expect(error?.message).toContain("the click outcome is unknown; inspect the window before sending more input");
+  expect(error?.message).not.toContain("nothing was clicked");
+  expect(calls).toBe(1);
+});
+
 test("region clicks reject other addressing and non-click tools before any remote call", async () => {
   const exec = async () => { throw new Error("must not run"); };
   await expect(cuAct(cfg, "local", "Fixture", "type_text", { text: "x" }, { region: { text: "a" } }, { snapshot, exec }))

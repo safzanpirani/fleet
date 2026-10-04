@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { completionScript, trailingFleetFlag } from "../src/cli.ts";
+import { applyProxyFlags, completionScript, trailingFleetFlag } from "../src/cli.ts";
 import type { FleetConfig } from "../src/config.ts";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -56,6 +56,112 @@ async function runCli(
   clearTimeout(deadline);
   return { stdout, stderr: killed ? `${stderr}\nrunCli: killed after ${RUN_CLI_DEADLINE_MS} ms` : stderr, code };
 }
+
+describe("proxy CLI flags", () => {
+  test("proxy options follow the command's leading value options", () => {
+    const cases: [string, string[]][] = [
+      ["exec", ["--cwd", "/tmp", "--timeout", "5", "--script", "-", "--interp", "bash"]],
+      ["exec", ["--cwd=/tmp", "--timeout=5"]],
+      ["spawn", ["--label", "batch one", "--cwd", "/tmp"]],
+      ["jobs", ["--lines", "2"]],
+      ["job", ["--timeout", "5"]],
+      ["edit", ["--old", "before", "--new", ""]],
+      ["ps", ["--sort", "cpu", "-n", "2"]],
+      ["screenshot", ["--out", "/tmp/shot.png"]],
+      ["computer", ["--settle", "0"]],
+      ["wait", ["--http", "https://example.invalid", "--status", "200"]],
+    ];
+    for (const [command, options] of cases) {
+      const env: Record<string, string | undefined> = {};
+      const payload = ["local", "curl", "--proxy", "payload"];
+      expect(applyProxyFlags([...options, "--proxy", "vpn", ...payload], env, command))
+        .toEqual([...options, ...payload]);
+      expect(env).toEqual({ FLEET_PROXY_OVERRIDE: "vpn" });
+    }
+  });
+
+  test("no-proxy follows value options and preserves equals-form literal values", () => {
+    const env: Record<string, string | undefined> = { FLEET_PROXY: "vpn", FLEET_PROXY_OVERRIDE: "vpn" };
+    expect(applyProxyFlags(["--cwd=--proxy", "--timeout", "5", "--no-proxy", "local"], env, "exec"))
+      .toEqual(["--cwd=--proxy", "--timeout", "5", "local"]);
+    expect(env).toEqual({ FLEET_NO_PROXY: "1" });
+  });
+
+  test("proxy scanning preserves separators, selectors, unknown options and missing values", () => {
+    const cases: [string, string[]][] = [
+      ["exec", ["--cwd", "/tmp", "--", "local", "--proxy", "payload"]],
+      ["exec", ["--cwd", "/tmp", "local", "--proxy", "payload"]],
+      ["exec", ["--json", "local", "--proxy", "payload"]],
+      ["exec", ["--unknown", "local", "--proxy", "payload"]],
+      ["ls", ["--cwd", "local", "--proxy", "payload"]],
+      ["exec", ["--cwd", "--proxy", "vpn", "local"]],
+    ];
+    for (const [command, args] of cases) {
+      const env: Record<string, string | undefined> = {};
+      expect(applyProxyFlags(args, env, command)).toEqual(args);
+      expect(env).toEqual({});
+    }
+  });
+
+  test("no-proxy rejects every equals-form value before environment mutation", () => {
+    for (const value of ["false", "true", ""]) {
+      const env = { FLEET_PROXY: "original", FLEET_PROXY_OVERRIDE: "original", FLEET_NO_PROXY: "0" };
+      const before = { ...env };
+      expect(() => applyProxyFlags(["--proxy", "replacement", `--no-proxy=${value}`, "local"], env, "exec"))
+        .toThrow("--no-proxy does not take a value");
+      expect(env).toEqual(before);
+    }
+  });
+
+  test("exec applies proxy options after cwd, timeout and script values", async () => {
+    const { root, bin, config } = fixture();
+    const captured = join(root, "ssh-args");
+    const script = join(root, "task.sh");
+    writeFileSync(script, "printf ok\n");
+    writeFileSync(config, JSON.stringify({
+      hosts: { local: { ssh: "local", os: "mac" } },
+      proxies: { vpn: { host: "proxy.invalid", port: 1080 } }, defaultProxy: "vpn",
+    }));
+    executable(join(bin, "ssh"), '#!/bin/sh\nprintf \'%s\\n\' "$@" > "$FLEET_PROXY_TEST_ARGV"\nexec /bin/bash -s\n');
+    const env = { FLEET_PROXY_TEST_ARGV: captured, FLEET_PROXY_OVERRIDE: "", FLEET_NO_PROXY: "", FLEET_PROXY: "" };
+    try {
+      const cases: [string[], boolean][] = [
+        [["--cwd", root, "--proxy", "vpn", "local", "printf ok"], true],
+        [["--timeout", "2", "--no-proxy", "local", "printf ok"], false],
+        [["--script", script, "--proxy=vpn", "local"], true],
+        [[`--cwd=${root}`, "--no-proxy", "local", "printf ok"], false],
+      ];
+      for (const [args, proxied] of cases) {
+        const result = await runCli(["exec", "--raw", ...args], config, bin, env);
+        expect(result, args.join(" ")).toEqual({ code: 0, stdout: "ok", stderr: "" });
+        expect((await Bun.file(captured).text()).includes("ProxyCommand=")).toBe(proxied);
+      }
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test("invalid proxy booleans and unknown command flags fail before SSH", async () => {
+    const { root, bin, config } = fixture();
+    const marker = join(root, "ssh-called");
+    executable(join(bin, "ssh"), `#!/bin/sh\ntouch '${marker}'\nexit 99\n`);
+    try {
+      const cases = [
+        ["--cwd", root, "--no-proxy=false", "local", "true"],
+        ["--no-proxy=true", "local", "true"],
+        ["--no-proxy=", "local", "true"],
+        ["--unknown", "local", "--proxy", "vpn", "true"],
+        ["--sort", "cpu", "--proxy", "vpn", "local", "true"],
+        ["--cwd", "--no-proxy", "local", "true"],
+      ];
+      for (const args of cases) {
+        const result = await runCli(["exec", ...args], config, bin);
+        expect(result.code, args.join(" ")).toBe(1);
+        expect(result.stdout).toBe("");
+        expect(result.stderr).toMatch(/does not take a value|unknown option|requires a value/);
+      }
+      expect(await Bun.file(marker).exists()).toBe(false);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+});
 
 describe("machine-readable CLI output", () => {
   test("named pointer and keyboard controls and file batches work through the CLI", async () => {

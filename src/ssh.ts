@@ -240,24 +240,36 @@ async function resolveWinBin(host: Host, timeoutMs = 0): Promise<WinBin> {
   if (host.winShell) return host.winShell;
   const cached = winBinCache.get(host.ssh);
   if (cached) return cached;
-  const detected = await (async (): Promise<WinBin> => {
+  const detected = await (async (): Promise<WinBin | undefined> => {
     // probe via the always-present Windows PowerShell
     const inner = `if (Get-Command pwsh -EA SilentlyContinue) { 'pwsh' } else { 'powershell' }`;
     const proc = Bun.spawn(["ssh", ...connOpts(host), "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", host.ssh,
       "powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand", b64utf16le(inner)],
       { stdout: "pipe", stderr: "ignore", env: sshEnv() });
-    let timedOut = false;
-    const timer = timeoutMs > 0
-      ? setTimeout(() => { timedOut = true; proc.kill("SIGKILL"); }, timeoutMs)
-      : null;
-    const out = (await new Response(proc.stdout).text()).trim();
-    await proc.exited;
-    if (timer) clearTimeout(timer);
-    if (timedOut) throw new Error("Windows shell discovery timed out");
-    return out.includes("pwsh") ? "pwsh" : "powershell";
-  })().catch((): WinBin => "powershell");
-  winBinCache.set(host.ssh, detected);
-  return detected;
+    const out = drain(proc.stdout);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const expired = new Promise<undefined>((resolve) => {
+      if (timeoutMs > 0) timer = setTimeout(() => {
+        proc.kill("SIGKILL");
+        // A shared master can retain stdout after this SSH process exits.
+        out.cancel();
+        resolve(undefined);
+      }, timeoutMs);
+    });
+    try {
+      const code = await Promise.race([
+        Promise.all([out.done, proc.exited]).then(([, code]) => code),
+        expired,
+      ]);
+      if (code !== 0) return undefined;
+      return out.text().includes("pwsh") ? "pwsh" : "powershell";
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  })().catch(() => undefined);
+  // A timeout or failed connection says nothing about the installed shell.
+  if (detected) winBinCache.set(host.ssh, detected);
+  return detected ?? "powershell";
 }
 
 export function buildArgs(host: Host, command: string, shell: Shell, winBin: WinBin = "powershell", cwd?: string, fresh = false): {
@@ -373,22 +385,31 @@ export async function exec(
   // pipes: they stay open until the REMOTE command ends. Once fleet stops a
   // call (timeout, or the completion marker's grace), it returns what it has
   // after a short drain instead of waiting for that end-of-output.
-  const out = drain(proc.stdout);
-  const errStream = drain(proc.stderr, (text) => {
-    if (!graceTimer && text.includes(marker))
-      graceTimer = setTimeout(() => stop("released"), DONE_GRACE_MS);
-  });
   let timedOut = false;
   let released = false;
   let graceTimer: ReturnType<typeof setTimeout> | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
   let onStop: () => void = () => {};
   const stopped = new Promise<void>((resolve) => { onStop = resolve; });
   function stop(why: "timeout" | "released") {
+    if (timedOut || released) return;
     if (why === "timeout") timedOut = true; else released = true;
     proc.kill(why === "timeout" ? "SIGKILL" : "SIGTERM");
     setTimeout(onStop, STOP_DRAIN_MS);
   }
-  const timer = timeoutMs > 0 ? setTimeout(() => stop("timeout"), remainingMs) : null;
+  const completed = new RegExp(`(?:^|\\n)${marker}(?:-?\\d+|\\?)\\r?\\n`);
+  const out = drain(proc.stdout);
+  const errStream = drain(proc.stderr, (text) => {
+    if (graceTimer || timedOut || !completed.test(text)) return;
+    if (timeoutMs > 0 && Date.now() - startedAt >= timeoutMs) {
+      stop("timeout");
+      return;
+    }
+    // The command finished on time; only its output-drain grace remains.
+    if (timer) clearTimeout(timer);
+    graceTimer = setTimeout(() => stop("released"), DONE_GRACE_MS);
+  });
+  if (timeoutMs > 0) timer = setTimeout(() => stop("timeout"), remainingMs);
   const finished = await Promise.race([
     Promise.all([out.done, errStream.done, proc.exited]).then(() => true),
     stopped.then(() => false),

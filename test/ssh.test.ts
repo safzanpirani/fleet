@@ -1,5 +1,5 @@
 import { test, expect, describe, spyOn } from "bun:test";
-import { bashEsc, bashPathAssignment, buildArgs, execStream, scpRemotePath, sshDiagnose } from "../src/ssh.ts";
+import { bashEsc, bashPathAssignment, buildArgs, exec, execStream, scpRemotePath, sshDiagnose } from "../src/ssh.ts";
 import type { Host } from "../src/config.ts";
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -376,6 +376,63 @@ describe("probe deadline cleanup", () => {
       expect(performance.now() - started).toBeLessThan(1000);
     } finally {
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("shell discovery cancels inherited stdout and retries after a transient timeout", async () => {
+    const host: Host = { name: "discovery", ssh: `discovery-${crypto.randomUUID()}`, os: "windows" };
+    const forced = process.env.FLEET_WIN_SHELL;
+    delete process.env.FLEET_WIN_SHELL;
+    let controller: ReadableStreamDefaultController<Uint8Array>;
+    let cancelled = false;
+    let closed = false;
+    const retained = new ReadableStream<Uint8Array>({
+      start(c) { controller = c; c.enqueue(new TextEncoder().encode("pwsh")); },
+      cancel() { cancelled = true; },
+    });
+    const close = () => {
+      if (!cancelled && !closed) { closed = true; controller!.close(); }
+    };
+    // The finite fixture also lets the old unbounded implementation fail promptly.
+    const release = setTimeout(close, 1500);
+    const completed = (stdout: string) => ({
+      stdout: new Response(stdout).body!, stderr: new Response("").body!,
+      exited: Promise.resolve(0), exitCode: 0, kill() {},
+    });
+    let discoveries = 0;
+    const executions: string[][] = [];
+    const spawn = spyOn(Bun, "spawn").mockImplementation((...args: unknown[]) => {
+      const argv = args[0] as string[];
+      if (argv.includes("-EncodedCommand")) {
+        discoveries++;
+        const proc = completed("pwsh");
+        if (discoveries === 1) proc.stdout = retained;
+        return proc as unknown as ReturnType<typeof Bun.spawn>;
+      }
+      executions.push(argv);
+      return completed("body\n") as unknown as ReturnType<typeof Bun.spawn>;
+    });
+    try {
+      const started = performance.now();
+      const first = await exec(host, "Write-Output body", "auto", { timeoutMs: 120, fresh: true });
+      expect(first.code).toBe(124);
+      expect(performance.now() - started).toBeLessThan(1000);
+      expect(cancelled).toBe(true);
+      expect(executions).toHaveLength(0);
+
+      const second = await exec(host, "Write-Output body", "auto", { timeoutMs: 1000, fresh: true });
+      expect(second.ok).toBe(true);
+      expect(second.stdout).toBe("body\n");
+      expect(discoveries).toBe(2);
+      expect(executions[0]).toContain("pwsh");
+      await exec(host, "Write-Output body", "auto", { timeoutMs: 1000, fresh: true });
+      expect(discoveries).toBe(2);
+    } finally {
+      spawn.mockRestore();
+      clearTimeout(release);
+      close();
+      if (forced === undefined) delete process.env.FLEET_WIN_SHELL;
+      else process.env.FLEET_WIN_SHELL = forced;
     }
   });
 });

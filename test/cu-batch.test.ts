@@ -67,6 +67,9 @@ test.each([
   { isError: true, content: [{ type: "text", text: "tool error" }] },
   { content: [{ type: "text", text: JSON.stringify({ status: "refused" }) }] },
   { escalation: { reason: "delivery_failed", target: "foreground" } },
+  { effect: "refused", code: "capture_stale" },
+  { code: "snapshot_id_required" },
+  { code: "stale_element_token", suggestion: "read the elements again" },
 ])("structured refusal with exit zero stops remaining actions: %j", async (reply) => {
   const fixture = await cuaFixture();
   try {

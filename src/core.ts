@@ -94,7 +94,12 @@ export function parseFlags(
 /** Split a string into tokens, honouring "double quotes" (quotes are dropped). */
 export function splitArgs(s: string): string[] {
   const out: string[] = []; let cur = ""; let q = false;
-  for (const ch of s) {
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i]!;
+    if (ch === "\\" && (s[i + 1] === '"' || (q && s[i + 1] === "\\"))) {
+      cur += s[++i]!;
+      continue;
+    }
     if (ch === '"') { q = !q; continue; }
     if (ch === " " && !q) { if (cur) { out.push(cur); cur = ""; } continue; }
     cur += ch;
@@ -4098,7 +4103,10 @@ async function cuActOnRegion(
 
 function regionFailure(error: CuRegionError, host: string): string {
   const hint = regionErrorHint(error.code, host);
-  return `perception ${error.code}: ${error.message}${error.detail ? ` (${error.detail})` : ""}; nothing was clicked`
+  const outcome = error.code === "session_lost"
+    ? "the click outcome is unknown; inspect the window before sending more input"
+    : "nothing was clicked";
+  return `perception ${error.code}: ${error.message}${error.detail ? ` (${error.detail})` : ""}; ${outcome}`
     + (hint ? `\n${hint}` : "");
 }
 
@@ -4214,6 +4222,8 @@ function cuBatchReplyCheck(os: Host["os"]): string {
     "  if ($reply.jsonrpc -and $reply.error) { return $true }",
     "  if ($reply.jsonrpc -and $reply.result) { $reply = $reply.result }",
     "  if ($reply.isError -eq $true -or $reply.status -in @('refused', 'error', 'failed') -or $reply.refusal -or $reply.error) { return $true }",
+    "  if ($reply.effect -eq 'refused') { return $true }",
+    "  if ($reply.code -is [string] -and $reply.code -cmatch '^[a-z]+(_[a-z]+)+$' -and ($reply.PSObject.Properties.Name -contains 'suggestion' -or $reply.code -cmatch '_(not_found|required|invalid|denied|failed|unavailable)$')) { return $true }",
     "  if ($reply.escalation.reason -in @('delivery_failed', 'background_unavailable')) { return $true }",
     "  if ($reply.structuredContent -and (Test-FleetInputRefusal ($reply.structuredContent | ConvertTo-Json -Depth 100 -Compress))) { return $true }",
     "  foreach ($part in $reply.content) { if ($part.type -eq 'text' -and (Test-FleetInputRefusal $part.text)) { return $true } }",
@@ -4221,12 +4231,15 @@ function cuBatchReplyCheck(os: Host["os"]): string {
     "}",
   ].join("\n");
   const parser = [
-    "import json, sys",
+    "import json, re, sys",
     "def refused(body):",
     "    try: value = json.loads(body)",
     "    except (ValueError, TypeError): return False",
     "    if not isinstance(value, dict): return False",
     "    if value.get('isError') is True or value.get('status') in ('refused', 'error', 'failed') or value.get('refusal') or value.get('error'): return True",
+    "    if value.get('effect') == 'refused': return True",
+    "    code = value.get('code')",
+    "    if isinstance(code, str) and re.fullmatch('[a-z]+(_[a-z]+)+', code) and ('suggestion' in value or re.search('_(not_found|required|invalid|denied|failed|unavailable)$', code)): return True",
     "    escalation = value.get('escalation')",
     "    if isinstance(escalation, dict) and escalation.get('reason') in ('delivery_failed', 'background_unavailable'): return True",
     "    if refused(json.dumps(value.get('structuredContent'))): return True",

@@ -1,7 +1,7 @@
 import { test, expect, describe } from "bun:test";
 import {
   deployHosts, deployScript, logsCmd, parseLeadingFlags, parseRecipeStep, resolveDeploySourceRoot,
-  restartCmd, routeSelector, statusCmd, waitFor, writeRemoteFile, pickPreferred,
+  restartCmd, routeSelector, statusCmd, waitFor, writeRemoteFile, pickPreferred, splitArgs,
 } from "../src/core.ts";
 import type { FleetConfig, Host } from "../src/config.ts";
 import { lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
@@ -170,6 +170,27 @@ describe("recipes", () => {
     },
     routes: { "main-win": { prefer: ["main", "winbox"] } },
   };
+
+  test("quoted exec recipes preserve escaped command quotes", async () => {
+    const parsed = parseRecipeStep(cfg, String.raw`exec web "printf '%s\n' \"two words\""`);
+    expect(parsed.kind).toBe("exec");
+    if (parsed.kind !== "exec") throw new Error("expected exec recipe");
+    expect(parsed.command).toBe(String.raw`printf '%s\n' "two words"`);
+    const proc = Bun.spawn(["bash", "--noprofile", "--norc", "-c", parsed.command], {
+      stdin: "ignore", stdout: "pipe", stderr: "pipe",
+    });
+    const [stdout, stderr, code] = await Promise.all([
+      new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited,
+    ]);
+    expect({ stdout, stderr, code }).toEqual({ stdout: "two words\n", stderr: "", code: 0 });
+  });
+
+  test("recipe quote escapes leave ordinary path backslashes intact", () => {
+    expect(splitArgs(String.raw`"a\\b \"c\""`)).toEqual([String.raw`a\b "c"`]);
+    expect(parseRecipeStep(cfg, String.raw`cp "C:\work dir\file.txt" web:/tmp/file`)).toMatchObject({
+      kind: "cp", local: String.raw`C:\work dir\file.txt`,
+    });
+  });
 
   test("exec flags inside the remote command stay payload", () => {
     expect(parseRecipeStep(cfg, "exec web echo keep --wsl --json --raw --cwd /x")).toEqual({

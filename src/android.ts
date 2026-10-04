@@ -1287,8 +1287,8 @@ export async function androidBatch(
     if (target !== "any") body.push(
       `f=$(dumpsys window 2>/dev/null | grep -m1 'mCurrentFocus='); tok=\${f##* }; tok=\${tok%\\}}; fp=\${tok%%/*}`,
       `case "$fp" in ${pattern}) ;; *) echo "${P}HALT ${i} focus moved to \${fp:-nothing}, not ${target}"; exit ${HALTED} ;; esac`);
-    // The first label step is covered by the check before the batch starts.
-    if (el && i !== labelled[0] && tree?.hash) body.push(regionCheck(el, i));
+    // Only step zero is covered by the check before the batch starts.
+    if (el && i > 0 && tree?.hash) body.push(regionCheck(el, i));
     // Every point is checked against the display before the first input, so a
     // bad coordinate refuses the batch instead of stopping it halfway.
     pointChecks.push(...checks);
