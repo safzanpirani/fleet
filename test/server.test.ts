@@ -594,3 +594,67 @@ describe("fleet_edit input contracts", () => {
     } finally { route.mockRestore(); edit.mockRestore(); }
   });
 });
+
+test("fleet_job_log forwards filters in readonly mode and reports inspection failure", async () => {
+  const tail = spyOn(jobs, "jobTail").mockResolvedValue({ host: "local", output: "selected\n", truncated: true });
+  try {
+    await withClient(true, async (client) => {
+      const r = await client.callTool({ name: "fleet_job_log", arguments: { ref: "local:sample", tail: 2, include: "READY", exclude: "skip" } });
+      expect(tail.mock.calls[0]).toEqual([cfg, "local:sample", undefined, 2, { include: "READY", exclude: "skip" }]);
+      expect(JSON.stringify(r.content)).toContain("truncated");
+      tail.mockRejectedValue(new Error("fixture inspection failed"));
+      expect((await client.callTool({ name: "fleet_job_log", arguments: { ref: "local:sample", include: "READY" } })).isError).toBe(true);
+    });
+  } finally { tail.mockRestore(); }
+});
+
+test("fleet_exec forwards literal argv and rejects mixed execution modes", async () => {
+  const execute = spyOn(core, "runExec").mockResolvedValue([{ host: "local", ok: true, code: 0, stdout: "ok", stderr: "" }]);
+  try {
+    await withClient(false, async (client) => {
+      const argv = ["program", "", "two words", "$HOME"];
+      expect((await client.callTool({ name: "fleet_exec", arguments: { selector: "local", argv } })).isError).not.toBe(true);
+      expect(execute.mock.calls[0]![2]).toEqual(argv);
+      expect((await client.callTool({ name: "fleet_exec", arguments: { selector: "local", argv, command: "true" } })).isError).toBe(true);
+      expect(execute.mock.calls).toHaveLength(1);
+    });
+  } finally { execute.mockRestore(); }
+});
+
+test("native service reads remain readonly and native restart remains mutating", async () => {
+  const execute = spyOn(ssh, "exec").mockResolvedValue({ host: "local", ok: false, code: 7, stdout: "", stderr: "fixture service failure" });
+  try {
+    await withClient(true, async (client) => {
+      const { tools } = await client.listTools();
+      expect(tools.find((t) => t.name === "fleet_logs")!.annotations!.readOnlyHint).toBe(true);
+      expect(tools.find((t) => t.name === "fleet_restart")).toBeUndefined();
+      for (const name of ["fleet_logs", "fleet_svc"]) {
+        const r = await client.callTool({ name, arguments: { host: "local", selector: "local", unit: "fixture.service", type: "systemd" } });
+        expect(r.isError).toBe(true);
+        expect(JSON.stringify(r.content)).toContain("fixture service failure");
+      }
+    });
+    await withClient(false, async (client) => {
+      const { tools } = await client.listTools();
+      expect(tools.find((t) => t.name === "fleet_restart")!.annotations!.destructiveHint).toBe(true);
+      const r = await client.callTool({ name: "fleet_restart", arguments: { host: "local", unit: "fixture.service", type: "systemd" } });
+      expect(r.isError).toBe(true);
+      expect(JSON.stringify(r.content)).toContain("fixture service failure");
+      const mixed = await client.callTool({ name: "fleet_restart", arguments: { host: "local", service: "alias", unit: "fixture.service", type: "systemd" } });
+      expect(mixed.isError).toBe(true);
+      expect(JSON.stringify(mixed.content)).toContain("either");
+    });
+  } finally { execute.mockRestore(); }
+});
+
+test("fleet_reboot forwards lifecycle observation and reports timeouts", async () => {
+  const reboot = spyOn(core, "rebootHosts").mockResolvedValue([{ host: "local", os: "linux", cmd: "", result: { host: "local", ok: false, code: 124, stdout: "", stderr: "local: waiting-down timeout" }, lifecycle: { phase: "waiting-down", wentDown: false, ready: false, elapsedMs: 1000 } }]);
+  try {
+    await withClient(false, async (client) => {
+      const r = await client.callTool({ name: "fleet_reboot", arguments: { selector: "local", wait: true, timeout: 1 } });
+      expect(reboot.mock.calls[0]![2]).toEqual({ wait: true, timeoutMs: 1000 });
+      expect(r.isError).toBe(true);
+      expect(JSON.stringify(r.content)).toContain("waiting-down");
+    });
+  } finally { reboot.mockRestore(); }
+});

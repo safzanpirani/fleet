@@ -1,5 +1,5 @@
 import { test, expect, describe } from "bun:test";
-import { configNotFoundMessage, configSearchPaths, resolveHosts, staleBinaryHint, validateConfig } from "../src/config.ts";
+import { configNotFoundMessage, configSearchPaths, loadConfig, resolveConfigPath, resolveHosts, staleBinaryHint, validateConfig } from "../src/config.ts";
 import { mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -289,6 +289,65 @@ describe("finding a config", () => {
       () => configNotFoundMessage(["/$bunfs/fleet.config.json", "/opt/fleet/fleet.config.json"]));
     expect(message).not.toContain("any of");
     expect(message).toContain("/opt/fleet/fleet.config.json");
+  });
+
+  test("missing config hides POSIX and Windows embedded paths", async () => {
+    const embedded = [
+      "/$bunfs/root/fleet.config.json",
+      "B:/~BUN/root/fleet.config.json",
+      "B:\\~BUN\\root\\fleet.config.json",
+      "b:/~BUN/root/fleet.config.json",
+      "b:\\~BUN\\root\\fleet.config.json",
+    ];
+    const real = "C:/Tools/fleet/fleet.config.json";
+    const message = await withEnv(undefined, () => configNotFoundMessage([...embedded, real]));
+    for (const path of embedded) expect(message).not.toContain(path);
+    expect(message).toContain(real);
+    expect(message).not.toContain("any of");
+  });
+
+  test("missing config preserves real Windows paths and explicit override errors", async () => {
+    const paths = [
+      "B:/Tools/fleet/fleet.config.json",
+      "b:\\Tools\\fleet\\fleet.config.json",
+      "B:/~BUN-backup/fleet.config.json",
+      "B:\\~BUN-backup\\fleet.config.json",
+    ];
+    const message = await withEnv(undefined, () => configNotFoundMessage(paths));
+    for (const path of paths) expect(message).toContain(path);
+    expect(message).toContain("any of");
+
+    const root = mkdtempSync(join(tmpdir(), "fleet-config-missing-"));
+    const missing = join(root, "missing.json");
+    try {
+      await withEnv(missing, async () => {
+        expect(configSearchPaths()).toEqual([missing]);
+        expect(await resolveConfigPath()).toBe(missing);
+        await expect(loadConfig()).rejects.toThrow(`FLEET_CONFIG points at ${missing}, which does not exist`);
+      });
+      // An explicit embedded-looking override must still name the requested path.
+      expect(await withEnv("B:/~BUN/missing.json", configNotFoundMessage))
+        .toBe("FLEET_CONFIG points at B:/~BUN/missing.json, which does not exist");
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test("missing config with only embedded candidates still gives an actionable override", async () => {
+    for (const paths of [[], ["/$bunfs/fleet.config.json"],
+      ["B:/~BUN/root/fleet.config.json", "b:\\~BUN\\root\\fleet.config.json"]]) {
+      const message = await withEnv(undefined, () => configNotFoundMessage(paths));
+      expect(message).toBe("no fleet config found — set FLEET_CONFIG=/path/to/fleet.config.json");
+    }
+  });
+
+  test("validation errors name the config file that was read", async () => {
+    const root = mkdtempSync(join(tmpdir(), "fleet-config-invalid-"));
+    const path = join(root, "fleet.config.json");
+    writeFileSync(path, JSON.stringify({ hosts: { fake: host("fake", "linux") }, notAConfigField: true }));
+    try {
+      await withEnv(path, async () => {
+        await expect(loadConfig()).rejects.toThrow(`invalid config ${path}: \`config\`: unknown field 'notAConfigField'`);
+      });
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });
 

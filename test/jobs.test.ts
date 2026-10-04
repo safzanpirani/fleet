@@ -803,3 +803,115 @@ describe("spawn --wsl", () => {
       { exec: async () => { throw new Error("must not run"); } })).rejects.toThrow("--wsl needs Windows hosts");
   });
 });
+
+describe("filtered job tails", () => {
+  async function fixtureLog(body: string, fn: (id: string, home: string) => Promise<void>) {
+    const home = mkdtempSync(join(tmpdir(), "fleet-filter-"));
+    const id = "filter-job";
+    const dir = join(home, ".fleet", "jobs", id);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "out"), body);
+    const execute = spyOn(ssh, "exec").mockImplementation(async (h, script) => {
+      const r = await runBash(script, home);
+      return { host: h.name, ok: r.code === 0, ...r };
+    });
+    try { await fn(id, home); expect(readFileSync(join(dir, "out"), "utf8")).toBe(body); }
+    finally { execute.mockRestore(); rmSync(home, { recursive: true, force: true }); }
+  }
+  test("filtered tail applies include and exclude before the line limit", async () => {
+    await fixtureLog("READY first\nREADY skip\nREADY second\nREADY third\n" + "noise\n".repeat(30), async (id) => {
+      expect((await jobTail(cfg, "web", id, 2, { include: "^READY", exclude: "skip" })).output)
+        .toBe("READY second\nREADY third\n");
+    });
+  });
+  test("filtered tail treats shell metacharacters as pattern data", async () => {
+    const pattern = "-quote'[$]";
+    await fixtureLog("noise\r\n-quote'$ first\r\n-quote'$ last", async (id) => {
+      expect((await jobTail(cfg, "web", id, 3, { include: pattern })).output)
+        .toBe("-quote'$ first\r\n-quote'$ last\n");
+    });
+    const execute = spyOn(ssh, "exec").mockResolvedValue({ host: "winbox", ok: true, code: 0, stdout: "", stderr: "" });
+    try {
+      await jobTail(cfg, "winbox", "filter-job", 2, { include: pattern, exclude: "NOISE" });
+      const script = execute.mock.calls[0]![1];
+      expect(script).toContain("-CaseSensitive");
+      expect(script).toContain("-ErrorAction Stop");
+      expect(script).toContain(pattern.replaceAll("'", "''"));
+      expect(script.indexOf("-Pattern")).toBeLessThan(script.indexOf("Select-Object -Last"));
+    } finally { execute.mockRestore(); }
+  });
+  test("filtered tail distinguishes no matches from unreadable logs and invalid regex", async () => {
+    await fixtureLog("hello\n", async (id, home) => {
+      expect((await jobTail(cfg, "web", id, 2, { include: "absent" })).output).toBe("");
+      await expect(jobTail(cfg, "web", id, 2, { include: "[" })).rejects.toThrow();
+      await expect(jobTail(cfg, "web", "missing", 2, { include: "hello" })).rejects.toThrow();
+    });
+    await fixtureLog("x".repeat(200_000), async (id) => {
+      const r = await jobTail(cfg, "web", id, 2, { include: "x" });
+      expect(Buffer.byteLength(r.output)).toBeLessThanOrEqual(65536);
+      expect(r.truncated).toBe(true);
+    });
+  });
+});
+
+test("until READY does not match lowercase ready", async () => {
+  const home = mkdtempSync(join(tmpdir(), "fleet-case-"));
+  const dir = join(home, ".fleet", "jobs", "case-job");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "out"), "ready\n");
+  try {
+    const posix = await runBash(waitPoll(host("local", "linux"), "case-job", "^READY$"), home);
+    expect(posix.code).toBe(0);
+    expect(posix.stdout).not.toContain("MATCH");
+    let clock = 0;
+    const r = await waitJob(cfg, "winbox:case-job", undefined, { until: "^READY$", timeoutMs: 2, intervalMs: 1 }, {
+      now: () => clock, sleep: async (ms) => { clock += ms; },
+      exec: async (h, script) => ({ host: h.name, ok: true, code: 0, stdout: script.includes("-CaseSensitive") ? "STARTING:0\n" : "MATCH\n", stderr: "" }),
+    });
+    expect(r.outcome).toBe("timeout");
+    expect(readFileSync(join(dir, "out"), "utf8")).toBe("ready\n");
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});
+
+test("until exact-case match preserves match and exit precedence", async () => {
+  const home = mkdtempSync(join(tmpdir(), "fleet-exact-"));
+  const dir = join(home, ".fleet", "jobs", "case-job");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "out"), "READY\n");
+  writeFileSync(join(dir, "exit"), "7\n");
+  try {
+    for (const target of ["web", "winbox"]) {
+      const r = await waitJob(cfg, `${target}:case-job`, undefined, { until: "^READY$" }, {
+        exec: async (h, script) => {
+          if (h.os === "windows") {
+            expect(script).toContain("-CaseSensitive");
+            return { host: h.name, ok: true, code: 0, stdout: "MATCH\nEXIT:7\n", stderr: "" };
+          }
+          const r = await runBash(script, home);
+          return { host: h.name, ok: r.code === 0, ...r };
+        },
+      });
+      expect(r).toMatchObject({ outcome: "matched", code: 7 });
+    }
+    expect(readFileSync(join(dir, "exit"), "utf8")).toBe("7\n");
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});
+
+test("filtered tail bounds decoded unicode and fails unreadable log paths", async () => {
+  const home = mkdtempSync(join(tmpdir(), "fleet-filter-bound-"));
+  const dir = join(home, ".fleet", "jobs", "bounded");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "out"), "雪".repeat(30_000));
+  const execute = spyOn(ssh, "exec").mockImplementation(async (h, script) => {
+    const r = await runBash(script, home);
+    return { host: h.name, ok: r.code === 0, ...r };
+  });
+  try {
+    const result = await jobTail(cfg, "web:bounded", undefined, 1, { include: "." });
+    expect(Buffer.byteLength(result.output)).toBeLessThanOrEqual(65536);
+    expect(result.truncated).toBe(true);
+    rmSync(join(dir, "out"));
+    mkdirSync(join(dir, "out"));
+    await expect(jobTail(cfg, "web:bounded", undefined, 1, { include: "." })).rejects.toThrow();
+  } finally { execute.mockRestore(); rmSync(home, { recursive: true, force: true }); }
+});

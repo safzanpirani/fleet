@@ -387,3 +387,33 @@ describe("pickPreferred", () => {
     expect(await pickPreferred([], 50)).toBe(-1);
   });
 });
+
+test("argv execution preserves empty whitespace unicode and metacharacter arguments", async () => {
+  const core = await import("../src/core.ts");
+  const args = ["", "two words", "雪", "a'b", '"quoted"', "$HOME", "$(false)", "x;y", "a\\b", "--json"];
+  const script = core.buildArgvCommand(["python3", "-c", "import sys,json; print(json.dumps(sys.argv[1:],ensure_ascii=False))", ...args], false);
+  const proc = Bun.spawn(["bash", "-c", script], { stdout: "pipe", stderr: "pipe" });
+  expect(JSON.parse(await new Response(proc.stdout).text())).toEqual(args);
+  expect(await proc.exited).toBe(0);
+  const win = core.buildArgvCommand(["C:\\Program Files\\fixture.exe", ...args], true);
+  expect(win).toStartWith("& 'C:\\Program Files\\fixture.exe' '' 'two words' '雪' 'a''b'");
+  expect(core.buildArgvCommand(["/path with spaces/tool", "arg"], false)).toBe("'/path with spaces/tool' 'arg'");
+});
+
+test("configured service aliases retain per-host mapping and skip rules", async () => {
+  const { spyOn } = await import("bun:test");
+  const ssh = await import("../src/ssh.ts");
+  const core = await import("../src/core.ts");
+  const cfg: FleetConfig = { hosts: {
+    a: { name: "a", ssh: "fixture-a", os: "linux", services: { app: { type: "systemd", name: "alpha" } } },
+    b: { name: "b", ssh: "fixture-b", os: "linux", services: { app: { type: "systemd-user", name: "beta" } } },
+    c: { name: "c", ssh: "fixture-c", os: "linux" },
+  } };
+  const execute = spyOn(ssh, "exec").mockImplementation(async (h) => ({ host: h.name, ok: true, code: 0, stdout: "active", stderr: "" }));
+  try {
+    expect((await core.restartService(cfg, "all", "app")).map((a) => a.host)).toEqual(["a", "b"]);
+    expect(execute.mock.calls[0]![1]).toContain("'alpha'");
+    expect(execute.mock.calls[1]![1]).toContain("'beta'");
+    expect(await core.svcStatus(cfg, "all", "app")).toHaveLength(2);
+  } finally { execute.mockRestore(); }
+});

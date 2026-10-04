@@ -139,6 +139,24 @@ answers instead.
   subnet and reads the ARP table for the machine's `mac`. Where the local ARP table
   is unreadable (recent macOS), pass `--from <linux host on the LAN>`.
 
+### Command options
+
+Use `exec --argv <selector> -- <program> <arguments...>` to preserve argument boundaries. Quote values for the local shell. Argv mode cannot combine with script mode.
+
+`jobs tail --include REGEX --exclude REGEX -n N` filters on the host before the line limit. Inclusion runs before exclusion. Filters and `jobs wait --until` patterns are case-sensitive. POSIX hosts use ERE; Windows uses .NET regex. Filtered output has a 64 KiB limit and reports truncation. Filters cannot combine with follow.
+
+`restart`, `logs`, and `svc` accept a configured alias or `--unit NAME --type TYPE`. Types are `systemd`, `systemd-user`, `winservice`, `nssm`, and `schtask`. Explicit units reject wildcards and report incompatible hosts. `restart` and `logs` support `--json`. `logs --raw` preserves stdout and sends diagnostics to stderr. Windows logs return service or task status.
+
+`reboot <selector> --yes --wait --timeout 300` observes the host stop answering before accepting SSH readiness. A timeout reports the last phase. Fleet never resends a reboot trigger after a lost acknowledgement.
+
+Fleet-owned `--json` options produce one JSON value on early failures. Error envelopes contain `ok`, `error.code`, `error.message`, and `command`. Payload flags do not enable JSON mode. Existing per-host result shapes remain unchanged.
+
+`tools sync` verifies that the remote shell selects the installed command before recording success. A shadowing command causes sync to fail and report its resolved path. Adjust PATH or manage the competing installation before rerunning sync. `tools status` compares manifests and does not verify current launcher resolution.
+
+`tools stamp` refuses skill-version downgrades and unorderable versions. Refusal preserves the complete skill file and its date. Use valid SemVer versions and update the package version before stamping.
+
+Missing-config errors omit Bun embedded paths and recommend `FLEET_CONFIG`. Inspect the config path named in validation errors. A compiled Fleet reads `fleet.config.json` beside its executable before later fallbacks.
+
 ## Logical routes
 
 A logical route chooses one concrete host entry from an ordered `prefer` list

@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { FleetConfig, Host } from "../src/config.ts";
@@ -27,7 +27,7 @@ test("compiled sync atomically updates a native executable and preserves it on b
       await writeFile(join(source, "src/cli.ts"), text);
       expect((await run(["tar", "czf", join(root, "demo-sync.tgz"), "-C", source, "."])).code).toBe(0);
       const script = installScript(target, { name: "demo", compile: true }, join(root, "demo"), manifest, "demo");
-      return run(["bash", "-c", script.cmd.replaceAll("$HOME", root)]);
+      return run(["bash", "-c", ('export PATH="$HOME/.local/bin:$PATH"\n' + script.cmd).replaceAll("$HOME", root)], root);
     };
     const first = await install('console.log("first")');
     expect(first.code, first.stderr).toBe(0);
@@ -48,6 +48,33 @@ test("compiled sync atomically updates a native executable and preserves it on b
       expect(await readFile(manifestPath, "utf8")).toBe(goodManifest);
       expect(await readdir(join(root, ".local/bin"))).toEqual(["demo"]);
     }
+  } finally { await rm(root, { recursive: true, force: true }); }
+}, 30000);
+
+test("compiled candidate help success does not bypass active launcher verification", async () => {
+  const root = await mkdtemp(join(tmpdir(), "fleet compiled shadow "));
+  const source = join(root, "source");
+  const shadow = join(root, "old bin", "demo");
+  const manifestPath = join(root, ".fleet-tools/demo.json");
+  const prior = '{"hash":"prior"}\n';
+  try {
+    await mkdir(join(source, "src"), { recursive: true });
+    await mkdir(join(root, "old bin"));
+    await mkdir(join(root, ".fleet-tools"));
+    await writeFile(shadow, "#!/bin/sh\necho old\n");
+    await chmod(shadow, 0o755);
+    await writeFile(manifestPath, prior);
+    await writeFile(join(source, "package.json"), '{"name":"demo","version":"1.0.0"}');
+    await writeFile(join(source, "src/cli.ts"), 'console.log("candidate help works")');
+    expect((await run(["tar", "czf", join(root, "demo-sync.tgz"), "-C", source, "."])).code).toBe(0);
+    const script = installScript(target, { name: "demo", compile: true }, join(root, "demo"), manifest, "demo");
+    const command = ('export PATH="$HOME/old bin:$HOME/.local/bin:$PATH"\n' + script.cmd).replaceAll("$HOME", root);
+    const result = await run(["bash", "-c", command]);
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain(shadow);
+    expect(await readFile(manifestPath, "utf8")).toBe(prior);
+    expect((await run([join(root, ".local/bin/demo"), "--help"])).stdout.trim()).toBe("candidate help works");
+    expect((await run([shadow])).stdout.trim()).toBe("old");
   } finally { await rm(root, { recursive: true, force: true }); }
 }, 30000);
 

@@ -510,3 +510,19 @@ describe("edit CLI lists", () => {
     // Eleven cold CLI starts in sequence; a loaded machine needs the headroom.
   }, 60_000);
 });
+
+test("ordinary shell commands still support pipelines and redirection", async () => {
+  const { runExec } = await import("../src/core.ts");
+  const root = mkdtempSync(join(tmpdir(), "fleet-shell-mode-"));
+  const cfg: FleetConfig = { hosts: { local: { name: "local", ssh: "fixture-local", os: "linux" } } };
+  const execute = spyOn(ssh, "exec").mockImplementation(async (h, command) => {
+    const p = Bun.spawn(["bash", "-c", command], { cwd: root, stdout: "pipe", stderr: "pipe" });
+    const [stdout, stderr, code] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited]);
+    return { host: h.name, ok: code === 0, code, stdout, stderr };
+  });
+  try {
+    const [r] = await runExec(cfg, "local", "printf 'one\\ntwo\\n' | tail -n 1 > result; cat result");
+    expect(r).toMatchObject({ ok: true, stdout: "two\n" });
+    expect(await Bun.file(join(root, "result")).text()).toBe("two\n");
+  } finally { execute.mockRestore(); rmSync(root, { recursive: true, force: true }); }
+});

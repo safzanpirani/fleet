@@ -444,18 +444,18 @@ export function hostKeyOpts(host: Host): string[] {
     "-o", `UserKnownHostsFile=${join(homedir(), ".ssh", "known_hosts")}`];
 }
 
-/** Bun's embedded filesystem prefix. `import.meta.url` resolves inside it in a
- *  `bun build --compile` binary, so ROOT becomes `/$bunfs` there — a path that
- *  exists only inside the executable and can never be created by a user. */
-const BUNFS = "/$bunfs";
+/** Compiled Bun binaries resolve import.meta.url inside an embedded filesystem.
+ *  POSIX uses /$bunfs; Windows uses B:/~BUN or B:\\~BUN. Users cannot create
+ *  config files there. Match whole directory names to preserve real paths. */
+const EMBEDDED_CONFIG_PATH = /^(?:\/\$bunfs(?:\/|$)|[bB]:[\\/]~BUN(?:[\\/]|$))/;
 
 /**
  * Every place fleet looks for a config, in order. `FLEET_CONFIG` wins over all
  * of them.
  *
  * When running from source, ROOT is the repo and the config sits next to it.
- * In a compiled binary ROOT is inside `BUNFS` and unreachable — hence the
- * fallbacks. Exported so a not-found error can say where it actually searched.
+ * In a compiled binary ROOT is inside Bun's embedded filesystem.
+ * Exported so a not-found error can say where it actually searched.
  */
 export function configSearchPaths(): string[] {
   if (process.env.FLEET_CONFIG) return [process.env.FLEET_CONFIG];
@@ -480,12 +480,11 @@ export async function resolveConfigPath(): Promise<string> {
 export function configNotFoundMessage(paths = configSearchPaths()): string {
   if (process.env.FLEET_CONFIG)
     return `FLEET_CONFIG points at ${paths[0]}, which does not exist`;
-  // A BUNFS path is not somewhere anyone can put a file, so offering it as a
-  // location would be worse than saying nothing.
-  const usable = paths.filter((p) => !p.startsWith(BUNFS));
+  const usable = paths.filter((p) => !EMBEDDED_CONFIG_PATH.test(p));
+  const override = "no fleet config found — set FLEET_CONFIG=/path/to/fleet.config.json";
+  if (!usable.length) return override;
   return [
-    "no fleet config found — set FLEET_CONFIG=/path/to/fleet.config.json,"
-      + ` or create one at${usable.length > 1 ? " any of" : ""}:`,
+    `${override}, or create one at${usable.length > 1 ? " any of" : ""}:`,
     ...usable.map((p) => `  ${p}`),
   ].join("\n");
 }

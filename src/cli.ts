@@ -46,7 +46,7 @@ import {
 import type { JobRow } from "./jobs.ts";
 import {
   pullFlag, pullVal, parseFlags, parseLeadingFlags, lsHosts, runExec, runScript, rebootRefusal, droppedStdinCheck, nestedShellNote, readScriptSource, editRemoteFile, parseEditList,
-  pushFile, pullFile, parseRemoteSpec, restartService, serviceLogs, svcStatus,
+  pushFile, pullFile, parseRemoteSpec, restartService, serviceLogs, svcStatus, serviceTarget,
   gpuRows, diskRows, sudoWrap, fetchDashboard, hostStatus, runRecipe, captureScreenshot, rebootHosts,
   cuInstall, cuRun, cuTools, cuDescribe, cuRecordStart, cuRecordStop, cuRecordStatus, cuRegions, cuPerception, bootMismatchNote,
   cuApps, cuShotWindow, browseHost, preferredImageExt, overlayGrid,
@@ -115,7 +115,23 @@ function renderKill(r: KillResult): void {
   if (r.error && r.targets.length) console.log(`  ${A.d(r.error)}`);
 }
 
-function die(m: string): never { console.error(A.r("✗ " + m)); process.exit(1); }
+let jsonFailureCommand: string | undefined;
+let failurePhase: "config" | "command" = "command";
+function die(m: string): never {
+  if (jsonFailureCommand) {
+    // Error strings can contain script source, option values, or config contents.
+    // Only fixed diagnostics enter the machine-readable failure envelope.
+    const error = failurePhase === "config"
+      ? { code: "CONFIG_ERROR", message: "Unable to load Fleet configuration. Check FLEET_CONFIG and the configuration file." }
+      : /unknown host|unknown selector|no hosts|unknown group/i.test(m)
+        ? { code: "UNKNOWN_SELECTOR", message: "The selector does not resolve to configured hosts." }
+        : /usage:|option|requires|needs an integer|choose either|cannot be combined|must come|--interp|--argv/i.test(m)
+          ? { code: "INVALID_ARGUMENT", message: "Invalid Fleet arguments. Check fleet help for this command." }
+          : { code: "COMMAND_FAILED", message: "Fleet could not complete the command. Inspect the target or local input before retrying." };
+    console.log(JSON.stringify({ ok: false, error, command: jsonFailureCommand }));
+  } else console.error(A.r("✗ " + m));
+  process.exit(1);
+}
 /** Pull a numeric flag value, failing LOUDLY on garbage instead of letting a
  *  NaN leak into a remote command (`tail -n NaN`) or a 0ms poll loop. */
 function numVal(rest: string[], flag: string, def: number, min = 1): number {
@@ -630,20 +646,54 @@ complete -F _fleet fleet`;
 const PROXY_LEADING_VALUES: Record<string, readonly string[]> = {
   exec: ["--cwd", "--timeout", "--script", "--interp"],
   spawn: ["--cwd", "--label"],
-  jobs: ["-n", "--lines", "--until", "--timeout"],
+  jobs: ["-n", "--lines", "--until", "--timeout", "--include", "--exclude"],
   edit: ["--old", "--new", "--old-file", "--new-file", "--edits"],
-  logs: ["-n"],
+  logs: ["-n", "--unit", "--type"],
+  restart: ["--unit", "--type"],
+  svc: ["--unit", "--type"],
   ps: ["--sort", "-n"],
   kill: ["--grace"],
   shot: ["--grid-step", "--out", "--output", "--monitor", "--region"],
   cu: ["--grid-step", "--grid-minor", "--for", "--probe", "--space", "--button", "--count", "--settle",
     "--out", "--element", "--label", "--role", "--nth", "--region", "--region-at", "--kind"],
   switch: ["--to", "--timeout"],
+  reboot: ["--timeout"],
   wait: ["--port", "--http", "--status", "--boot", "--timeout", "--interval"],
   deploy: ["--restart"],
   tools: ["--max-parallel"],
   find: ["--from"],
 };
+
+/** Detect owned JSON options without loading config, mutating proxy state, or
+ * parsing remote payloads. Keep this boundary aligned with exec flag hoisting. */
+export function fleetJsonCommand(command: string | undefined, args: string[]): string | undefined {
+  const canonical = command === "job" ? "jobs" : command === "service" ? "svc" : command === "push" || command === "pull" ? "cp" : command;
+  if (!canonical || !["exec", "spawn", "jobs", "cp", "edit", "tools", "restart", "logs", "svc"].includes(canonical)) return undefined;
+  const values = new Set([...(PROXY_LEADING_VALUES[canonical] ?? []), "--proxy"]);
+  const payload = canonical === "exec" || canonical === "spawn";
+  const bools = new Set(canonical === "exec"
+    ? ["--argv", "--json", "--wsl", "--raw", "--sudo", "--confirm-reboot", "--fresh"]
+    : ["--json", "--wsl", "--elevated", "--confirm-reboot", "--fresh"]);
+  let selector = false;
+  for (let i = 0; i < args.length; i++) {
+    const token = args[i]!;
+    if (token === "--") break;
+    const equal = token.indexOf("=");
+    const name = equal > 0 && token.startsWith("--") ? token.slice(0, equal) : token;
+    if (payload && selector && (name === "--proxy" || (!bools.has(name) && !values.has(name)))) break;
+    if (token === "--json") return canonical;
+    if (values.has(name)) {
+      // A following option is a missing-value error, not an option value.
+      if (equal < 0 && args[i + 1] !== undefined && !args[i + 1]!.startsWith("--")) i++;
+      continue;
+    }
+    if (payload && !token.startsWith("-")) {
+      if (selector) break;
+      selector = true;
+    }
+  }
+  return undefined;
+}
 
 /**
  * Pull `--proxy NAME|URL` / `--no-proxy` out of the LEADING flag run — the same
@@ -657,7 +707,7 @@ const PROXY_LEADING_VALUES: Record<string, readonly string[]> = {
 export function applyProxyFlags(
   rest: string[], env: Record<string, string | undefined> = process.env, command?: string,
 ): string[] {
-  const aliases: Record<string, string> = { job: "jobs", screenshot: "shot", computer: "cu" };
+  const aliases: Record<string, string> = { job: "jobs", service: "svc", screenshot: "shot", computer: "cu" };
   const valueFlags = PROXY_LEADING_VALUES[aliases[command ?? ""] ?? command ?? ""] ?? [];
   const out: string[] = [];
   let explicit: string | undefined;
@@ -740,7 +790,7 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
     case "exec": {
       // Flags are parsed from the LEADING tokens only, so a --wsl/--json/… inside
       // the remote command is passed through verbatim instead of being hijacked.
-      const EXEC_BOOLS = ["--json", "--wsl", "--raw", "--sudo", "--confirm-reboot", "--fresh"];
+      const EXEC_BOOLS = ["--argv", "--json", "--wsl", "--raw", "--sudo", "--confirm-reboot", "--fresh"];
       const EXEC_VALUES = ["--cwd", "--timeout", "--script", "--interp"];
       const { flags, rest: lead } = parseLeadingFlags(rest, EXEC_BOOLS, EXEC_VALUES);
       const sel = lead.shift();
@@ -759,6 +809,9 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       // remote leftovers, and the source never touches a shell command line.
       const scriptPath = typeof flags["--script"] === "string" && flags["--script"] ? flags["--script"] : undefined;
       const interp = typeof flags["--interp"] === "string" && flags["--interp"] ? flags["--interp"] : undefined;
+      const argv = flags["--argv"] === true;
+      if (argv && (scriptPath || interp)) die("--argv cannot be combined with --script or --interp");
+      if (argv && !separated) die("--argv requires -- before the program");
       const cmd = pos.join(" ");
       if (scriptPath) {
         if (!sel) die("usage: fleet exec --script <file|-> [--interp cmd] [--cwd dir] [--timeout S] [--wsl] [--sudo] [--raw] [--json] <sel> [--] [ARG…]");
@@ -792,7 +845,7 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       const target = await routeSelector(cfg, sel!);
       const nested = nestedShellNote(cmd, resolveHosts(cfg, target), wsl);
       if (nested) console.error(A.y(nested));
-      const results = await runExec(cfg, target, cmd, { wsl, cwd, timeoutMs, sudo, fresh });
+      const results = await runExec(cfg, target, argv ? pos : cmd, { wsl, cwd, timeoutMs, sudo, fresh });
       if (json) console.log(JSON.stringify(results, null, 2));
       else if (raw) results.forEach(printRaw);
       else { results.forEach(printResult); await printBootMismatch(cfg, results); }
@@ -834,7 +887,7 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
 
     case "jobs": {
       // Normalize only owned aliases, then validate before resolving any host.
-      const parsed = parseFlags(rest, ["--json", "-f", "--follow", "--all"], ["-n", "--lines", "--until", "--timeout"]);
+      const parsed = parseFlags(rest, ["--json", "-f", "--follow", "--all"], ["-n", "--lines", "--until", "--timeout", "--include", "--exclude"]);
       rest = parsed.rest;
       const flags = parsed.flags;
       for (const [alias, canonical] of [["--lines", "-n"], ["--follow", "-f"]] as const) {
@@ -846,7 +899,7 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       const json = flags["--json"] === true;
       const verb = rest[0];
       const allowed: Record<string, string[]> = {
-        list: ["--json"], log: ["--json"], tail: ["--json", "-n", "-f"],
+        list: ["--json"], log: ["--json"], tail: ["--json", "-n", "-f", "--include", "--exclude"],
         kill: ["--json"], wait: ["--json", "--until", "--timeout"], prune: ["--json", "--all"],
       };
       const action = verb && Object.hasOwn(allowed, verb) ? verb : "list";
@@ -866,10 +919,14 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
         if (verb === "tail") {
           const follow = flags["-f"] === true;
           if (follow && json) die("--json cannot be combined with --follow");
+          const include = typeof flags["--include"] === "string" ? flags["--include"] : undefined;
+          const exclude = typeof flags["--exclude"] === "string" ? flags["--exclude"] : undefined;
+          if (follow && (include !== undefined || exclude !== undefined)) die("filters cannot be combined with --follow");
           const n = numFlag(flags, "-n", 40);
           const a = rest[0] ?? die("usage: fleet jobs tail <host:id> [-n N] [-f]");
           if (follow) return await jobFollow(cfg, a, rest[1], n);
-          const result = await jobTail(cfg, a, rest[1], n);
+          const result = await jobTail(cfg, a, rest[1], n, { include, exclude });
+          if (!json && result.truncated) console.error("fleet: job output truncated at 65536 bytes");
           if (json) console.log(JSON.stringify(result, null, 2));
           else process.stdout.write(result.output.endsWith("\n") || !result.output ? result.output : result.output + "\n");
           return 0;
@@ -1028,11 +1085,13 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
     }
 
     case "restart": {
-      const { rest: pos } = parseFlags(rest, [], []);
-      const [sel, svcName] = pos;
-      if (!sel || !svcName || pos.length !== 2) die("usage: fleet restart <sel> <service>");
-      const actions = await restartService(cfg, await routeSelector(cfg, sel!), svcName!);
-      for (const a of actions) {
+      const { flags, rest: pos } = parseFlags(rest, ["--json"], ["--unit", "--type"]);
+      const [sel, alias] = pos;
+      const target = serviceTarget(alias, flags["--unit"] as string | undefined, flags["--type"] as string | undefined);
+      if (!sel || pos.length > 2) die("usage: fleet restart <sel> <service> | <sel> --unit NAME --type TYPE [--json]");
+      const actions = await restartService(cfg, await routeSelector(cfg, sel), target);
+      if (flags["--json"]) console.log(JSON.stringify(actions, null, 2));
+      else for (const a of actions) {
         console.log(A.d(`↻ ${a.host} :: ${a.service} (${a.type})`));
         printResult(a.result);
       }
@@ -1040,16 +1099,22 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
     }
 
     case "reboot": {
-      const { flags, rest: pos } = parseFlags(rest, ["--yes", "-y"], []);
+      const { flags, rest: pos } = parseFlags(rest, ["--yes", "-y", "--wait"], ["--timeout"]);
       const yes = flags["--yes"] === true || flags["-y"] === true;
+      const wait = flags["--wait"] === true;
+      const timeout = numFlag(flags, "--timeout", 300);
+      if (flags["--timeout"] !== undefined && !wait) die("--timeout requires --wait");
       const [sel] = pos;
-      if (!sel || pos.length !== 1) die("usage: fleet reboot <sel> [--yes]");
-      const routed = await routeSelector(cfg, sel!);
+      if (!sel || pos.length !== 1) die("usage: fleet reboot <sel> [--yes] [--wait [--timeout S]]");
+      if (!yes && !process.stdin.isTTY) die("reboot requires --yes non-interactively");
+      const routed = await routeSelector(cfg, sel);
       const hosts = resolveHosts(cfg, routed).map((h) => h.name);
       if (!await confirm(`reboot ${A.b(hosts.join(", "))} (this drops the connection)`, yes)) return 1;
-      const actions = await rebootHosts(cfg, routed);
-      for (const a of actions)
-        console.log(`${a.result.ok ? A.g("↻") : A.r("✗")} ${A.b(a.host)} ${A.d("· " + a.os + (a.result.ok ? " · rebooting" : " · exit " + a.result.code))}${a.result.stderr ? "\n  " + A.d(a.result.stderr) : ""}`);
+      const actions = await rebootHosts(cfg, routed, { wait, ...(wait ? { timeoutMs: timeout * 1000 } : {}) });
+      for (const a of actions) {
+        const detail = a.lifecycle ? a.lifecycle.phase : a.result.ok ? "rebooting" : "exit " + a.result.code;
+        console.log(`${a.result.ok ? A.g("↻") : A.r("✗")} ${A.b(a.host)} ${A.d("· " + a.os + " · " + detail)}${a.result.stderr ? "\n  " + A.d(a.result.stderr) : ""}`);
+      }
       return actions.some((a) => !a.result.ok) ? 1 : 0;
     }
 
@@ -1068,12 +1133,16 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
     }
 
     case "logs": {
-      const { flags, rest: pos } = parseFlags(rest, [], ["-n"]);
+      const { flags, rest: pos } = parseFlags(rest, ["--json", "--raw"], ["-n", "--unit", "--type"]);
+      if (flags["--json"] && flags["--raw"]) die("choose either --raw or --json");
       const n = numFlag(flags, "-n", 30);
-      const [sel, svcName] = pos;
-      if (!sel || !svcName || pos.length !== 2) die("usage: fleet logs <sel> <service> [-n N]");
-      const actions = await serviceLogs(cfg, await routeSelector(cfg, sel!), svcName!, n);
-      for (const a of actions) {
+      const [sel, alias] = pos;
+      const target = serviceTarget(alias, flags["--unit"] as string | undefined, flags["--type"] as string | undefined);
+      if (!sel || pos.length > 2) die("usage: fleet logs <sel> <service> | <sel> --unit NAME --type TYPE [-n N] [--raw | --json]");
+      const actions = await serviceLogs(cfg, await routeSelector(cfg, sel), target, n);
+      if (flags["--json"]) console.log(JSON.stringify(actions, null, 2));
+      else if (flags["--raw"]) actions.forEach((a) => printRaw(a.result));
+      else for (const a of actions) {
         if (actions.length > 1) console.log(A.d(`— ${a.host} :: ${a.service}`));
         printResult(a.result);
       }
@@ -1081,12 +1150,13 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
     }
 
     case "svc": case "service": {
-      const { flags, rest: pos } = parseFlags(rest, ["--json"], []);
+      const { flags, rest: pos } = parseFlags(rest, ["--json"], ["--unit", "--type"]);
       const json = flags["--json"] === true;
-      const name = pos[0];
-      const sel = pos[1] ?? "all";
-      if (!name || pos.length > 2) die("usage: fleet svc <service> [sel]   (status across every host that has it)");
-      const rows = await svcStatus(cfg, await routeSelector(cfg, sel), name!);
+      const explicit = flags["--unit"] !== undefined || flags["--type"] !== undefined;
+      const target = serviceTarget(explicit ? undefined : pos[0], flags["--unit"] as string | undefined, flags["--type"] as string | undefined);
+      const sel = (explicit ? pos[0] : pos[1]) ?? "all";
+      if (pos.length > (explicit ? 1 : 2)) die("choose either a service alias or an explicit unit");
+      const rows = await svcStatus(cfg, await routeSelector(cfg, sel), target);
       if (json) { console.log(JSON.stringify(rows, null, 2)); return rows.some((r) => !r.up) ? 1 : 0; }
       for (const r of rows)
         console.log(`${r.up ? A.g("●") : A.r("○")} ${A.b(r.host.padEnd(10))} ${A.d(r.service.padEnd(16))} ${r.up ? A.g(r.detail) : A.y(r.detail)} ${A.d("(" + r.type + ")")}`);
@@ -2327,12 +2397,16 @@ export function installSyncStdout(): void {
 
 if (import.meta.main) {
   const [, , command, ...rest] = process.argv;
+  jsonFailureCommand = fleetJsonCommand(command, rest);
   // Internal byte pipes (ssh ProxyCommand, the Windows session broker) keep the stream.
   if (!command?.startsWith("__")) installSyncStdout();
   Promise.resolve().then(async () => {
     const help = helpText(command ? [command, ...rest] : []);
     if (help !== undefined) { console.log(help); return 0; }
-    return dispatch(command, rest, await loadConfig());
+    failurePhase = "config";
+    const config = await loadConfig();
+    failurePhase = "command";
+    return dispatch(command, rest, config);
   })
     .then((code) => { process.exitCode = code; })
     .catch((e) => die(e.message));

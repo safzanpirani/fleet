@@ -20,3 +20,12 @@ describe("stdout through a shell pipe", () => {
     expect(out.replace(/x+/, "x").replace(/y+/, "y")).toBe("xy\nz");
   });
 });
+
+test("json error survives a shell pipe and contains no ANSI escapes", () => {
+  const r = Bun.spawnSync(["bash", "-o", "pipefail", "-c", "bun src/cli.ts exec --json unknown true | cat"], {
+    cwd: root, env: { ...process.env, FLEET_CONFIG: "/nonexistent/fleet-json-fixture.json", FORCE_COLOR: "1" },
+  });
+  expect(r.exitCode).toBe(1);
+  expect(JSON.parse(r.stdout.toString())).toMatchObject({ ok: false, command: "exec" });
+  expect(r.stdout.toString() + r.stderr.toString()).not.toContain("\x1b");
+});

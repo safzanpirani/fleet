@@ -155,12 +155,13 @@ function interpretStatus(type: ServiceType, out: string): { up: boolean; detail:
 }
 export interface SvcStatus { host: string; service: string; type: ServiceType; up: boolean; detail: string; }
 /** Status of one named service across every host that defines it (default: all). */
-export async function svcStatus(cfg: FleetConfig, sel: string, name: string): Promise<SvcStatus[]> {
-  return Promise.all(serviceHosts(cfg, sel, name).map(async ({ host, svc }) => {
+export async function svcStatus(cfg: FleetConfig, sel: string, target: ServiceTarget): Promise<SvcStatus[]> {
+  return Promise.all(serviceHosts(cfg, sel, target).map(async ({ host, svc, error }) => {
+    if (error) return { host: host.name, service: serviceName(target), type: svc.type, up: false, detail: error };
     const { cmd, shell } = statusCmd(svc);
     const r = await exec(host, cmd, shell);
-    const { up, detail } = interpretStatus(svc.type, r.ok ? r.stdout : (r.stderr || "error"));
-    return { host: host.name, service: name, type: svc.type, up, detail };
+    const status = r.ok ? interpretStatus(svc.type, r.stdout) : { up: false, detail: r.stderr || `exit ${r.code}` };
+    return { host: host.name, service: serviceName(target), type: svc.type, ...status };
   }));
 }
 
@@ -235,14 +236,22 @@ async function writeLsState(path: string, state: Record<string, boolean>): Promi
 }
 
 // ── exec ──────────────────────────────────────────────────────────────────────
+/** Quote an explicit argument vector for the target shell. */
+export function buildArgvCommand(argv: string[], powershell: boolean): string {
+  if (!argv.length || !argv[0] || argv.some((arg) => arg.includes("\0")))
+    throw new Error("argv requires a nonempty program and arguments without NUL bytes");
+  return (powershell ? "& " : "") + argv.map((arg) => `'${powershell ? psEsc(arg) : bashEsc(arg)}'`).join(" ");
+}
+
 export async function runExec(
-  cfg: FleetConfig, sel: string, cmd: string,
+  cfg: FleetConfig, sel: string, cmd: string | string[],
   opts: { wsl?: boolean; cwd?: string; timeoutMs?: number; sudo?: boolean; fresh?: boolean } = {},
 ): Promise<ExecResult[]> {
   const hosts = resolveHosts(cfg, sel);
   const shell: Shell = opts.wsl ? "wsl" : "auto";
   return Promise.all(hosts.map(async (h) => {
-    const sudo = opts.sudo ? await sudoWrap(h, cmd, !!opts.wsl) : { cmd };
+    const command = Array.isArray(cmd) ? buildArgvCommand(cmd, h.os === "windows" && !opts.wsl) : cmd;
+    const sudo = opts.sudo ? await sudoWrap(h, command, !!opts.wsl) : { cmd: command };
     if ("error" in sudo) return sudo.error;
     return exec(h, sudo.cmd, shell, { cwd: opts.cwd, timeoutMs: opts.timeoutMs, fresh: opts.fresh });
   }));
@@ -1734,12 +1743,8 @@ export async function switchMachine(
   const left = () => timeoutMs - (Date.now() - start);
   // Phase: the source boot must stop answering. If it never does, the trigger
   // did not reboot anything, and waiting for the target would only burn time.
-  let wentDown = false;
   const downBy = Date.now() + Math.min(120_000, Math.max(0, left()));
-  while (Date.now() < downBy) {
-    if (!await probeHost(liveHost, 4000)) { wentDown = true; break; }
-    await Bun.sleep(Math.min(3000, Math.max(0, downBy - Date.now())));
-  }
+  const wentDown = await waitHostState(liveHost, false, downBy, 3000, { probe: probeHost });
   if (!wentDown) {
     const now = await bootState(cfg, machine, { probe: (h) => probeHost(h) });
     report("done", `${liveHost.name} kept answering; no reboot happened`);
@@ -4962,40 +4967,59 @@ export async function cuVerify(
   };
 }
 
-// ── restart / logs (resolve a configured service on the first selected host) ──
+// ── restart / logs ───────────────────────────────────────────────────────────
 export interface ServiceAction {
   host: string; service: string; type: string; cmd: string; result: ExecResult;
 }
-/** Every host the selector resolves to that actually defines the named service.
- *  Fans out (consistent with exec/cp) rather than silently using the first host;
- *  throws only if NO matched host has the service. */
-function serviceHosts(cfg: FleetConfig, sel: string, svcName: string): { host: Host; svc: Service }[] {
+/** Configured aliases map per host; explicit units report every selected host. */
+export type ServiceTarget = string | { unit: string; type: ServiceType };
+
+/** Validate addressing before frontends route a selector or contact a host. */
+export function serviceTarget(alias?: string, unit?: string, type?: string): ServiceTarget {
+  if (unit === undefined && type === undefined) {
+    if (!alias) throw new Error("supply a service alias or --unit NAME --type TYPE");
+    return alias;
+  }
+  if (alias !== undefined) throw new Error("choose either a service alias or an explicit unit");
+  if (!unit || !unit.trim() || /^-/.test(unit) || /[\x00-\x1f\x7f*?\[\]]/.test(unit))
+    throw new Error("unit must be a literal nonempty name without wildcards, controls, or a leading dash");
+  if (!["systemd", "systemd-user", "winservice", "nssm", "schtask"].includes(type ?? ""))
+    throw new Error("--type requires systemd, systemd-user, winservice, nssm, or schtask");
+  return { unit, type: type as ServiceType };
+}
+const serviceName = (target: ServiceTarget) => typeof target === "string" ? target : target.unit;
+function serviceHosts(cfg: FleetConfig, sel: string, target: ServiceTarget): { host: Host; svc: Service; error?: string }[] {
+  if (typeof target !== "string") serviceTarget(undefined, target.unit, target.type);
   const hosts = resolveHosts(cfg, sel);
+  if (typeof target !== "string") return hosts.map((host) => {
+    const compatible = target.type.startsWith("systemd") ? host.os === "linux" : host.os === "windows";
+    return { host, svc: { name: target.unit, type: target.type },
+      ...(!compatible ? { error: `${target.type} is incompatible with ${host.os}` } : {}) };
+  });
   const matched = hosts.flatMap((host) => {
-    const svc = host.services?.[svcName];
+    const svc = host.services?.[target];
     return svc ? [{ host, svc }] : [];
   });
   if (!matched.length) {
     const opts = hosts.flatMap((h) => Object.keys(h.services ?? {}));
-    throw new Error(`no host in '${sel}' has service '${svcName}' (available: ${[...new Set(opts)].join(", ") || "none"})`);
+    throw new Error(`no host in '${sel}' has service '${target}' (available: ${[...new Set(opts)].join(", ") || "none"})`);
   }
   return matched;
 }
-export async function restartService(
-  cfg: FleetConfig, sel: string, svcName: string,
+async function serviceAction(
+  cfg: FleetConfig, sel: string, target: ServiceTarget, command: (svc: Service) => { cmd: string; shell: Shell },
 ): Promise<ServiceAction[]> {
-  return Promise.all(serviceHosts(cfg, sel, svcName).map(async ({ host, svc }) => {
-    const { cmd, shell } = restartCmd(svc);
-    return { host: host.name, service: svcName, type: svc.type, cmd, result: await exec(host, cmd, shell) };
+  return Promise.all(serviceHosts(cfg, sel, target).map(async ({ host, svc, error }) => {
+    const { cmd, shell } = error ? { cmd: "", shell: "auto" as Shell } : command(svc);
+    const result = error ? { host: host.name, ok: false, code: 1, stdout: "", stderr: error } : await exec(host, cmd, shell);
+    return { host: host.name, service: serviceName(target), type: svc.type, cmd, result };
   }));
 }
-export async function serviceLogs(
-  cfg: FleetConfig, sel: string, svcName: string, n: number,
-): Promise<ServiceAction[]> {
-  return Promise.all(serviceHosts(cfg, sel, svcName).map(async ({ host, svc }) => {
-    const { cmd, shell } = logsCmd(svc, n);
-    return { host: host.name, service: svcName, type: svc.type, cmd, result: await exec(host, cmd, shell) };
-  }));
+export async function restartService(cfg: FleetConfig, sel: string, target: ServiceTarget): Promise<ServiceAction[]> {
+  return serviceAction(cfg, sel, target, restartCmd);
+}
+export async function serviceLogs(cfg: FleetConfig, sel: string, target: ServiceTarget, n: number): Promise<ServiceAction[]> {
+  return serviceAction(cfg, sel, target, (svc) => logsCmd(svc, n));
 }
 
 // ── reboot the whole machine ──────────────────────────────────────────────────
@@ -5024,13 +5048,57 @@ export function firmwareRebootCmd(host: Host): { cmd: string; shell: Shell } {
   throw new Error("fleet bios: macOS has no firmware setup to reboot into");
 }
 
-export interface RebootAction { host: string; os: string; cmd: string; result: ExecResult; }
-/** Reboot every host the selector resolves to. */
-export async function rebootHosts(cfg: FleetConfig, sel: string): Promise<RebootAction[]> {
-  const hosts = resolveHosts(cfg, sel);
-  return Promise.all(hosts.map(async (h) => {
+export interface RebootLifecycle {
+  phase: "waiting-down" | "waiting-up" | "ready";
+  wentDown: boolean; ready: boolean; elapsedMs: number;
+}
+interface LifecycleDeps {
+  probe?: (host: Host, capMs?: number) => Promise<boolean>;
+  now?: () => number;
+  sleep?: (ms: number) => Promise<unknown>;
+}
+/** Observe one transition under a single deadline. A late probe cannot succeed. */
+async function waitHostState(host: Host, up: boolean, deadline: number, intervalMs: number, deps: LifecycleDeps = {}): Promise<boolean> {
+  const now = deps.now ?? Date.now;
+  const sleep = deps.sleep ?? Bun.sleep;
+  const probeHost = deps.probe ?? probe;
+  while (now() < deadline) {
+    const reached = await probeHost(host, Math.min(4000, deadline - now())) === up;
+    if (reached && now() <= deadline) return true;
+    if (now() < deadline) await sleep(Math.min(intervalMs, deadline - now()));
+  }
+  return false;
+}
+export interface RebootAction {
+  host: string; os: string; cmd: string; result: ExecResult;
+  triggered?: ExecResult; lifecycle?: RebootLifecycle;
+}
+/** Send once, then optionally observe the original host go down and return. */
+export async function rebootHosts(cfg: FleetConfig, sel: string, opts: {
+  wait?: boolean; timeoutMs?: number; intervalMs?: number;
+  deps?: LifecycleDeps & { exec?: typeof exec };
+} = {}): Promise<RebootAction[]> {
+  const timeout = opts.timeoutMs ?? 300_000, interval = opts.intervalMs ?? 3000;
+  if (!Number.isSafeInteger(timeout) || timeout <= 0 || !Number.isSafeInteger(interval) || interval <= 0)
+    throw new Error("reboot timeout and interval must be positive integer milliseconds");
+  if (opts.timeoutMs !== undefined && !opts.wait) throw new Error("reboot timeout requires wait");
+  const now = opts.deps?.now ?? Date.now;
+  const run = opts.deps?.exec ?? exec;
+  return Promise.all(resolveHosts(cfg, sel).map(async (h) => {
     const { cmd, shell } = rebootCmd(h);
-    return { host: h.name, os: h.os, cmd, result: await exec(h, cmd, shell) };
+    const start = now(), deadline = start + timeout;
+    const triggered = await run(h, cmd, shell, opts.wait ? { timeoutMs: Math.min(timeout, SWITCH_TRIGGER_MS) } : {});
+    const base = { host: h.name, os: h.os, cmd, result: triggered };
+    // SSH failure or timeout may follow delivery. Observe; never resend.
+    if (!opts.wait || (!triggered.ok && triggered.code !== 255 && triggered.code !== 124)) return base;
+    const wentDown = await waitHostState(h, false, deadline, interval, opts.deps);
+    const ready = wentDown && await waitHostState(h, true, deadline, interval, opts.deps);
+    const lifecycle: RebootLifecycle = {
+      phase: ready ? "ready" : wentDown ? "waiting-up" : "waiting-down", wentDown, ready, elapsedMs: now() - start,
+    };
+    const result = { ...triggered, ok: ready, code: ready ? 0 : 124,
+      stderr: ready ? "" : `${h.name}: reboot observation timed out in ${lifecycle.phase}; ${wentDown ? "host did not return" : "host never stopped answering"}` };
+    return { ...base, triggered, lifecycle, result };
   }));
 }
 

@@ -649,7 +649,7 @@ describe("skillDestinations", () => {
 async function localScript(home: string, cmd: string): Promise<ssh.ExecResult> {
   const proc = Bun.spawn(["bash", "-s"], {
     cwd: home,
-    env: { ...process.env, HOME: home, PATH: `${join(home, "bin")}:${process.env.PATH}` },
+    env: { ...process.env, HOME: home, PATH: `${join(home, "bin")}:${join(home, ".local/bin")}:${process.env.PATH}` },
     stdin: new TextEncoder().encode(cmd), stdout: "pipe", stderr: "pipe",
   });
   const [stdout, stderr, code] = await Promise.all([
@@ -659,6 +659,85 @@ async function localScript(home: string, cmd: string): Promise<ssh.ExecResult> {
 }
 
 describe("tool installation transactions", () => {
+  test("sync refuses a launcher shadowed earlier on PATH", async () => {
+    const root = makeTool();
+    const home = mkdtempSync(join(tmpdir(), "fleet shadow "));
+    const shadow = join(home, "bin", "demo");
+    const manifestPath = join(home, ".fleet-tools", "demo.json");
+    const prior = '{"hash":"prior"}\n';
+    mkdirSync(join(home, "bin"));
+    mkdirSync(join(home, ".fleet-tools"));
+    writeFileSync(manifestPath, prior);
+    writeFileSync(shadow, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    writeFileSync(join(home, "bin", "bun"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    writeFileSync(join(home, "bin", "tar"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    const execute = spyOn(ssh, "exec").mockImplementation(async (_h, cmd) => localScript(home, cmd));
+    const transfer = spyOn(ssh, "scp").mockImplementation(async (h) =>
+      ({ host: h.name, ok: true, code: 0, stdout: "", stderr: "" }));
+    try {
+      const [result] = await syncTool(cfgFor(root), "demo", "web", { skill: false });
+      expect(result?.ok).toBe(false);
+      expect(result?.error).toContain(shadow);
+      expect(await Bun.file(manifestPath).text()).toBe(prior);
+      expect(await Bun.file(shadow).text()).toBe("#!/bin/sh\nexit 0\n");
+    } finally {
+      execute.mockRestore(); transfer.mockRestore();
+      rmSync(root, { recursive: true, force: true }); rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test("sync verifies a custom bin and paths containing spaces", async () => {
+    const home = mkdtempSync(join(tmpdir(), "fleet custom launcher "));
+    try {
+      mkdirSync(join(home, "bin"));
+      mkdirSync(join(home, ".local/bin"), { recursive: true });
+      // Resolve the launcher through a symlinked PATH directory.
+      symlinkSync(join(home, ".local/bin"), join(home, "selected bin"));
+      writeFileSync(join(home, "bin", "bun"), '#!/bin/sh\n[ "$1" = install ] && exit 0\nprintf "<%s>\\n" "$@"\n', { mode: 0o755 });
+      writeFileSync(join(home, "bin", "tar"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+      const manifest = { tool: "demo", version: "1.0.0", hash: "new", syncedAt: "2026-10-04", dir: "unused" };
+      const script = installScript(host("fixture", "linux"), { name: "demo", entry: "src/custom cli.ts" }, "$HOME/install dir", manifest, "custom-demo");
+      const result = await localScript(home, 'export PATH="$HOME/selected bin:$PATH"\n' + script.cmd);
+      expect(result.ok, result.stderr).toBe(true);
+      expect((await Bun.file(join(home, ".fleet-tools/demo.json")).json()).hash).toBe("new");
+      const invoked = await localScript(home, "custom-demo 'space arg' '$(literal)' '*.txt' ''");
+      expect(invoked.ok, invoked.stderr).toBe(true);
+      expect(invoked.stdout).toBe(`<${home}/install dir/src/custom cli.ts>\n<space arg>\n<$(literal)>\n<*.txt>\n<>\n`);
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+
+  test("Windows sync verifies Get-Command before stamping", async () => {
+    const root = makeTool();
+    const shadow = "C:\\Old Tools\\custom-demo.exe";
+    let checked = false;
+    let stamped = false;
+    const execute = spyOn(ssh, "exec").mockImplementation(async (h, cmd) => {
+      if (cmd.includes("$shimText")) {
+        const lookup = cmd.indexOf("Get-Command 'custom-demo'");
+        const stamp = cmd.indexOf('Set-Content -Path "$env:USERPROFILE\\.fleet-tools');
+        expect(lookup).toBeGreaterThan(cmd.indexOf('Set-Content -Path "$shim'));
+        expect(lookup).toBeLessThan(stamp);
+        expect(cmd).toContain("[IO.Path]::GetFullPath($resolved)");
+        expect(cmd).toContain('[IO.Path]::GetFullPath("$shim\\custom-demo.cmd")');
+        checked = lookup >= 0 && lookup < stamp;
+        stamped = !checked;
+        if (checked) return { host: h.name, ok: false, code: 1, stdout: "", stderr: `launcher is shadowed by '${shadow}'` };
+      }
+      return { host: h.name, ok: true, code: 0, stdout: "", stderr: "" };
+    });
+    const transfer = spyOn(ssh, "scp").mockImplementation(async (h) =>
+      ({ host: h.name, ok: true, code: 0, stdout: "", stderr: "" }));
+    try {
+      const [result] = await syncTool(cfgFor(root, { bin: "custom-demo" }), "demo", "main", { skill: false });
+      expect(checked).toBe(true);
+      expect(stamped).toBe(false);
+      expect(result?.ok).toBe(false);
+      expect(result?.error).toContain(shadow);
+    } finally {
+      execute.mockRestore(); transfer.mockRestore(); rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test.skipIf(process.platform !== "darwin")("sync archives omit macOS extended attributes", async () => {
     const root = makeTool();
     const file = join(root, "src", "cli.ts");
@@ -899,6 +978,48 @@ describe("stampSkill", () => {
     writeFileSync(p, body);
     return p;
   };
+
+  test("stampSkill refuses 0.5.1 to 0.1.0 without changing any bytes", async () => {
+    const original = "---\nname: demo\nversion: 0.5.1\nupdated: 2020-01-01\n---\n\nbody\n";
+    const p = write(original);
+    try {
+      await expect(stampSkill(p, "0.1.0", "2026-10-04")).rejects.toThrow(/0\.5\.1.*0\.1\.0/);
+      expect(await Bun.file(p).text()).toBe(original);
+    } finally { rmSync(join(p, ".."), { recursive: true, force: true }); }
+  });
+
+  test("stampSkill compares numeric version components and prereleases", async () => {
+    for (const [existing, requested, allowed] of [
+      ["0.10.0", "0.9.0", false], ["0.9.0", "0.10.0", true],
+      ["1.0.0-rc.1", "1.0.0", true], ["1.0.0", "1.0.0-rc.1", false],
+      ["1.0.0-rc.2", "1.0.0-rc.10", true], ["1.0.0-rc.10", "1.0.0-rc.2", false],
+      ["1.0.0+build.2", "1.0.0+build.1", true],
+      ['"0.10.0" # authored', "0.9.0", false], ["'0.9.0'", "0.10.0", true],
+    ] as const) {
+      const original = `---\nname: demo\nversion: ${existing}\nupdated: 2020-01-01\n---\nbody\n`;
+      const p = write(original);
+      try {
+        if (allowed) {
+          expect(await stampSkill(p, requested, "2026-10-04")).toBe(true);
+          expect(await Bun.file(p).text()).toContain(`version: ${requested}\n`);
+        } else {
+          await expect(stampSkill(p, requested, "2026-10-04")).rejects.toThrow("downgrade");
+          expect(await Bun.file(p).text()).toBe(original);
+        }
+      } finally { rmSync(join(p, ".."), { recursive: true, force: true }); }
+    }
+  });
+
+  test("stampSkill preserves an unorderable authored version", async () => {
+    for (const existing of ["latest", "1.2", "01.2.3", "1.0.0-01", "", "|\n  custom"]) {
+      const original = `---\nname: demo\nversion: ${existing}\nupdated: 2020-01-01\n---\nbody\n`;
+      const p = write(original);
+      try {
+        await expect(stampSkill(p, "1.0.0", "2026-10-04")).rejects.toThrow(/cannot compare.*version/i);
+        expect(await Bun.file(p).text()).toBe(original);
+      } finally { rmSync(join(p, ".."), { recursive: true, force: true }); }
+    }
+  });
 
   test("inserts version + updated right after name", async () => {
     const p = write("---\nname: demo\ndescription: d\n---\n\nbody\n");

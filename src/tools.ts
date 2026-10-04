@@ -409,6 +409,9 @@ export function installScript(
       `New-Item -ItemType Directory -Force -Path $shim | Out-Null`,
       `$shimText = "@echo off\`r\`n""$bun"" ""$dir\\${winEntry}"" %*"`,
       `Set-Content -Path "$shim\\${bin}.cmd" -Value $shimText -Encoding ascii`,
+      `$command=Get-Command ${psSingle(bin)} -EA SilentlyContinue | Select-Object -First 1`,
+      `$resolved=$command.Source`,
+      `if(-not $resolved -or $command.CommandType -ne 'Application' -or [IO.Path]::GetFullPath($resolved) -ne [IO.Path]::GetFullPath("$shim\\${bin}.cmd")){throw "installed launcher is shadowed by '$resolved'; expected $shim\\${bin}.cmd; put $shim first on PATH"}`,
       `New-Item -ItemType Directory -Force -Path "${MANIFEST_DIR_WIN}" | Out-Null`,
       `Set-Content -Path "${MANIFEST_DIR_WIN}\\${spec.name}.json" -Value (${psSingle(json)} -replace '__DIR__', $dir.Replace('\\','\\\\')) -Encoding utf8`,
       `"installed ${spec.name} -> $dir"`,
@@ -444,6 +447,10 @@ export function installScript(
       `chmod 755 "$candidate"`,
     ]),
     `mv -f "$candidate" "$launcher"`,
+    // Compare file identity so relative paths and symlinked PATH directories
+    // select the same installed launcher. A function or alias cannot pass.
+    `resolved="$(command -v -- ${shSingle(bin)})" || resolved=''`,
+    `if [ "$(type -t -- ${shSingle(bin)})" != file ] || [ ! "$resolved" -ef "$launcher" ]; then echo "installed launcher is shadowed or missing: resolved '$resolved'; expected $launcher; put $HOME/.local/bin first on PATH" >&2; exit 1; fi`,
     `sed "s|__DIR__|$dir|" > "${MANIFEST_DIR_POSIX}/${spec.name}.json" <<'MANIFEST'\n${json}\nMANIFEST`,
     `echo "installed ${spec.name} -> $dir"`,
   ].join("\n") };
@@ -453,6 +460,10 @@ export function installScript(
  *  double quotes intact. Internal `'` doubles. */
 function psSingle(s: string): string {
   return `'${s.replace(/'/g, "''")}'`;
+}
+
+function shSingle(s: string): string {
+  return `'${s.replace(/'/g, "'\\''")}'`;
 }
 
 export async function skillDestinations(h: Host, name: string): Promise<string[]> {
@@ -668,6 +679,20 @@ export async function stampSkill(path: string, version: string, date: string): P
   const m = /^---\n([\s\S]*?)\n---\n/.exec(src);
   if (!m) throw new Error(`${basename(path)} has no YAML frontmatter to stamp`);
   let fm = m[1]!;
+  const authored = [...fm.matchAll(/^version:[ \t]*(.*)$/gm)];
+  if (authored.length) {
+    const raw = authored[0]![1]!.trim();
+    // Accept plain or quoted scalar versions with an optional YAML comment.
+    // Block scalars, ranges and other version schemes have no safe ordering.
+    const scalar = /^(?:"([^"]*)"|'([^']*)'|([^\s#]+))(?:[ \t]+#.*)?[ \t]*$/.exec(raw);
+    const existing = scalar ? scalar[1] ?? scalar[2] ?? scalar[3]! : raw;
+    if (authored.length !== 1 || !scalar || !orderableVersion(existing) || !orderableVersion(version))
+      throw new Error(`cannot compare skill version '${existing}' with package version '${version}'; use one valid SemVer version field and a valid package version before stamping`);
+    if (Bun.semver.order(existing, version) > 0)
+      throw new Error(`refusing skill version downgrade from '${existing}' to package version '${version}'; update the package version before stamping`);
+  } else if (!orderableVersion(version)) {
+    throw new Error(`cannot stamp package version '${version}'; use a valid SemVer package version`);
+  }
   const set = (key: string, value: string): void => {
     const re = new RegExp(`^${key}:.*$`, "m");
     if (re.test(fm)) fm = fm.replace(re, `${key}: ${value}`);
@@ -682,4 +707,13 @@ export async function stampSkill(path: string, version: string, date: string): P
   if (out === src) return false;
   await Bun.write(path, out);
   return true;
+}
+
+/** Reject ambiguous inputs before Bun's permissive SemVer comparison. */
+function orderableVersion(version: string): boolean {
+  const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.exec(version);
+  if (!match) return false;
+  const numeric = (value: string) => Number.isSafeInteger(Number(value));
+  return match.slice(1, 4).every((part) => numeric(part!)) &&
+    (match[4]?.split(".").every((part) => !/^\d+$/.test(part) || (/^(0|[1-9]\d*)$/.test(part) && numeric(part))) ?? true);
 }

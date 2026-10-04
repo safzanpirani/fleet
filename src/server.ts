@@ -15,7 +15,7 @@ import type { ExecResult } from "./ssh.ts";
 import { focusElements } from "./focus.ts";
 import { formatIdle, sessionStates } from "./session.ts";
 import {
-  lsHosts, runExec, runScript, rebootRefusal, nestedShellNote, readScriptSource, editRemoteFile, pushFile, pullFile, restartService, serviceLogs,
+  lsHosts, runExec, runScript, rebootRefusal, nestedShellNote, readScriptSource, editRemoteFile, pushFile, pullFile, restartService, serviceLogs, serviceTarget,
   gpuRows, diskRows, hostStatus, runRecipe, captureScreenshot, overlayGrid, cuRun,
   cuInstall, cuTools, cuDescribe, cuRecordStart, cuRecordStop, cuRecordStatus,
   cuApps, cuShotWindow, browseHost, deployHosts, diagnose,
@@ -125,15 +125,18 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
   server.registerTool("fleet_logs", {
     title: "Read a service's recent logs",
     description: "Fetch recent logs / status for a configured service (journalctl on Linux, "
-      + "Get-Service / schtasks query on Windows). Use fleet_ls for valid service names.",
+      + "Get-Service / schtasks query on Windows). Supply service for a configured alias, or unit and type for a literal native service.",
     inputSchema: {
       host: z.string().describe("Host name or selector. Reads every matched host defining this service; skips hosts without it."),
-      service: z.string().describe("Configured service name on that host."),
+      service: z.string().optional().describe("Configured service alias; mutually exclusive with unit/type."),
+      unit: z.string().optional().describe("Literal native service name; requires type."),
+      type: z.enum(["systemd", "systemd-user", "winservice", "nssm", "schtask"]).optional().describe("Native service backend; requires unit."),
       lines: z.number().int().positive().optional().describe("How many log lines (default 30)."),
     },
     annotations: { readOnlyHint: true, openWorldHint: true },
-  }, async ({ host, service, lines }) => {
-    const actions = await serviceLogs(cfg, await routeSelector(cfg, host), service, lines ?? 30);
+  }, async ({ host, service, unit, type, lines }) => {
+    const target = serviceTarget(service, unit, type);
+    const actions = await serviceLogs(cfg, await routeSelector(cfg, host), target, lines ?? 30);
     return text(renderExec(actions.map((a) => a.result)), actions.some((a) => !a.result.ok));
   });
 
@@ -141,14 +144,17 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     title: "Service status across the fleet",
     description: "At-a-glance up/down status of one named service on every host that defines it "
       + "(systemd is-active / Get-Service / schtasks query). Answers \"is X running everywhere?\" "
-      + "in one call. Use fleet_ls for valid service names.",
+      + "in one call. Supply service for a configured alias, or unit and type for a literal native service.",
     inputSchema: {
-      service: z.string().describe("Configured service name to check."),
+      service: z.string().optional().describe("Configured service alias; mutually exclusive with unit/type."),
+      unit: z.string().optional().describe("Literal native service name; requires type."),
+      type: z.enum(["systemd", "systemd-user", "winservice", "nssm", "schtask"]).optional().describe("Native service backend; requires unit."),
       selector: z.string().optional().describe("Optional host selector to scope it (default: all)."),
     },
     annotations: { readOnlyHint: true, openWorldHint: true },
-  }, async ({ service, selector }) => {
-    const rows = await svcStatus(cfg, await routeSelector(cfg, selector ?? "all"), service);
+  }, async ({ service, unit, type, selector }) => {
+    const target = serviceTarget(service, unit, type);
+    const rows = await svcStatus(cfg, await routeSelector(cfg, selector ?? "all"), target);
     const out = rows.map((r) => `${r.up ? "●" : "○"} ${r.host.padEnd(10)} ${r.service.padEnd(16)} ${r.detail} (${r.type})`).join("\n");
     return text(out, rows.some((r) => !r.up));
   });
@@ -181,11 +187,14 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     inputSchema: {
       ref: z.string().describe("Job reference: \"host:id\" (e.g. \"web:mr0gnez7-iqd8\")."),
       tail: z.number().int().positive().optional().describe("Return only the last N lines (default: full log)."),
+      include: z.string().optional().describe("Case-sensitive target regex; include matches before tailing (default 40 lines with filters)."),
+      exclude: z.string().optional().describe("Case-sensitive target regex; exclude matches after inclusion."),
     },
     annotations: { readOnlyHint: true, openWorldHint: true },
-  }, async ({ ref, tail }) => {
-    const { output } = tail ? await jobTail(cfg, ref, undefined, tail) : await jobLog(cfg, ref);
-    return text(output || "(no output yet)");
+  }, async ({ ref, tail, include, exclude }) => {
+    const result = tail || include !== undefined || exclude !== undefined
+      ? await jobTail(cfg, ref, undefined, tail ?? 40, { include, exclude }) : await jobLog(cfg, ref);
+    return text((result.output || "(no output yet)") + ("truncated" in result && result.truncated ? "\n[fleet: output truncated at 65536 bytes]" : ""));
   });
 
   server.registerTool("fleet_session", {
@@ -530,7 +539,8 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       + "Windows box). " + sel,
     inputSchema: {
       selector: z.string().describe("Host selector, e.g. \"winbox\", \"@linux\", \"all\", \"vps,@gpu\"."),
-      command: z.string().describe("Command to run, verbatim. Quotes/pipes/$ round-trip as-is."),
+      command: z.string().optional().describe("Shell command, verbatim. Supply exactly one of command or argv."),
+      argv: z.array(z.string()).min(1).optional().describe("Literal program and arguments. Supply exactly one of command or argv."),
       wsl: z.boolean().optional().describe("Run the command inside WSL bash on a Windows host."),
       cwd: z.string().optional().describe("Working directory on the target (fails fast if missing)."),
       timeout: z.number().int().positive().optional()
@@ -540,12 +550,14 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       fresh: z.boolean().optional().describe("Open a new ssh login instead of reusing a shared connection (and skip the kept-open Windows session), e.g. after a group change such as usermod -aG docker."),
     },
     annotations: { openWorldHint: true },
-  }, async ({ selector, command, wsl, cwd, timeout, sudo, confirmReboot, fresh }) => {
-    const refusal = confirmReboot ? null : rebootRefusal(command, "confirmReboot: true");
+  }, async ({ selector, command, argv, wsl, cwd, timeout, sudo, confirmReboot, fresh }) => {
+    if ((command === undefined) === (argv === undefined)) return text("supply exactly one of command or argv", true);
+    const program = command ?? argv!.join(" ");
+    const refusal = confirmReboot ? null : rebootRefusal(program, "confirmReboot: true");
     if (refusal) return text(refusal, true);
     const target = await routeSelector(cfg, selector);
-    const nested = nestedShellNote(command, resolveHosts(cfg, target), wsl);
-    const results = await runExec(cfg, target, command,
+    const nested = nestedShellNote(program, resolveHosts(cfg, target), wsl);
+    const results = await runExec(cfg, target, argv ?? command!,
       { wsl, cwd, sudo, fresh, timeoutMs: timeout ? timeout * 1000 : undefined });
     return text((nested ? nested + "\n" : "") + renderExec(results), results.some((r) => !r.ok));
   });
@@ -737,14 +749,17 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     title: "Restart a configured service",
     description: "Restart a service that is defined in the host's config (systemd / Windows "
       + "service / scheduled task — the right restart verb is chosen automatically). Use fleet_ls "
-      + "to see each host's known service names.",
+      + "to see configured aliases, or supply unit and type for a literal native service.",
     inputSchema: {
       host: z.string().describe("Host name or selector. Restarts every matched host defining this service; skips hosts without it."),
-      service: z.string().describe("Configured service name on that host."),
+      service: z.string().optional().describe("Configured service alias; mutually exclusive with unit/type."),
+      unit: z.string().optional().describe("Literal native service name; requires type."),
+      type: z.enum(["systemd", "systemd-user", "winservice", "nssm", "schtask"]).optional().describe("Native service backend; requires unit."),
     },
     annotations: { destructiveHint: true, openWorldHint: true },
-  }, async ({ host, service }) => {
-    const actions = await restartService(cfg, await routeSelector(cfg, host), service);
+  }, async ({ host, service, unit, type }) => {
+    const target = serviceTarget(service, unit, type);
+    const actions = await restartService(cfg, await routeSelector(cfg, host), target);
     const out = actions.map((a) => `↻ ${a.host} :: ${a.service} (${a.type})\n${renderExec([a.result])}`).join("\n\n");
     return text(out, actions.some((a) => !a.result.ok));
   });
@@ -816,12 +831,15 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       + "the connection. A dual-boot machine name auto-routes to its live OS. " + sel,
     inputSchema: {
       selector: z.string().describe("Host selector to reboot."),
+      wait: z.boolean().optional().describe("Observe the host go down and return before reporting ready."),
+      timeout: z.number().int().positive().optional().describe("Observation deadline in seconds (default 300); requires wait."),
     },
     annotations: { destructiveHint: true, openWorldHint: true },
-  }, async ({ selector }) => {
-    const actions = await rebootHosts(cfg, await routeSelector(cfg, selector));
+  }, async ({ selector, wait, timeout }) => {
+    if (timeout !== undefined && !wait) return text("timeout requires wait", true);
+    const actions = await rebootHosts(cfg, await routeSelector(cfg, selector), { wait, timeoutMs: timeout === undefined ? undefined : timeout * 1000 });
     const out = actions.map((a) =>
-      `${a.result.ok ? "↻" : "✗"} ${a.host} · ${a.os}${a.result.ok ? " · rebooting" : " · exit " + a.result.code}`,
+      `${a.result.ok ? "↻" : "✗"} ${a.host} · ${a.os}${a.lifecycle ? " · " + a.lifecycle.phase : a.result.ok ? " · rebooting" : " · exit " + a.result.code}${a.result.stderr ? " · " + a.result.stderr : ""}`,
     ).join("\n");
     return text(out, actions.some((a) => !a.result.ok));
   });

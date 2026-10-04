@@ -76,6 +76,24 @@ every host, and a `routes` entry (`{"prefer": ["lan-host", "lan-host-ts"]}`) fal
 to Tailscale automatically only when the LAN box does not answer. Dual-boot `machines`
 probe LAN first too.
 
+### Command options
+
+Use `exec --argv <selector> -- <program> <arguments...>` to preserve argument boundaries. Quote values for the local shell. Argv mode cannot combine with script mode.
+
+`jobs tail --include REGEX --exclude REGEX -n N` filters on the host before the line limit. Inclusion runs before exclusion. Filters and `jobs wait --until` patterns are case-sensitive. POSIX hosts use ERE; Windows uses .NET regex. Filtered output has a 64 KiB limit and reports truncation. Filters cannot combine with follow.
+
+`restart`, `logs`, and `svc` accept a configured alias or `--unit NAME --type TYPE`. Types are `systemd`, `systemd-user`, `winservice`, `nssm`, and `schtask`. Explicit units reject wildcards and report incompatible hosts. `restart` and `logs` support `--json`. `logs --raw` preserves stdout and sends diagnostics to stderr. Windows logs return service or task status.
+
+`reboot <selector> --yes --wait --timeout 300` observes the host stop answering before accepting SSH readiness. A timeout reports the last phase. Fleet never resends a reboot trigger after a lost acknowledgement.
+
+Fleet-owned `--json` options produce one JSON value on early failures. Error envelopes contain `ok`, `error.code`, `error.message`, and `command`. Payload flags do not enable JSON mode. Existing per-host result shapes remain unchanged.
+
+`tools sync` verifies that the remote shell selects the installed command before recording success. A shadowing command causes sync to fail and report its resolved path. Adjust PATH or manage the competing installation before rerunning sync. `tools status` compares manifests and does not verify current launcher resolution.
+
+`tools stamp` refuses skill-version downgrades and unorderable versions. Refusal preserves the complete skill file and its date. Use valid SemVer versions and update the package version before stamping.
+
+Missing-config errors omit Bun embedded paths and recommend `FLEET_CONFIG`. Inspect the config path named in validation errors. A compiled Fleet reads `fleet.config.json` beside its executable before later fallbacks.
+
 ## Selectors
 
 Anywhere `<sel>` appears: a hostname, logical route, group, `all`, Daytona
@@ -91,8 +109,7 @@ Anywhere `<sel>` appears: a hostname, logical route, group, `all`, Daytona
   for Windows hosts. So `fleet exec all "uptime"` works on Linux but fails on Windows
   (no native `uptime`). For cross-OS, pick portable commands or scope by group
   (`fleet exec @linux ...`).
-- `restart` and `logs` need a service defined in config. Run `fleet ls` to see each
-  host's services; an unknown name prints the valid ones.
+- `restart` and `logs` accept configured aliases or explicit `--unit NAME --type TYPE` targets. Run `fleet ls` to see configured services.
 - `fleet top` is a live foreground loop. Run it only interactively; use
   `fleet status <host>` for one-shot output.
 - A non-zero exit on any host makes `exec` and `cp` exit non-zero.

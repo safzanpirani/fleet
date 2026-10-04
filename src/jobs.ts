@@ -24,7 +24,7 @@
  */
 import { resolveHosts } from "./config.ts";
 import type { FleetConfig, Host } from "./config.ts";
-import { exec, execStream, execStreamWin } from "./ssh.ts";
+import { exec, execStream, execStreamWin, bashEsc, psEsc } from "./ssh.ts";
 import type { ExecResult, Shell } from "./ssh.ts";
 
 const b64 = (s: string) => Buffer.from(s, "utf8").toString("base64");
@@ -392,10 +392,54 @@ if [ -f "$d/out" ]; then cat "$d/out"; fi`;
   return { host: host.name, output: r.stdout };
 }
 
-export async function jobTail(cfg: FleetConfig, a: string, b: string | undefined, n: number): Promise<{ host: string; output: string }> {
+export interface JobLogFilters { include?: string; exclude?: string }
+export interface JobLogResult { host: string; output: string; truncated?: boolean }
+const FILTER_OUTPUT_BYTES = 65536;
+const shQuote = (s: string) => `'${bashEsc(s)}'`;
+const psQuote = (s: string) => `'${psEsc(s)}'`;
+
+/** Filter before tailing on the host. Temporary files never touch the job spool. */
+function filteredTailScript(host: Host, id: string, lines: number, filters: JobLogFilters): string {
+  if (host.os === "windows") {
+    const stages = [filters.include === undefined ? "" : ` | Select-String -Pattern ${psQuote(filters.include)} -CaseSensitive -ErrorAction Stop | ForEach-Object { $_.Line }`,
+      filters.exclude === undefined ? "" : ` | Select-String -Pattern ${psQuote(filters.exclude)} -NotMatch -CaseSensitive -ErrorAction Stop | ForEach-Object { $_.Line }`].join("");
+    return `$ErrorActionPreference='Stop'
+$d="$env:USERPROFILE\\.fleet\\jobs\\${id}"
+if (!(Test-Path -LiteralPath $d -PathType Container)) { throw 'fleet: no such job' }
+$o=Join-Path $d 'out'
+${[filters.include, filters.exclude].filter((p) => p !== undefined).map((p) => `[void][regex]::new(${psQuote(p!)})`).join("\n")}
+if (Test-Path -LiteralPath $o) {
+  $selected=@(Get-Content -LiteralPath $o -ErrorAction Stop${stages} | Select-Object -Last ${lines})
+  $text=if ($selected.Count) { ($selected -join "\`n") + "\`n" } else { '' }
+  $bytes=[Text.Encoding]::UTF8.GetBytes($text)
+  if ($bytes.Length -gt ${FILTER_OUTPUT_BYTES}) { [Console]::Error.WriteLine('FLEET_LOG_TRUNCATED'); $text=[Text.Encoding]::UTF8.GetString($bytes,0,${FILTER_OUTPUT_BYTES}) }
+  [Console]::Write($text)
+}`;
+  }
+  const stages = [filters.include === undefined ? "" : `grep -E -e ${shQuote(filters.include)} "$input" > "$tmp/include"; rc=$?
+[ "$rc" -le 1 ] || exit "$rc"
+input="$tmp/include"`,
+    filters.exclude === undefined ? "" : `grep -vE -e ${shQuote(filters.exclude)} "$input" > "$tmp/exclude"; rc=$?
+[ "$rc" -le 1 ] || exit "$rc"
+input="$tmp/exclude"`].join("\n");
+  return `d="$HOME/.fleet/jobs/${id}"
+[ -d "$d" ] || { echo 'fleet: no such job' >&2; exit 1; }
+tmp=$(mktemp -d) || exit 1
+trap 'rm -rf "$tmp"' EXIT
+input="$d/out"
+if [ ! -e "$input" ]; then input=/dev/null; fi
+${stages}
+tail -n ${lines} "$input" > "$tmp/tail" || exit 1
+size=$(wc -c < "$tmp/tail") || exit 1
+if [ "$size" -gt ${FILTER_OUTPUT_BYTES} ]; then echo FLEET_LOG_TRUNCATED >&2; fi
+head -c ${FILTER_OUTPUT_BYTES} "$tmp/tail"`;
+}
+
+export async function jobTail(cfg: FleetConfig, a: string, b: string | undefined, n: number, filters: JobLogFilters = {}): Promise<JobLogResult> {
   const { host, id } = resolveJobRef(cfg, a, b);
   const lines = lineCount(n);
-  const script = host.os === "windows"
+  const filtered = filters.include !== undefined || filters.exclude !== undefined;
+  const script = filtered ? filteredTailScript(host, id, lines, filters) : host.os === "windows"
     ? `$d="$env:USERPROFILE\\.fleet\\jobs\\${id}"
 if (!(Test-Path -LiteralPath $d -PathType Container)) { Write-Error "fleet: no such job: ${id}"; exit 1 }
 $o=Join-Path $d 'out'
@@ -405,7 +449,11 @@ if (Test-Path -LiteralPath $o -PathType Leaf) { Get-Content -LiteralPath $o -Tai
 if [ -f "$d/out" ]; then tail -n ${lines} "$d/out"; fi`;
   const r = await exec(host, script, shellFor(host));
   if (!r.ok) throw new Error(r.stderr || r.stdout || `failed to tail job ${id} output (exit ${r.code})`);
-  return { host: host.name, output: r.stdout };
+  let output = r.stdout;
+  // UTF-8 decoding can expand a cut final code point into a replacement character.
+  const truncated = filtered && (r.stderr.includes("FLEET_LOG_TRUNCATED") || Buffer.byteLength(output) > FILTER_OUTPUT_BYTES);
+  while (filtered && Buffer.byteLength(output) > FILTER_OUTPUT_BYTES) output = output.slice(0, -1);
+  return { host: host.name, output, ...(truncated ? { truncated: true } : {}) };
 }
 
 /** Live follow (`tail -f`) — streams to the local terminal until ctrl-c or the
@@ -526,7 +574,7 @@ export function waitPoll(host: Host, id: string, until?: string): string {
   assertId(id);
   if (host.os === "windows") {
     const untilSrc = until
-      ? `$rx=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${b64(until)}')); try { if (Test-Path "$dir\\out") { if (Select-String -Path "$dir\\out" -Pattern $rx -EA Stop) { 'MATCH' } } } catch { Write-Error "fleet: invalid --until regex: $($_.Exception.Message)" -EA Continue; exit 2 }`
+      ? `$rx=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${b64(until)}')); try { if (Test-Path "$dir\\out") { if (Select-String -Path "$dir\\out" -Pattern $rx -CaseSensitive -EA Stop) { 'MATCH' } } } catch { Write-Error "fleet: invalid --until regex: $($_.Exception.Message)" -EA Continue; exit 2 }`
       : "";
     return [
       `$ErrorActionPreference='Stop'`,

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { applyProxyFlags, completionScript, trailingFleetFlag } from "../src/cli.ts";
+import { applyProxyFlags, completionScript, fleetJsonCommand, trailingFleetFlag } from "../src/cli.ts";
 import type { FleetConfig } from "../src/config.ts";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -64,6 +64,9 @@ describe("proxy CLI flags", () => {
       ["exec", ["--cwd=/tmp", "--timeout=5"]],
       ["spawn", ["--label", "batch one", "--cwd", "/tmp"]],
       ["jobs", ["--lines", "2"]],
+      ["jobs", ["--include", "READY", "--exclude", "noise"]],
+      ["service", ["--unit", "fixture", "--type", "winservice"]],
+      ["reboot", ["--timeout", "10"]],
       ["job", ["--timeout", "5"]],
       ["edit", ["--old", "before", "--new", ""]],
       ["ps", ["--sort", "cpu", "-n", "2"]],
@@ -314,20 +317,14 @@ describe("machine-readable CLI output", () => {
       for (const args of cases) {
         const r = await runCli(args, config, bin);
         expect(r.code, args.join(" ")).toBe(1);
-        expect(r.stderr).not.toBe("");
-        expect(r.stdout).toBe("");
+        if (fleetJsonCommand(args[0], args.slice(1))) expect(JSON.parse(r.stdout).ok).toBe(false);
+        else { expect(r.stderr).not.toBe(""); expect(r.stdout).toBe(""); }
       }
       expect(await Bun.file(marker).exists()).toBe(false);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
-  test("invalid non-passthrough options fail before SSH or copying", async () => {
-    const { root, bin, config } = fixture();
-    try {
-      const marker = join(root, "remote-called");
-      for (const command of ["ssh", "scp"])
-        executable(join(bin, command), `#!/bin/sh\ntouch '${marker}'\nexit 99\n`);
-      const cases = [
+  const invalidNonPassthroughCases = [
         ["edit", "local:/fixture", "--old", "before", "--new"],
         ["edit", "local:/fixture", "--old", "before", "--new", "after", "--dryrun"],
         ["edit", "local:/fixture", "--old", "before", "--new", "--json"],
@@ -370,15 +367,21 @@ describe("machine-readable CLI output", () => {
         ["run", "fixture", "extra"],
         ["completion", "bash", "extra"],
       ];
-      for (const args of cases) {
+  test.each(invalidNonPassthroughCases.map((args) => ({ args })))(
+    "invalid non-passthrough options fail before SSH or copying: %j", async ({ args }) => {
+      const { root, bin, config } = fixture();
+      try {
+        const marker = join(root, "remote-called");
+        for (const command of ["ssh", "scp"])
+          executable(join(bin, command), `#!/bin/sh\ntouch '${marker}'\nexit 99\n`);
         const result = await runCli(args, config, bin);
         expect(result.code, args.join(" ")).toBe(1);
-        expect(result.stderr, args.join(" ")).not.toBe("");
-        expect(result.stdout, args.join(" ")).toBe("");
-      }
-      expect(await Bun.file(marker).exists()).toBe(false);
-    } finally { rmSync(root, { recursive: true, force: true }); }
-  }, 15_000);
+        if (args[0] === "edit" && args.includes("--json")) expect(JSON.parse(result.stdout).ok).toBe(false);
+        else { expect(result.stderr, args.join(" ")).not.toBe(""); expect(result.stdout, args.join(" ")).toBe(""); }
+        expect(await Bun.file(marker).exists()).toBe(false);
+      } finally { rmSync(root, { recursive: true, force: true }); }
+    },
+  );
 
   test("edit distinguishes missing replacement values and preserves literal replacement bytes", async () => {
     const { root, bin, config } = fixture();
@@ -420,10 +423,10 @@ describe("machine-readable CLI output", () => {
       }));
       const result = await runCli(["tools", "sync", "demo", "local", "--max-parallel=2", "--json"], config, bin);
       expect(result.code).toBe(1);
-      expect(result.stderr).toContain("--max-parallel");
+      expect(JSON.parse(result.stdout).ok).toBe(false);
       const missingSelector = await runCli(["tools", "sync", "--all", "--json"], config, bin);
       expect(missingSelector.code).toBe(1);
-      expect(missingSelector.stderr).toContain("needs a selector");
+      expect(JSON.parse(missingSelector.stdout).ok).toBe(false);
       expect(await Bun.file(marker).exists()).toBe(false);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
@@ -828,4 +831,159 @@ describe("trailingFleetFlag", () => {
     expect(trailingFleetFlag(["--json"], bools, valued)).toBeUndefined();
     expect(trailingFleetFlag(["curl", "--retry", "3"], bools, valued)).toBeUndefined();
   });
+});
+
+test("jobs tail validates filters before routing and emits one JSON value", async () => {
+  const { root, bin, config } = fixture();
+  try {
+    executable(join(bin, "ssh"), "#!/bin/sh\ncat >/dev/null\nprintf 'selected\\n'\n");
+    for (const ref of [["local:sample"], ["local", "sample"]]) {
+      const r = await runCli(["jobs", "tail", "--include", "READY", ...ref, "--exclude", "skip", "-n", "2", "--json"], config, bin);
+      expect(r.code, r.stderr).toBe(0);
+      expect(JSON.parse(r.stdout)).toEqual({ host: "local", output: "selected\n" });
+    }
+    for (const args of [["--include"], ["--include", "READY", "--follow"], ["--exclude", "skip", "--follow"]]) {
+      const r = await runCli(["jobs", "tail", "unknown:sample", ...args], config, bin);
+      expect(r.code).toBe(1);
+      expect(r.stderr).not.toContain("unknown host");
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("exec argv preserves bash -c as one argument", async () => {
+  const { root, bin, config } = fixture();
+  try {
+    executable(join(bin, "ssh"), "#!/bin/sh\nexec bash\n");
+    const r = await runCli(["exec", "--argv", "--raw", "local", "--", "bash", "-c", "printf '%s|%s' \"$1\" \"$2\"", "ignored", "two words", ""], config, bin);
+    expect(r.code, r.stderr).toBe(0);
+    expect(r.stdout).toBe("two words|");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("exec argv does not consume payload help json proxy or timeout flags", async () => {
+  const { root, bin, config } = fixture();
+  try {
+    executable(join(bin, "ssh"), "#!/bin/sh\nexec bash\n");
+    const args = ["--help", "--json", "--proxy", "payload", "--timeout", "7"];
+    const r = await runCli(["exec", "--argv", "--raw", "local", "--", "printf", "%s\\n", ...args], config, bin);
+    expect(r.code, r.stderr).toBe(0);
+    expect(r.stdout).toBe(args.join("\n") + "\n");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("argv conflicts with script and interp before stdin or routing", async () => {
+  const { root, config } = fixture();
+  try {
+    for (const mode of [["--script", "-"], ["--interp", "bash"]]) {
+      const r = await runCli(["exec", "--argv", ...mode, "unknown", "--", "true"], config);
+      expect(r.code).toBe(1);
+      expect(r.stderr).toContain("--argv cannot");
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("service json retains host status and raw logs preserve stdout", async () => {
+  const { root, bin, config } = fixture();
+  try {
+    executable(join(bin, "ssh"), "#!/bin/sh\ncat >/dev/null\nprintf 'partial  '\nprintf 'fixture failure\\n' >&2\nexit 7\n");
+    for (const verb of ["restart", "logs", "svc"]) {
+      const r = await runCli([verb, "local", "--unit", "fixture.service", "--type", "systemd", "--json"], config, bin);
+      expect(r.code).toBe(1);
+      const rows = JSON.parse(r.stdout);
+      expect(rows[0].host).toBe("local");
+      if (verb !== "svc") expect(rows[0].result).toMatchObject({ ok: false, code: 7, stdout: "partial  " });
+      else expect(rows[0].up).toBe(false);
+    }
+    const raw = await runCli(["logs", "local", "--unit", "fixture.service", "--type", "systemd", "--raw"], config, bin);
+    expect(raw.stdout).toBe("partial  ");
+    expect(raw.stderr).toBe("fixture failure\n");
+    for (const args of [["--raw", "--json"], ["alias"], ["--type", "bogus"]]) {
+      const r = await runCli(["logs", "unknown", "--unit", "fixture", "--type", "systemd", ...args], config, bin);
+      expect(r.code).toBe(1);
+      expect(r.stderr).not.toContain("unknown host");
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("reboot wait validates timeout and confirmation before mutation", async () => {
+  const { root, bin, config } = fixture();
+  try {
+    const marker = join(root, "calls");
+    executable(join(bin, "ssh"), `#!/bin/sh\nprintf x >> '${marker}'\ncat >/dev/null\nprintf 'ok\\n'\nexit 0\n`);
+    for (const flags of [["--wait"], ["--yes", "--wait", "--timeout"], ["--yes", "--wait", "--timeout", "1.5"], ["--yes", "--timeout", "1"]]) {
+      const r = await runCli(["reboot", "local", ...flags], config, bin);
+      expect(r.code).toBe(1);
+      expect(await Bun.file(marker).exists()).toBe(false);
+    }
+    const timeout = await runCli(["reboot", "local", "--yes", "--wait", "--timeout", "1"], config, bin);
+    expect(timeout.code).toBe(1);
+    expect(timeout.stdout).toContain("waiting-down");
+    expect(timeout.stdout).not.toContain("rebooting");
+    expect(timeout.stdout).not.toContain("ready");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("json failures cover missing config unknown selector invalid option and incompatible options", async () => {
+  const { root, bin, config } = fixture();
+  try {
+    const marker = join(root, "ssh-called");
+    executable(join(bin, "ssh"), `#!/bin/sh\ntouch '${marker}'\nexit 99\n`);
+    const cases = [
+      { args: ["exec", "--json", "unknown", "secret-command"], config: join(root, "missing") },
+      { args: ["exec", "--json", "unknown", "secret-command"], config },
+      { args: ["exec", "--json", "--unknown", "secret-value"], config },
+      { args: ["exec", "--json", "--raw", "local", "secret-command"], config },
+      { args: ["spawn", "--json", "unknown", "secret-command"], config },
+      { args: ["jobs", "tail", "unknown:sample", "--json", "--lines", "1.5"], config },
+      { args: ["cp", "--json"], config },
+      { args: ["edit", "--json", "local:/fixture", "--old", "secret-value"], config: join(root, "missing") },
+      { args: ["tools", "sync", "--json", "--unknown"], config },
+      { args: ["exec", "--proxy", "fixture-proxy", "--json", "unknown", "secret-command"], config: join(root, "missing") },
+    ];
+    for (const c of cases) {
+      const r = await runCli(c.args, c.config, bin, { FORCE_COLOR: "1" });
+      expect(r.code).toBe(1);
+      const value = JSON.parse(r.stdout);
+      expect(value).toMatchObject({ ok: false, command: c.args[0] });
+      expect(typeof value.error.code).toBe("string");
+      expect(typeof value.error.message).toBe("string");
+      expect(r.stdout + r.stderr).not.toMatch(/secret-command|secret-value|\x1b/);
+    }
+    expect(await Bun.file(marker).exists()).toBe(false);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("payload json does not enable Fleet error envelopes", async () => {
+  const { root } = fixture();
+  try {
+    const cases = [
+      ["exec", "unknown", "--", "program", "--json"],
+      ["exec", "unknown", "program", "--json"],
+      ["exec", "unknown", "--proxy", "payload", "--json"],
+      ["exec", "unknown", "program --json"],
+      ["exec", "--script", "script.sh", "unknown", "--", "--json"],
+      ["exec", "--script=--json", "unknown"],
+      ["exec", "--argv", "unknown", "--", "program", "--json"],
+      ["exec", "--proxy", "fixture", "unknown", "--", "program", "--json"],
+      ["spawn", "unknown", "program", "--json"],
+      ["edit", "--new=--json", "unknown:/file"],
+      ["exec", "--cwd=--json", "unknown", "true"],
+    ];
+    for (const args of cases) {
+      const r = await runCli(args, join(root, "missing"));
+      expect(r.code).toBe(1);
+      expect(r.stdout).toBe("");
+      expect(r.stderr).not.toBe("");
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("json host failures preserve existing result arrays and exit statuses", async () => {
+  const { root, bin, config } = fixture();
+  try {
+    executable(join(bin, "ssh"), "#!/bin/sh\ncat >/dev/null\nprintf 'partial\\n'\nprintf 'failed\\n' >&2\nexit 7\n");
+    const r = await runCli(["exec", "--json", "local", "true"], config, bin);
+    expect(r.code).toBe(1);
+    expect(JSON.parse(r.stdout)).toEqual([{ host: "local", ok: false, code: 7, stdout: "partial\n", stderr: "failed" }]);
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
