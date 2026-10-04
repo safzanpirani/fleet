@@ -156,7 +156,7 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
   server.registerTool("fleet_jobs", {
     title: "List detached jobs",
     description: "List the detached background jobs (fleet spawn) across the fleet — each shows "
-      + "host:id, status (running/exited/dead), exit code, pid, and the command. " + sel,
+      + "host:id, status (starting/running/exited/dead), exit code, pid, and the command. " + sel,
     inputSchema: {
       selector: z.string().optional().describe("Optional host selector to scope the list (default: all)."),
     },
@@ -167,7 +167,7 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       (h, e) => errors.push(`✗ ${h}: list failed — ${e}`));
     if (!rows.length && !errors.length) return text("no jobs");
     const out = rows.map((r) =>
-      `${r.status === "running" ? "●" : r.status === "exited" ? "○" : "✗"} `
+      `${r.status === "running" ? "●" : r.status === "exited" || r.status === "starting" ? "○" : "✗"} `
       + `${(r.host + ":" + r.id).padEnd(24)} ${r.status.padEnd(8)} `
       + `${(r.status === "exited" ? "exit " + r.code : "pid " + (r.pid ?? "—")).padEnd(10)} ${r.cmd}`,
     ).join("\n");
@@ -386,7 +386,8 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     title: "Wait for a detached job",
     description: "Wait until a detached job exits or its output matches a regex. MCP waits are "
       + `deliberately bounded; timeout is required and capped at ${MCP_WAIT_CAP_S}s. A job that `
-      + "outlives that is still running — call this again, or poll fleet_jobs / fleet_job_log.",
+      + "outlives that may still be starting or running; call this again, or poll fleet_jobs / fleet_job_log. "
+      + "Repeated missing-PID observations after the startup grace return launch-unconfirmed; the scheduler might still start it.",
     inputSchema: {
       ref: z.string().describe("Job reference: \"host:id\"."),
       until: z.string().optional().describe("Resolve early when the job output matches this regex."),
@@ -403,6 +404,7 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     });
     const ok = r.outcome === "matched" || (r.outcome === "exited" && r.code === 0);
     const state = r.outcome === "matched" ? "matched"
+      : r.outcome === "launch-unconfirmed" ? `launch-unconfirmed; ${r.detail}`
       : r.outcome === "timeout" ? "timeout" : r.outcome === "dead" ? "dead; inspect logs and artifacts before retrying" : `exit ${r.code}`;
     return text(
       `${ok ? "●" : "○"} ${r.host}:${r.id} · ${state} · ${Math.round(r.elapsedMs / 1000)}s`

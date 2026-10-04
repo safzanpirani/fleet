@@ -113,7 +113,7 @@ function Test-FleetJobProcess([int]$ProcessId, [string]$Runner) {
 export interface JobRow {
   host: string;
   id: string;
-  status: "running" | "exited" | "dead";
+  status: "starting" | "running" | "exited" | "dead";
   code: number | null;        // exit code when status === "exited"
   pid: number | null;
   started: number | null;     // epoch seconds
@@ -309,6 +309,7 @@ for d in "$base"/*/; do
   pid="$(cat "$d/pid" 2>/dev/null)"
   started="$(cat "$d/started" 2>/dev/null)"
   if code="$(read_exit "$d")"; then st="exited"
+  elif [ -z "$pid" ]; then st="starting"; code="-"
   elif is_owned "$pid" "$d/run"; then st="running"; code="-"
   else st="dead"; code="-"; fi
   cmd="$(tr '\\n\\t' '  ' < "$d/cmd" 2>/dev/null | cut -c1-160)"
@@ -326,6 +327,7 @@ foreach ($d in (Get-ChildItem -Directory $base -EA SilentlyContinue)) {
   $started=(Get-Content "$p\\started" -EA SilentlyContinue | Select-Object -First 1)
   $code=Get-FleetJobExit $p
   if ($null -ne $code) { $st="exited" }
+  elseif (-not $jpid) { $st="starting"; $code="-" }
   elseif ($jpid -and (Test-FleetJobProcess ([int]$jpid) "$p\\run.ps1")) { $st="running"; $code="-" }
   else { $st="dead"; $code="-" }
   $cmd=(Get-Content "$p\\cmd.ps1" -Raw -EA SilentlyContinue)
@@ -339,7 +341,7 @@ foreach ($d in (Get-ChildItem -Directory $base -EA SilentlyContinue)) {
 }
 `;
 
-const STATUSES = new Set<JobRow["status"]>(["running", "exited", "dead"]);
+const STATUSES = new Set<JobRow["status"]>(["starting", "running", "exited", "dead"]);
 export function parseRows(host: string, stdout: string): JobRow[] {
   return stdout.split("\n").map((l) => l.replace(/\r$/, "")).filter(Boolean).map((line) => {
     const [id, st, code, pid, started, ...rest] = line.split("\t");
@@ -504,6 +506,8 @@ export async function killJob(cfg: FleetConfig, a: string, b?: string): Promise<
 }
 
 // ── wait --until ──────────────────────────────────────────────────────────────
+export const JOB_STARTUP_GRACE_MS = 120_000;
+
 export interface WaitOpts {
   until?: string;        // regex; resolve as soon as `out` matches
   timeoutMs?: number;
@@ -512,24 +516,34 @@ export interface WaitOpts {
 }
 export interface JobWaitResult {
   host: string; id: string;
-  outcome: "exited" | "matched" | "timeout" | "dead";
+  outcome: "exited" | "matched" | "timeout" | "dead" | "launch-unconfirmed";
   code: number | null;
   elapsedMs: number;
+  detail?: string;
 }
 
 export function waitPoll(host: Host, id: string, until?: string): string {
   assertId(id);
   if (host.os === "windows") {
     const untilSrc = until
-      ? `$rx=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${b64(until)}')); try { if (Test-Path "$dir\\out") { if (Select-String -Path "$dir\\out" -Pattern $rx -EA Stop) { 'MATCH' } } } catch { Write-Error "fleet: invalid --until regex: $($_.Exception.Message)"; exit 2 }`
+      ? `$rx=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${b64(until)}')); try { if (Test-Path "$dir\\out") { if (Select-String -Path "$dir\\out" -Pattern $rx -EA Stop) { 'MATCH' } } } catch { Write-Error "fleet: invalid --until regex: $($_.Exception.Message)" -EA Continue; exit 2 }`
       : "";
     return [
+      `$ErrorActionPreference='Stop'`,
       WIN_OWNED_FN,
       `$dir="$env:USERPROFILE\\.fleet\\jobs\\${id}"`,
-      `if (!(Test-Path $dir)) { 'MISSING'; exit 0 }`,
-      `$code=Get-FleetJobExit $dir; if ($null -ne $code) { 'EXIT:' + $code }`,
+      `if (!(Test-Path -LiteralPath $dir)) { 'MISSING'; exit 0 }`,
+      `Get-ChildItem -LiteralPath $dir -Force -EA Stop | Out-Null`,
       untilSrc,
-      `if ($null -eq (Get-FleetJobExit $dir)) { $jpid=(Get-Content "$dir\\pid" -EA SilentlyContinue | Select-Object -First 1); if ($jpid -and -not (Test-FleetJobProcess ([int]$jpid) "$dir\\run.ps1")) { 'DEAD' } }`,
+      // Read directly so an unreadable record is an inspection failure.
+      `$code=$null; if (Test-Path -LiteralPath "$dir\\exit") { $value=[IO.File]::ReadAllText("$dir\\exit").Trim(); if ($value -match '^-?[0-9]+$') { $code=$value } }`,
+      `if ($null -ne $code) { 'EXIT:' + $code; exit 0 }`,
+      `$jpid=$null; if (Test-Path -LiteralPath "$dir\\pid") { $jpid=(Get-Content -LiteralPath "$dir\\pid" -EA Stop | Select-Object -First 1) }`,
+      `if (-not $jpid) {`,
+      `  $age=''; try { $created=([DateTimeOffset](Get-Item -LiteralPath $dir -EA Stop).CreationTimeUtc).ToUnixTimeSeconds(); if ($created -gt 0) { $age=[Math]::Max(0, [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - $created) } } catch { }`,
+      `  'STARTING:' + $age`,
+      `} elseif (-not (Test-FleetJobProcess ([int]$jpid) "$dir\\run.ps1")) { 'DEAD' }`,
+      `exit 0`,
     ].join("\n");
   }
   const untilSrc = until
@@ -540,15 +554,26 @@ export function waitPoll(host: Host, id: string, until?: string): string {
   // an inspection failure on every tick.
   return UNIX_OWNED_FN + `dir="$HOME/.fleet/jobs/${id}"\n` +
     `[ -d "$dir" ] || { echo MISSING; exit 0; }\n` +
-    `if code="$(read_exit "$dir")"; then echo "EXIT:$code"; fi\n` +
+    `[ -r "$dir" ] && [ -x "$dir" ] || { echo "fleet: job spool is unreadable" >&2; exit 1; }\n` +
+    `ls -A "$dir" >/dev/null || exit 1\n` +
     untilSrc +
-    `\nif ! read_exit "$dir" >/dev/null; then pid="$(cat "$dir/pid" 2>/dev/null)"; if [ -n "$pid" ] && ! is_owned "$pid" "$dir/run"; then echo DEAD; fi; fi` +
+    `\ncode=""; if [ -e "$dir/exit" ] || [ -L "$dir/exit" ]; then code="$(cat "$dir/exit")" || exit 1; fi\n` +
+    `if [[ "$code" =~ ^-?[0-9]+$ ]]; then echo "EXIT:$code"; exit 0; fi\n` +
+    `pid=""; if [ -e "$dir/pid" ] || [ -L "$dir/pid" ]; then pid="$(cat "$dir/pid")" || exit 1; fi\n` +
+    `if [ -z "$pid" ]; then\n` +
+    // Birth time is immutable; directory mtime changes as the runner writes files.
+    // Report age from the host's clock to avoid controller/host clock skew.
+    `  created="$(stat -c %W "$dir" 2>/dev/null)" || created="$(stat -f %B "$dir" 2>/dev/null)" || created=""\n` +
+    `  age=""; if [[ "$created" =~ ^[0-9]+$ ]] && [ "$created" -gt 0 ]; then\n` +
+    `    current="$(date +%s)"; if [[ "$current" =~ ^[0-9]+$ ]]; then age=$((current-created)); [ "$age" -ge 0 ] || age=0; fi\n` +
+    `  fi\n` +
+    `  echo "STARTING:$age"\n` +
+    `elif ! is_owned "$pid" "$dir/run"; then echo DEAD; fi` +
     `\nexit 0`;
 }
 
-/** Block until the job exits, or (with --until) its output matches a regex, or
- *  the timeout elapses. Polls the spool via repeated exec — same model as
- *  `fleet wait`. */
+/** Observe exit/match, the caller's deadline, or repeated dead/unconfirmed
+ *  launch evidence. Polls never change the spool or relaunch the job. */
 export async function waitJob(
   cfg: FleetConfig, a: string, b: string | undefined, opts: WaitOpts = {},
   dependencies: { exec?: typeof exec; now?: () => number; sleep?: (ms: number) => Promise<unknown> } = {},
@@ -566,6 +591,8 @@ export async function waitJob(
   let inspectionFailures = 0;
   let missingPolls = 0;
   let deadPolls = 0;
+  let startupSince: number | undefined;
+  let startupPolls = 0;
   for (;;) {
     const beforePoll = now() - start;
     if (timeoutMs && beforePoll >= timeoutMs)
@@ -578,6 +605,7 @@ export async function waitJob(
         return { host: host.name, id, outcome: "timeout", code: null, elapsedMs: elapsed };
       inspectionFailures++;
       deadPolls = 0;
+      startupPolls = 0;
       if (r.code === 2) throw new Error(r.stderr || `invalid wait poll for ${id}`);
       if (inspectionFailures >= 3)
         throw new Error(r.stderr || `failed to inspect job ${id} after ${inspectionFailures} attempts (exit ${r.code})`);
@@ -586,6 +614,8 @@ export async function waitJob(
       inspectionFailures = 0;
       if (/^MISSING$/m.test(r.stdout)) {
         deadPolls = 0;
+        startupPolls = 0;
+        startupSince = undefined;
         missingPolls++;
         if (missingPolls >= 3) throw new Error(`no such job: ${id}`);
         opts.onTick?.(`job spool not visible; retrying (${missingPolls}/3)`, elapsed);
@@ -596,10 +626,26 @@ export async function waitJob(
           return { host: host.name, id, outcome: "matched", code: exit ? Number(exit[1]) : null, elapsedMs: elapsed };
         if (exit)
           return { host: host.name, id, outcome: "exited", code: Number(exit[1]), elapsedMs: elapsed };
-        deadPolls = /^DEAD\r?$/m.test(r.stdout) ? deadPolls + 1 : 0;
-        if (deadPolls >= 3)
-          return { host: host.name, id, outcome: "dead", code: null, elapsedMs: elapsed };
-        opts.onTick?.(opts.until ? "waiting for match/exit" : "running", elapsed);
+        const starting = r.stdout.match(/^STARTING:(\d*)\r?$/m);
+        if (starting) {
+          const ageMs = Number(starting[1]) * 1000;
+          startupSince ??= now() - (Number.isFinite(ageMs) ? ageMs : 0);
+          startupPolls = now() - startupSince >= JOB_STARTUP_GRACE_MS ? startupPolls + 1 : 0;
+          deadPolls = 0;
+          if (startupPolls >= 3)
+            return {
+              host: host.name, id, outcome: "launch-unconfirmed", code: null, elapsedMs: elapsed,
+              detail: "launch never recorded a PID; the scheduler might still start it. Inspect this job before taking further action.",
+            };
+          opts.onTick?.("starting; launch has not recorded a PID", elapsed);
+        } else {
+          startupSince = undefined;
+          startupPolls = 0;
+          deadPolls = /^DEAD\r?$/m.test(r.stdout) ? deadPolls + 1 : 0;
+          if (deadPolls >= 3)
+            return { host: host.name, id, outcome: "dead", code: null, elapsedMs: elapsed };
+          opts.onTick?.(opts.until ? "waiting for match/exit" : "running", elapsed);
+        }
       }
     }
     if (timeoutMs && elapsed >= timeoutMs)

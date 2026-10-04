@@ -712,6 +712,19 @@ describe("machine-readable CLI output", () => {
     }
   });
 
+  test.each([false, true])("jobs wait renders an unconfirmed launch (json=%j)", async (json) => {
+    const { root, bin, config } = fixture();
+    try {
+      executable(join(bin, "ssh"), "#!/bin/sh\ncat >/dev/null\nprintf 'STARTING:180\\n'\n");
+      const result = await runCli(["jobs", "wait", "local:startup-job", ...(json ? ["--json"] : [])], config, bin);
+      expect(result.code, result.stderr).toBe(1);
+      expect(result.stdout).toContain("launch never recorded a PID");
+      expect(result.stdout).toContain("scheduler might still start it");
+      if (json) expect(JSON.parse(result.stdout)).toMatchObject({ outcome: "launch-unconfirmed", code: null });
+      else expect(result.stdout).toContain("launch-unconfirmed");
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }, 15_000);
+
   test("jobs wait --json keeps terminal clearing off stdout", async () => {
     const { root, bin, config } = fixture();
     try {

@@ -898,6 +898,7 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
           const tag = r.outcome === "matched" ? A.g("● matched") : r.outcome === "exited"
             ? (r.code === 0 ? A.g("● exit 0") : A.r("● exit " + r.code)) : A.y("○ " + r.outcome);
           console.log(`${tag} ${A.b(r.host + ":" + r.id)} ${A.d(`(${Math.round(r.elapsedMs / 1000)}s)`)}`);
+          if (r.detail) console.log(r.detail);
           return exitCode;
         }
       }
@@ -922,7 +923,7 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       for (const e of listErrors) console.error(`${A.r("✗")} ${A.y("jobs list failed on " + e)}`);
       if (json) { console.log(JSON.stringify(rows, null, 2)); return listErrors.length ? 1 : 0; }
       if (!rows.length) { console.log(A.d(listErrors.length ? "no jobs (some hosts failed)" : "no jobs")); return listErrors.length ? 1 : 0; }
-      const dot = (s: JobRow["status"]) => s === "running" ? A.g("●") : s === "exited" ? A.d("○") : A.r("✗");
+      const dot = (s: JobRow["status"]) => s === "starting" ? A.y("○") : s === "running" ? A.g("●") : s === "exited" ? A.d("○") : A.r("✗");
       const ago = (t: number | null) => t == null ? "" : `${Math.max(0, Math.round((Date.now() / 1000 - t) / 60))}m`;
       for (const r of rows)
         console.log(`${dot(r.status)} ${A.b((r.host + ":" + r.id).padEnd(22))} ${A.d(r.status.padEnd(8))} ${A.d((r.status === "exited" ? "exit " + r.code : ago(r.started)).padEnd(8))} ${A.d("pid " + (r.pid ?? "—")).padEnd(14)} ${r.cmd}`);

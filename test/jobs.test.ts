@@ -2,7 +2,7 @@ import { test, expect, describe, spyOn } from "bun:test";
 import { jobLog, jobTail, killScript, listJobs, pruneJobs, resolveJobRef, parseRows, newId, spawnJob, unixSpawnScript, waitJob, waitPoll } from "../src/jobs.ts";
 import * as ssh from "../src/ssh.ts";
 import type { FleetConfig, Host } from "../src/config.ts";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -48,6 +48,11 @@ describe("resolveJobRef", () => {
 });
 
 describe("parseRows", () => {
+  test("a starting row preserves the missing-PID state", () => {
+    expect(parseRows("fixture", "startup\tstarting\t-\t-\t-\tcmd")[0])
+      .toMatchObject({ status: "starting", pid: null, code: null });
+  });
+
   test("parses a well-formed row", () => {
     const [r] = parseRows("web", "id1\trunning\t-\t4242\t1700000000\techo hi");
     expect(r).toEqual({
@@ -592,6 +597,154 @@ describe("detached job lifecycle", () => {
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
+  });
+});
+
+describe("job startup wait", () => {
+  async function fixture(
+    run: (f: {
+      dir: string; ticks: string[]; polls: () => number;
+      wait: (before?: (poll: number) => string | void) => ReturnType<typeof waitJob>;
+    }) => Promise<void>,
+    ageSeconds: number | null = 0,
+  ) {
+    const home = mkdtempSync(join(tmpdir(), "fleet-job-startup-"));
+    const dir = join(home, ".fleet", "jobs", "startup-job");
+    mkdirSync(dir, { recursive: true });
+    let clock = 1_700_000_000_000;
+    const created = clock / 1000 - (ageSeconds ?? 0);
+    let polls = 0;
+    const ticks: string[] = [];
+    try {
+      await run({ dir, ticks, polls: () => polls, wait: (before) => waitJob(cfg, "web:startup-job", undefined, {
+        intervalMs: 30_000,
+        onTick: (state) => ticks.push(state),
+      }, {
+        now: () => clock,
+        sleep: async (ms) => { clock += ms; },
+        exec: async (h, script) => {
+          if (polls >= 12) throw new Error("fixture poll budget exhausted: wait did not terminate");
+          const prefix = before?.(polls) ?? "";
+          polls++;
+          const r = await runBash([
+            // Keep production poll execution local; fake only time and transport failures.
+            `stat() { ${ageSeconds === null ? "return 1" : `echo ${created}`}; }`,
+            `date() { echo ${clock / 1000}; }`,
+            prefix, script,
+          ].join("\n"), home);
+          return { host: h.name, ok: r.code === 0, ...r };
+        },
+      }) });
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  }
+
+  test.each([0, 180, null])("no PID terminates after grace and repeated observations (initial age %j)", async (age) => {
+    await fixture(async (f) => {
+      const result = await f.wait();
+      expect(result).toMatchObject({ outcome: "launch-unconfirmed", code: null, elapsedMs: age === 180 ? 60_000 : 180_000 });
+      expect(result).toHaveProperty("detail", expect.stringContaining("launch never recorded a PID"));
+      expect(result).toHaveProperty("detail", expect.stringContaining("scheduler might still start it"));
+      expect(f.polls()).toBe(age === 180 ? 3 : 7);
+      expect(f.ticks.every((tick) => tick.includes("starting"))).toBe(true);
+      expect(readdirSync(f.dir)).toEqual([]);
+    }, age);
+  });
+
+  test("PID arriving during grace becomes running and then exits normally", async () => {
+    await fixture(async (f) => {
+      const result = await f.wait((poll) => {
+        if (poll === 2) writeFileSync(join(f.dir, "pid"), "123");
+        if (poll === 6) writeFileSync(join(f.dir, "exit"), "7\n");
+        // Supply a known process identity to the real POSIX ownership check.
+        return 'uname() { echo Darwin; }; ps() { echo "$dir/run"; }';
+      });
+      expect(result).toMatchObject({ outcome: "exited", code: 7 });
+      expect(f.ticks.slice(0, 2).every((tick) => tick.includes("starting"))).toBe(true);
+      expect(f.ticks.slice(2)).toEqual(["running", "running", "running", "running"]);
+      expect(readdirSync(f.dir).sort()).toEqual(["exit", "pid"]);
+    });
+  });
+
+  test("an exit record before any PID wins over the startup verdict", async () => {
+    await fixture(async (f) => {
+      const result = await f.wait((poll) => {
+        if (poll === 6) writeFileSync(join(f.dir, "exit"), "9\n");
+      });
+      expect(result).toMatchObject({ outcome: "exited", code: 9, elapsedMs: 180_000 });
+      expect(f.ticks.every((tick) => tick.includes("starting"))).toBe(true);
+      expect(readdirSync(f.dir)).toEqual(["exit"]);
+    });
+  });
+
+  test.each(["ssh", "spool"])("%s inspection failures before and after grace reset no-PID evidence", async (failure) => {
+    await fixture(async (f) => {
+      const result = await f.wait((poll) => {
+        if ([1, 5, 7].includes(poll)) return failure === "ssh"
+          ? 'echo "fixture SSH failure" >&2; exit 255'
+          : 'ls() { echo "fixture spool unreadable" >&2; return 1; }';
+        if (poll === 10) writeFileSync(join(f.dir, "exit"), "0\n");
+      });
+      expect(result).toMatchObject({ outcome: "exited", code: 0, elapsedMs: 300_000 });
+      expect(f.ticks.filter((tick) => tick.includes("inspection failed"))).toHaveLength(3);
+      expect(f.ticks[0]).toContain("starting");
+      expect(readdirSync(f.dir)).toEqual(["exit"]);
+    });
+  });
+
+  test("persistent inspection failures report an inspection error", async () => {
+    await fixture(async (f) => {
+      await expect(f.wait((poll) => poll >= 5 ? 'echo "fixture SSH failure" >&2; exit 255' : ""))
+        .rejects.toThrow("fixture SSH failure");
+      expect(readdirSync(f.dir)).toEqual([]);
+    });
+  });
+
+  test("both poll generators explicitly finish successfully and emit startup age", () => {
+    for (const os of ["linux", "mac", "windows"] as const) {
+      const script = waitPoll(host("fixture", os), "startup-job");
+      expect(script).toContain("STARTING:");
+      expect(script.trim()).toEndWith("exit 0");
+    }
+    expect(waitPoll(host("fixture", "windows"), "startup-job")).toContain("CreationTimeUtc");
+  });
+
+  test("the real POSIX poll reads creation time and never modifies an empty spool", async () => {
+    const home = mkdtempSync(join(tmpdir(), "fleet-job-birth-"));
+    const dir = join(home, ".fleet", "jobs", "birth-job");
+    try {
+      mkdirSync(dir, { recursive: true });
+      const result = await runBash(waitPoll(host("fixture", "mac"), "birth-job"), home);
+      expect(result.code, result.stderr).toBe(0);
+      const match = result.stdout.match(/^STARTING:(\d*)\n$/);
+      expect(match).not.toBeNull();
+      if (statSync(dir).birthtimeMs > 0) {
+        expect(match![1]).not.toBe("");
+        expect(Number(match![1])).toBeLessThan(10);
+      }
+      expect(readdirSync(dir)).toEqual([]);
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+
+  test.each(["pid", "exit"])("an unreadable %s is an inspection error, not missing-PID evidence", async (file) => {
+    await fixture(async (f) => {
+      mkdirSync(join(f.dir, file));
+      await expect(f.wait()).rejects.toThrow();
+      expect(f.polls()).toBe(3);
+      expect(f.ticks.every((tick) => tick.includes("inspection failed"))).toBe(true);
+      expect(readdirSync(f.dir)).toEqual([file]);
+    }, 180);
+  });
+
+  test("a spool without search permission cannot establish missing-PID evidence", async () => {
+    await fixture(async (f) => {
+      chmodSync(f.dir, 0o600);
+      try {
+        await expect(f.wait()).rejects.toThrow("spool is unreadable");
+        expect(f.polls()).toBe(3);
+        expect(f.ticks.every((tick) => tick.includes("inspection failed"))).toBe(true);
+      } finally { chmodSync(f.dir, 0o700); }
+      expect(readdirSync(f.dir)).toEqual([]);
+    }, 180);
   });
 });
 

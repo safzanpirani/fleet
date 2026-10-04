@@ -436,6 +436,22 @@ describe("Fleet MCP parity", () => {
     } finally { spawn.mockRestore(); }
   });
 
+  test("an unconfirmed launch explains that the scheduler can still start it", async () => {
+    const wait = spyOn(jobs, "waitJob").mockResolvedValue({
+      host: "local", id: "startup-id", outcome: "launch-unconfirmed", code: null, elapsedMs: 6_000,
+      detail: "launch never recorded a PID; the scheduler might still start it. Inspect this job before taking further action.",
+    });
+    try {
+      await withClient(true, async (client) => {
+        const result = await client.callTool({ name: "fleet_job_wait", arguments: { ref: "local:startup-id", timeout: 120 } });
+        expect(result.isError).toBe(true);
+        expect(JSON.stringify(result.content)).toContain("launch never recorded a PID");
+        expect(JSON.stringify(result.content)).toContain("scheduler might still start it");
+        expect(JSON.stringify(result.content)).not.toContain("exit null");
+      });
+    } finally { wait.mockRestore(); }
+  });
+
   test("dead jobs and unverified tool installations are MCP errors", async () => {
     const wait = spyOn(jobs, "waitJob").mockResolvedValue({ host: "local", id: "dead-id", outcome: "dead", code: null, elapsedMs: 6 });
     const status = spyOn(tools, "toolsStatus").mockResolvedValue([{
