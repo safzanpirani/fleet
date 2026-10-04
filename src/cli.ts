@@ -45,7 +45,7 @@ import {
 } from "./jobs.ts";
 import type { JobRow } from "./jobs.ts";
 import {
-  pullFlag, pullVal, parseFlags, parseLeadingFlags, lsHosts, runExec, runScript, rebootRefusal, droppedStdinCheck, nestedShellNote, readScriptSource, editRemoteFile, parseEditList,
+  pullFlag, pullVal, parseFlags, parseLeadingFlags, lsHosts, runExec, runScript, rebootRefusal, droppedStdinCheck, nestedShellNote, readScriptSource, extensionFromShebang, editRemoteFile, parseEditList,
   pushFile, pullFile, parseRemoteSpec, restartService, serviceLogs, svcStatus,
   gpuRows, diskRows, sudoWrap, fetchDashboard, hostStatus, runRecipe, captureScreenshot, rebootHosts,
   cuInstall, cuRun, cuTools, cuDescribe, cuRecordStart, cuRecordStop, cuRecordStatus, cuRegions, cuPerception, bootMismatchNote,
@@ -628,7 +628,7 @@ complete -F _fleet fleet`;
 }
 
 const PROXY_LEADING_VALUES: Record<string, readonly string[]> = {
-  exec: ["--cwd", "--timeout", "--script", "--interp"],
+  exec: ["--cwd", "--timeout", "--script", "--script-body", "--interp"],
   spawn: ["--cwd", "--label"],
   jobs: ["-n", "--lines", "--until", "--timeout"],
   edit: ["--old", "--new", "--old-file", "--new-file", "--edits"],
@@ -741,7 +741,7 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       // Flags are parsed from the LEADING tokens only, so a --wsl/--json/… inside
       // the remote command is passed through verbatim instead of being hijacked.
       const EXEC_BOOLS = ["--json", "--wsl", "--raw", "--sudo", "--confirm-reboot", "--fresh"];
-      const EXEC_VALUES = ["--cwd", "--timeout", "--script", "--interp"];
+      const EXEC_VALUES = ["--cwd", "--timeout", "--script", "--script-body", "--interp"];
       const { flags, rest: lead } = parseLeadingFlags(rest, EXEC_BOOLS, EXEC_VALUES);
       const sel = lead.shift();
       const { pos, separated } = hoistFlags(flags, lead, EXEC_BOOLS, EXEC_VALUES);
@@ -758,11 +758,15 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       // --script ships a LOCAL file (or stdin) as the program: no cp to /tmp, no
       // remote leftovers, and the source never touches a shell command line.
       const scriptPath = typeof flags["--script"] === "string" && flags["--script"] ? flags["--script"] : undefined;
+      const scriptBody = flags["--script-body"] as string | undefined;
+      if (scriptPath && scriptBody !== undefined) die("choose either --script or --script-body");
+      if (scriptBody !== undefined && !scriptBody.trim()) die("--script-body cannot be empty");
       const interp = typeof flags["--interp"] === "string" && flags["--interp"] ? flags["--interp"] : undefined;
       const cmd = pos.join(" ");
-      if (scriptPath) {
+      if (scriptPath || scriptBody !== undefined) {
         if (!sel) die("usage: fleet exec --script <file|-> [--interp cmd] [--cwd dir] [--timeout S] [--wsl] [--sudo] [--raw] [--json] <sel> [--] [ARG…]");
-        const script = await readScriptSource(scriptPath);
+        const script = scriptBody === undefined ? await readScriptSource(scriptPath!)
+          : { source: scriptBody, ext: extensionFromShebang(scriptBody), label: "<script-body>" };
         const refusal = confirmReboot ? null : rebootRefusal(script.source, "--confirm-reboot");
         if (refusal) die(refusal);
         const results = await runScript(cfg, await routeSelector(cfg, sel!), script, { wsl, cwd, timeoutMs, interp, sudo, fresh, args: pos });
@@ -771,7 +775,7 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
         else { results.forEach(printResult); await printBootMismatch(cfg, results); }
         return results.some((r) => !r.ok) ? 1 : 0;
       }
-      if (interp) die("--interp requires --script");
+      if (interp) die("--interp requires --script or --script-body");
       if (!sel || !cmd) die("usage: fleet exec [--cwd dir] [--timeout S] [--wsl] [--sudo] [--fresh] [--confirm-reboot] [--raw] [--json] <sel> <cmd…>   |   fleet exec --script <file|-> <sel>");
       // A remote command starting with a fleet flag means the flag was written
       // AFTER <sel>, where it is treated as part of the command and shipped to
@@ -1907,7 +1911,7 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
     }
 
     case "wait": {
-      const { flags, rest: pos } = parseFlags(rest, ["--json", "--ssh"],
+      const { flags, rest: pos } = parseFlags(rest, ["--json", "--ssh", "--after-down"],
         ["--port", "--http", "--status", "--boot", "--timeout", "--interval"]);
       const primaryFlags = ["--ssh", "--port", "--http", "--boot"];
       const requestedConditions = primaryFlags.filter((flag) => flags[flag] !== undefined);
@@ -1925,7 +1929,7 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       const interval = numFlag(flags, "--interval", 3) * 1000;
       const [sel] = pos;
       if (!sel || pos.length !== 1) die("usage: fleet wait <host|machine> [--ssh | --port N | --http URL [--status N] | --boot OS] [--timeout S] [--interval S]");
-      const cond: Parameters<typeof waitFor>[2] = { timeoutMs: timeout, intervalMs: interval };
+      const cond: Parameters<typeof waitFor>[2] = { timeoutMs: timeout, intervalMs: interval, afterDown: flags["--after-down"] === true };
       if (boot) cond.boot = boot;
       else if (http) { cond.http = http; if (status) cond.status = status; }
       else if (port) cond.port = port;

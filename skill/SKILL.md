@@ -668,3 +668,17 @@ For one-off work on the local machine, or hosts not in `fleet.config.json`, use 
 - Exit records are published atomically. Empty or malformed records do not hide a live runner or allow pruning it. Linux and macOS cancellation tracks surviving descendants through TERM and KILL.
 - Set `tools.<name>.compile` to `true` for native Bun executables on Linux/macOS. Sync builds, signs macOS candidates, and requires `--help` to succeed within ten seconds before replacing the launcher. Failed builds preserve the prior executable and manifest; source and skills may already be updated. Windows selections fail before syncing.
 - `FLEET_CONFIG` takes precedence and fails if its file is absent. Source checkouts retain the example-config fallback. Missing-config diagnostics omit Bun embedded filesystem paths.
+
+
+### Inline scripts and reboot waits
+
+`fleet exec --script-body 'print("hello")' --interp python3 web` sends source
+without a local script file or stdin. A supported shebang can select the interpreter.
+Arguments after the selector reach the script. `--script-body` and `--script` are
+mutually exclusive. Use a protected script file or stdin for source containing credentials.
+
+After scheduling a reboot, run `fleet wait web --ssh --after-down --timeout 300`.
+Fleet waits for a failed probe and then a successful probe. Both phases share the
+same deadline. Start the wait before downtime occurs; missed downtime causes a timeout.
+A failed probe can also indicate a network outage. This mode does not verify boot identity.
+Ordinary `fleet wait web --ssh` continues to check current readiness.
