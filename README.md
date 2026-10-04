@@ -917,3 +917,17 @@ real CLI with everyday tasks (Calculator arithmetic, a new folder in Explorer, a
 character from Character Map, the device name from Settings), checks each result
 through the app's own state or the file system, and closes what it opened.
 `--paid` adds the `elements --task` case, which calls the TypeSafe API.
+
+
+### Inline scripts and reboot waits
+
+`fleet exec --script-body 'print("hello")' --interp python3 web` sends source
+without a local script file or stdin. A supported shebang can select the interpreter.
+Arguments after the selector reach the script. `--script-body` and `--script` are
+mutually exclusive. Use a protected script file or stdin for source containing credentials.
+
+After scheduling a reboot, run `fleet wait web --ssh --after-down --timeout 300`.
+Fleet waits for a failed probe and then a successful probe. Both phases share the
+same deadline. Start the wait before downtime occurs; missed downtime causes a timeout.
+A failed probe can also indicate a network outage. This mode does not verify boot identity.
+Ordinary `fleet wait web --ssh` continues to check current readiness.

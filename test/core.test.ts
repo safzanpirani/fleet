@@ -387,3 +387,35 @@ describe("pickPreferred", () => {
     expect(await pickPreferred([], 50)).toBe(-1);
   });
 });
+
+
+describe("wait after a scheduled reboot", () => {
+  const cfg: FleetConfig = { hosts: { box: { name: "box", ssh: "unused", os: "linux" } } };
+  test("waits through delayed shutdown before accepting readiness", async () => {
+    const states = [true, true, false, false, true];
+    const details: string[] = [];
+    const result = await waitFor(cfg, "box", {
+      afterDown: true, timeoutMs: 1000, intervalMs: 1,
+      onTick: (detail) => details.push(detail),
+    }, { probe: async () => states.shift() ?? true });
+    expect(result.ok).toBe(true);
+    expect(result.attempts).toBe(5);
+    expect(details[0]).toContain("waiting for condition to go down");
+    expect(details[2]).toContain("observed down");
+  });
+  test("times out when shutdown never happens or recovery never happens", async () => {
+    for (const state of [true, false]) {
+      const result = await waitFor(cfg, "box", { afterDown: true, timeoutMs: 20, intervalMs: 1 }, { probe: async () => state });
+      expect(result.ok).toBe(false);
+      if (state) expect(result.lastDetail).toContain("waiting for condition to go down");
+    }
+  });
+  test("accepts a host already down and preserves ordinary readiness behavior", async () => {
+    let count = 0;
+    const result = await waitFor(cfg, "box", { afterDown: true, timeoutMs: 1000, intervalMs: 1 }, { probe: async () => ++count > 1 });
+    expect(result.ok).toBe(true);
+    expect(result.attempts).toBe(2);
+    const ordinary = await waitFor(cfg, "box", { timeoutMs: 1000 }, { probe: async () => true });
+    expect(ordinary.attempts).toBe(1);
+  });
+});

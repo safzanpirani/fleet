@@ -62,6 +62,7 @@ describe("proxy CLI flags", () => {
     const cases: [string, string[]][] = [
       ["exec", ["--cwd", "/tmp", "--timeout", "5", "--script", "-", "--interp", "bash"]],
       ["exec", ["--cwd=/tmp", "--timeout=5"]],
+      ["exec", ["--script-body", "echo ok", "--interp", "bash"]],
       ["spawn", ["--label", "batch one", "--cwd", "/tmp"]],
       ["jobs", ["--lines", "2"]],
       ["job", ["--timeout", "5"]],
@@ -567,6 +568,40 @@ describe("machine-readable CLI output", () => {
     }
   });
 
+  test("script bodies run without stdin and preserve source and arguments", async () => {
+    const { root, bin, config } = fixture();
+    executable(join(bin, "ssh"), "#!/bin/sh\nexec /bin/bash -s\n");
+    const source = 'import sys\nprint("héllo & $HOME")\nprint(repr(sys.argv[1:]))\n';
+    try {
+      const result = await runCli(["exec", "--raw", "--script-body", source, "--interp", "python3", "local", "--", "two words", "it's", "--json"], config, bin);
+      expect(result.code, result.stderr).toBe(0);
+      expect(result.stdout).toBe(`héllo & $HOME\n['two words', "it's", '--json']\n`);
+      const inferred = await runCli(["exec", "--raw", "--script-body", "#!/bin/bash\nprintf shebang", "local"], config, bin);
+      expect(inferred.code, inferred.stderr).toBe(0);
+      expect(inferred.stdout).toBe("shebang");
+      const failed = await runCli(["exec", "--raw", "--script-body", "exit 7", "--interp", "bash", "local"], config, bin);
+      expect(failed.code).toBe(1);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test("invalid script bodies fail before contacting a host", async () => {
+    const { root, bin, config } = fixture();
+    const marker = join(root, "contacted");
+    executable(join(bin, "ssh"), `#!/bin/sh\ntouch '${marker}'\nexit 99\n`);
+    try {
+      for (const options of [
+        ["--script-body", " "],
+        ["--script-body", "echo ok"],
+        ["--script", "-", "--script-body", "echo ok", "--interp", "bash"],
+      ]) {
+        const result = await runCli(["exec", ...options, "local"], config, bin);
+        expect(result.code).toBe(1);
+        expect(result.stderr).toMatch(/cannot be empty|needs --interp|choose either/);
+      }
+      expect(await Bun.file(marker).exists()).toBe(false);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   test("exec rejects --interp without --script", async () => {
     const { root, config } = fixture();
     try {
@@ -710,6 +745,17 @@ describe("machine-readable CLI output", () => {
       server.stop(true);
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  test("wait --after-down does not accept an already healthy endpoint", async () => {
+    const { root, config } = fixture();
+    const server = Bun.serve({ port: 0, fetch: () => new Response("ok") });
+    try {
+      const result = await runCli(["wait", "probe", "--http", `http://127.0.0.1:${server.port}`,
+        "--after-down", "--timeout", "1", "--interval", "1", "--json"], config);
+      expect(result.code).toBe(1);
+      expect(JSON.parse(result.stdout)).toMatchObject({ ok: false, lastDetail: expect.stringContaining("waiting for condition to go down") });
+    } finally { server.stop(true); rmSync(root, { recursive: true, force: true }); }
   });
 
   test.each([false, true])("jobs wait renders an unconfirmed launch (json=%j)", async (json) => {

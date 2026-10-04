@@ -475,8 +475,8 @@ export async function runScript(
   cfg: FleetConfig, sel: string, script: ScriptSource,
   opts: { wsl?: boolean; cwd?: string; timeoutMs?: number; interp?: string; sudo?: boolean; fresh?: boolean; args?: string[] } = {},
 ): Promise<ExecResult[]> {
-  if (script.label === "<stdin>" && !script.ext && !opts.interp)
-    throw new Error("fleet: --script - needs --interp <command> unless stdin starts with a supported shebang");
+  if (["<stdin>", "<script-body>"].includes(script.label) && !script.ext && !opts.interp)
+    throw new Error(`fleet: ${script.label === "<stdin>" ? "--script -" : "--script-body"} needs --interp <command> unless the source starts with a supported shebang`);
   const hosts = resolveHosts(cfg, sel);
   const shell: Shell = opts.wsl ? "wsl" : "auto";
   return Promise.all(hosts.map((h) => {
@@ -1965,6 +1965,7 @@ export async function findHost(
 export interface WaitResult { ok: boolean; elapsedMs: number; attempts: number; lastDetail: string; }
 export interface WaitCond {
   ssh?: boolean; port?: number; http?: string; status?: number; boot?: string;
+  afterDown?: boolean;
   timeoutMs?: number; intervalMs?: number; onTick?: (detail: string, ms: number) => void;
 }
 
@@ -2016,14 +2017,17 @@ export async function waitFor(
   if (!c.http && c.port == null && !cfg.hosts[target] && !cfg.routes?.[target] && !cfg.machines?.[target])
     throw new Error(`unknown host, route, or machine: ${target}`);
   const start = Date.now(); let attempts = 0, lastDetail = "";
+  let waitingForDown = c.afterDown === true;
   while (Date.now() - start < timeoutMs) {
     attempts++;
     const remaining = Math.max(1, timeoutMs - (Date.now() - start));
     const { ok, detail } = await probeOnce(cfg, target, c, remaining, deps.probe);
-    lastDetail = detail;
+    const ready = ok && !waitingForDown;
+    lastDetail = waitingForDown ? (ok ? `waiting for condition to go down (${detail})` : `observed down (${detail}); waiting for readiness`) : detail;
+    if (!ok) waitingForDown = false;
     const elapsed = Date.now() - start;
-    c.onTick?.(detail, elapsed);
-    if (ok) return { ok: true, elapsedMs: elapsed, attempts, lastDetail };
+    c.onTick?.(lastDetail, elapsed);
+    if (ready) return { ok: true, elapsedMs: elapsed, attempts, lastDetail };
     await Bun.sleep(Math.min(intervalMs, Math.max(0, timeoutMs - (Date.now() - start))));
   }
   return { ok: false, elapsedMs: Date.now() - start, attempts, lastDetail };
