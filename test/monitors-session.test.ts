@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mainMonitor, parseMonitors, parseRegion, pickMonitor, regionRect } from "../src/monitors.ts";
 import { parseLinuxSession, parseMacSession, parseQueryIdle, parseWindowsSession } from "../src/session.ts";
 import { captureCmd, droppedStdinCheck, readsStdin } from "../src/core.ts";
-import { buildArgs } from "../src/ssh.ts";
+import { buildArgs, psHiddenLaunch } from "../src/ssh.ts";
 
 // A two-monitor Hyprland layout: a rotated 1080p monitor left of a 1440p one at 1.25.
 const HYPR = `@hyprland
@@ -53,6 +53,25 @@ describe("monitor layouts", () => {
     expect(cmd.indexOf("dpms on")).toBeLessThan(cmd.indexOf("grim -s"));
     expect(captureCmd("linux", { rect: { x: 0, y: 0, width: 2048, height: 1152 }, output: "DP-3", wholeOutput: true }).cmd)
       .toContain("grim -o 'DP-3'");
+  });
+
+  test("a Windows capture task runs under a headless conhost, so Windows Terminal opens no window", () => {
+    const cmd = captureCmd("windows").cmd;
+    const hidden = psHiddenLaunch("$psexe", "$psarg");
+    expect(cmd).toContain(`$act.Path=${hidden.exe}; $act.Arguments=${hidden.args}`);
+    expect(hidden.exe).toContain(`"$env:SystemRoot\\System32\\conhost.exe"`);
+    expect(hidden.args).toContain(`'--headless "' + $psexe`);
+    // COM, not the ScheduledTasks cmdlets: no CIM module load, no stop wait after success.
+    expect(cmd).not.toMatch(/Register-ScheduledTask|Stop-ScheduledTask|Get-ScheduledTaskInfo/);
+    expect(cmd).toContain("if(-not $captured){ try { $task.Stop(0) }");
+  });
+
+  test("a Windows capture declares DPI awareness before it reads the screen", () => {
+    const cmd = captureCmd("windows").cmd;
+    const aware = cmd.indexOf("SetProcessDpiAwarenessContext([IntPtr](-4))");
+    expect(aware).toBeGreaterThan(-1);
+    expect(aware).toBeLessThan(cmd.indexOf("SystemInformation]::VirtualScreen"));
+    expect(cmd).not.toContain("-MemberDefinition");
   });
 });
 

@@ -198,6 +198,26 @@ function b64utf16le(s: string): string {
   return Buffer.from(s, "utf16le").toString("base64");
 }
 
+/** PowerShell expressions for the program and arguments that run `exe` with
+ *  `args` (both PowerShell string expressions) without a window. Windows 11
+ *  hands a new console to Windows Terminal, which ignores -WindowStyle Hidden
+ *  and opens a window on the user's desktop. A headless conhost hosts the
+ *  console itself and never creates one. */
+export function psHiddenLaunch(exe: string, args: string): { exe: string; args: string } {
+  const conhost = `"$env:SystemRoot\\System32\\conhost.exe"`;
+  const has = `(Test-Path -LiteralPath ${conhost})`;
+  return {
+    exe: `$(if ${has} { ${conhost} } else { ${exe} })`,
+    args: `$(if ${has} { '--headless "' + ${exe} + '" ' + ${args} } else { ${args} })`,
+  };
+}
+
+/** PowerShell expression for a scheduled-task action of `psHiddenLaunch`. */
+export function psHiddenTaskAction(exe: string, args: string): string {
+  const launch = psHiddenLaunch(exe, args);
+  return `(New-ScheduledTaskAction -Execute ${launch.exe} -Argument ${launch.args})`;
+}
+
 // ── --cwd support ────────────────────────────────────────────────────────────
 // Prepend a directory change to the command, shell-appropriately. We never lose
 // the quoting-proof guarantee: the cwd is embedded into the SAME base64/stdin

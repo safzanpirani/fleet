@@ -7,8 +7,7 @@
  *   bun run scripts/smoke-http.ts            # full control
  *   FLEET_MCP_READONLY=1 bun run scripts/smoke-http.ts   # expect read/probe tools only
  */
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 

@@ -1,7 +1,6 @@
 import { describe, expect, spyOn, test } from "bun:test";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import type { Tool } from "@modelcontextprotocol/sdk/types.js";
+import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
+import type { Tool } from "@modelcontextprotocol/client";
 import type { FleetConfig } from "../src/config.ts";
 import { buildServer } from "../src/server.ts";
 import * as jobs from "../src/jobs.ts";
@@ -67,6 +66,7 @@ const MUTATING_TOOLS = [
   "fleet_cu_regions",
   "fleet_cu_verify",
   "fleet_cu_screenshot_window",
+  "fleet_cu_task",
   "fleet_cu_windows",
   "fleet_cu_record",
   "fleet_deploy",
@@ -188,8 +188,8 @@ describe("Fleet MCP parity", () => {
       await withClient(true, async (client) => {
         const { tools } = await client.listTools();
         expect(tools.some((tool) => tool.name === "fleet_android_flow")).toBe(false);
-        const denied = await client.callTool({ name: "fleet_android_flow", arguments: { host: "local", steps: [{ action: "key", key: "back" }] } });
-        expect(denied.isError).toBe(true);
+        await expect(client.callTool({ name: "fleet_android_flow", arguments: { host: "local", steps: [{ action: "key", key: "back" }] } }))
+          .rejects.toThrow(/fleet_android_flow not found/);
       });
       expect(flow).not.toHaveBeenCalled();
     } finally { flow.mockRestore(); }

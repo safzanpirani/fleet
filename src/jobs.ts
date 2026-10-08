@@ -24,7 +24,7 @@
  */
 import { resolveHosts } from "./config.ts";
 import type { FleetConfig, Host } from "./config.ts";
-import { exec, execStream, execStreamWin, bashEsc, psEsc } from "./ssh.ts";
+import { exec, execStream, execStreamWin, bashEsc, psEsc, psHiddenTaskAction } from "./ssh.ts";
 import type { ExecResult, Shell } from "./ssh.ts";
 
 const b64 = (s: string) => Buffer.from(s, "utf8").toString("base64");
@@ -231,7 +231,7 @@ function windowsSpawnScript(id: string, cmd: string, cwd?: string, elevated = fa
     `$task="fleet_$id"`,
     `$psexe = (Get-Process -Id $PID).Path`,
     `$arg = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + "$dir\\run.ps1" + '"'`,
-    `$action = New-ScheduledTaskAction -Execute $psexe -Argument $arg`,
+    `$action = ${psHiddenTaskAction("$psexe", "$arg")}`,
     // Limited drops the administrator token, so storage and other CIM cmdlets
     // fail with "Access to a CIM resource was not available". --elevated asks
     // for the full token, which an administrator's ssh session can grant.

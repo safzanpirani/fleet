@@ -407,6 +407,31 @@ fleet cu web click '{"pid":3848,"window_id":66756,"x":100,"y":200}'
   `fleet_cu_windows`, `fleet_cu_open`, `fleet_cu_screenshot_window` and `fleet_cu_describe`;
   `args: ["install"]` fans out over a selector there too.
 
+### Jev subtasks
+
+```sh
+fleet cu mac task TextEdit "Write the note" --verify "The document text is Buy milk" --input text="Buy milk"
+fleet cu winbox task "Example App" "Sign in" --verify "The account page is shown" \
+  --input user=alice --secret-env password=EXAMPLE_PW --max-actions 10
+fleet cu phone task com.example "Search for cats" --verify "Results for cats are listed" --input query=cats
+fleet cu winbox task "Example App" --file subtask.json --json
+```
+
+`task` hands a bounded subtask to TypeSafe's Jev, a port of arc-cua's action
+layer. Each step reads the window's controls, asks Jev for one operation among the
+controls the window exposes now, sends it through the verified input above, and
+reads the window again. Jev never writes text: it picks an `--input` key and Fleet
+enters that literal value. A field that no input fits ends as `NEEDS_INPUT` and
+names the field. `--secret-env KEY=ENVVAR` supplies a value that Jev sees only as a
+placeholder. Controls labelled like delete, send, purchase or close are refused
+unless `--allow` names the category. `SUBTASK_COMPLETE` needs every `--verify`
+criterion judged satisfied. `BLOCKED` means three actions changed nothing.
+`NEEDS_AGENT` hands back with a reason. Inspect the window before more input after
+any other status. `--dry-run` decides the first action and stops. `--file` takes
+arc-cua's JSON fields: `goal`, `verification`, `inputs`, `secret_inputs`,
+`constraints`, `allowed_risks`, `shortcuts` and `max_actions`. Each step costs one
+paid Jev request. The MCP equivalent is `fleet_cu_task`.
+
 ### Android phones
 
 A host with an `android` block is a phone reached over SSH into
@@ -892,7 +917,7 @@ git-ignored `fleet.config.local.json` if you don't want hosts in git.
 | `NO_COLOR` / `FORCE_COLOR` | output is uncoloured unless stdout is a terminal; `NO_COLOR` always disables colour, `FORCE_COLOR=1` forces it |
 | `FLEET_WIN_SESSION` | `0` turns off the kept-open PowerShell session that makes repeat Windows execs take ~50-250 ms instead of ~0.6 s |
 | `FLEET_WIN_SESSION_IDLE_S` | idle seconds before that session closes (default 600) |
-| `TYPESAFE_API_KEY` | enables `fleet cu … elements --task` (paid call; fails open). `FLEET_JEV_CONFIG` may name a JSON file with `apiKey` instead |
+| `TYPESAFE_API_KEY` | enables `fleet cu … task`, which runs a bounded subtask with Jev choosing each action (one paid call per step), and `fleet cu … elements --task` (paid call; fails open). `FLEET_JEV_CONFIG` may name a JSON file with `apiKey` instead |
 | `FLEET_NO_SSH_MUX` | `1` disables SSH connection multiplexing. By default fleet reuses one master connection per host (`ControlMaster=auto`, `ControlPersist=60s`, sockets under `~/.fleet/ssh/`) so fan-outs and poll loops don't re-handshake; a wedged socket is fixed by this flag or `rm ~/.fleet/ssh/cm-*` |
 
 ## Why
@@ -902,7 +927,7 @@ every machine, so no command has to survive multiple layers of quoting.
 
 ## Stack
 Bun + strict TypeScript. The CLI itself has zero runtime deps; the MCP server
-adds `@modelcontextprotocol/sdk` + `zod`. `bun run typecheck` to verify.
+adds `@modelcontextprotocol/server`, `@modelcontextprotocol/node` + `zod`. `bun run typecheck` to verify.
 
 ## Tool synchronization and deployment
 

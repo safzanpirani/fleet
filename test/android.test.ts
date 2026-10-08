@@ -1047,8 +1047,20 @@ describe("the controller's own adb", () => {
       const argvs: string[][] = [];
       const r = await androidWatch([h], { viewOnly: true }, { local: local([]), spawn: fakeSpawn(argvs) });
       expect(r.ok).toBe(true);
-      expect(argvs[0]).toEqual(expect.arrayContaining(["scrcpy", "-s", `127.0.0.1:${server.port}`, "--no-control"]));
+      expect(argvs[0]).toEqual(expect.arrayContaining(["scrcpy", "-s", `127.0.0.1:${server.port}`, "--no-control",
+        "--video-codec=h264", "--hwdec=auto"]));
     } finally { server.stop(true); }
+  });
+  test("watch and record refuse scrcpy older than 5.0 before touching the phone", async () => {
+    const calls: string[][] = [];
+    const base = local(calls);
+    const old = async (cmd: string[]) => cmd[0] === "scrcpy" ? { code: 0, stdout: "scrcpy 4.1 <https://github.com/Genymobile/scrcpy>\n", stderr: "" } : base(cmd);
+    const argvs: string[][] = [];
+    const r = await androidWatch([lan], {}, { local: old, spawn: fakeSpawn(argvs) });
+    expect(r).toMatchObject({ ok: false, detail: "scrcpy 4.1 is installed on this machine; fleet needs scrcpy 5.0 or later" });
+    expect((await androidRecordStart([lan], "x.mp4", {}, { local: old, spawn: fakeSpawn(argvs) })).ok).toBe(false);
+    expect(argvs).toEqual([]);
+    expect(calls.some((c) => c[0] === "ssh")).toBe(false);
   });
   test("an unreachable adb address is skipped without adb connect", async () => {
     const calls: string[][] = [];

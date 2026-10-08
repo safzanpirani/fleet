@@ -15,16 +15,16 @@
  * stdio rule: nothing but JSON-RPC may touch stdout. All diagnostics go to
  * stderr (console.error); the action layer in core.ts never prints.
  */
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { serveStdio } from "@modelcontextprotocol/server/stdio";
 import { loadConfig } from "./config.ts";
 import { buildServer } from "./server.ts";
 
 async function main() {
   const cfg = await loadConfig();
   const readOnly = process.env.FLEET_MCP_READONLY === "1";
-  const server = buildServer(cfg, { readOnly });
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
+  // serveStdio answers stateless 2026-07-28 requests and 2025-era initialize
+  // handshakes from the same factory.
+  serveStdio(() => buildServer(cfg, { readOnly }));
   console.error(`fleet-mcp (stdio) ready · ${Object.keys(cfg.hosts).length} hosts · `
     + `${Object.keys(cfg.recipes ?? {}).length} recipes${readOnly ? " · read-only" : ""}`);
 }

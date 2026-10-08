@@ -23,7 +23,9 @@
  */
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { timingSafeEqual } from "node:crypto";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { toNodeHandler } from "@modelcontextprotocol/node";
+import { NodeStreamableHTTPServerTransport } from "@modelcontextprotocol/node";
+import { createMcpHandler, isLegacyRequest } from "@modelcontextprotocol/server";
 import { loadConfig, type FleetConfig } from "./config.ts";
 import { buildServer } from "./server.ts";
 
@@ -98,6 +100,17 @@ export function createFleetHttpServer(
   const hostCount = Object.keys(cfg.hosts).length;
   const readOnly = opts.readOnly ?? false;
 
+  // Both eras are stateless, with a fresh server per request. 2026-07-28 calls
+  // go to the SDK's modern handler. 2025-era calls keep the v1 wiring, because
+  // the SDK's legacy leg always answers with SSE and existing clients expect JSON.
+  const modern = toNodeHandler(createMcpHandler(() => buildServer(cfg, { readOnly }), { legacy: "reject" }));
+  const legacy = async (req: IncomingMessage, res: ServerResponse, body: unknown) => {
+    const transport = new NodeStreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
+    const server = buildServer(cfg, { readOnly });
+    res.on("close", () => { void server.close().catch(() => {}); });
+    await server.connect(transport);
+    await transport.handleRequest(req, res, body);
+  };
   return createServer(async (req, res) => {
     let path: string;
     try { path = new URL(req.url ?? "/", "http://localhost").pathname; }
@@ -121,14 +134,12 @@ export function createFleetHttpServer(
           return sendJson(res, 405, { error: "method not allowed; POST to /mcp" }, { allow: "POST" });
         }
         const body = await readBody(req, limit);
-        const transport = new StreamableHTTPServerTransport({
-          sessionIdGenerator: undefined,   // stateless
-          enableJsonResponse: true,
+        const probe = new Request("http://localhost/mcp", {
+          method: "POST",
+          headers: { "content-type": "application/json", "mcp-protocol-version": String(req.headers["mcp-protocol-version"] ?? "") },
+          body: JSON.stringify(body),
         });
-        const server = buildServer(cfg, { readOnly });
-        res.on("close", () => { void server.close().catch(() => {}); });
-        await server.connect(transport);
-        await transport.handleRequest(req, res, body);
+        await (await isLegacyRequest(probe) ? legacy : modern)(req, res, body);
         return;
       }
 

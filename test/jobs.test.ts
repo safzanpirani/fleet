@@ -110,6 +110,18 @@ describe("killScript", () => {
   });
 });
 
+describe("Windows spawn", () => {
+  test("the job task runs under a headless conhost, so Windows Terminal opens no window", async () => {
+    const scripts: string[] = [];
+    const [r] = await spawnJob(cfg, "winbox", "Get-Date", {}, {
+      newId: () => "job-1",
+      exec: async (h, script) => { scripts.push(script); return { host: h.name, ok: true, code: 0, stdout: "OK job-1 42\n", stderr: "" }; },
+    });
+    expect(r).toMatchObject({ ok: true, pid: 42 });
+    expect(scripts[0]).toContain(`$action = ${ssh.psHiddenTaskAction("$psexe", "$arg")}`);
+  });
+});
+
 async function runBash(script: string, home: string): Promise<{ code: number; stdout: string; stderr: string }> {
   const proc = Bun.spawn(["bash"], {
     env: { ...process.env, HOME: home },

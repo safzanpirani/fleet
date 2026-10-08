@@ -5,6 +5,7 @@ import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:f
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { cuaFixture } from "./helpers/cua-driver.ts";
+import { helpText, overviewGroups } from "../src/help.ts";
 
 const cli = join(import.meta.dir, "../src/cli.ts");
 
@@ -248,6 +249,25 @@ describe("machine-readable CLI output", () => {
       }
       expect(await Bun.file(marker).exists()).toBe(false);
     } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test("help colours only on request and keeps the plain text", () => {
+    const strip = (s: string) => s.replace(/\x1b\[[\d;]*m/g, "");
+    for (const args of [[], ["jobs", "--help"], ["help", "cu"], ["help", "proxy"], ["help", "tools", "sync"]]) {
+      const plain = helpText(args)!;
+      expect(plain).not.toContain("\x1b[");
+      const painted = helpText(args, true)!;
+      expect(painted).toContain("\x1b[");
+      expect(strip(painted)).toBe(plain);
+    }
+  });
+
+  test("help overview lists every command once under a heading", () => {
+    const names = overviewGroups().flatMap(([, n]) => n);
+    expect(new Set(names).size).toBe(names.length);
+    expect(overviewGroups().some(([title]) => title === "Other")).toBe(false);
+    const text = helpText([])!;
+    for (const name of names) expect(text).toContain(`  fleet ${name}`);
   });
 
   test("exec payload help remains a remote argument", async () => {

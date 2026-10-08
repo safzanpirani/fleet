@@ -1764,11 +1764,18 @@ function portOpen(host: string, port: number, timeoutMs: number): Promise<boolea
   });
 }
 
+/** scrcpy 5.0 adds --hwdec (watch) and fixes a --time-limit data race
+ *  (record). An unparseable version is let through. */
+const SCRCPY_MIN_MAJOR = 5;
+
 async function firstNetworkSerial(hosts: Host[], run: LocalRun, need: string[]): Promise<{ host?: Host; serial?: string; why: string[] }> {
   const why: string[] = [];
   for (const tool of need) {
     const v = await run([tool, "--version"]).catch(() => ({ code: 127, stdout: "", stderr: "" }));
     if (v.code !== 0 && tool !== "adb") return { why: [`${tool} is not installed on this machine`] };
+    const scrcpyV = tool === "scrcpy" ? /scrcpy (\d+)\.(\d+)/.exec(v.stdout) : null;
+    if (scrcpyV && Number(scrcpyV[1]) < SCRCPY_MIN_MAJOR)
+      return { why: [`scrcpy ${scrcpyV[1]}.${scrcpyV[2]} is installed on this machine; fleet needs scrcpy ${SCRCPY_MIN_MAJOR}.0 or later`] };
     if (tool === "adb" && (await run(["adb", "version"]).catch(() => ({ code: 127 }))).code !== 0)
       return { why: ["adb is not installed on this machine"] };
   }
@@ -1799,8 +1806,10 @@ export async function androidWatch(
   const run = deps.local ?? localRun;
   const found = await firstNetworkSerial(hosts, run, ["adb", "scrcpy"]);
   if (!found.serial || !found.host) return { ok: false, detail: found.why.join("; ") };
+  // H.264 over H.265: lower latency for a live window. --hwdec=auto decodes on
+  // the GPU (VideoToolbox, D3D11VA, VA-API) and falls back to software.
   const proc = (deps.spawn ?? Bun.spawn)(["scrcpy", "-s", found.serial, "--no-audio", "--window-title", `fleet · ${found.host.name}`,
-    ...scrcpyQuality(found.host), ...(opts.viewOnly ? ["--no-control"] : [])],
+    "--video-codec=h264", "--hwdec=auto", ...scrcpyQuality(found.host), ...(opts.viewOnly ? ["--no-control"] : [])],
     { stdout: "ignore", stderr: "ignore", stdin: "ignore" });
   proc.unref();
   return { ok: true, host: found.host.name, serial: found.serial, pid: proc.pid,
@@ -1821,7 +1830,8 @@ const pidAlive = (pid: number) => { try { process.kill(pid, 0); return true; } c
 
 /** Record the phone's screen to an MP4 on this machine with scrcpy (no window).
  *  The phone's own screenrecord cannot be used: OxygenOS refuses its output
- *  file for adb's shell. */
+ *  file for adb's shell. Without playback scrcpy decodes nothing; it muxes the
+ *  phone's hardware-encoded H.264, which QuickTime plays. */
 export async function androidRecordStart(
   hosts: Host[], out: string, opts: { limitS?: number; bitRateMbps?: number } = {},
   deps: { local?: LocalRun; spawn?: typeof Bun.spawn; cacheDir?: string } = {},

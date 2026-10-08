@@ -34,6 +34,10 @@ import { format } from "node:util";
 import { loadConfig, resolveHosts } from "./config.ts";
 import { runWinSessionBroker } from "./winsession.ts";
 import { focusElements } from "./focus.ts";
+import {
+  androidTaskBackend, desktopTaskBackend, jevTransport, loadTaskKey, parseSubtask, runTask, stepDescription,
+  type TaskResult,
+} from "./task.ts";
 import { sessionStates, formatIdle } from "./session.ts";
 import type { FleetConfig, Host } from "./config.ts";
 import { helpText } from "./help.ts";
@@ -234,6 +238,110 @@ const ANDROID_USAGE = `usage (Android host):
     open and input verbs accept trailing --read FILTER (or '*') after their operands; --json includes the read
     TARGET is the package that must hold focus (a word in it matches), or "any".
     input flags: [--settle MS] [--shot] [--out FILE] [--json]`;
+
+/** Every value of a repeatable flag, in order. */
+function pullAll(rest: string[], flag: string): string[] {
+  const out: string[] = [];
+  for (let v = pullVal(rest, flag); v !== undefined; v = pullVal(rest, flag)) out.push(v);
+  return out;
+}
+
+/** `fleet cu <host> task`: hand a bounded subtask to Jev, which drives the
+ *  window through fleet's verified input until the criteria hold. */
+export async function cuTaskCommand(
+  cfg: FleetConfig, target: string, sel: string, rest: string[],
+  o: { settle: number; foreground: boolean; android: boolean },
+): Promise<number> {
+  const json = pullFlag(rest, "--json");
+  const dryRun = pullFlag(rest, "--dry-run");
+  const file = pullVal(rest, "--file");
+  const verify = pullAll(rest, "--verify");
+  const inputs = pullAll(rest, "--input");
+  const secretEnv = pullAll(rest, "--secret-env");
+  const constraints = pullAll(rest, "--constraint");
+  const allow = pullAll(rest, "--allow");
+  const shortcuts = pullAll(rest, "--shortcut");
+  const maxActions = pullVal(rest, "--max-actions");
+  const minConfidence = pullVal(rest, "--min-confidence");
+  const minMargin = pullVal(rest, "--min-margin");
+  const timeout = pullVal(rest, "--timeout");
+  const usage = `usage: fleet cu ${sel} task <TARGET> <GOAL> --verify TEXT [--verify TEXT…] [--input KEY=VALUE…] `
+    + "[--secret-env KEY=ENVVAR…] [--constraint TEXT…] [--allow delete|send|purchase|close…] [--shortcut CHORD=DESCRIPTION…] "
+    + "[--max-actions N]  |  task <TARGET> --file SUBTASK.json|-";
+  const q = rest[1];
+  if (!q || (file ? rest.length !== 2 : rest.length !== 3)) die(usage);
+  const pair = (flag: string, v: string): [string, string] => {
+    const i = v.indexOf("=");
+    if (i < 1) die(`${flag} needs KEY=VALUE (got '${v}')`);
+    return [v.slice(0, i), v.slice(i + 1)];
+  };
+  let raw: Record<string, unknown>;
+  if (file) {
+    if ([verify, inputs, secretEnv, constraints, allow, shortcuts].some((l) => l.length) || maxActions !== undefined)
+      die("--file holds the whole subtask; put verification, inputs and the rest in the JSON");
+    const source = file === "-" ? await Bun.stdin.text() : await readFile(file, "utf8");
+    try { raw = JSON.parse(source); } catch { die(`${file === "-" ? "stdin" : file} is not valid JSON`); }
+  } else {
+    const values: Record<string, string> = Object.fromEntries(inputs.map((v) => pair("--input", v)));
+    const secrets = secretEnv.map((v) => {
+      const [key, name] = pair("--secret-env", v);
+      const value = process.env[name];
+      if (value === undefined) die(`--secret-env ${key}: environment variable ${name} is not set`);
+      if (Object.hasOwn(values, key)) die(`input ${key} is given twice`);
+      values[key] = value!;
+      return key;
+    });
+    raw = {
+      goal: rest[2], verification: verify, inputs: values, constraints,
+      allowed_risks: allow.flatMap((a) => a.split(",")).map((a) => a.trim()).filter(Boolean),
+      shortcuts: Object.fromEntries(shortcuts.map((v) => pair("--shortcut", v))),
+      secret_inputs: secrets,
+      ...(maxActions !== undefined ? { max_actions: Number(maxActions) } : {}),
+    };
+  }
+  let task;
+  try { task = parseSubtask(raw!); } catch (error) { die(error instanceof Error ? error.message : String(error)); }
+  const fraction = (flag: string, v: string | undefined) => {
+    if (v === undefined) return undefined;
+    const n = Number(v);
+    if (!Number.isFinite(n) || n < 0 || n > 1) die(`${flag} must be a number from 0 to 1 (got '${v}')`);
+    return n;
+  };
+  if (timeout !== undefined && (!/^\d+$/.test(timeout) || Number(timeout) < 1)) die(`--timeout must be a positive integer in seconds (got '${timeout}')`);
+  const key = loadTaskKey();
+  if (!key) die("a task needs a TypeSafe key: set TYPESAFE_API_KEY, or name a JSON file with apiKey in FLEET_JEV_CONFIG");
+  const backend = o.android
+    ? androidTaskBackend(cfg, target, q, { settleMs: o.settle })
+    : desktopTaskBackend(cfg, target, q, { settleMs: o.settle, foreground: o.foreground });
+  let observed = false;
+  let r: TaskResult;
+  try {
+    r = await runTask(task!, backend, jevTransport(key!), {
+      dryRun, minConfidence: fraction("--min-confidence", minConfidence), minMargin: fraction("--min-margin", minMargin),
+      timeoutMs: timeout === undefined ? undefined : Number(timeout) * 1000,
+    }, (event) => {
+      // Progress goes to stderr, a line per step, so stdout stays the result.
+      if (event.kind === "observed" && !observed) {
+        observed = true;
+        const actionable = event.view.elements.filter((e) => e.actions.length).length;
+        console.error(A.d(`  ${event.view.application} · ${JSON.stringify(event.view.window)} · `
+          + `${event.view.elements.length} control(s), ${actionable} actionable`));
+      } else if (event.kind === "step") {
+        const s = event.record;
+        const mark = s.effect === "changed" ? A.g(s.effect) : s.effect === "no_change" ? A.y(s.effect) : A.d(s.effect);
+        console.error(`  ${s.step}. ${stepDescription(s)} → ${mark} ${A.d(`· jev ${s.jev_ms} ms · ${(s.elapsed_ms / 1000).toFixed(1)} s`)}`);
+      } else if (event.kind === "stale") console.error(A.y(`  stale: ${event.detail}; reading the window again`));
+    });
+  } catch (error) { die(error instanceof Error ? error.message : String(error)); }
+  if (json) { console.log(JSON.stringify({ host: target, ...r! })); return ["SUBTASK_COMPLETE", "DRY_RUN"].includes(r!.status) ? 0 : 1; }
+  const badge = r!.status === "SUBTASK_COMPLETE" ? A.g("●") : r!.status === "DRY_RUN" ? A.c("→") : r!.status === "NEEDS_INPUT" ? A.y("?") : A.r("✗");
+  console.log(`${badge} ${A.b(r!.status)} ${A.d(`· ${r!.actions_taken} action(s) · ${(r!.elapsed_ms / 1000).toFixed(1)} s · ${r!.jev_calls} Jev call(s)`)}`);
+  if (r!.reason) console.log(`  ${r!.reason}`);
+  if (r!.needs_input) console.log(`  needs a value for ${r!.needs_input.role ?? ""} ${JSON.stringify(r!.needs_input.name ?? r!.needs_input.element_id)}`
+    + (r!.needs_input.value ? A.d(` (now ${JSON.stringify(r!.needs_input.value)})`) : "") + A.d("; add it as an input and run again"));
+  if (r!.planned_action) console.log(A.d(`  ${JSON.stringify(r!.planned_action)}`));
+  return ["SUBTASK_COMPLETE", "DRY_RUN"].includes(r!.status) ? 0 : 1;
+}
 
 const androidStateLine = (s: AndroidState) =>
   `${s.pkg || "nothing"} focused` + (s.width ? ` · ${s.width}x${s.height}` : "")
@@ -746,7 +854,7 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
   let rest = applyProxyFlags(rest0, process.env, command);
   switch (command) {
     case undefined: case "help": case "-h": case "--help":
-      console.log(helpText(["help", ...rest]));
+      console.log(helpText(["help", ...rest], COLOR));
       return 0;
 
     case "ls": case "hosts": {
@@ -1404,6 +1512,14 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
         const phone = names.length > 0 && names.every((n) => cfg.hosts[n]?.android);
         die((error instanceof Error ? error.message : String(error))
           + (phone ? `\nif Termux's SSH server died, try: fleet cu ${sel} revive` : ""));
+      }
+      if (rest[0] === "task") {
+        const stray = [["--element", elementToken], ["--label", elementLabel], ["--role", elementRole], ["--nth", elementNth],
+          ["--region", regionText], ["--region-at", regionAt], ["--kind", regionKind], ["--out", out], ["--shot", wantShot || undefined],
+          ["--grid", grid || undefined], ["--space", spaceArg], ["--button", button], ["--probe", probeArg]]
+          .filter(([, v]) => v !== undefined).map(([f]) => f);
+        if (stray.length) die(`${stray.join(", ")} ${stray.length === 1 ? "does" : "do"} not apply to task; Jev picks the controls`);
+        return cuTaskCommand(cfg, target, sel, rest, { settle, foreground, android: isAndroidHost(cfg, target) });
       }
       if (isAndroidHost(cfg, target)) {
         const desktopOnly = [["--space", spaceArg], ["--button", button], ["--probe", probeArg], ["--element", elementToken],
@@ -2401,7 +2517,7 @@ if (import.meta.main) {
   // Internal byte pipes (ssh ProxyCommand, the Windows session broker) keep the stream.
   if (!command?.startsWith("__")) installSyncStdout();
   Promise.resolve().then(async () => {
-    const help = helpText(command ? [command, ...rest] : []);
+    const help = helpText(command ? [command, ...rest] : [], COLOR);
     if (help !== undefined) { console.log(help); return 0; }
     failurePhase = "config";
     const config = await loadConfig();

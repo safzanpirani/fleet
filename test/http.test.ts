@@ -1,8 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { request } from "node:http";
 import type { AddressInfo } from "node:net";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { createFleetHttpServer } from "../src/http.ts";
 import type { FleetConfig } from "../src/config.ts";
 
@@ -111,12 +110,34 @@ describe("Fleet HTTP transport", () => {
           expect(tools.some((tool) => tool.name === "fleet_exec")).toBe(!readOnly);
           expect(tools.some((tool) => tool.name === "fleet_wait")).toBe(true);
           if (readOnly) {
-            const denied = await client.callTool({ name: "fleet_exec", arguments: { selector: "fixture", command: "true" } });
-            expect(denied.isError).toBe(true);
-            expect(JSON.stringify(denied.content)).toContain("not found");
+            await expect(client.callTool({ name: "fleet_exec", arguments: { selector: "fixture", command: "true" } }))
+              .rejects.toThrow(/fleet_exec not found/);
           }
         } finally { await client.close(); }
       });
     }
+  });
+
+  test("serves stateless 2026-07-28 requests with a private tools/list cache hint", async () => {
+    await withServer({}, async (base, headers) => {
+      const meta = {
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientInfo": { name: "test", version: "0" },
+        "io.modelcontextprotocol/clientCapabilities": {},
+      };
+      const call = (id: number, method: string) => fetch(`${base}/mcp`, {
+        method: "POST",
+        headers: { ...headers, "mcp-protocol-version": "2026-07-28", "mcp-method": method },
+        body: JSON.stringify({ jsonrpc: "2.0", id, method, params: { _meta: meta } }),
+      });
+      const discover = await call(1, "server/discover");
+      expect(discover.status).toBe(200);
+      expect(await discover.json()).toMatchObject({ result: { supportedVersions: ["2026-07-28"] } });
+      const list = await call(2, "tools/list");
+      expect(list.status).toBe(200);
+      const body = await list.json() as { result: { tools: unknown[]; ttlMs: number; cacheScope: string } };
+      expect(body.result.tools.length).toBeGreaterThan(0);
+      expect(body.result).toMatchObject({ ttlMs: 3_600_000, cacheScope: "private" });
+    });
   });
 });

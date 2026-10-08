@@ -7,7 +7,7 @@
  */
 import { hostKeyOpts, resolveHosts, REPO_ROOT, lookupProxy, normalizeProxy, resolveProxy } from "./config.ts";
 import type { FleetConfig, Host, Service, ServiceType, Machine } from "./config.ts";
-import { connOpts, exec, probe, probeDetail, scp, scpPull, sshDiagnose, bashEsc, bashPathAssignment, psEsc } from "./ssh.ts";
+import { connOpts, exec, probe, probeDetail, scp, scpPull, sshDiagnose, bashEsc, bashPathAssignment, psEsc, psHiddenLaunch } from "./ssh.ts";
 import { checkProxy, proxyCommandFor } from "./proxy.ts";
 import type { ProxyCheck } from "./proxy.ts";
 import type { ExecResult, Shell, TransferOptions } from "./ssh.ts";
@@ -2086,7 +2086,9 @@ export async function deliverImage(
     let candidate = png;
     if (wantWebp && cwebp) {
       candidate = join(staging, "capture.webp");
-      const proc = Bun.spawn([cwebp, "-lossless", "-quiet", png, "-o", candidate], { stdout: "ignore", stderr: "pipe" });
+      // -z 0 is lossless at the fastest effort: about 13x faster than -lossless
+      // on a 3640x1920 desktop (0.17 s vs 2.2 s) for a file about 24% larger.
+      const proc = Bun.spawn([cwebp, "-z", "0", "-quiet", png, "-o", candidate], { stdout: "ignore", stderr: "pipe" });
       const [code, stderr] = await Promise.all([proc.exited, new Response(proc.stderr).text()]);
       if (code !== 0) return { result: { ...pull, ok: false, code, stderr: `cwebp failed: ${stderr}` }, path };
       await validateImageArtifact(candidate);
@@ -2326,6 +2328,7 @@ export interface CaptureTarget {
 const LINUX_CAPTURE_TIMEOUT_S = 20;
 
 export function captureCmd(os: Host["os"], target: CaptureTarget = {}): { cmd: string; shell: Shell } {
+  const hidden = psHiddenLaunch("$psexe", "$psarg");
   if (os === "windows") return { shell: "powershell", cmd: [
     // sshd runs in session 0 (no desktop), so a direct CopyFromScreen captures a
     // blank virtual screen. Run the grab inside the logged-in user's interactive
@@ -2339,6 +2342,18 @@ export function captureCmd(os: Host["os"], target: CaptureTarget = {}): { cmd: s
     `$code=0; $bmp=$null; $g=$null`,
     `$fleetOutput='${psEsc(target.winOutput ?? "")}'; $fleetRegion='${target.winRegion ? target.winRegion.join(",") : ""}'`,
     `try {`,
+    // Windows PowerShell is not DPI aware, so under display scaling Windows
+    // reports a shrunken screen and CopyFromScreen copies only its top-left
+    // part. Declare per-monitor awareness first. Reflection.Emit binds user32
+    // without the csc compile that Add-Type -MemberDefinition costs.
+    `  try {`,
+    `    $tb=[Reflection.Emit.AssemblyBuilder]::DefineDynamicAssembly((New-Object Reflection.AssemblyName 'FleetDpi'),'Run').DefineDynamicModule('FleetDpi').DefineType('FleetDpi','Public,Class')`,
+    `    $pinvoke={ param($name,$types) [void]$tb.DefinePInvokeMethod($name,'user32.dll','Public,Static,PinvokeImpl',[Reflection.CallingConventions]::Standard,[bool],$types,[Runtime.InteropServices.CallingConvention]::Winapi,[Runtime.InteropServices.CharSet]::Auto) }`,
+    `    & $pinvoke 'SetProcessDpiAwarenessContext' ([Type[]]@([IntPtr])); & $pinvoke 'SetProcessDPIAware' $null`,
+    `    $dpi=$tb.CreateType(); $aware=$false`,
+    `    try { $aware=$dpi::SetProcessDpiAwarenessContext([IntPtr](-4)) } catch {}`,
+    `    if (-not $aware) { [void]$dpi::SetProcessDPIAware() }`,
+    `  } catch {}`,
     `  Add-Type -AssemblyName System.Windows.Forms,System.Drawing`,
     `  $vs=[System.Windows.Forms.SystemInformation]::VirtualScreen`,
     `  $r=New-Object System.Drawing.Rectangle($vs.X,$vs.Y,$vs.Width,$vs.Height)`,
@@ -2372,13 +2387,20 @@ export function captureCmd(os: Host["os"], target: CaptureTarget = {}): { cmd: s
     `$created=$false; $captured=$false`,
     `try {`,
     `$psexe=(Get-Process -Id $PID).Path`,
-    `$action=New-ScheduledTaskAction -Execute $psexe -Argument ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $ps1 + '"')`,
-    `$principal=New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited`,
-    `Register-ScheduledTask -TaskName $tn -Action $action -Principal $principal -Force | Out-Null; $created=$true`,
-    `Start-ScheduledTask -TaskName $tn`,
+    `$psarg='-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $ps1 + '"'`,
+    // The Task Scheduler COM API registers, starts and deletes the task in
+    // milliseconds. The ScheduledTasks cmdlets load a CIM module first, and
+    // Stop-ScheduledTask waits on a task that has already finished.
+    `$svc=New-Object -ComObject Schedule.Service; $svc.Connect(); $root=$svc.GetFolder('\\')`,
+    `$def=$svc.NewTask(0)`,
+    `$def.Settings.DisallowStartIfOnBatteries=$false; $def.Settings.StopIfGoingOnBatteries=$false`,
+    `$act=$def.Actions.Create(0); $act.Path=${hidden.exe}; $act.Arguments=${hidden.args}`,
+    // 6 = create or update; 3 = run in the user's interactive session.
+    `$task=$root.RegisterTaskDefinition($tn,$def,6,$env:USERNAME,$null,3); $created=$true`,
+    `[void]$task.Run($null)`,
     `$deadline=(Get-Date).AddSeconds(12)`,
-    `while(-not (Test-Path -LiteralPath "$out.done") -and (Get-Date) -lt $deadline){ Start-Sleep -Milliseconds 200 }`,
-    `$taskResult=(Get-ScheduledTaskInfo -TaskName $tn -ErrorAction SilentlyContinue).LastTaskResult`,
+    `while(-not (Test-Path -LiteralPath "$out.done") -and (Get-Date) -lt $deadline){ Start-Sleep -Milliseconds 50 }`,
+    `$taskResult=$task.LastTaskResult`,
     `if(-not (Test-Path -LiteralPath "$out.done")){throw "capture task did not finish (task result $taskResult); is a user logged in interactively?"}`,
     `$captureCode=[IO.File]::ReadAllText("$out.done").Trim()`,
     `if($captureCode -ne '0'){ $detail=Get-Content -LiteralPath "$out.error" -Raw -ErrorAction SilentlyContinue; throw "capture task failed (exit $captureCode; task result $taskResult): $detail" }`,
@@ -2387,7 +2409,7 @@ export function captureCmd(os: Host["os"], target: CaptureTarget = {}): { cmd: s
     `Write-Output $out`,
     `exit 0`,
     `} catch { Write-Error $_ -ErrorAction Continue; exit 4 } finally {`,
-    `  if($created){ Stop-ScheduledTask -TaskName $tn -ErrorAction SilentlyContinue; Unregister-ScheduledTask -TaskName $tn -Confirm:$false -ErrorAction SilentlyContinue }`,
+    `  if($created){ if(-not $captured){ try { $task.Stop(0) } catch {} }; try { $root.DeleteTask($tn,0) } catch {} }`,
     `  Remove-Item -LiteralPath $ps1,"$out.done","$out.error" -Force -ErrorAction SilentlyContinue`,
     `  if(-not $captured){Remove-Item -LiteralPath $out -Force -ErrorAction SilentlyContinue}`,
     `}`,
@@ -2505,7 +2527,7 @@ export interface ScreenshotResult {
 /** Capture a screenshot on the first selected host and pull it to `localPath`. */
 export async function captureScreenshot(
   cfg: FleetConfig, sel: string, localPath: string,
-  deps: { exec?: typeof exec; deliver?: typeof deliverImage } = {},
+  deps: { exec?: typeof exec; deliver?: typeof deliverImage; pull?: typeof scpPull } = {},
   opts: { output?: string; region?: string; wake?: boolean } = {},
 ): Promise<ScreenshotResult> {
   const host = resolveHosts(cfg, sel)[0]!;
@@ -2520,14 +2542,20 @@ export async function captureScreenshot(
 
   // deliverImage normalizes the Windows path for scp and optionally transcodes
   // to webp locally; `path` is the actual file written (.webp or .png fallback).
+  // The remote file is deleted as soon as the pull ends, while the transcode runs.
+  const rm = rmCmd(host.os, remotePath);
+  let cleanup: Promise<unknown> | undefined;
+  const removeRemote = () => cleanup ??= run(host, rm.cmd, rm.shell).catch(() => {});
+  const pullThenRemove: typeof scpPull = async (...args) => {
+    try { return await (deps.pull ?? scpPull)(...args); } finally { void removeRemote(); }
+  };
   try {
-    const { result: pull, path } = await (deps.deliver ?? deliverImage)(host, remotePath, localPath);
+    const { result: pull, path } = await (deps.deliver ?? deliverImage)(host, remotePath, localPath, { pull: pullThenRemove });
     if (!pull.ok) throw new Error(`could not pull screenshot from ${host.name}: ${pull.stderr || "scp exit " + pull.code}`);
     await validateImageArtifact(path);
     return { host: host.name, localPath: path, remotePath, capture, pull };
   } finally {
-    const cleanup = rmCmd(host.os, remotePath);
-    await run(host, cleanup.cmd, cleanup.shell).catch(() => {});
+    await removeRemote();
   }
 }
 

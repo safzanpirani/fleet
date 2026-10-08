@@ -8,11 +8,12 @@
  * only when `readOnly` is false — the kill-switch (`FLEET_MCP_READONLY=1`)
  * makes them vanish from `tools/list`.
  */
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import { resolveHosts, type FleetConfig } from "./config.ts";
 import type { ExecResult } from "./ssh.ts";
 import { focusElements } from "./focus.ts";
+import { androidTaskBackend, desktopTaskBackend, jevTransport, loadTaskKey, parseSubtask, runTask, RISK_CATEGORIES } from "./task.ts";
 import { formatIdle, sessionStates } from "./session.ts";
 import {
   lsHosts, runExec, runScript, rebootRefusal, nestedShellNote, readScriptSource, editRemoteFile, pushFile, pullFile, restartService, serviceLogs, serviceTarget,
@@ -31,7 +32,7 @@ import { toolsStatus } from "./tools.ts";
 import { processList, processKill } from "./procs.ts";
 import type { KillResult } from "./procs.ts";
 import {
-  androidDoctor, androidElementsOf, androidShot, androidAct, androidOpen, androidApps, androidBootstrap,
+  isAndroidHost, androidDoctor, androidElementsOf, androidShot, androidAct, androidOpen, androidApps, androidBootstrap,
   androidBatch, androidFlow, androidInputText, androidKeycode, androidWait, androidRelease, androidNotifications,
   androidRecordStart, androidRecordStatus, androidRecordStop,
 } from "./android.ts";
@@ -101,7 +102,12 @@ export const MCP_WAIT_CAP_S = 120;
 export interface BuildOpts { readOnly?: boolean }
 
 export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
-  const server = new McpServer({ name: "fleet", version: "0.5.0" });
+  // The tool list is fixed per process but names hosts, groups, and recipes, so
+  // only the requesting client may cache it.
+  const server = new McpServer(
+    { name: "fleet", version: "0.5.0" },
+    { cacheHints: { "tools/list": { ttlMs: 3_600_000, cacheScope: "private" } } },
+  );
   const sel = selectorHelp(cfg);
   const recipeNames = Object.keys(cfg.recipes ?? {});
 
@@ -110,7 +116,7 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     title: "List fleet hosts",
     description: "Probe reachability of every configured host and list each host's OS, "
       + "ssh alias, GPU flag, and configured service names.",
-    inputSchema: {},
+    inputSchema: z.object({}),
     annotations: { readOnlyHint: true, openWorldHint: true },
   }, async () => {
     const rows = await lsHosts(cfg);
@@ -126,13 +132,13 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     title: "Read a service's recent logs",
     description: "Fetch recent logs / status for a configured service (journalctl on Linux, "
       + "Get-Service / schtasks query on Windows). Supply service for a configured alias, or unit and type for a literal native service.",
-    inputSchema: {
-      host: z.string().describe("Host name or selector. Reads every matched host defining this service; skips hosts without it."),
-      service: z.string().optional().describe("Configured service alias; mutually exclusive with unit/type."),
-      unit: z.string().optional().describe("Literal native service name; requires type."),
-      type: z.enum(["systemd", "systemd-user", "winservice", "nssm", "schtask"]).optional().describe("Native service backend; requires unit."),
-      lines: z.number().int().positive().optional().describe("How many log lines (default 30)."),
-    },
+    inputSchema: z.object({
+          host: z.string().describe("Host name or selector. Reads every matched host defining this service; skips hosts without it."),
+          service: z.string().optional().describe("Configured service alias; mutually exclusive with unit/type."),
+          unit: z.string().optional().describe("Literal native service name; requires type."),
+          type: z.enum(["systemd", "systemd-user", "winservice", "nssm", "schtask"]).optional().describe("Native service backend; requires unit."),
+          lines: z.number().int().positive().optional().describe("How many log lines (default 30)."),
+        }),
     annotations: { readOnlyHint: true, openWorldHint: true },
   }, async ({ host, service, unit, type, lines }) => {
     const target = serviceTarget(service, unit, type);
@@ -145,12 +151,12 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     description: "At-a-glance up/down status of one named service on every host that defines it "
       + "(systemd is-active / Get-Service / schtasks query). Answers \"is X running everywhere?\" "
       + "in one call. Supply service for a configured alias, or unit and type for a literal native service.",
-    inputSchema: {
-      service: z.string().optional().describe("Configured service alias; mutually exclusive with unit/type."),
-      unit: z.string().optional().describe("Literal native service name; requires type."),
-      type: z.enum(["systemd", "systemd-user", "winservice", "nssm", "schtask"]).optional().describe("Native service backend; requires unit."),
-      selector: z.string().optional().describe("Optional host selector to scope it (default: all)."),
-    },
+    inputSchema: z.object({
+          service: z.string().optional().describe("Configured service alias; mutually exclusive with unit/type."),
+          unit: z.string().optional().describe("Literal native service name; requires type."),
+          type: z.enum(["systemd", "systemd-user", "winservice", "nssm", "schtask"]).optional().describe("Native service backend; requires unit."),
+          selector: z.string().optional().describe("Optional host selector to scope it (default: all)."),
+        }),
     annotations: { readOnlyHint: true, openWorldHint: true },
   }, async ({ service, unit, type, selector }) => {
     const target = serviceTarget(service, unit, type);
@@ -163,9 +169,9 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     title: "List detached jobs",
     description: "List the detached background jobs (fleet spawn) across the fleet — each shows "
       + "host:id, status (starting/running/exited/dead), exit code, pid, and the command. " + sel,
-    inputSchema: {
-      selector: z.string().optional().describe("Optional host selector to scope the list (default: all)."),
-    },
+    inputSchema: z.object({
+          selector: z.string().optional().describe("Optional host selector to scope the list (default: all)."),
+        }),
     annotations: { readOnlyHint: true, openWorldHint: true },
   }, async ({ selector }) => {
     const errors: string[] = [];
@@ -184,12 +190,12 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     title: "Read a detached job's output",
     description: "Fetch the captured output of one detached job, addressed as host:id (from "
       + "fleet_jobs). Pass tail to get only the last N lines instead of the full log.",
-    inputSchema: {
-      ref: z.string().describe("Job reference: \"host:id\" (e.g. \"web:mr0gnez7-iqd8\")."),
-      tail: z.number().int().positive().optional().describe("Return only the last N lines (default: full log)."),
-      include: z.string().optional().describe("Case-sensitive target regex; include matches before tailing (default 40 lines with filters)."),
-      exclude: z.string().optional().describe("Case-sensitive target regex; exclude matches after inclusion."),
-    },
+    inputSchema: z.object({
+          ref: z.string().describe("Job reference: \"host:id\" (e.g. \"web:mr0gnez7-iqd8\")."),
+          tail: z.number().int().positive().optional().describe("Return only the last N lines (default: full log)."),
+          include: z.string().optional().describe("Case-sensitive target regex; include matches before tailing (default 40 lines with filters)."),
+          exclude: z.string().optional().describe("Case-sensitive target regex; exclude matches after inclusion."),
+        }),
     annotations: { readOnlyHint: true, openWorldHint: true },
   }, async ({ ref, tail, include, exclude }) => {
     const result = tail || include !== undefined || exclude !== undefined
@@ -202,7 +208,7 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     description: "For each host: whether the desktop is logged in, locked, or at the login screen, "
       + "who is on it, idle time where the desktop reports it, and which displays are powered off. "
       + "Check this before computer use or a screenshot. " + sel,
-    inputSchema: { selector: z.string().describe("Host selector.") },
+    inputSchema: z.object({ selector: z.string().describe("Host selector.") }),
     annotations: { readOnlyHint: true, openWorldHint: true },
   }, async ({ selector }) => {
     const states = await sessionStates(cfg, await routeSelector(cfg, selector));
@@ -218,11 +224,11 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     description: "Report which boot (OS) is currently live on a dual-boot machine, and the "
       + "reachability of each of its boots. Machines: "
       + (Object.keys(cfg.machines ?? {}).join(", ") || "none configured") + ".",
-    inputSchema: {
-      machine: z.string().describe("Dual-boot machine name."),
-      entries: z.boolean().optional().describe("List the UEFI boot entries from the live boot instead, "
-        + "with the boot each configured firmware label resolves to and entries off the first EFI partition."),
-    },
+    inputSchema: z.object({
+          machine: z.string().describe("Dual-boot machine name."),
+          entries: z.boolean().optional().describe("List the UEFI boot entries from the live boot instead, "
+            + "with the boot each configured firmware label resolves to and entries off the first EFI partition."),
+        }),
     annotations: { readOnlyHint: true, openWorldHint: true },
   }, async ({ machine, entries }) => {
     if (entries) {
@@ -243,7 +249,7 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     title: "GPU stats across the fleet",
     description: "Every GPU reported by the dashboard: utilisation, free VRAM, temperature, "
       + "power draw, and the currently loaded model (if any).",
-    inputSchema: {},
+    inputSchema: z.object({}),
     annotations: { readOnlyHint: true, openWorldHint: true },
   }, async () => {
     const rows = await gpuRows(cfg);
@@ -261,9 +267,9 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     description: "Free space per volume, queried live over ssh. Unlike `fleet_status` — which only "
       + "reports the boot volume (C:\\ or /) from the dashboard — this sees EVERY drive, so use it "
       + "for questions about secondary drives (D:, E:, external disks). Defaults to the whole fleet.",
-    inputSchema: {
-      selector: z.string().optional().describe(selectorHelp(cfg) + " Defaults to \"all\"."),
-    },
+    inputSchema: z.object({
+          selector: z.string().optional().describe(selectorHelp(cfg) + " Defaults to \"all\"."),
+        }),
     annotations: { readOnlyHint: true, openWorldHint: true },
   }, async ({ selector }) => {
     const sel = selector ?? "all";
@@ -284,12 +290,12 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       + "(% of one core), memory, age, owner, command line, the fleet job that started it, and whether "
       + "fleet_kill would refuse it. filter matches a process name (or a pid); the command line is never "
       + "searched. Without a filter the top 20 by cpu come back.",
-    inputSchema: {
-      selector: z.string().describe(selectorHelp(cfg)),
-      filter: z.string().optional().describe("Process name substring, or a pid."),
-      sort: z.enum(["cpu", "mem"]).optional(),
-      limit: z.number().int().positive().optional().describe("Rows per host (default 20 without a filter, all with one)."),
-    },
+    inputSchema: z.object({
+          selector: z.string().describe(selectorHelp(cfg)),
+          filter: z.string().optional().describe("Process name substring, or a pid."),
+          sort: z.enum(["cpu", "mem"]).optional(),
+          limit: z.number().int().positive().optional().describe("Rows per host (default 20 without a filter, all with one)."),
+        }),
     annotations: { readOnlyHint: true, openWorldHint: true },
   }, async ({ selector, filter, sort, limit }) => {
     const lists = await processList(cfg, await routeSelector(cfg, selector), { filter, sort, limit: limit ?? (filter ? undefined : 20) });
@@ -300,9 +306,9 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     title: "Live host stats",
     description: "Live CPU / memory / disk / GPU stats pulled from the dashboard, plus uptime "
       + "checks. Omit `host` for the whole fleet, or pass one host name to scope it.",
-    inputSchema: {
-      host: z.string().optional().describe("Optional single host name to scope the report."),
-    },
+    inputSchema: z.object({
+          host: z.string().optional().describe("Optional single host name to scope the report."),
+        }),
     annotations: { readOnlyHint: true, openWorldHint: true },
   }, async ({ host }) => {
     const { nodes, uptime } = await hostStatus(cfg, host);
@@ -324,10 +330,10 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     title: "List Daytona sandboxes",
     description: "Discover live Daytona sandboxes that can be addressed by the other tools as "
       + "`dt:<id|name|unique-prefix>`. Requires DAYTONA_API_KEY in the server environment.",
-    inputSchema: {
-      timeout: z.number().int().min(1).max(300).optional()
-        .describe("API deadline in seconds (default: DAYTONA_API_TIMEOUT_MS, capped here at 300s)."),
-    },
+    inputSchema: z.object({
+          timeout: z.number().int().min(1).max(300).optional()
+            .describe("API deadline in seconds (default: DAYTONA_API_TIMEOUT_MS, capped here at 300s)."),
+        }),
     annotations: { readOnlyHint: true, openWorldHint: true },
   }, async ({ timeout }) => {
     const boxes = await listSandboxes(timeout ? timeout * 1000 : undefined);
@@ -342,9 +348,9 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     title: "Diagnose host reachability",
     description: "Diagnose why one host is unreachable using an SSH handshake plus its configured "
       + "health URL, and return actionable failure hints. " + sel,
-    inputSchema: {
-      host: z.string().describe("Host, logical route, or dual-boot machine to diagnose."),
-    },
+    inputSchema: z.object({
+          host: z.string().describe("Host, logical route, or dual-boot machine to diagnose."),
+        }),
     annotations: { readOnlyHint: true, openWorldHint: true },
   }, async ({ host }) => {
     const d = await diagnose(cfg, host);
@@ -363,16 +369,16 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     description: "Poll until SSH, a TCP port, an HTTP status, or a dual-boot target becomes ready. "
       + `MCP waits are deliberately bounded; timeout is required and capped at ${MCP_WAIT_CAP_S}s. `
       + "For anything longer, call this repeatedly rather than asking for one long hold.",
-    inputSchema: {
-      target: z.string().describe("Host/machine for SSH, port, and boot waits; an informational label for HTTP waits."),
-      port: z.number().int().min(1).max(65535).optional().describe("Wait for this TCP port."),
-      http: z.string().url().optional().describe("Wait for this HTTP(S) URL."),
-      status: z.number().int().min(100).max(599).optional().describe("Expected HTTP status (default 200; requires http)."),
-      boot: z.string().optional().describe("Wait for a dual-boot machine to reach this OS label."),
-      timeout: z.number().int().min(1).max(MCP_WAIT_CAP_S)
-        .describe(`Required deadline in seconds (max ${MCP_WAIT_CAP_S}).`),
-      interval: z.number().int().min(1).max(60).optional().describe("Polling interval in seconds (default 3)."),
-    },
+    inputSchema: z.object({
+          target: z.string().describe("Host/machine for SSH, port, and boot waits; an informational label for HTTP waits."),
+          port: z.number().int().min(1).max(65535).optional().describe("Wait for this TCP port."),
+          http: z.string().url().optional().describe("Wait for this HTTP(S) URL."),
+          status: z.number().int().min(100).max(599).optional().describe("Expected HTTP status (default 200; requires http)."),
+          boot: z.string().optional().describe("Wait for a dual-boot machine to reach this OS label."),
+          timeout: z.number().int().min(1).max(MCP_WAIT_CAP_S)
+            .describe(`Required deadline in seconds (max ${MCP_WAIT_CAP_S}).`),
+          interval: z.number().int().min(1).max(60).optional().describe("Polling interval in seconds (default 3)."),
+        }),
     annotations: { readOnlyHint: true, openWorldHint: true },
   }, async ({ target, port, http, status, boot, timeout, interval }) => {
     const selected = [port != null, http != null, boot != null].filter(Boolean).length;
@@ -397,13 +403,13 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       + `deliberately bounded; timeout is required and capped at ${MCP_WAIT_CAP_S}s. A job that `
       + "outlives that may still be starting or running; call this again, or poll fleet_jobs / fleet_job_log. "
       + "Repeated missing-PID observations after the startup grace return launch-unconfirmed; the scheduler might still start it.",
-    inputSchema: {
-      ref: z.string().describe("Job reference: \"host:id\"."),
-      until: z.string().optional().describe("Resolve early when the job output matches this regex."),
-      timeout: z.number().int().min(1).max(MCP_WAIT_CAP_S)
-        .describe(`Required deadline in seconds (max ${MCP_WAIT_CAP_S}).`),
-      interval: z.number().int().min(1).max(60).optional().describe("Polling interval in seconds (default 3)."),
-    },
+    inputSchema: z.object({
+          ref: z.string().describe("Job reference: \"host:id\"."),
+          until: z.string().optional().describe("Resolve early when the job output matches this regex."),
+          timeout: z.number().int().min(1).max(MCP_WAIT_CAP_S)
+            .describe(`Required deadline in seconds (max ${MCP_WAIT_CAP_S}).`),
+          interval: z.number().int().min(1).max(60).optional().describe("Polling interval in seconds (default 3)."),
+        }),
     annotations: { readOnlyHint: true, openWorldHint: true },
   }, async ({ ref, until, timeout, interval }) => {
     const r = await waitJob(cfg, ref, undefined, {
@@ -428,10 +434,10 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       + "and which have drifted. Compares local source and skill fingerprints with the last "
       + "sync manifest. This does not verify the active launcher or detect edits after sync. "
       + "Missing, stale, and unreachable targets report an error.",
-    inputSchema: {
-      tool: z.string().optional().describe("Single registered tool name (default: all of them)."),
-      selector: z.string().optional().describe("Host selector (default: each tool's configured hosts)."),
-    },
+    inputSchema: z.object({
+          tool: z.string().optional().describe("Single registered tool name (default: all of them)."),
+          selector: z.string().optional().describe("Host selector (default: each tool's configured hosts)."),
+        }),
     annotations: { readOnlyHint: true, openWorldHint: true },
   }, async ({ tool, selector }) => {
     const known = Object.keys(cfg.tools ?? {});
@@ -453,10 +459,10 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     title: "List cua-driver tools",
     description: "Run cua-driver list-tools on a host and optionally filter its self-documented "
       + "tool list by a case-insensitive substring. " + sel,
-    inputSchema: {
-      host: z.string().describe("Host name or selector (first matched host is used)."),
-      filter: z.string().optional().describe("Case-insensitive substring matched against each output line."),
-    },
+    inputSchema: z.object({
+          host: z.string().describe("Host name or selector (first matched host is used)."),
+          filter: z.string().optional().describe("Case-insensitive substring matched against each output line."),
+        }),
     annotations: { readOnlyHint: true, openWorldHint: true },
   }, async ({ host, filter }) => {
     const r = await cuTools(cfg, await routeSelector(cfg, host), filter);
@@ -470,13 +476,13 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       + "full prose. Set forApp to ground the advice in one real window: the stock text tells "
       + "you to prefer element_index, which cannot resolve at all on a window whose "
       + "accessibility tree is empty. " + sel,
-    inputSchema: {
-      host: z.string().describe("Host name or selector (first matched host is used)."),
-      tool: z.string().min(1).describe("Exact cua-driver tool name."),
-      brief: z.boolean().optional().describe("Trim to name, summary, and field list."),
-      forApp: z.string().optional()
-        .describe("PID, window_id (w123), process name, app name, or window title to check element support against."),
-    },
+    inputSchema: z.object({
+          host: z.string().describe("Host name or selector (first matched host is used)."),
+          tool: z.string().min(1).describe("Exact cua-driver tool name."),
+          brief: z.boolean().optional().describe("Trim to name, summary, and field list."),
+          forApp: z.string().optional()
+            .describe("PID, window_id (w123), process name, app name, or window title to check element support against."),
+        }),
     annotations: { readOnlyHint: true, openWorldHint: true },
   }, async ({ host, tool, brief, forApp }) => {
     const target = await routeSelector(cfg, host);
@@ -506,14 +512,14 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       + "diagnosing what is actually on screen (a hung app, a dialog, a crashed UI). Captures the "
       + "active interactive session on Windows/mac; on Linux needs grim/scrot/imagemagick and a "
       + "reachable display. " + sel,
-    inputSchema: {
-      host: z.string().describe("Host name (or selector — first matched host is used)."),
-      grid: z.boolean().optional().describe("Overlay a labeled coordinate grid on the returned image."),
-      gridStep: z.number().int().positive().max(1000).optional().describe("Grid spacing in pixels (default 100)."),
-      output: z.string().optional().describe("One monitor: a connector name (DP-3), main, focused (Linux), or a 1-based index. Windows: main, an index, or DISPLAYn."),
-      region: z.string().optional().describe("Part of that monitor (main when output is omitted): top-left, top-right, bottom-left, bottom-right, top, bottom, left, right, center, or X,Y,W,H fractions."),
-      wake: z.boolean().optional().describe("Linux Wayland: switch powered-off monitors on for the capture and back off. Without it, a capture of an off monitor is refused."),
-    },
+    inputSchema: z.object({
+          host: z.string().describe("Host name (or selector — first matched host is used)."),
+          grid: z.boolean().optional().describe("Overlay a labeled coordinate grid on the returned image."),
+          gridStep: z.number().int().positive().max(1000).optional().describe("Grid spacing in pixels (default 100)."),
+          output: z.string().optional().describe("One monitor: a connector name (DP-3), main, focused (Linux), or a 1-based index. Windows: main, an index, or DISPLAYn."),
+          region: z.string().optional().describe("Part of that monitor (main when output is omitted): top-left, top-right, bottom-left, bottom-right, top, bottom, left, right, center, or X,Y,W,H fractions."),
+          wake: z.boolean().optional().describe("Linux Wayland: switch powered-off monitors on for the capture and back off. Without it, a capture of an off monitor is refused."),
+        }),
     annotations: { openWorldHint: true },
   }, async ({ host, grid, gridStep, output, region, wake }) => withTempImage("fleet-shot-", async (local) => {
     try {
@@ -537,18 +543,18 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       + "command verbatim, never pre-escape it. Command syntax is the TARGET's native shell: "
       + "bash for @linux/@mac, PowerShell for @windows (set wsl:true to run bash inside WSL on a "
       + "Windows box). " + sel,
-    inputSchema: {
-      selector: z.string().describe("Host selector, e.g. \"winbox\", \"@linux\", \"all\", \"vps,@gpu\"."),
-      command: z.string().optional().describe("Shell command, verbatim. Supply exactly one of command or argv."),
-      argv: z.array(z.string()).min(1).optional().describe("Literal program and arguments. Supply exactly one of command or argv."),
-      wsl: z.boolean().optional().describe("Run the command inside WSL bash on a Windows host."),
-      cwd: z.string().optional().describe("Working directory on the target (fails fast if missing)."),
-      timeout: z.number().int().positive().optional()
-        .describe("Wall-clock cap in seconds — a hung command returns exit 124 instead of blocking forever."),
-      sudo: z.boolean().optional().describe("Run as root (POSIX only). Passwordless sudo is used when it works; otherwise the password comes from the host's sudo.passwordFile/passwordEnv, sent over ssh stdin."),
-      confirmReboot: z.boolean().optional().describe("Required when the command looks like a reboot or power-off. Prefer fleet_switch or fleet_reboot."),
-      fresh: z.boolean().optional().describe("Open a new ssh login instead of reusing a shared connection (and skip the kept-open Windows session), e.g. after a group change such as usermod -aG docker."),
-    },
+    inputSchema: z.object({
+          selector: z.string().describe("Host selector, e.g. \"winbox\", \"@linux\", \"all\", \"vps,@gpu\"."),
+          command: z.string().optional().describe("Shell command, verbatim. Supply exactly one of command or argv."),
+          argv: z.array(z.string()).min(1).optional().describe("Literal program and arguments. Supply exactly one of command or argv."),
+          wsl: z.boolean().optional().describe("Run the command inside WSL bash on a Windows host."),
+          cwd: z.string().optional().describe("Working directory on the target (fails fast if missing)."),
+          timeout: z.number().int().positive().optional()
+            .describe("Wall-clock cap in seconds — a hung command returns exit 124 instead of blocking forever."),
+          sudo: z.boolean().optional().describe("Run as root (POSIX only). Passwordless sudo is used when it works; otherwise the password comes from the host's sudo.passwordFile/passwordEnv, sent over ssh stdin."),
+          confirmReboot: z.boolean().optional().describe("Required when the command looks like a reboot or power-off. Prefer fleet_switch or fleet_reboot."),
+          fresh: z.boolean().optional().describe("Open a new ssh login instead of reusing a shared connection (and skip the kept-open Windows session), e.g. after a group change such as usermod -aG docker."),
+        }),
     annotations: { openWorldHint: true },
   }, async ({ selector, command, argv, wsl, cwd, timeout, sudo, confirmReboot, fresh }) => {
     if ((command === undefined) === (argv === undefined)) return text("supply exactly one of command or argv", true);
@@ -567,7 +573,7 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     description: "Close fleet's shared ssh connection to each selected host, and stop a Windows "
       + "host's kept-open PowerShell session, so the next call logs in fresh (for example after "
       + "usermod -aG docker). fleet_exec with fresh: true does the same for one call. " + sel,
-    inputSchema: { selector: z.string().describe("Host selector.") },
+    inputSchema: z.object({ selector: z.string().describe("Host selector.") }),
     annotations: { openWorldHint: false, idempotentHint: true },
   }, async ({ selector }) => {
     const rows = await dropMasters(cfg, await routeSelector(cfg, selector));
@@ -627,20 +633,20 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       + "(the script text). The interpreter follows the extension — .py→python3, .sh→native "
       + "shell, .ps1→PowerShell, .js→node, .ts→bun — or set `interp` explicitly, which is "
       + "required when passing `source` without an `ext`. " + sel,
-    inputSchema: {
-      selector: z.string().describe("Host selector."),
-      path: z.string().optional().describe("Path to a LOCAL script file to run remotely."),
-      source: z.string().optional().describe("Script text, as an alternative to `path`."),
-      ext: z.string().optional().describe("Extension for `source` (e.g. '.py') to pick the interpreter."),
-      interp: z.string().optional().describe("Interpreter command, overriding the extension guess."),
-      cwd: z.string().optional().describe("Directory to run in (fails fast if missing)."),
-      wsl: z.boolean().optional().describe("Run inside WSL on a Windows host."),
-      timeoutSeconds: z.number().int().positive().optional().describe("Kill the script after N seconds."),
-      sudo: z.boolean().optional().describe("Run as root (POSIX only). Passwordless sudo is used when it works; otherwise the password comes from the host's sudo.passwordFile/passwordEnv, sent over ssh stdin."),
-      confirmReboot: z.boolean().optional().describe("Required when the command looks like a reboot or power-off. Prefer fleet_switch or fleet_reboot."),
-      fresh: z.boolean().optional().describe("Open a new ssh login instead of reusing a shared connection (and skip the kept-open Windows session), e.g. after a group change such as usermod -aG docker."),
-      args: z.array(z.string()).optional().describe("Positional arguments for the script: $1… in shells, $args or param() in PowerShell, argv elsewhere."),
-    },
+    inputSchema: z.object({
+          selector: z.string().describe("Host selector."),
+          path: z.string().optional().describe("Path to a LOCAL script file to run remotely."),
+          source: z.string().optional().describe("Script text, as an alternative to `path`."),
+          ext: z.string().optional().describe("Extension for `source` (e.g. '.py') to pick the interpreter."),
+          interp: z.string().optional().describe("Interpreter command, overriding the extension guess."),
+          cwd: z.string().optional().describe("Directory to run in (fails fast if missing)."),
+          wsl: z.boolean().optional().describe("Run inside WSL on a Windows host."),
+          timeoutSeconds: z.number().int().positive().optional().describe("Kill the script after N seconds."),
+          sudo: z.boolean().optional().describe("Run as root (POSIX only). Passwordless sudo is used when it works; otherwise the password comes from the host's sudo.passwordFile/passwordEnv, sent over ssh stdin."),
+          confirmReboot: z.boolean().optional().describe("Required when the command looks like a reboot or power-off. Prefer fleet_switch or fleet_reboot."),
+          fresh: z.boolean().optional().describe("Open a new ssh login instead of reusing a shared connection (and skip the kept-open Windows session), e.g. after a group change such as usermod -aG docker."),
+          args: z.array(z.string()).optional().describe("Positional arguments for the script: $1… in shells, $args or param() in PowerShell, argv elsewhere."),
+        }),
     annotations: { openWorldHint: true },
   }, async ({ selector, path, source, ext, interp, cwd, wsl, timeoutSeconds, sudo, confirmReboot, fresh, args }) => {
     if (!path && source === undefined) return text("give either `path` or `source`", true);
@@ -669,14 +675,14 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       + "path is passed verbatim (forward slashes and C:\\… both work on Windows OpenSSH). Pass an "
       + "array of paths to copy several files in one call — `remote` must then be an existing "
       + "directory. " + sel,
-    inputSchema: {
-      local: z.union([z.string(), z.array(z.string()).min(1)])
-        .describe("Path to the local file to push, or an array of paths (remote must be a directory)."),
-      selector: z.string().describe("Destination host selector."),
-      remote: z.string().describe("Remote destination path."),
-      recursive: z.boolean().optional().describe("Recursively copy a directory."),
-      resume: z.boolean().optional().describe("Copy with rsync --partial; repeat the call after an interruption to continue. POSIX hosts only."),
-    },
+    inputSchema: z.object({
+          local: z.union([z.string(), z.array(z.string()).min(1)])
+            .describe("Path to the local file to push, or an array of paths (remote must be a directory)."),
+          selector: z.string().describe("Destination host selector."),
+          remote: z.string().describe("Remote destination path."),
+          recursive: z.boolean().optional().describe("Recursively copy a directory."),
+          resume: z.boolean().optional().describe("Copy with rsync --partial; repeat the call after an interruption to continue. POSIX hosts only."),
+        }),
     annotations: { openWorldHint: true },
   }, async ({ local, selector, remote, recursive, resume }) => {
     const results = await pushFile(cfg, local, await routeSelector(cfg, selector), remote, recursive, { resume });
@@ -692,14 +698,14 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     description: "Pull one or more remote files or directories to the MCP server's local filesystem. "
       + "Exactly one source host must match. Pass an array of remote paths to pull several in one "
       + "call — `local` must then be an existing directory. Daytona downloads are supported. " + sel,
-    inputSchema: {
-      selector: z.string().describe("Single source host selector."),
-      remote: z.union([z.string(), z.array(z.string()).min(1)])
-        .describe("Remote source path, or an array of paths (local must be a directory)."),
-      local: z.string().describe("Destination path on the MCP server/controller."),
-      recursive: z.boolean().optional().describe("Recursively copy a directory."),
-      resume: z.boolean().optional().describe("Copy with rsync --partial; repeat the call after an interruption to continue. POSIX hosts only."),
-    },
+    inputSchema: z.object({
+          selector: z.string().describe("Single source host selector."),
+          remote: z.union([z.string(), z.array(z.string()).min(1)])
+            .describe("Remote source path, or an array of paths (local must be a directory)."),
+          local: z.string().describe("Destination path on the MCP server/controller."),
+          recursive: z.boolean().optional().describe("Recursively copy a directory."),
+          resume: z.boolean().optional().describe("Copy with rsync --partial; repeat the call after an interruption to continue. POSIX hosts only."),
+        }),
     annotations: { openWorldHint: true },
   }, async ({ selector, remote, local, recursive, resume }) => {
     const r = await pullFile(cfg, await routeSelector(cfg, selector), remote, local, recursive, { resume });
@@ -718,17 +724,17 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       + "system is true. Sends a polite stop (SIGTERM / taskkill), waits grace seconds, and with force kills "
       + "survivors. Processes no fleet job started are refused unless confirm_foreign is true: ask the user "
       + "first. Returns each pid's outcome: exited, killed, running, denied, gone, or changed (pid reused).",
-    inputSchema: {
-      selector: z.string().describe(selectorHelp(cfg)),
-      target: z.string().describe("A pid, comma-separated pids, or a process name."),
-      tree: z.boolean().optional().describe("Also stop every descendant, children first."),
-      force: z.boolean().optional().describe("SIGKILL / Stop-Process -Force whatever survives the polite stop."),
-      all: z.boolean().optional().describe("Stop every process a name matches."),
-      system: z.boolean().optional().describe("Lift the system-process guard."),
-      grace: z.number().min(0).max(120).optional().describe("Seconds to wait for a polite exit (default 5)."),
-      dry_run: z.boolean().optional().describe("Resolve and return the plan; signal nothing."),
-      confirm_foreign: z.boolean().optional().describe("Required to stop processes no fleet job started."),
-    },
+    inputSchema: z.object({
+          selector: z.string().describe(selectorHelp(cfg)),
+          target: z.string().describe("A pid, comma-separated pids, or a process name."),
+          tree: z.boolean().optional().describe("Also stop every descendant, children first."),
+          force: z.boolean().optional().describe("SIGKILL / Stop-Process -Force whatever survives the polite stop."),
+          all: z.boolean().optional().describe("Stop every process a name matches."),
+          system: z.boolean().optional().describe("Lift the system-process guard."),
+          grace: z.number().min(0).max(120).optional().describe("Seconds to wait for a polite exit (default 5)."),
+          dry_run: z.boolean().optional().describe("Resolve and return the plan; signal nothing."),
+          confirm_foreign: z.boolean().optional().describe("Required to stop processes no fleet job started."),
+        }),
     annotations: { destructiveHint: true, openWorldHint: true },
   }, async ({ selector, target, tree, force, all, system, grace, dry_run, confirm_foreign }) => {
     const opts = { tree, force, all, system, graceS: grace };
@@ -750,12 +756,12 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     description: "Restart a service that is defined in the host's config (systemd / Windows "
       + "service / scheduled task — the right restart verb is chosen automatically). Use fleet_ls "
       + "to see configured aliases, or supply unit and type for a literal native service.",
-    inputSchema: {
-      host: z.string().describe("Host name or selector. Restarts every matched host defining this service; skips hosts without it."),
-      service: z.string().optional().describe("Configured service alias; mutually exclusive with unit/type."),
-      unit: z.string().optional().describe("Literal native service name; requires type."),
-      type: z.enum(["systemd", "systemd-user", "winservice", "nssm", "schtask"]).optional().describe("Native service backend; requires unit."),
-    },
+    inputSchema: z.object({
+          host: z.string().describe("Host name or selector. Restarts every matched host defining this service; skips hosts without it."),
+          service: z.string().optional().describe("Configured service alias; mutually exclusive with unit/type."),
+          unit: z.string().optional().describe("Literal native service name; requires type."),
+          type: z.enum(["systemd", "systemd-user", "winservice", "nssm", "schtask"]).optional().describe("Native service backend; requires unit."),
+        }),
     annotations: { destructiveHint: true, openWorldHint: true },
   }, async ({ host, service, unit, type }) => {
     const target = serviceTarget(service, unit, type);
@@ -771,16 +777,16 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       + "fleet_job_log. Use this instead of fleet_exec for anything that takes more than a few "
       + "seconds. Works on Linux (setsid), macOS (nohup), and Windows (interactive Scheduled Task → sees the "
       + "GPU). Command syntax is the target's native shell. " + sel,
-    inputSchema: {
-      selector: z.string().describe("Host selector (a dual-boot machine name auto-routes to its live OS)."),
-      command: z.string().describe("Command to run, verbatim. Quotes/pipes/$ round-trip as-is."),
-      cwd: z.string().optional().describe("Working directory to run in (fails fast if missing)."),
-      label: z.string().optional().describe("Optional human-readable label prefixed onto the job id."),
-      wsl: z.boolean().optional().describe("Windows hosts only: run the command in bash inside WSL, so its redirects and paths are Linux ones."),
-      elevated: z.boolean().optional().describe("Windows hosts only: run the job with the administrator token (needed by storage/CIM cmdlets such as Resize-Partition)."),
-      confirmReboot: z.boolean().optional().describe("Required when the command looks like a reboot or power-off."),
-      fresh: z.boolean().optional().describe("Open a new ssh login instead of reusing a shared connection (and skip the kept-open Windows session), e.g. after a group change such as usermod -aG docker."),
-    },
+    inputSchema: z.object({
+          selector: z.string().describe("Host selector (a dual-boot machine name auto-routes to its live OS)."),
+          command: z.string().describe("Command to run, verbatim. Quotes/pipes/$ round-trip as-is."),
+          cwd: z.string().optional().describe("Working directory to run in (fails fast if missing)."),
+          label: z.string().optional().describe("Optional human-readable label prefixed onto the job id."),
+          wsl: z.boolean().optional().describe("Windows hosts only: run the command in bash inside WSL, so its redirects and paths are Linux ones."),
+          elevated: z.boolean().optional().describe("Windows hosts only: run the job with the administrator token (needed by storage/CIM cmdlets such as Resize-Partition)."),
+          confirmReboot: z.boolean().optional().describe("Required when the command looks like a reboot or power-off."),
+          fresh: z.boolean().optional().describe("Open a new ssh login instead of reusing a shared connection (and skip the kept-open Windows session), e.g. after a group change such as usermod -aG docker."),
+        }),
     annotations: { openWorldHint: true },
   }, async ({ selector, command, cwd, label, wsl, elevated, confirmReboot, fresh }) => {
     const refusal = confirmReboot ? null : rebootRefusal(command, "confirmReboot: true");
@@ -795,9 +801,9 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
   server.registerTool("fleet_job_kill", {
     title: "Kill a detached job",
     description: "Terminate one detached job (and its whole process tree), addressed as host:id.",
-    inputSchema: {
-      ref: z.string().describe("Job reference: \"host:id\"."),
-    },
+    inputSchema: z.object({
+          ref: z.string().describe("Job reference: \"host:id\"."),
+        }),
     annotations: { destructiveHint: true, openWorldHint: true },
   }, async ({ ref }) => {
     const r = await killJob(cfg, ref);
@@ -808,10 +814,10 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     title: "Prune detached job spools",
     description: "Delete completed job spools. With includeDead:true, also delete dead/stale "
       + "spools. Running jobs are always preserved. " + sel,
-    inputSchema: {
-      selector: z.string().optional().describe("Host selector (default: all)."),
-      includeDead: z.boolean().optional().describe("Also remove dead/stale spools (default false)."),
-    },
+    inputSchema: z.object({
+          selector: z.string().optional().describe("Host selector (default: all)."),
+          includeDead: z.boolean().optional().describe("Also remove dead/stale spools (default false)."),
+        }),
     annotations: { destructiveHint: true, openWorldHint: true },
   }, async ({ selector, includeDead }) => {
     const rows = await pruneJobs(
@@ -829,11 +835,11 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     title: "Reboot whole machine(s)",
     description: "Reboot every host the selector resolves to (the OS, not a service). This drops "
       + "the connection. A dual-boot machine name auto-routes to its live OS. " + sel,
-    inputSchema: {
-      selector: z.string().describe("Host selector to reboot."),
-      wait: z.boolean().optional().describe("Observe the host go down and return before reporting ready."),
-      timeout: z.number().int().positive().optional().describe("Observation deadline in seconds (default 300); requires wait."),
-    },
+    inputSchema: z.object({
+          selector: z.string().describe("Host selector to reboot."),
+          wait: z.boolean().optional().describe("Observe the host go down and return before reporting ready."),
+          timeout: z.number().int().positive().optional().describe("Observation deadline in seconds (default 300); requires wait."),
+        }),
     annotations: { destructiveHint: true, openWorldHint: true },
   }, async ({ selector, wait, timeout }) => {
     if (timeout !== undefined && !wait) return text("timeout requires wait", true);
@@ -848,9 +854,9 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     title: "Reboot machine(s) into firmware setup",
     description: "Reboot Windows UEFI or systemd Linux hosts directly into BIOS/UEFI firmware "
       + "setup. macOS hosts are reported as unsupported. This drops the connection. " + sel,
-    inputSchema: {
-      selector: z.string().describe("Host selector to reboot into firmware setup."),
-    },
+    inputSchema: z.object({
+          selector: z.string().describe("Host selector to reboot into firmware setup."),
+        }),
     annotations: { destructiveHint: true, openWorldHint: true },
   }, async ({ selector }) => {
     const actions = await firmwareRebootHosts(cfg, await routeSelector(cfg, selector));
@@ -867,14 +873,14 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       + "went down, then wait until the target answers. Returns every phase. On a timeout it says which "
       + "OS the machine came back in. dryRun shows the plan without rebooting. Machines: "
       + (Object.keys(cfg.machines ?? {}).join(", ") || "none") + ".",
-    inputSchema: {
-      machine: z.string().describe("Dual-boot machine name."),
-      to: z.string().describe("Target OS/boot label to switch into."),
-      wait: z.boolean().optional().describe("Wait until the target boot is reachable (default true)."),
-      dryRun: z.boolean().optional().describe("Resolve the trigger (and the firmware entry) without rebooting."),
-      timeout: z.number().int().min(1).max(3600).optional()
-        .describe("Arrival deadline in seconds (default 300, max 3600)."),
-    },
+    inputSchema: z.object({
+          machine: z.string().describe("Dual-boot machine name."),
+          to: z.string().describe("Target OS/boot label to switch into."),
+          wait: z.boolean().optional().describe("Wait until the target boot is reachable (default true)."),
+          dryRun: z.boolean().optional().describe("Resolve the trigger (and the firmware entry) without rebooting."),
+          timeout: z.number().int().min(1).max(3600).optional()
+            .describe("Arrival deadline in seconds (default 300, max 3600)."),
+        }),
     annotations: { destructiveHint: true, openWorldHint: true },
   }, async ({ machine, to, wait, dryRun, timeout }) => {
     const r = await switchMachine(cfg, machine, to, {
@@ -894,10 +900,10 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     description: "Verify the host's configured Chrome DevTools Protocol endpoint, optionally open "
       + "one URL in a new tab, and return the endpoint plus current target list. This only resolves "
       + "and attaches to CDP. Use cua-driver browser_* tools for page interaction. " + sel,
-    inputSchema: {
-      host: z.string().describe("Host with a cdp field in fleet.config.json."),
-      url: z.string().optional().describe("URL to open through PUT /json/new before listing targets."),
-    },
+    inputSchema: z.object({
+          host: z.string().describe("Host with a cdp field in fleet.config.json."),
+          url: z.string().optional().describe("URL to open through PUT /json/new before listing targets."),
+        }),
     annotations: { openWorldHint: true },
   }, async ({ host, url }) => {
     try {
@@ -913,11 +919,11 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     description: "Start, stop, or inspect cua-driver trajectory recording. Start uses out as the "
       + "remote recording directory. Stop uses out as a local controller directory "
       + "and pulls the finalized artifacts through Fleet's file-pull path. " + sel,
-    inputSchema: {
-      host: z.string().describe("Host name or selector (first matched host is used)."),
-      action: z.enum(["start", "stop", "status"]),
-      out: z.string().optional().describe("Remote directory for start; local controller directory for stop."),
-    },
+    inputSchema: z.object({
+          host: z.string().describe("Host name or selector (first matched host is used)."),
+          action: z.enum(["start", "stop", "status"]),
+          out: z.string().optional().describe("Remote directory for start; local controller directory for stop."),
+        }),
     annotations: { openWorldHint: true },
   }, async ({ host, action, out }) => {
     try {
@@ -946,14 +952,14 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       + "[\"click\",\"{\\\"pid\\\":1234,\\\"window_id\\\":5,\\\"x\\\":100,\\\"y\\\":200}\"], or "
       + "[\"install\"] to install it. Set image:true for screen/window-capture calls to get the "
       + "PNG back. Needs a logged-in interactive desktop on the target. " + sel,
-    inputSchema: {
-      host: z.string().describe("Host name (or selector — first matched host is used, except "
-        + "for args:[\"install\"], which installs on every host the selector resolves to)."),
-      args: z.array(z.string()).describe("cua-driver CLI args, verbatim (tool name + JSON arg)."),
-      image: z.boolean().optional().describe("True if the call captures a screenshot/window image."),
-      grid: z.boolean().optional().describe("Overlay a labeled coordinate grid on the returned image."),
-      gridStep: z.number().int().positive().max(1000).optional().describe("Grid spacing in pixels (default 100)."),
-    },
+    inputSchema: z.object({
+          host: z.string().describe("Host name (or selector — first matched host is used, except "
+            + "for args:[\"install\"], which installs on every host the selector resolves to)."),
+          args: z.array(z.string()).describe("cua-driver CLI args, verbatim (tool name + JSON arg)."),
+          image: z.boolean().optional().describe("True if the call captures a screenshot/window image."),
+          grid: z.boolean().optional().describe("Overlay a labeled coordinate grid on the returned image."),
+          gridStep: z.number().int().positive().max(1000).optional().describe("Grid spacing in pixels (default 100)."),
+        }),
     annotations: { openWorldHint: true },
   }, async ({ host, args, image, grid, gridStep }) => {
     if (args[0] === "install") {
@@ -983,11 +989,11 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     title: "List desktop applications",
     description: "List applications visible to cua-driver on the target's active desktop, "
       + "optionally filtered by name. " + sel,
-    inputSchema: {
-      host: z.string().describe("Host name or selector (first matched host is used)."),
-      filter: z.string().optional().describe("Case-insensitive app-name substring."),
-      all: z.boolean().optional().describe("Linux: include processes that own no window (kernel threads, daemons)."),
-    },
+    inputSchema: z.object({
+          host: z.string().describe("Host name or selector (first matched host is used)."),
+          filter: z.string().optional().describe("Case-insensitive app-name substring."),
+          all: z.boolean().optional().describe("Linux: include processes that own no window (kernel threads, daemons)."),
+        }),
     annotations: { openWorldHint: true },
   }, async ({ host, filter, all }) => {
     const { apps, result, hidden } = await cuApps(cfg, await routeSelector(cfg, host), filter, { all });
@@ -1005,11 +1011,11 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       + "and any window sitting ABOVE it. A window above the target is usually a modal dialog, "
       + "and it silently swallows every click and keystroke aimed at the window underneath. "
       + "Omit app to list every top-level window on the desktop. " + sel,
-    inputSchema: {
-      host: z.string().describe("Host name or selector (first matched host is used)."),
-      app: z.string().optional()
-        .describe("PID, window_id (w123), process name (Playnite.DesktopApp[.exe]), app name, or window title."),
-    },
+    inputSchema: z.object({
+          host: z.string().describe("Host name or selector (first matched host is used)."),
+          app: z.string().optional()
+            .describe("PID, window_id (w123), process name (Playnite.DesktopApp[.exe]), app name, or window title."),
+        }),
     annotations: { openWorldHint: true },
   }, async ({ host, app }) => {
     const target = await routeSelector(cfg, host);
@@ -1049,17 +1055,17 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       + "image carries a caption stating the exact coordinate frame (pid, window_id, origin) that "
       + "its numbers are in. Use probe to draw a crosshair where a click at those coordinates "
       + "would actually land, without clicking. " + sel,
-    inputSchema: {
-      host: z.string().describe("Host name or selector (first matched host is used)."),
-      app: z.string().describe("PID, window_id (w123), process name (Playnite.DesktopApp[.exe]), app name, or window title."),
-      grid: z.boolean().optional().describe("Overlay a labeled coordinate grid on the returned image."),
-      gridStep: z.number().int().positive().max(1000).optional().describe("Grid spacing in pixels (default 100)."),
-      probe: z.object({ x: z.number(), y: z.number() }).optional()
-        .describe("Draw a crosshair where a click at this point would land. Verifies aim without clicking."),
-      space: z.enum(["window", "screen"]).optional()
-        .describe("Coordinate frame of probe. window (default) = pixels in this capture; screen = desktop pixels."),
-      composite: z.boolean().optional().describe("Set false to capture the target window alone (default true)."),
-    },
+    inputSchema: z.object({
+          host: z.string().describe("Host name or selector (first matched host is used)."),
+          app: z.string().describe("PID, window_id (w123), process name (Playnite.DesktopApp[.exe]), app name, or window title."),
+          grid: z.boolean().optional().describe("Overlay a labeled coordinate grid on the returned image."),
+          gridStep: z.number().int().positive().max(1000).optional().describe("Grid spacing in pixels (default 100)."),
+          probe: z.object({ x: z.number(), y: z.number() }).optional()
+            .describe("Draw a crosshair where a click at this point would land. Verifies aim without clicking."),
+          space: z.enum(["window", "screen"]).optional()
+            .describe("Coordinate frame of probe. window (default) = pixels in this capture; screen = desktop pixels."),
+          composite: z.boolean().optional().describe("Set false to capture the target window alone (default true)."),
+        }),
     annotations: { openWorldHint: true },
   }, async ({ host, app, grid, gridStep, probe, space, composite }) =>
     withTempImage("fleet-cua-window-", async (local) => {
@@ -1108,34 +1114,34 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       + "on a background window, and an ambiguous label is refused with the candidates listed. "
       + "A reply saying the input was not delivered fails the call; retry with "
       + "args.delivery_mode \"foreground\". " + sel,
-    inputSchema: {
-      host: z.string().describe("Host name or selector (first matched host is used)."),
-      app: z.string().describe("PID, window_id (w123), process name, app name, or window title."),
-      tool: z.string().describe("cua-driver input tool: click, press_key, type_text, scroll, hotkey, …"),
-      args: z.record(z.string(), z.any()).optional()
-        .describe("Tool arguments WITHOUT pid/window_id/target or from_zoom. Fleet supplies the target and checks x/y and drag endpoints."),
-      x: z.number().optional().describe("Pixel X, validated and translated into window-local space."),
-      y: z.number().optional().describe("Pixel Y, validated and translated into window-local space."),
-      element: z.object({
-        token: z.string().optional().describe("element_token from fleet_cu_elements (no lookup needed)."),
-        label: z.string().optional().describe("Control label: exact match first, then substring, case-insensitive."),
-        role: z.string().optional().describe("Control role to narrow a label match: Button, Edit, MenuItem, CheckBox, …"),
-        nth: z.number().int().min(1).optional().describe("1-based pick among several matches."),
-      }).strict().optional().describe("Address a control by accessibility instead of x/y."),
-      region: z.object({
-        text: z.string().optional().describe("OCR text of the region: exact match first, then substring, case-insensitive."),
-        at: z.object({ x: z.number().int().min(0), y: z.number().int().min(0) }).strict().optional()
-          .describe("A point inside the region in capture pixels, such as a center from fleet_cu_regions; the smallest region containing it in a fresh parse is clicked. Region ids and OCR text change between parses, so name a listed region by its point."),
-        kind: z.enum(["text", "icon"]).optional().describe("Keep only this kind of region."),
-        nth: z.number().int().min(1).optional().describe("1-based pick among several matches."),
-      }).strict().optional().describe("Click, right_click or double_click a Cua Perception region: fleet captures, parses, picks one region and clicks its center bound to that capture, in one driver session. For windows with no accessibility tree. Needs the cua-perception extension on the host."),
-      space: z.enum(["window", "screen"]).optional()
-        .describe("Frame for all coordinates, including args.from_x/from_y/to_x/to_y. window (default) = shot-window pixels; screen = desktop."),
-      settleMs: z.number().int().min(0).max(10000).optional()
-        .describe("Wait before the after-capture (default 400)."),
-      screenshot: z.boolean().optional().describe("Return the after image."),
-      grid: z.boolean().optional().describe("Overlay the coordinate grid on the after image."),
-    },
+    inputSchema: z.object({
+          host: z.string().describe("Host name or selector (first matched host is used)."),
+          app: z.string().describe("PID, window_id (w123), process name, app name, or window title."),
+          tool: z.string().describe("cua-driver input tool: click, press_key, type_text, scroll, hotkey, …"),
+          args: z.record(z.string(), z.any()).optional()
+            .describe("Tool arguments WITHOUT pid/window_id/target or from_zoom. Fleet supplies the target and checks x/y and drag endpoints."),
+          x: z.number().optional().describe("Pixel X, validated and translated into window-local space."),
+          y: z.number().optional().describe("Pixel Y, validated and translated into window-local space."),
+          element: z.object({
+            token: z.string().optional().describe("element_token from fleet_cu_elements (no lookup needed)."),
+            label: z.string().optional().describe("Control label: exact match first, then substring, case-insensitive."),
+            role: z.string().optional().describe("Control role to narrow a label match: Button, Edit, MenuItem, CheckBox, …"),
+            nth: z.number().int().min(1).optional().describe("1-based pick among several matches."),
+          }).strict().optional().describe("Address a control by accessibility instead of x/y."),
+          region: z.object({
+            text: z.string().optional().describe("OCR text of the region: exact match first, then substring, case-insensitive."),
+            at: z.object({ x: z.number().int().min(0), y: z.number().int().min(0) }).strict().optional()
+              .describe("A point inside the region in capture pixels, such as a center from fleet_cu_regions; the smallest region containing it in a fresh parse is clicked. Region ids and OCR text change between parses, so name a listed region by its point."),
+            kind: z.enum(["text", "icon"]).optional().describe("Keep only this kind of region."),
+            nth: z.number().int().min(1).optional().describe("1-based pick among several matches."),
+          }).strict().optional().describe("Click, right_click or double_click a Cua Perception region: fleet captures, parses, picks one region and clicks its center bound to that capture, in one driver session. For windows with no accessibility tree. Needs the cua-perception extension on the host."),
+          space: z.enum(["window", "screen"]).optional()
+            .describe("Frame for all coordinates, including args.from_x/from_y/to_x/to_y. window (default) = shot-window pixels; screen = desktop."),
+          settleMs: z.number().int().min(0).max(10000).optional()
+            .describe("Wait before the after-capture (default 400)."),
+          screenshot: z.boolean().optional().describe("Return the after image."),
+          grid: z.boolean().optional().describe("Overlay the coordinate grid on the after image."),
+        }),
     annotations: { openWorldHint: true },
   }, async ({ host, app, tool, args, x, y, element, region, space, settleMs, screenshot, grid }) => {
     const target = await routeSelector(cfg, host);
@@ -1177,14 +1183,14 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       + "and its center in window-local pixels as a fallback. Pass a token or label to fleet_cu_act `element` "
       + "instead of reading coordinates off an image. filter is applied host-side, so a large tree is not shipped "
       + "whole. available:false means the walk found nothing and the window needs pixels. " + sel,
-    inputSchema: {
-      host: z.string().describe("Host name or selector (first matched host is used)."),
-      app: z.string().describe("PID, window_id (w123), process name, app name, or window title."),
-      filter: z.string().optional().describe("Case-insensitive substring over labels and values; ancestors are kept."),
-      role: z.string().optional().describe("Keep only this role: Button, Edit, MenuItem, CheckBox, ListItem, …"),
-      maxElements: z.number().int().min(1).max(5000).optional().describe("Cap on nodes walked, containers included (driver default 5000); a small cap can return no controls at all."),
-      task: z.string().optional().describe("What you are about to do. Controls a judge is confident the task does not need are hidden (needs TYPESAFE_API_KEY on the fleet side; fails open). Cuts a 300-row window to the handful that matter."),
-    },
+    inputSchema: z.object({
+          host: z.string().describe("Host name or selector (first matched host is used)."),
+          app: z.string().describe("PID, window_id (w123), process name, app name, or window title."),
+          filter: z.string().optional().describe("Case-insensitive substring over labels and values; ancestors are kept."),
+          role: z.string().optional().describe("Keep only this role: Button, Edit, MenuItem, CheckBox, ListItem, …"),
+          maxElements: z.number().int().min(1).max(5000).optional().describe("Cap on nodes walked, containers included (driver default 5000); a small cap can return no controls at all."),
+          task: z.string().optional().describe("What you are about to do. Controls a judge is confident the task does not need are hidden (needs TYPESAFE_API_KEY on the fleet side; fails open). Cuts a 300-row window to the handful that matter."),
+        }),
     annotations: { readOnlyHint: true, openWorldHint: true },
   }, async ({ host, app, filter, role, maxElements, task }) => {
     try {
@@ -1216,15 +1222,15 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       + "when it finds controls. Click a region with fleet_cu_act `region` (text or at); that call parses a fresh capture "
       + "and binds the click to it; name a listed region by its `center` (region.at), because ids and OCR text change between parses. A region is an observation, not proof that it accepts input. Parsing costs about 3 s "
       + "on Linux and 8-9 s on Windows. not_installed means the host lacks the extension (fleet cu <host> perception install). " + sel,
-    inputSchema: {
-      host: z.string().describe("Host name or selector (first matched host is used)."),
-      app: z.string().describe("PID, window_id (w123), process name, app name, or window title."),
-      filter: z.string().optional().describe("Keep regions whose OCR text contains this, case-insensitive."),
-      kind: z.enum(["text", "icon"]).optional().describe("Parse only this kind of region."),
-      minConfidence: z.number().min(0).max(1).optional().describe("Drop regions below this confidence."),
-      maxRegions: z.number().int().min(1).max(1000).optional().describe("Cap on regions returned by the parser."),
-      screenshot: z.boolean().optional().describe("Return the parsed capture itself; region bounds index its pixels."),
-    },
+    inputSchema: z.object({
+          host: z.string().describe("Host name or selector (first matched host is used)."),
+          app: z.string().describe("PID, window_id (w123), process name, app name, or window title."),
+          filter: z.string().optional().describe("Keep regions whose OCR text contains this, case-insensitive."),
+          kind: z.enum(["text", "icon"]).optional().describe("Parse only this kind of region."),
+          minConfidence: z.number().min(0).max(1).optional().describe("Drop regions below this confidence."),
+          maxRegions: z.number().int().min(1).max(1000).optional().describe("Cap on regions returned by the parser."),
+          screenshot: z.boolean().optional().describe("Return the parsed capture itself; region bounds index its pixels."),
+        }),
     annotations: { readOnlyHint: true, openWorldHint: true },
   }, async ({ host, app, filter, kind, minConfidence, maxRegions, screenshot }) => {
     const run = async (local?: string) => {
@@ -1249,12 +1255,12 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     description: "Start an app by name, open a URL in a named app, or open a URL in the default browser, then "
       + "return the window to address next (a new window, else the launched process's largest one). Pass its "
       + "title as `app` to fleet_cu_elements / fleet_cu_act. " + sel,
-    inputSchema: {
-      host: z.string().describe("Host name or selector (first matched host is used)."),
-      app: z.string().optional().describe("App to launch (\"Google Chrome\", \"explorer\", \"notepad\"). Omit to use the default browser for `url`."),
-      url: z.string().optional().describe("URL (or path/argument) to open in the app, or in the default browser."),
-      waitMs: z.number().int().min(0).max(30000).optional().describe("How long to wait for a window (default 6000)."),
-    },
+    inputSchema: z.object({
+          host: z.string().describe("Host name or selector (first matched host is used)."),
+          app: z.string().optional().describe("App to launch (\"Google Chrome\", \"explorer\", \"notepad\"). Omit to use the default browser for `url`."),
+          url: z.string().optional().describe("URL (or path/argument) to open in the app, or in the default browser."),
+          waitMs: z.number().int().min(0).max(30000).optional().describe("How long to wait for a window (default 6000)."),
+        }),
     annotations: { openWorldHint: true },
   }, async ({ host, app, url, waitMs }) => {
     try {
@@ -1274,13 +1280,13 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       + "{element:{selector:{label_contains?,role?},exists:true,value_equals?,enabled?,selected?}} or "
       + "{window:{exists?,bounds?:{x,y,width,height,tolerance_px?}}}. Waits up to timeoutMs for the state "
       + "to hold for stableSamples consecutive reads. " + sel,
-    inputSchema: {
-      host: z.string().describe("Host name or selector (first matched host is used)."),
-      app: z.string().describe("PID, window_id (w123), process name, app name, or window title."),
-      expect: z.array(z.record(z.string(), z.any())).min(1).max(8).describe("Predicates, combined with AND."),
-      timeoutMs: z.number().int().min(0).max(10000).optional().describe("Bounded wait (driver default 5000; 0 = one sample)."),
-      stableSamples: z.number().int().min(1).max(5).optional().describe("Consecutive satisfied samples required (default 2)."),
-    },
+    inputSchema: z.object({
+          host: z.string().describe("Host name or selector (first matched host is used)."),
+          app: z.string().describe("PID, window_id (w123), process name, app name, or window title."),
+          expect: z.array(z.record(z.string(), z.any())).min(1).max(8).describe("Predicates, combined with AND."),
+          timeoutMs: z.number().int().min(0).max(10000).optional().describe("Bounded wait (driver default 5000; 0 = one sample)."),
+          stableSamples: z.number().int().min(1).max(5).optional().describe("Consecutive satisfied samples required (default 2)."),
+        }),
     annotations: { readOnlyHint: true, openWorldHint: true },
   }, async ({ host, app, expect, timeoutMs, stableSamples }) => {
     try {
@@ -1300,20 +1306,20 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       + "Returns each step's completed/failed/not_run/unconfirmed status and the whole sequence's pixel effect. "
       + "Take a fresh observation between batches that open dialogs, move windows, or change layout. "
       + "A completed step confirms driver exit, not its application effect. Screenshot is returned by default. " + sel,
-    inputSchema: {
-      host: z.string().describe("One host or route."),
-      app: z.string().min(1).describe("PID, window_id (w123), process name, app name, or exact window title shared by every action."),
-      actions: z.array(z.object({
-        tool: z.enum(CU_BATCH_TOOLS),
-        args: z.record(z.string(), z.any()).optional().describe("Raw tool arguments without pid/window_id/target or from_zoom."),
-        space: z.enum(["window", "screen"]).optional().describe("Override the batch coordinate space for this action."),
-        delayMs: z.number().int().min(0).max(10000).optional().describe("Delay after successful input; at most 60000 ms total."),
-      }).strict()).min(1).max(100),
-      space: z.enum(["window", "screen"]).optional(),
-      settleMs: z.number().int().min(0).max(10000).optional(),
-      screenshot: z.boolean().optional().describe("Return the final image (default true)."),
-      grid: z.boolean().optional().describe("Overlay the final image coordinate grid."),
-    },
+    inputSchema: z.object({
+          host: z.string().describe("One host or route."),
+          app: z.string().min(1).describe("PID, window_id (w123), process name, app name, or exact window title shared by every action."),
+          actions: z.array(z.object({
+            tool: z.enum(CU_BATCH_TOOLS),
+            args: z.record(z.string(), z.any()).optional().describe("Raw tool arguments without pid/window_id/target or from_zoom."),
+            space: z.enum(["window", "screen"]).optional().describe("Override the batch coordinate space for this action."),
+            delayMs: z.number().int().min(0).max(10000).optional().describe("Delay after successful input; at most 60000 ms total."),
+          }).strict()).min(1).max(100),
+          space: z.enum(["window", "screen"]).optional(),
+          settleMs: z.number().int().min(0).max(10000).optional(),
+          screenshot: z.boolean().optional().describe("Return the final image (default true)."),
+          grid: z.boolean().optional().describe("Overlay the final image coordinate grid."),
+        }),
     annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
   }, async ({ host, app, actions, space, settleMs, screenshot, grid }) => {
     const run = async (local?: string) => {
@@ -1331,15 +1337,74 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     catch (error) { return text(error instanceof Error ? error.message : String(error), true); }
   });
 
+  server.registerTool("fleet_cu_task", {
+    title: "Hand a bounded UI subtask to Jev",
+    description: "Run a bounded subtask in one window (or on an Android phone) with TypeSafe's Jev choosing each "
+      + "next operation from the controls the window exposes now: click, double/right click, entering one of YOUR "
+      + "inputs, a key, a chord, or a scroll. Fleet performs each through its verified input and reads the window "
+      + "again. Jev never writes text: it picks an input key and fleet enters that literal value; a field none "
+      + "fits ends as NEEDS_INPUT naming the field, so add the value and run again. secret_inputs reach the host "
+      + "but never Jev. Controls labelled like delete/send/purchase/close are refused unless allowed_risks lists "
+      + "that category. SUBTASK_COMPLETE needs every verification criterion judged satisfied; BLOCKED means three "
+      + "actions changed nothing; NEEDS_AGENT hands back with a reason. Inspect the window before more input after "
+      + "any status but SUBTASK_COMPLETE. Needs a TypeSafe key on the fleet controller. " + sel,
+    inputSchema: {
+      host: z.string().describe("One host or route; an Android host drives the phone."),
+      app: z.string().min(1).describe("Desktop: PID, window_id (w123), process name, app name, or window title. "
+        + "Android: the package that must hold focus (a word in it matches), or \"any\"."),
+      goal: z.string().min(1).describe("What to accomplish, in one bounded subtask."),
+      verification: z.array(z.string().min(1)).min(1).describe("Criteria that are observable in the window when the goal is done."),
+      inputs: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).optional()
+        .describe("Literal values Jev may choose to enter, by name. Supply every value the task types."),
+      secret_inputs: z.array(z.string()).optional().describe("Input names whose values Jev never sees."),
+      constraints: z.array(z.string().min(1)).optional().describe("What must not happen."),
+      allowed_risks: z.array(z.enum(RISK_CATEGORIES as [string, ...string[]])).optional()
+        .describe("Consequential control categories this subtask may activate."),
+      shortcuts: z.record(z.string(), z.string()).optional()
+        .describe("Extra chords such as MOD+S, each with a description of what it does here. Desktop only."),
+      max_actions: z.number().int().min(1).max(200).optional().describe("Action budget (default 30)."),
+      min_confidence: z.number().min(0).max(1).optional().describe("Hand back instead of acting below this confidence."),
+      min_margin: z.number().min(0).max(1).optional().describe("Hand back when the choice leads its runner-up by less."),
+      dry_run: z.boolean().optional().describe("Decide and validate the first action, then stop without acting."),
+      foreground: z.boolean().optional().describe("Desktop: deliver input in the foreground."),
+      timeout_s: z.number().int().min(1).max(3600).optional().describe("Wall-clock budget for the whole run."),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
+  }, async ({ host, app, goal, verification, inputs, secret_inputs, constraints, allowed_risks, shortcuts,
+    max_actions, min_confidence, min_margin, dry_run, foreground, timeout_s }) => {
+    try {
+      const task = parseSubtask({
+        goal, verification,
+        ...(inputs ? { inputs } : {}), ...(secret_inputs ? { secret_inputs } : {}), ...(constraints ? { constraints } : {}),
+        ...(allowed_risks ? { allowed_risks } : {}), ...(shortcuts ? { shortcuts } : {}),
+        ...(max_actions !== undefined ? { max_actions } : {}),
+      });
+      const key = loadTaskKey();
+      if (!key) return text("a task needs a TypeSafe key on the fleet controller (TYPESAFE_API_KEY)", true);
+      const target = await routeSelector(cfg, host);
+      const android = isAndroidHost(cfg, target);
+      if (android && (foreground || (shortcuts && Object.keys(shortcuts).length)))
+        return text("foreground and shortcuts apply to desktop hosts only", true);
+      const backend = android ? androidTaskBackend(cfg, target, app) : desktopTaskBackend(cfg, target, app, { foreground });
+      const r = await runTask(task, backend, jevTransport(key), {
+        dryRun: dry_run, minConfidence: min_confidence, minMargin: min_margin,
+        timeoutMs: timeout_s === undefined ? undefined : timeout_s * 1000,
+      });
+      return text(JSON.stringify({ host: target, ...r }));
+    } catch (error) {
+      return text(error instanceof Error ? error.message : String(error), true);
+    }
+  });
+
   server.registerTool("fleet_deploy", {
     title: "Deploy Fleet to host(s)",
     description: "Build a Fleet source tarball, copy it to matching hosts, install dependencies, "
       + "and optionally restart a configured service. " + sel,
-    inputSchema: {
-      selector: z.string().describe("Destination host selector."),
-      restart: z.union([z.boolean(), z.string()]).optional()
-        .describe("true: configured/default Fleet service; false: no restart; string: named configured service."),
-    },
+    inputSchema: z.object({
+          selector: z.string().describe("Destination host selector."),
+          restart: z.union([z.boolean(), z.string()]).optional()
+            .describe("true: configured/default Fleet service; false: no restart; string: named configured service."),
+        }),
     annotations: { destructiveHint: true, openWorldHint: true },
   }, async ({ selector, restart }) => {
     const rows = await deployHosts(cfg, await routeSelector(cfg, selector), {
@@ -1359,9 +1424,9 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     title: "Run a saved recipe (playbook)",
     description: "Run a saved recipe — an ordered playbook of fleet steps that stops on the first "
       + "failure." + (recipeNames.length ? ` Available recipes: ${recipeNames.join(", ")}.` : " (No recipes configured.)"),
-    inputSchema: {
-      recipe: z.string().describe(recipeNames.length ? `One of: ${recipeNames.join(", ")}.` : "Recipe name."),
-    },
+    inputSchema: z.object({
+          recipe: z.string().describe(recipeNames.length ? `One of: ${recipeNames.join(", ")}.` : "Recipe name."),
+        }),
     annotations: { openWorldHint: true },
   }, async ({ recipe }) => {
     const run = await runRecipe(cfg, recipe);
@@ -1383,7 +1448,7 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     description: "Report every link from SSH to the phone's input system (Termux, adb, adbd, screen awake, "
       + "unlocked, uiautomator) and which package holds focus. Input is refused while the screen is off or "
       + "the phone is locked; a phone that rebooted needs Wireless debugging turned on by hand. " + phoneHelp,
-    inputSchema: { host: z.string().describe("An Android host name.") },
+    inputSchema: z.object({ host: z.string().describe("An Android host name.") }),
     annotations: { readOnlyHint: true, openWorldHint: true },
   }, async ({ host }) => {
     try {
@@ -1399,11 +1464,11 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       + "person (it needs Wi-Fi), this finds its random port from Termux and switches adbd back to the fixed port, "
       + "which then keeps working off Wi-Fi until the next reboot. pairPort/pairCode run a one-time pairing first, "
       + "from Wireless debugging → Pair device with pairing code. " + phoneHelp,
-    inputSchema: {
-      host: z.string().describe("An Android host name."),
-      pairPort: z.number().int().min(1).max(65535).optional().describe("Port shown in the pairing dialog."),
-      pairCode: z.string().regex(/^\d{6}$/).optional().describe("6-digit code shown in the pairing dialog."),
-    },
+    inputSchema: z.object({
+          host: z.string().describe("An Android host name."),
+          pairPort: z.number().int().min(1).max(65535).optional().describe("Port shown in the pairing dialog."),
+          pairCode: z.string().regex(/^\d{6}$/).optional().describe("6-digit code shown in the pairing dialog."),
+        }),
     annotations: { openWorldHint: true },
   }, async ({ host, pairPort, pairCode }) => {
     try {
@@ -1421,12 +1486,12 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       + "resource id, actions (tap, long_press, scroll, check, type), state, and center in device pixels. "
       + "Pass a label to fleet_android_act instead of reading coordinates off an image. Takes ~2.5 s. "
       + "An empty list means the screen draws itself (a game, a canvas): use fleet_android_screenshot. " + phoneHelp,
-    inputSchema: {
-      host: z.string().describe("An Android host name."),
-      filter: z.string().optional().describe("Case-insensitive substring over labels, text, content-desc and ids."),
-      role: z.string().optional().describe("Keep only this class short name: Button, EditText, TextView, Switch, …"),
-      all: z.boolean().optional().describe("Include unlabeled inert nodes (layout containers)."),
-    },
+    inputSchema: z.object({
+          host: z.string().describe("An Android host name."),
+          filter: z.string().optional().describe("Case-insensitive substring over labels, text, content-desc and ids."),
+          role: z.string().optional().describe("Keep only this class short name: Button, EditText, TextView, Switch, …"),
+          all: z.boolean().optional().describe("Include unlabeled inert nodes (layout containers)."),
+        }),
     annotations: { readOnlyHint: true, openWorldHint: true },
   }, async ({ host, filter, role, all }) => {
     try {
@@ -1446,11 +1511,11 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     description: "Capture the phone's screen, encoded to WebP on the phone (half size by default, ~60 KB). "
       + "The reply states the scale from image pixels to device pixels. grid captures full size and labels "
       + "device pixels. Prefer fleet_android_elements, which needs no image. " + phoneHelp,
-    inputSchema: {
-      host: z.string().describe("An Android host name."),
-      width: z.number().int().min(100).max(10000).optional().describe("Image width in pixels (default half the device width)."),
-      grid: z.boolean().optional().describe("Full-size capture with a device-pixel coordinate grid."),
-    },
+    inputSchema: z.object({
+          host: z.string().describe("An Android host name."),
+          width: z.number().int().min(100).max(10000).optional().describe("Image width in pixels (default half the device width)."),
+          grid: z.boolean().optional().describe("Full-size capture with a device-pixel coordinate grid."),
+        }),
     annotations: { openWorldHint: true },
   }, async ({ host, width, grid }) =>
     withTempImage("fleet-android-", async (local) => {
@@ -1482,33 +1547,33 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       + "two fingers apart (in) or together (out) on a diagonal; with no x/y or element it guesses the target (the "
       + "largest image, map, web or terminal view, else the largest scrollable one) and the spread from the UI "
       + "tree. gesture sends 1-5 fingers that land together, one straight stroke each. " + phoneHelp,
-    inputSchema: {
-      host: z.string().describe("An Android host name."),
-      target: z.string().describe("Package that must hold focus, a word in it, or \"any\"."),
-      action: z.enum(["tap", "long_press", "swipe", "swipe2", "zoom", "gesture", "scroll", "key", "type"]),
-      x: z.number().optional().describe("Device pixel X for tap/long_press/zoom centre, the swipe start, or swipe2's first finger."),
-      y: z.number().optional().describe("Device pixel Y for tap/long_press/zoom centre, the swipe start, or swipe2's first finger."),
-      x2: z.number().optional().describe("Swipe end X, or swipe2's second finger X."),
-      y2: z.number().optional().describe("Swipe end Y, or swipe2's second finger Y."),
-      dx: z.number().optional().describe("swipe2: how far both fingers move in X."),
-      dy: z.number().optional().describe("swipe2: how far both fingers move in Y."),
-      strokes: z.array(z.tuple([z.number(), z.number(), z.number(), z.number()])).min(1).max(5).optional()
-        .describe("gesture: one [x1, y1, x2, y2] per finger, in device pixels."),
-      zoom: z.enum(["in", "out"]).optional().describe("zoom: in spreads the fingers apart, out pinches them together."),
-      scale: z.number().min(1.2).max(10).optional().describe("zoom: ratio of the far to the near finger spacing (default 2.5)."),
-      element: z.object({
-        label: z.string().optional().describe("Text, content-desc, or resource id: exact first, then substring."),
-        role: z.string().optional().describe("Class short name to narrow a match: Button, EditText, …"),
-        nth: z.number().int().min(1).optional().describe("1-based pick among several matches."),
-      }).strict().optional().describe("Address an element instead of x/y (tap, long_press, type, scroll, zoom)."),
-      direction: z.enum(["up", "down", "left", "right"]).optional().describe("scroll: which content to reveal."),
-      amount: z.number().int().min(1).max(10).optional().describe("scroll: number of swipes (default 1)."),
-      key: z.string().optional().describe("key: back, home, enter, recents, tab, backspace, wakeup, … or KEYCODE_*."),
-      text: z.string().optional().describe("type: printable ASCII typed into the focused field (or element)."),
-      durationMs: z.number().int().min(1).max(10000).optional().describe("long_press hold, or swipe/swipe2/zoom/gesture duration."),
-      settleMs: z.number().int().min(0).max(10000).optional().describe("Wait before the after-hash (default 400)."),
-      screenshot: z.boolean().optional().describe("Return the after image."),
-    },
+    inputSchema: z.object({
+          host: z.string().describe("An Android host name."),
+          target: z.string().describe("Package that must hold focus, a word in it, or \"any\"."),
+          action: z.enum(["tap", "long_press", "swipe", "swipe2", "zoom", "gesture", "scroll", "key", "type"]),
+          x: z.number().optional().describe("Device pixel X for tap/long_press/zoom centre, the swipe start, or swipe2's first finger."),
+          y: z.number().optional().describe("Device pixel Y for tap/long_press/zoom centre, the swipe start, or swipe2's first finger."),
+          x2: z.number().optional().describe("Swipe end X, or swipe2's second finger X."),
+          y2: z.number().optional().describe("Swipe end Y, or swipe2's second finger Y."),
+          dx: z.number().optional().describe("swipe2: how far both fingers move in X."),
+          dy: z.number().optional().describe("swipe2: how far both fingers move in Y."),
+          strokes: z.array(z.tuple([z.number(), z.number(), z.number(), z.number()])).min(1).max(5).optional()
+            .describe("gesture: one [x1, y1, x2, y2] per finger, in device pixels."),
+          zoom: z.enum(["in", "out"]).optional().describe("zoom: in spreads the fingers apart, out pinches them together."),
+          scale: z.number().min(1.2).max(10).optional().describe("zoom: ratio of the far to the near finger spacing (default 2.5)."),
+          element: z.object({
+            label: z.string().optional().describe("Text, content-desc, or resource id: exact first, then substring."),
+            role: z.string().optional().describe("Class short name to narrow a match: Button, EditText, …"),
+            nth: z.number().int().min(1).optional().describe("1-based pick among several matches."),
+          }).strict().optional().describe("Address an element instead of x/y (tap, long_press, type, scroll, zoom)."),
+          direction: z.enum(["up", "down", "left", "right"]).optional().describe("scroll: which content to reveal."),
+          amount: z.number().int().min(1).max(10).optional().describe("scroll: number of swipes (default 1)."),
+          key: z.string().optional().describe("key: back, home, enter, recents, tab, backspace, wakeup, … or KEYCODE_*."),
+          text: z.string().optional().describe("type: printable ASCII typed into the focused field (or element)."),
+          durationMs: z.number().int().min(1).max(10000).optional().describe("long_press hold, or swipe/swipe2/zoom/gesture duration."),
+          settleMs: z.number().int().min(0).max(10000).optional().describe("Wait before the after-hash (default 400)."),
+          screenshot: z.boolean().optional().describe("Return the after image."),
+        }),
     annotations: { openWorldHint: true },
   }, async ({ host, target, action, x, y, x2, y2, dx, dy, strokes, zoom, scale, element, direction, amount, key, text: typed, durationMs, settleMs, screenshot }) => {
     const need = <T>(v: T | undefined, what: string): T => {
@@ -1553,22 +1618,22 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
       + "still look the same and stops the batch if not. Every step re-checks that target holds focus, and "
       + "every point is checked against the display before anything runs. The first failure stops the batch; "
       + "later steps report not_run. " + phoneHelp,
-    inputSchema: {
-      host: z.string().describe("An Android host name."),
-      target: z.string().describe("Package that must hold focus throughout, a word in it, or \"any\"."),
-      steps: z.array(z.object({
-        action: z.enum(["tap", "long_press", "swipe", "swipe2", "gesture", "scroll", "key", "type", "sleep"]),
-        x: z.number().optional(), y: z.number().optional(), x2: z.number().optional(), y2: z.number().optional(),
-        dx: z.number().optional(), dy: z.number().optional(),
-        strokes: z.array(z.tuple([z.number(), z.number(), z.number(), z.number()])).min(1).max(5).optional(),
-        label: z.string().optional(), role: z.string().optional(), nth: z.number().int().min(1).optional(),
-        key: z.string().optional(), text: z.string().optional(),
-        direction: z.enum(["up", "down", "left", "right"]).optional(), amount: z.number().int().min(1).max(10).optional(),
-        ms: z.number().int().min(0).max(10000).optional().describe("sleep length, long_press hold, or swipe/swipe2/gesture duration."),
-      }).strict()).min(1).max(50),
-      gapMs: z.number().int().min(0).max(10000).optional().describe("Pause between steps (default 250)."),
-      settleMs: z.number().int().min(0).max(10000).optional().describe("Wait before the after-hash (default 400)."),
-    },
+    inputSchema: z.object({
+          host: z.string().describe("An Android host name."),
+          target: z.string().describe("Package that must hold focus throughout, a word in it, or \"any\"."),
+          steps: z.array(z.object({
+            action: z.enum(["tap", "long_press", "swipe", "swipe2", "gesture", "scroll", "key", "type", "sleep"]),
+            x: z.number().optional(), y: z.number().optional(), x2: z.number().optional(), y2: z.number().optional(),
+            dx: z.number().optional(), dy: z.number().optional(),
+            strokes: z.array(z.tuple([z.number(), z.number(), z.number(), z.number()])).min(1).max(5).optional(),
+            label: z.string().optional(), role: z.string().optional(), nth: z.number().int().min(1).optional(),
+            key: z.string().optional(), text: z.string().optional(),
+            direction: z.enum(["up", "down", "left", "right"]).optional(), amount: z.number().int().min(1).max(10).optional(),
+            ms: z.number().int().min(0).max(10000).optional().describe("sleep length, long_press hold, or swipe/swipe2/gesture duration."),
+          }).strict()).min(1).max(50),
+          gapMs: z.number().int().min(0).max(10000).optional().describe("Pause between steps (default 250)."),
+          settleMs: z.number().int().min(0).max(10000).optional().describe("Wait before the after-hash (default 400)."),
+        }),
     annotations: { openWorldHint: true },
   }, async ({ host, target, steps, gapMs, settleMs }) => {
     try {
@@ -1659,13 +1724,13 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     description: "Poll on the phone until an element with a label appears (gone: disappears), or until a package "
       + "holds focus (gone: leaves). Label polls take a UI dump each (~2.5 s), focus polls ~0.2 s. The result "
       + "is confirmed with the same matcher as a label tap. " + phoneHelp,
-    inputSchema: {
-      host: z.string().describe("An Android host name."),
-      label: z.string().optional(), role: z.string().optional(),
-      focus: z.string().optional().describe("A package, or a word in one."),
-      gone: z.boolean().optional(),
-      timeoutMs: z.number().int().min(0).max(MCP_WAIT_CAP_S * 1000).optional().describe("Default 10000."),
-    },
+    inputSchema: z.object({
+          host: z.string().describe("An Android host name."),
+          label: z.string().optional(), role: z.string().optional(),
+          focus: z.string().optional().describe("A package, or a word in one."),
+          gone: z.boolean().optional(),
+          timeoutMs: z.number().int().min(0).max(MCP_WAIT_CAP_S * 1000).optional().describe("Default 10000."),
+        }),
     annotations: { readOnlyHint: true, openWorldHint: true },
   }, async ({ host, label, role, focus, gone, timeoutMs }) => {
     try {
@@ -1681,7 +1746,7 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     description: "Stop the helper that serves fast UI-tree reads, releasing its accessibility connection now "
       + "instead of after 2 idle minutes. Call it when you are done with the phone: some apps react to an "
       + "accessibility client being present. " + phoneHelp,
-    inputSchema: { host: z.string().describe("An Android host name.") },
+    inputSchema: z.object({ host: z.string().describe("An Android host name.") }),
     annotations: { openWorldHint: true },
   }, async ({ host }) => {
     try {
@@ -1695,11 +1760,11 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     description: "List the notifications currently in the phone's shade, newest first: package, title, text, "
       + "and when. They can hold private messages and one-time codes, so call this only when the user asked "
       + "for something that needs them. " + phoneHelp,
-    inputSchema: {
-      host: z.string().describe("An Android host name."),
-      pkg: z.string().optional().describe("Only notifications from packages containing this (e.g. whatsapp)."),
-      limit: z.number().int().min(1).max(1000).optional(),
-    },
+    inputSchema: z.object({
+          host: z.string().describe("An Android host name."),
+          pkg: z.string().optional().describe("Only notifications from packages containing this (e.g. whatsapp)."),
+          limit: z.number().int().min(1).max(1000).optional(),
+        }),
     annotations: { readOnlyHint: true, openWorldHint: true },
   }, async ({ host, pkg, limit }) => {
     try {
@@ -1714,14 +1779,14 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     description: "start records the phone's screen to an MP4 on the machine running fleet, with scrcpy over this "
       + "machine's adb (the phone's own screenrecord is blocked on some ROMs); it stops by itself at the limit "
       + "(default 600 s). stop finishes the file and returns its path. status says whether one is running. Needs "
-      + "adb and scrcpy where fleet runs. " + phoneHelp,
-    inputSchema: {
-      host: z.string().describe("An Android host name or a route of them."),
-      action: z.enum(["start", "stop", "status"]),
-      out: z.string().optional().describe("start: local path for the MP4 (required for start)."),
-      limitS: z.number().int().min(1).max(3600).optional().describe("start: stop after this many seconds (default 600)."),
-      bitRateMbps: z.number().min(0.5).max(40).optional().describe("start: video bit rate."),
-    },
+      + "adb and scrcpy 5.0 or later where fleet runs. " + phoneHelp,
+    inputSchema: z.object({
+          host: z.string().describe("An Android host name or a route of them."),
+          action: z.enum(["start", "stop", "status"]),
+          out: z.string().optional().describe("start: local path for the MP4 (required for start)."),
+          limitS: z.number().int().min(1).max(3600).optional().describe("start: stop after this many seconds (default 600)."),
+          bitRateMbps: z.number().min(0.5).max(40).optional().describe("start: video bit rate."),
+        }),
     annotations: { openWorldHint: true },
   }, async ({ host, action, out, limitS, bitRateMbps }) => {
     try {
@@ -1740,12 +1805,12 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     description: "Launch a package (com.android.chrome) through its launcher activity, or open a URL with a VIEW "
       + "intent, then wait for focus to move and report the package now in front. List packages with "
       + "fleet_android_apps. Refused while the screen is off or the phone is locked. " + phoneHelp,
-    inputSchema: {
-      host: z.string().describe("An Android host name."),
-      what: z.string().describe("A package name or a URL."),
-      inPackage: z.string().optional().describe("For a URL: the package that should open it, skipping the chooser."),
-      waitMs: z.number().int().min(0).max(60000).optional().describe("How long to wait for focus to move (default 5000)."),
-    },
+    inputSchema: z.object({
+          host: z.string().describe("An Android host name."),
+          what: z.string().describe("A package name or a URL."),
+          inPackage: z.string().optional().describe("For a URL: the package that should open it, skipping the chooser."),
+          waitMs: z.number().int().min(0).max(60000).optional().describe("How long to wait for focus to move (default 5000)."),
+        }),
     annotations: { openWorldHint: true },
   }, async ({ host, what, waitMs, inPackage }) => {
     try {
@@ -1759,11 +1824,11 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
   server.registerTool("fleet_android_apps", {
     title: "List the phone's packages",
     description: "List installed package names, user-installed ones by default, for fleet_android_open. " + phoneHelp,
-    inputSchema: {
-      host: z.string().describe("An Android host name."),
-      filter: z.string().optional().describe("Case-insensitive substring."),
-      all: z.boolean().optional().describe("Include system packages."),
-    },
+    inputSchema: z.object({
+          host: z.string().describe("An Android host name."),
+          filter: z.string().optional().describe("Case-insensitive substring."),
+          all: z.boolean().optional().describe("Include system packages."),
+        }),
     annotations: { readOnlyHint: true, openWorldHint: true },
   }, async ({ host, filter, all }) => {
     try {

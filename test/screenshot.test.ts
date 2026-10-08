@@ -10,6 +10,8 @@ const host: Host = { name: "win", ssh: "unused", os: "windows" };
 const cfg: FleetConfig = { hosts: { win: host } };
 const success = (stdout = ""): ExecResult => ({ host: host.name, ok: true, code: 0, stdout, stderr: "" });
 const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=", "base64");
+/** A 1x1 PNG with valid chunk CRCs, for tests that run a real decoder. */
+const decodablePng = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==", "base64");
 
 /** cuShotWindow resolves the target before capturing; these tests are about the
  *  capture-and-transfer half, so targeting is answered from a fixture. */
@@ -56,6 +58,21 @@ describe("capture artifacts", () => {
     } finally { await rm(root, { recursive: true, force: true }); }
   });
 
+  test.skipIf(!Bun.which("cwebp"))("a webp capture is transcoded losslessly", async () => {
+    const root = await mkdtemp(join(tmpdir(), "fleet-image-test-"));
+    const output = join(root, "result.webp");
+    try {
+      const result = await deliverImage(host, "C:\\Temp\\capture.png", output, {
+        pull: async (_host, _remote, path) => { await writeFile(path, decodablePng); return success(); },
+      });
+      expect(result).toMatchObject({ result: { ok: true }, path: output });
+      await validateImageArtifact(output);
+      // VP8L is the lossless WebP bitstream; lossy output would be VP8.
+      expect((await readFile(output)).toString("ascii", 12, 16)).toBe("VP8L");
+      expect(await readdir(root)).toEqual(["result.webp"]);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
   test("valid capture transfer installs verified bytes and removes staging", async () => {
     const root = await mkdtemp(join(tmpdir(), "fleet-image-test-"));
     const output = join(root, "result.png");
@@ -83,6 +100,25 @@ describe("capture artifacts", () => {
     expect(calls).toHaveLength(2);
     expect(calls[1]).toContain("Remove-Item");
     expect(calls[1]).toContain("capture.png");
+  });
+
+  test("the remote capture is removed as soon as the pull ends, while the local transcode runs", async () => {
+    const root = await mkdtemp(join(tmpdir(), "fleet-shot-test-"));
+    const calls: string[] = [];
+    try {
+      await captureScreenshot(cfg, "win", join(root, "shot.png"), {
+        exec: async (_host, command) => { calls.push(command); return success("C:\\Temp\\capture.png"); },
+        pull: async () => success(),
+        deliver: async (h, remote, local, d) => {
+          await d!.pull!(h, remote, local);
+          expect(calls).toHaveLength(2);
+          expect(calls[1]).toContain("Remove-Item");
+          await writeFile(local, png);
+          return { result: success(), path: local };
+        },
+      });
+      expect(calls).toHaveLength(2);
+    } finally { await rm(root, { recursive: true, force: true }); }
   });
 
   test("window capture requires a real local artifact even after successful transfer", async () => {

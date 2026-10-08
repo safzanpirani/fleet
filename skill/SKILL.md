@@ -50,6 +50,7 @@ fleet exec win-box "nvidia-smi"
 | `fleet cu <host> click\|set\|type <target> --label TEXT` · `menu <target> <item…>` | Act on a control by label or `--element TOKEN` instead of x,y; invoke a native menu path. |
 | `fleet cu <host> regions <target> [filter]` · `click <target> --region TEXT` | Read text and icons from a window's pixels with the optional Cua Perception extension, and click one bound to its capture. For windows with no accessibility tree. |
 | `fleet cu <sel> perception [status\|install\|remove]` | Check, install (≈420 MB signed download on the host, AGPL-3.0 component), or remove the cua-perception extension. |
+| `fleet cu <host\|phone> task <target> <goal> --verify TEXT --input K=V` | Hand a bounded subtask to Jev, which picks each next control action until the criteria hold. Needs `TYPESAFE_API_KEY`; one paid request per step. |
 | `fleet restart <host> <service>` | Restart a **configured** service (see config). |
 | `fleet bios <sel> [--yes]` | Reboot Windows UEFI/systemd Linux hosts into firmware setup. |
 | `fleet logs <host> <service> [-n N]` | Recent logs / status for a service. |
@@ -121,12 +122,14 @@ Anywhere `<sel>` appears: a hostname, logical route, group, `all`, Daytona
   without an extra discovery round-trip. When omitted, it auto-prefers **PowerShell 7
   (`pwsh`)** and falls back to Windows PowerShell 5.1. Override every host with
   `FLEET_WIN_SHELL=powershell|pwsh`.
-- **Screenshots default to WebP** (lossless, crisp text, smaller) when `cwebp` is on the
-  local machine; otherwise PNG. Pass `--out foo.png` to force PNG. Applies to `shot` and
+- **Screenshots default to WebP** (lossless via `cwebp -z 0`, crisp text, smaller) when
+  `cwebp` is on the local machine; otherwise PNG. Pass `--out foo.png` to force PNG. Applies to `shot` and
   `cu` image pulls.
 - `fleet shot` needs a **logged-in interactive session** to capture a real desktop.
-  On Windows it hops into the user session via a one-shot `schtasks /IT` task (sshd runs
-  in session 0 with no desktop), so a direct grab would otherwise be blank. A **headless**
+  On Windows it hops into the user session via a one-shot interactive task (sshd runs
+  in session 0 with no desktop), so a direct grab would otherwise be blank. The task runs
+  under a headless `conhost`, so no terminal window opens, and it captures at full
+  resolution under display scaling. A **headless**
   box with no monitor returns black 800×600 unless it has a virtual display (a Virtual
   Display Driver pinned to a resolution). Nothing can capture when no user is logged in
   (lock screen).
@@ -381,6 +384,31 @@ also needs a real or virtual display.
   - Foreground input lands on whatever window is on top at that point. `bring_to_front`
     the target first; maximizing through accessibility does not raise a window.
 
+### Jev subtasks
+
+```sh
+fleet cu mac task TextEdit "Write the note" --verify "The document text is Buy milk" --input text="Buy milk"
+fleet cu winbox task "Example App" "Sign in" --verify "The account page is shown" \
+  --input user=alice --secret-env password=EXAMPLE_PW --max-actions 10
+fleet cu phone task com.example "Search for cats" --verify "Results for cats are listed" --input query=cats
+fleet cu winbox task "Example App" --file subtask.json --json
+```
+
+`task` hands a bounded subtask to TypeSafe's Jev, a port of arc-cua's action
+layer. Each step reads the window's controls, asks Jev for one operation among the
+controls the window exposes now, sends it through the verified input above, and
+reads the window again. Jev never writes text: it picks an `--input` key and Fleet
+enters that literal value. A field that no input fits ends as `NEEDS_INPUT` and
+names the field. `--secret-env KEY=ENVVAR` supplies a value that Jev sees only as a
+placeholder. Controls labelled like delete, send, purchase or close are refused
+unless `--allow` names the category. `SUBTASK_COMPLETE` needs every `--verify`
+criterion judged satisfied. `BLOCKED` means three actions changed nothing.
+`NEEDS_AGENT` hands back with a reason. Inspect the window before more input after
+any other status. `--dry-run` decides the first action and stops. `--file` takes
+arc-cua's JSON fields: `goal`, `verification`, `inputs`, `secret_inputs`,
+`constraints`, `allowed_risks`, `shortcuts` and `max_actions`. Each step costs one
+paid Jev request. The MCP equivalent is `fleet_cu_task`.
+
 ### Android phones
 
 A host with an `"android"` block is a phone reached over SSH into Termux. Termux's own
@@ -415,7 +443,7 @@ desktop ones; `fleet help cu` lists them.
   says what it picked. `gesture <TARGET> X1,Y1,X2,Y2 …` sends 1-5 fingers, one straight
   stroke each. Batch takes `swipe2` and `gesture` steps.
 - **Watch, record, notifications:** `watch [--view-only]` opens a live scrcpy window
-  here; `record start [--out F.mp4]` and `record stop` write an MP4 here;
+  here (needs scrcpy 5.0+ on this machine); `record start [--out F.mp4]` and `record stop` write an MP4 here;
   `notifications [pkg]` lists the shade (private: read it only when asked).
 - **SSH to Termux down?** `revive` opens Termux through this machine's adb so its shell
   setup starts sshd; `--restart` force-stops Termux first.
