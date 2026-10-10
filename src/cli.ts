@@ -76,7 +76,7 @@ import {
   androidBootstrap, androidBatch, androidFlow, androidWait, androidRelease, androidNotifications,
   androidRecordStart, androidRecordStatus, androidRecordStop, androidRevive, androidWatch,
 } from "./android.ts";
-import type { AndroidAction, AndroidBatchStep, AndroidDeps, AndroidElement, AndroidFlowStep, AndroidLocator, AndroidState } from "./android.ts";
+import type { AndroidAction, AndroidBatchStep, AndroidChanges, AndroidDeps, AndroidElement, AndroidFlowStep, AndroidLocator, AndroidState } from "./android.ts";
 
 /** Colour only for a person at a terminal. Output piped to an agent or a file
  *  is data, and escape codes inside it are noise every reader has to strip.
@@ -421,6 +421,15 @@ export async function androidCu(
         + (e.within && !hideWithin ? A.d(` in ${e.within}`) : ""));
     }
   };
+  /** What an input changed, read in the same round trip (off with --read or --no-read). */
+  const printChanges = (c: AndroidChanges) => {
+    const shown = c.added.slice(0, 25);
+    console.log(A.d(c.baseline
+      ? `changes: ${c.added.length} new, ${c.removed} gone, ${c.total} on screen`
+      : `screen now (no earlier read to compare): ${c.total} element(s)`));
+    printElements(shown, false);
+    if (c.added.length > shown.length) console.log(A.d(`  … ${c.added.length - shown.length} more; fleet cu ${sel} elements [filter]`));
+  };
   /** --read FILTER: print the screen after an action, in the same call. */
   const readAfter = async () => {
     if (readArg === undefined || noRead) return {};
@@ -657,7 +666,8 @@ export async function androidCu(
   const shotPath = o.wantShot || o.out ? (o.out ?? `${sel}-after-${stamp}.webp`) : undefined;
   let r;
   try {
-    r = await androidAct(cfg, target, app, action, { settleMs: o.settle, imageOut: shotPath, element: locator }, deps);
+    r = await androidAct(cfg, target, app, action,
+      { settleMs: o.settle, imageOut: shotPath, element: locator, readChanges: readArg === undefined && !noRead }, deps);
   } catch (error) { die(error instanceof Error ? error.message : String(error)); }
   const reading = r.result.ok && !r.refusal ? await readAfter() : {};
   if (json) { console.log(JSON.stringify({ ...r, ...reading })); return r.result.ok ? 0 : 1; }
@@ -671,6 +681,7 @@ export async function androidCu(
   if (r.reason) console.log(A.d(`  ${r.reason}`));
   if (!r.refusal && r.result.stderr) console.error(A.d(r.result.stderr.split("\n").map((l) => "  " + l).join("\n")));
   if (r.localImage) { console.log(`after → ${r.localImage}`); open(r.localImage); }
+  if (r.changes) printChanges(r.changes);
   printRead(reading);
   return r.result.ok ? 0 : 1;
 }

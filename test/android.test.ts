@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { mkdtempSync } from "node:fs";
 import {
+  androidChanges,
   androidAct, androidBatch, androidFlow, androidBootstrap, androidElements, androidOpen, androidRelease, androidWait, androidElementsOf, androidInputText, androidKeycode, androidPick, androidShot,
   androidState, androidTargetPattern, parseUiDump, unpackReply, parseNotifications, androidNotifications,
   androidRecordStart, androidRecordStatus, androidRecordStop, androidRevive, androidWatch, androidZoomPlan,
@@ -178,6 +179,38 @@ describe("androidAct", () => {
     expect(dev.indexOf("inb 10 20")).toBeLessThan(dev.indexOf("input tap 10 20"));
     expect(dev.indexOf("refuse \"the phone is locked")).toBeLessThan(dev.indexOf("input tap"));
     expect(dev.startsWith("(\numask 077\n") && dev.endsWith("\ntrue\n) </dev/null")).toBe(true);
+  });
+  test("a still screen gets a short window to change before it counts as no_change", async () => {
+    const f = fake({ stdout: [...STATE, "__FA__HA a", "__FA__INPUT 0", "__FA__HB a"] });
+    await androidAct(cfg, "phone", "any", { kind: "tap", x: 1, y: 1 }, {}, deps(f));
+    const dev = deviceScript(f.scripts[0]!);
+    expect(dev).toContain(`if [ -n "$HA" ] && [ "$HA" = "$HB" ]; then w=0; while [ $w -lt 4 ]`);
+    expect(dev.indexOf("while [ $w -lt 4 ]")).toBeLessThan(dev.indexOf('echo "__FA__HB $HB"'));
+  });
+  test("readChanges lists what the input added and refreshes the tree cache", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "fleet-android-cache-"));
+    const frame = "f".repeat(32);
+    const seed = fake({ stdout: [...STATE, "__FA__XML", XML, "__FA__XMLEND", `__FA__FRAME ${frame}`] });
+    await androidElementsOf(cfg, "phone", {}, deps(seed, dir));
+    const after = XML.replace("</node></hierarchy>", `<node index="8" text="Connected" resource-id="" class="android.widget.TextView" `
+      + `package="com.example" content-desc="" clickable="false" enabled="true" bounds="[0,1000][500,1100]" /></node></hierarchy>`)
+      .replace(/<node index="3" text="Save"[^>]*\/>/, "");
+    const next = "e".repeat(32);
+    const f = fake({ stdout: [...STATE, "__FA__HA a", "__FA__INPUT 0", "__FA__HB b", "__FA__HC b",
+      "__FA__XML", after, "__FA__XMLEND", `__FA__FRAME ${next}`] });
+    const r = await androidAct(cfg, "phone", "any", { kind: "tap", x: 1, y: 1 }, { readChanges: true }, deps(f, dir));
+    expect(deviceScript(f.scripts[0]!)).toContain("then dump; screencap >");
+    expect(r.changes?.baseline).toBe(true);
+    expect(r.changes?.added.map((e) => e.label)).toEqual(["Connected"]);
+    expect(r.changes?.removed).toBe(0);
+    const unchanged = fake({ stdout: [...STATE, "__FA__HA a", "__FA__INPUT 0", "__FA__HB a"] });
+    const still = await androidAct(cfg, "phone", "any", { kind: "tap", x: 1, y: 1 }, { readChanges: true }, deps(unchanged, dir));
+    expect(still.changes).toBeUndefined();
+  });
+  test("androidChanges without a previous read lists the whole screen", () => {
+    const els = androidElements(parseUiDump(XML), { width: 1000, height: 2000 });
+    expect(androidChanges(undefined, els)).toEqual({ added: els, removed: 0, total: els.length, baseline: false });
+    expect(androidChanges(els, els.slice(1))).toMatchObject({ added: [], removed: 1, baseline: true });
   });
   test("equal frames are no_change", async () => {
     const f = fake({ stdout: [...STATE, "__FA__HA a", "__FA__INPUT 0", "__FA__HB a"] });

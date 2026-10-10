@@ -730,6 +730,9 @@ export function androidZoomPlan(
 
 /** Frames hashed after the first changed one, looking for two in a row that agree. */
 const STABLE_TRIES = 6;
+/** Extra 0.1 s frame checks after the settle pause when nothing moved yet: a tap
+ *  whose page or list arrives a little later otherwise reads as no_change. */
+const CHANGE_POLLS = 4;
 
 /** What the pixels did. Equal before and after frames are no_change. A screen
  *  that moved and settled is changed, unless it settled back where it started
@@ -744,10 +747,35 @@ export function androidEffect(hA: string, hB: string, hC: string, unstable: bool
   return { effect: "indeterminate", reason: "the settling capture failed, so the pixel change could not be verified" };
 }
 
+/** What an input changed on screen, from the tree read in the same round trip. */
+export interface AndroidChanges {
+  /** Elements on screen now that the previous read did not have (all of them without a previous read). */
+  added: AndroidElement[];
+  /** How many elements of the previous read are gone. */
+  removed: number;
+  /** Elements on screen now. */
+  total: number;
+  /** False when there was no previous read to compare with. */
+  baseline: boolean;
+}
+
+const elementKey = (e: AndroidElement) => `${e.role}|${e.label}|${e.id}`;
+
+/** Elements that appeared, and how many disappeared, between two reads. */
+export function androidChanges(before: AndroidElement[] | undefined, after: AndroidElement[]): AndroidChanges {
+  if (!before) return { added: after, removed: 0, total: after.length, baseline: false };
+  const had = new Set(before.map(elementKey));
+  const has = new Set(after.map(elementKey));
+  return { added: after.filter((e) => !had.has(elementKey(e))), removed: before.filter((e) => !has.has(elementKey(e))).length,
+    total: after.length, baseline: true };
+}
+
 export interface AndroidActResult {
   host: string; result: ExecResult; state: AndroidState;
   effect: AndroidEffect; reason?: string; refusal?: string;
   element?: AndroidElement;
+  /** Set when the input asked for `readChanges` and the screen moved. */
+  changes?: AndroidChanges;
   summary: string;
   hashes: string[];
   localImage?: string;
@@ -853,7 +881,7 @@ const MULTI_TOUCH = new Set(["swipe2", "gesture", "zoom"]);
  *  locked, or another package holds focus. */
 export async function androidAct(
   cfg: FleetConfig, sel: string, target: string, action: AndroidAction,
-  opts: { settleMs?: number; imageOut?: string; imageWidth?: number; element?: AndroidLocator } = {},
+  opts: { settleMs?: number; imageOut?: string; imageWidth?: number; element?: AndroidLocator; readChanges?: boolean } = {},
   deps: AndroidDeps = {},
 ): Promise<AndroidActResult> {
   const { host } = androidHost(cfg, sel);
@@ -965,11 +993,13 @@ function staleGuard(expect: string, el: AndroidElement | undefined): string {
 async function sendInput(
   cfg: FleetConfig, sel: string, target: string, action: AndroidAction, el: AndroidElement | undefined,
   expect: string | undefined,
-  opts: { settleMs?: number; imageOut?: string; imageWidth?: number },
+  opts: { settleMs?: number; imageOut?: string; imageWidth?: number; readChanges?: boolean },
   deps: AndroidDeps,
   installed = false,
 ): Promise<AndroidActResult | "stale"> {
   const { host } = androidHost(cfg, sel);
+  const readChanges = opts.readChanges === true;
+  const beforeTree = readChanges ? await readTreeCache(deps, host.name) : undefined;
   const settle = opts.settleMs ?? 400;
   const { checks, cmds, summary } = inputCommands(action, el);
   const wake = action.kind === "key" && androidKeycode(action.key) === "KEYCODE_WAKEUP";
@@ -986,7 +1016,7 @@ async function sendInput(
   if (expect !== undefined && !/^[0-9a-f]{32}$/.test(expect)) expect = undefined;
   const device = [
     DEVICE_STATE,
-    ...(readBack || multi ? [DEVICE_DUMP] : []),
+    ...(readBack || multi || readChanges ? [DEVICE_DUMP] : []),
     deviceGates(wake ? undefined : target, { needAwake: !wake, needUnlocked: !wake }),
     `input_pkg=$pkg`,
     ...checks,
@@ -995,7 +1025,9 @@ async function sendInput(
     ...(!wake ? [deliveryGate] : []),
     `iout=$( { ${deliveryCommands.join("\n")} ; } 2>&1 ); echo "${P}INPUT $?"`,
     `[ -n "$iout" ] && echo "${P}INPUTOUT $(printf '%s' "$iout" | tr '\\n' ' ' | cut -c1-300)"`,
-    `sleep ${seconds(settle)}; HB=$(fh); echo "${P}HB $HB"`,
+    `sleep ${seconds(settle)}; HB=$(fh)`,
+    ...(!wake ? [`if [ -n "$HA" ] && [ "$HA" = "$HB" ]; then w=0; while [ $w -lt ${CHANGE_POLLS} ]; do sleep 0.1; HB=$(fh); [ "$HB" != "$HA" ] && break; w=$((w + 1)); done; fi`] : []),
+    `echo "${P}HB $HB"`,
     // Android animates nearly every action (flings, page transitions), so one
     // more frame is not enough: hash until two frames in a row agree.
     `if [ -n "$HA" ] && [ -n "$HB" ] && [ "$HA" != "$HB" ]; then`,
@@ -1004,7 +1036,10 @@ async function sendInput(
     `    if [ "$h" = "$prev" ]; then HC=$h; break; fi; prev=$h; n=$((n + 1)); done`,
     `  [ -n "$HC" ] && echo "${P}HC $HC" || echo "${P}UNSTABLE $prev"`,
     `fi`,
-    ...(readBack ? [`[ -n "$HA" ] && [ "$HA" != "$HB" ] && [ -z "$HC" ] && dump`] : []),
+    ...(readBack && !readChanges ? [`[ -n "$HA" ] && [ "$HA" != "$HB" ] && [ -z "$HC" ] && dump`] : []),
+    // The screen after the input, with the frame hash that keys it, so the
+    // caller sees what changed and the next label action can skip a read.
+    ...(readChanges ? [`if [ -z "$HA" ] || [ "$HA" != "$HB" ]; then dump; screencap > ${FRAME_FILE} 2>/dev/null && echo "${P}FRAME $(tail -c +$SKIP ${FRAME_FILE} | md5sum | cut -d' ' -f1)"; fi`] : []),
   ].join("\n");
   const r = await runPhone(cfg, sel, device, opts.imageOut ? { capture: { width: opts.imageWidth ?? host.android?.shotWidth } } : {}, deps.exec);
   if (r.lines.has("STALE")) return "stale";
@@ -1040,6 +1075,15 @@ async function sendInput(
   // A screen that moved no longer matches the saved tree. The hash check would
   // catch that anyway; dropping it saves the next label action a wasted trip.
   if (effect !== "no_change") await dropTreeCache(deps, host.name);
+  let changes: AndroidChanges | undefined;
+  if (readChanges && r.xml) {
+    const size = { width: r.state.width, height: r.state.height };
+    const after = androidElements(parseUiDump(r.xml), size);
+    const before = beforeTree ? androidElements(parseUiDump(beforeTree.xml), { width: beforeTree.width, height: beforeTree.height }) : undefined;
+    changes = androidChanges(before, after);
+    const frame = one("FRAME");
+    if (/^[0-9a-f]{32}$/.test(frame)) await writeTreeCache(deps, host.name, { hash: frame, xml: r.xml, ...size });
+  }
   let result = inputFailed ? failed(r, `input failed: ${inputOut || `exit ${one("INPUT")}`}`) : r.result;
   let localImage: string | undefined;
   if (opts.imageOut && r.image) {
@@ -1050,7 +1094,7 @@ async function sendInput(
     result = failed(r, "the after-capture produced no image");
   }
   return { ...base, result, effect, ...(reason ? { reason } : {}), hashes: [hA, hB, hC].filter(Boolean),
-    ...(localImage ? { localImage } : {}) };
+    ...(changes ? { changes } : {}), ...(localImage ? { localImage } : {}) };
 }
 
 export interface AndroidOpenResult { host: string; result: ExecResult; state: AndroidState; what: string; refusal?: string }

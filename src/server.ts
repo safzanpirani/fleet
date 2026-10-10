@@ -1573,9 +1573,11 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
           durationMs: z.number().int().min(1).max(10000).optional().describe("long_press hold, or swipe/swipe2/zoom/gesture duration."),
           settleMs: z.number().int().min(0).max(10000).optional().describe("Wait before the after-hash (default 400)."),
           screenshot: z.boolean().optional().describe("Return the after image."),
+          changes: z.boolean().optional().describe("Read the screen in the same round trip and list the elements the input added "
+            + "(default true), so no separate fleet_android_elements call is needed."),
         }),
     annotations: { openWorldHint: true },
-  }, async ({ host, target, action, x, y, x2, y2, dx, dy, strokes, zoom, scale, element, direction, amount, key, text: typed, durationMs, settleMs, screenshot }) => {
+  }, async ({ host, target, action, x, y, x2, y2, dx, dy, strokes, zoom, scale, element, direction, amount, key, text: typed, durationMs, settleMs, screenshot, changes }) => {
     const need = <T>(v: T | undefined, what: string): T => {
       if (v === undefined) throw new Error(`${action} needs ${what}`);
       return v;
@@ -1593,13 +1595,17 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
         : action === "key" ? { kind: "key", key: need(key, "key") }
         : { kind: "type", text: need(typed, "text") };
       const r = await androidAct(cfg, await routeSelector(cfg, host), target, a,
-        { settleMs, element, imageOut: local?.replace(/\.png$/, ".webp") });
+        { settleMs, element, imageOut: local?.replace(/\.png$/, ".webp"), readChanges: changes !== false });
       const lines = [
         r.refusal ? `refused: ${r.refusal}` : `effect: ${r.effect}${r.reason ? ` — ${r.reason}` : ""}`,
         `${phoneState(r.state)} · ${r.summary}`
         + (r.element ? ` → ${r.element.role} ${JSON.stringify(r.element.label)}${r.element.id ? ` #${r.element.id}` : ""}`
           + (r.element.within ? ` in ${r.element.within}` : "") : ""),
         ...(r.result.stderr && !r.refusal ? ["", r.result.stderr] : []),
+        ...(r.changes ? ["", (r.changes.baseline
+          ? `changes: ${r.changes.added.length} new, ${r.changes.removed} gone, ${r.changes.total} on screen`
+          : `screen now (no earlier read to compare): ${r.changes.total} element(s)`),
+          JSON.stringify(phoneElementRows(r.changes.added.slice(0, 25)))] : []),
       ];
       const content: any[] = [{ type: "text" as const, text: lines.join("\n") }];
       if (r.localImage) content.push({ type: "image" as const, data: await consumeImage(r.localImage),

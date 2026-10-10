@@ -430,6 +430,14 @@ desktop ones; `fleet help cu` lists them.
   in the wrong place. The default target `any` skips the package check: pass `--target`.
   The final screen prints; `--read FILTER` narrows it and `--no-read` skips it. `--read`
   on `open`, `tap`, `type`, `key` and `scroll` prints the screen after that one action.
+- **Single inputs list what changed.** When the frame moved, `tap`, `type`, `key`,
+  `scroll` and `long-press` read the screen in the same round trip and print the elements
+  that appeared since the last read (`changes: N new, M gone, T on screen`), so a separate
+  `elements` call is rarely needed; the new tree also becomes the cache the next label
+  action resolves against. A frame that has not moved after the settle pause is checked
+  four more times (0.1 s apart) before the input counts as `no_change`. `--read FILTER`
+  prints the filtered screen instead and `--no-read` skips both. MCP: `fleet_android_act`
+  takes `changes` (default true).
 - **Read the effect line.** `changed` / `no_change` / `indeterminate` come from frame
   hashes on the phone. Animated screens and blinking cursors give `indeterminate`;
   confirm with `wait --focus PKG` or `wait --label TEXT`.
