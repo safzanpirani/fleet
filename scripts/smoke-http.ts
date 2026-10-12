@@ -69,16 +69,11 @@ try {
   const hasMutating = names.includes("fleet_exec");
   if (READONLY) {
     check("read-only: no fleet_exec", !hasMutating, names.length + " tools");
-    check("read-only: bounded waits remain", names.includes("fleet_wait") && names.includes("fleet_job_wait"));
-    check("read-only: diagnostics remain", names.includes("fleet_dt") && names.includes("fleet_doctor"));
-    check("read-only: destructive parity tools hidden",
-      !names.includes("fleet_deploy") && !names.includes("fleet_jobs_prune") && !names.includes("fleet_pull"));
+    check("read-only: probes remain", names.includes("fleet_status") && names.includes("fleet_job_log"));
+    check("read-only: capture hidden", !names.includes("fleet_screenshot"));
   } else {
     check("full: fleet_exec present", hasMutating, names.length + " tools");
-    check("full: parity tools present",
-      ["fleet_dt", "fleet_doctor", "fleet_wait", "fleet_job_wait", "fleet_pull",
-        "fleet_jobs_prune", "fleet_deploy", "fleet_cu_screenshot_window"]
-        .every((name) => names.includes(name)));
+    check("full: fleet_screenshot present", names.includes("fleet_screenshot"));
   }
 
   const res = await client.callTool({ name: "fleet_status", arguments: {} });

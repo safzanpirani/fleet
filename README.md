@@ -19,7 +19,7 @@ fleet status                     # the whole fleet at a glance
 - Commands containing quotes, pipes, `$`, JSON, and shell operators arrive intact.
 - Logical routes can prefer a fast connection and fall back to another.
 - Long-running jobs survive SSH disconnects and remain easy to inspect.
-- The same operations are available to people through the CLI and agents through MCP.
+- People and agents use the same CLI. A small MCP server covers clients without a shell.
 
 Driving fleet from Claude Code, Factory Droid, Codex, or another agent? Start with
 **[Agent setup](#agent-setup)**.
@@ -338,7 +338,7 @@ fleet cu web shot-window firefox --grid --out w.png
 
 `open` takes an app, an app plus a URL or path, or a bare URL for the default
 browser. It waits (`--wait MS`) for a new top-level window and prints the title to
-pass to every later verb. MCP: `fleet_cu_open`.
+pass to every later verb.
 
 ### Input you can trust
 
@@ -403,9 +403,7 @@ fleet cu web click '{"pid":3848,"window_id":66756,"x":100,"y":200}'
   1 when a reply is a refusal, an `isError`, a failed delivery, or a lookup error such
   as `window_id_not_found`, so an agent's shell sees the failure without parsing it.
 - An image comes back only when you pass `--out` (or use `shot-window`).
-- Exposed to agents as `fleet_cu` (raw), `fleet_cu_act` (verified input),
-  `fleet_cu_windows`, `fleet_cu_open`, `fleet_cu_screenshot_window` and `fleet_cu_describe`;
-  `args: ["install"]` fans out over a selector there too.
+- Computer use is CLI only; the MCP server has no `cu` tools.
 
 ### Jev subtasks
 
@@ -430,7 +428,7 @@ criterion judged satisfied. `BLOCKED` means three actions changed nothing.
 any other status. `--dry-run` decides the first action and stops. `--file` takes
 arc-cua's JSON fields: `goal`, `verification`, `inputs`, `secret_inputs`,
 `constraints`, `allowed_risks`, `shortcuts` and `max_actions`. Each step costs one
-paid Jev request. The MCP equivalent is `fleet_cu_task`.
+paid Jev request.
 
 ### Android phones
 
@@ -590,8 +588,9 @@ triggers it more reliably than the generic wording shipped here.
 ### 3. Register the MCP server if you need it
 
 Skip this if steps 1 and 2 cover your agent. For a client that cannot run shell
-commands, or to use the read-only kill switch, fleet serves the same config,
-selectors and exec over [MCP](https://modelcontextprotocol.io) on stdio. Register it
+commands, or to use the read-only kill switch, fleet serves eight tools with the
+same config, selectors and exec over [MCP](https://modelcontextprotocol.io) on stdio.
+An agent with a shell should use the CLI, which covers every command. Register it
 per client:
 
 ```sh
@@ -687,13 +686,14 @@ All prefixed `fleet_`, grouped by access:
 
 | Group | Tools |
 |---|---|
-| **Read-only**: carry `readOnlyHint`, always registered | `ls` · `logs` · `svc` · `gpu` · `disk` · `status` · `jobs` · `job_log` · `boot` · `session` · `ps` · `dt` · `doctor` · `wait` · `job_wait` · `tools_status` · `cu_tools` · `cu_describe` |
-| **Mutating**: dropped by the read-only kill switch | `exec` · `cp` · `restart` · `spawn` · `drop` · `job_kill` · `reboot` · `bios` · `switch` · `screenshot` · `cu` · `run` · `android_*` (state, elements, screenshot, act, batch, flow, wait, open, apps, bootstrap, release) · `kill` |
-| **Not exposed** | `top` / `ssh` (need a live TTY) · job `tail -f` / `wait` (would block) |
+| **Read-only**: carry `readOnlyHint`, always registered | `ls` · `status` · `ps` · `logs` · `jobs` · `job_log` |
+| **Mutating**: dropped by the read-only kill switch | `exec` · `screenshot` |
+
+Every other command is CLI only.
 
 - `screenshot` counts as mutating, because capturing runs commands on the host (on Windows it registers a one-shot scheduled task).
 - `exec` accepts an optional `timeout` (seconds); a hung remote command returns exit **124** instead of blocking the server.
-- Host, group and recipe names are written into the tool descriptions, so an agent sees valid selectors without a round trip.
+- Host and group names are written into the tool descriptions, so an agent sees valid selectors without a round trip.
 - Smoke-test end-to-end: `bun run scripts/smoke.ts`.
 
 `server.ts` (`buildServer`) defines the tools once for the stdio server (`mcp.ts`)
@@ -762,8 +762,7 @@ never retried as a plain coordinate click. An ambiguous or missing match lists t
 candidates and sends nothing. Region IDs and OCR text change between parses of the
 same window, so `--region-at X,Y` names a region from an earlier listing by a point
 inside it; the smallest region containing that point is clicked. Linux and macOS
-hosts need `python3`. MCP: `fleet_cu_regions`, and `fleet_cu_act` with
-`region: {text | at, kind?, nth?}`.
+hosts need `python3`.
 
 A batch targets one fixed window, executes ordered input on the host, and captures
 before/after the whole sequence. Use `--file actions.json` or `-` for stdin. Each
@@ -776,7 +775,7 @@ not an application effect. Inspect the desktop after unconfirmed input. Observe
 again between batches that open a dialog, move a window, or change the layout.
 
 Limits are 100 actions, 256 KiB JSON, ten seconds per explicit delay and sixty
-seconds total delay. The MCP tool `fleet_cu_batch` returns a final image by default.
+seconds total delay.
 Run `fleet cu <host> tools` and `describe <tool>` for the installed raw inventory
 and schemas. The Fleet skill's Computer Use section catalogs every raw tool in
 the published platform registries, including platform-specific controls.
@@ -795,8 +794,8 @@ FLEET_MCP_TOKEN=<long-random> bun run src/http.ts     # or: bun run serve
   (or `X-API-Key`); without it the answer is `401`. The token can run commands on
   every host, so keep it long, random and out of git. `GET /health` is the only
   unauthenticated route, and it returns only the host count and the read-only flag.
-- **Kill switch.** `FLEET_MCP_READONLY=1` drops every mutating tool, including
-  `screenshot` and `cu`, which execute on the host. The 18 read-only tools remain.
+- **Kill switch.** `FLEET_MCP_READONLY=1` drops `exec` and `screenshot`, which
+  execute on the host. The six read-only tools remain.
 - **Binding.** The default is `127.0.0.1:8787` (`FLEET_MCP_HOST`, `FLEET_MCP_PORT`).
   Only the local cloudflared should reach it, and the token guards the public side.
 - Register in an MCP client with URL `https://<your-fleet-host>/mcp` and the

@@ -1,6 +1,6 @@
 ---
 name: fleet
-description: Run commands, launch detached background jobs, restart services, push files, screenshot desktops, and read live status across a fleet of machines (Linux, Windows, and Mac boxes) over SSH without quoting problems, through the `fleet` CLI or its MCP server. Use when the user wants to exec/run something on one or many of their boxes, spawn a long-running job that outlives the SSH session (and tail/wait/kill it), restart or tail logs for a service, copy a file to host(s), screenshot a remote machine, check fleet/host/GPU status or the status dashboard, register/use the fleet MCP server (Claude Code, Factory Droid, Codex), drive a remote desktop with `fleet cu`, or mentions fleet, @linux/@windows/@gpu, or "all my machines / servers".
+description: Run commands, launch detached background jobs, restart services, push files, screenshot desktops, and read live status across a fleet of machines (Linux, Windows, and Mac boxes) over SSH without quoting problems, through the `fleet` CLI. Use when the user wants to exec/run something on one or many of their boxes, spawn a long-running job that outlives the SSH session (and tail/wait/kill it), restart or tail logs for a service, copy a file to host(s), screenshot a remote machine, check fleet/host/GPU status or the status dashboard, drive a remote desktop with `fleet cu`, or mentions fleet, @linux/@windows/@gpu, or "all my machines / servers".
 ---
 
 # fleet
@@ -8,8 +8,8 @@ description: Run commands, launch detached background jobs, restart services, pu
 `fleet` is a global CLI (installed from the repo, on PATH via `bun link`) that drives a
 set of machines over SSH. It sends each program over stdin to `bash -ls` on Linux and
 macOS and to PowerShell `-Command -` on Windows, so pass commands as they are and never
-escape them. Prefer `fleet exec` over raw `ssh` for these machines. The same actions are
-also available as an MCP server (see below).
+escape them. Prefer `fleet exec` over raw `ssh` for these machines. A small MCP server
+covers clients without a shell (see below); agents with a shell use the CLI.
 
 Host names, groups, and recipes come from `fleet.config.json`; the examples below use the
 placeholder hosts from `fleet.config.example.json` (`web`, `gpu-box`, `win-box`, `vps`,
@@ -116,7 +116,7 @@ Anywhere `<sel>` appears: a hostname, logical route, group, `all`, Daytona
 - A non-zero exit on any host makes `exec` and `cp` exit non-zero.
 - **Use `--script` for stdin programs and quote-heavy PowerShell.** Fleet accepts a supported shebang or an explicit `--interp`. It rejects untyped stdin.
 - **Use real newlines with `fleet edit`.** The CLI preserves argument bytes and does not translate the characters `\\n`. A leading `~` in Unix edit paths expands safely. Type `\n` newlines even for a Windows CRLF file; fleet converts them to the file's style.
-- **Several changes to one file? One `fleet edit --edits -` call.** Pipe a JSON array such as `[{"old":"a","new":"b"},{"old":"x","new":"y","all":true}]`. Edits apply in order, and if any edit misses, the file is left unchanged. MCP: the `edits` array on `fleet_edit`.
+- **Several changes to one file? One `fleet edit --edits -` call.** Pipe a JSON array such as `[{"old":"a","new":"b"},{"old":"x","new":"y","all":true}]`. Edits apply in order, and if any edit misses, the file is left unchanged.
 - **Sync paired skills to every agent root.** `fleet tools sync` installs `SKILL.md` under `~/.claude/skills`, `~/.agents/skills`, and `~/.openclaw/skills`.
 - **Windows shell:** fleet uses a host's configured `winShell` (`pwsh` or `powershell`)
   without an extra discovery round-trip. When omitted, it auto-prefers **PowerShell 7
@@ -152,7 +152,7 @@ jobs) instead of holding an `exec` or a backgrounded SSH session open.
   so `fleet jobs wait gpu-box:<id> && deploy` works.
 - A typical flow: `fleet spawn --cwd /srv/app gpu-box "./train.sh"`, then `fleet jobs`,
   then `fleet jobs tail gpu-box:<id> -f` or `fleet jobs wait gpu-box:<id> --until '<rx>'`, then
-  `fleet jobs prune` when done. MCP exposes bounded job waits and inspection; live tailing stays CLI-only.
+  `fleet jobs prune` when done. MCP can list jobs and read their logs; everything else is CLI only.
 
 ## Exec behavior you can rely on
 
@@ -262,14 +262,11 @@ also needs a real or virtual display.
     out the driver's ~5 s poll first.
   - `fleet cu win-box open explorer 'C:\Windows'`, `open notepad`, or `open https://bun.sh`
     (default browser) launches through `launch_app` and prints the window to address next.
-    MCP: `fleet_cu_open`.
   - `fleet cu win-box elements "<title>" --task "open the Fonts folder"` hides the controls a
     TypeSafe Jev judge is confident the task does not need: Explorer at `C:\Windows` went
     from 295 rows to 18 with Fonts kept, in ~1.6 s. It needs `TYPESAFE_API_KEY` (or a JSON
     file with `apiKey` named by `FLEET_JEV_CONFIG`), runs only past 30 rows, and fails open.
-    Each use is a paid Jev call. MCP: `fleet_cu_elements` `task`.
-  - MCP: `fleet_cu_elements`, `fleet_cu_open`, `fleet_cu_verify`, and `fleet_cu_act` with
-    `element: {token | label, role?, nth?}`.
+    Each use is a paid Jev call.
   - cua-driver's CLI exits 0 even when it refuses. Raw `fleet cu <host> <tool> <json>`
     exits 1 with `fleet: the driver reported …` when the reply is a refusal, `isError`, a
     failed delivery, or a lookup code such as `window_id_not_found`. A plain-text error
@@ -306,7 +303,6 @@ also needs a real or virtual display.
     installs or updates, and runs the self-test. The extension bundles OmniParser
     under AGPL-3.0; a `not_installed` reply never justifies installing it without the
     user's go-ahead.
-  - MCP: `fleet_cu_regions`, and `fleet_cu_act` with `region: {text | at: {x, y}, kind?, nth?}`.
 - **Lookup verbs** resolve the pid and window_id for you:
   - `fleet cu <host> apps [name]` prints a `pid  name` table, optionally filtered by name.
   - `fleet cu <host> windows [target]` lists every top-level window, or one process's
@@ -407,7 +403,7 @@ criterion judged satisfied. `BLOCKED` means three actions changed nothing.
 any other status. `--dry-run` decides the first action and stops. `--file` takes
 arc-cua's JSON fields: `goal`, `verification`, `inputs`, `secret_inputs`,
 `constraints`, `allowed_risks`, `shortcuts` and `max_actions`. Each step costs one
-paid Jev request. The MCP equivalent is `fleet_cu_task`.
+paid Jev request.
 
 ### Android phones
 
@@ -436,8 +432,7 @@ desktop ones; `fleet help cu` lists them.
   `elements` call is rarely needed; the new tree also becomes the cache the next label
   action resolves against. A frame that has not moved after the settle pause is checked
   four more times (0.1 s apart) before the input counts as `no_change`. `--read FILTER`
-  prints the filtered screen instead and `--no-read` skips both. MCP: `fleet_android_act`
-  takes `changes` (default true).
+  prints the filtered screen instead and `--no-read` skips both.
 - **Read the effect line.** `changed` / `no_change` / `indeterminate` come from frame
   hashes on the phone. Animated screens and blinking cursors give `indeterminate`;
   confirm with `wait --focus PKG` or `wait --label TEXT`.
@@ -560,7 +555,6 @@ Batch tools: `click`, `right_click`, `double_click`, `drag`, `scroll`, `press_ke
 raw calls. A batch shares one fixed window and one coordinate frame. Target
 resolution happens once, followed by one remote execution for the sequence and
 its before/after captures. Image transfer adds a copy and cleanup when requested.
-The MCP equivalent is `fleet_cu_batch`, which returns the final image by default.
 
 All coordinates are checked before any input. A nonzero driver exit, structured
 refusal, or delivery-failure escalation stops the batch. Linux and macOS batches
@@ -614,52 +608,41 @@ Codex's native computer-use API, over Fleet's remote transport.
   arguments. `get_window_state` needs `window_id` (from `list_windows`); its image
   is base64 inside the JSON. Fleet's `--out` sets cua-driver's `screenshot_out_file`
   JSON field and pulls the resulting image locally.
-- Exposed as MCP tool `fleet_cu` (`{host, args[], image?}`; returns the PNG when `image:true`).
 
 ## MCP server
 
-fleet is also a stdio MCP server (`src/mcp.ts`, bin `fleet-mcp`) with the same config,
-exec, selectors and recipes, exposed as tools. Use it when an MCP client should call
-tools instead of the CLI. Register with Claude Code:
+fleet is also an MCP server (`src/mcp.ts` over stdio, bin `fleet-mcp`; `src/http.ts` over
+HTTP) for MCP clients without a shell. An agent with a shell should use the CLI, which
+covers every command. Register with Claude Code only when the agent cannot run commands:
 
 ```sh
 claude mcp add fleet -- bun run /path/to/fleet/src/mcp.ts
 ```
 
 Run standalone with `bun run mcp` (honours `FLEET_CONFIG`); smoke-test end-to-end with
-`bun run scripts/smoke.ts`.
+`bun run scripts/smoke.ts`. It registers eight tools:
 
-| Tool | Args | CLI equivalent |
-|---|---|---|
-| `fleet_ls` | none | `fleet ls` |
-| `fleet_exec` | `selector`, `command`, `wsl?` | `fleet exec` |
-| `fleet_cp` | `local`, `selector`, `remote` | `fleet cp` |
-| `fleet_screenshot` | `host` | `fleet shot` (returns the PNG as an image) |
-| `fleet_cu` | `host`, `args[]`, `image?` | `fleet cu` (computer-use; returns PNG when `image`) |
-| `fleet_cu_act` | `host`, `app`, `tool`, `x?`, `y?`, `space?` | verified input; returns `changed` / `no_change` / `indeterminate` |
-| `fleet_restart` | `host`, `service` | `fleet restart` |
-| `fleet_logs` | `host`, `service`, `lines?` | `fleet logs` |
-| `fleet_gpu` | none | `fleet gpu` |
-| `fleet_disk` | `selector?` | `fleet disk [selector]` |
-| `fleet_status` | `host?` | `fleet status` |
-| `fleet_bios` | `selector` | `fleet bios <selector> --yes` |
-| `fleet_run` | `recipe` | `fleet run` |
+| Tool | CLI equivalent |
+|---|---|
+| `fleet_ls` | `fleet ls` |
+| `fleet_status` | `fleet status` |
+| `fleet_ps` | `fleet ps` |
+| `fleet_logs` | `fleet logs` |
+| `fleet_jobs` | `fleet jobs` |
+| `fleet_job_log` | `fleet jobs log` / `tail` |
+| `fleet_exec` | `fleet exec` (mutating) |
+| `fleet_screenshot` | `fleet shot` (mutating; returns the PNG as an image) |
 
-- `top`, `ssh` and live `jobs tail -f` are CLI only. Detached jobs and bounded waits are available over MCP.
-- The CLI rules apply: pass `command` unescaped, write it in the target's shell, and
-  name only services defined in config for `restart` and `logs`.
-- `fleet_restart` and `fleet_bios` are annotated `destructive`; `ls`/`logs`/`gpu`/`disk`/`status` are
-  `readOnly` where they only inspect state. Screenshot and computer-use tools execute on hosts and are hidden in read-only mode.
-  Host, group and recipe names are written into the tool descriptions, so an agent sees
-  valid selectors without a round trip.
-- The CLI (`cli.ts`) and the MCP server (`mcp.ts`) both call `src/core.ts`, so the exec
-  path lives in one place.
+- Every other command is CLI only.
+- The CLI rules apply: pass `command` unescaped and write it in the target's shell.
+- The read tools carry `readOnlyHint`. The read-only kill switch hides `exec` and
+  `screenshot`. Host and group names are written into the tool descriptions.
 
 **Remote endpoint:** fleet can also be deployed as a public HTTP MCP server (Streamable
 HTTP at `/mcp`; legacy `/sse` returns 410) for remote clients. It runs on one host as a service
 (`src/http.ts`, `buildServer` from `src/server.ts`) behind a reverse proxy / tunnel, and is
 **bearer-token gated** (`Authorization: Bearer <FLEET_MCP_TOKEN>`; the token lives only in
-the service env). `FLEET_MCP_READONLY=1` is the kill-switch (drops exec/cp/restart/run).
+the service env). `FLEET_MCP_READONLY=1` is the kill-switch (drops exec and screenshot).
 The host it runs on is the SSH origin for the whole fleet. Build/run details are in
 `DEPLOY.md`; `fleet restart <host> fleet-mcp` bounces it.
 

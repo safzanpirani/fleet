@@ -27,8 +27,8 @@ try {
 
   show("fleet_status {}", await client.callTool({ name: "fleet_status", arguments: {} }));
 
-  show("fleet_restart (bogus → expect isError)",
-    await client.callTool({ name: "fleet_restart", arguments: { host: "web", service: "does-not-exist" } }), true);
+  show("fleet_logs (bogus service → expect isError)",
+    await client.callTool({ name: "fleet_logs", arguments: { host: "web", service: "does-not-exist" } }), true);
 
   show("fleet_exec web 'echo + quotes round-trip'",
     await client.callTool({ name: "fleet_exec", arguments: {

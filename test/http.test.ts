@@ -108,7 +108,7 @@ describe("Fleet HTTP transport", () => {
           }));
           const { tools } = await client.listTools();
           expect(tools.some((tool) => tool.name === "fleet_exec")).toBe(!readOnly);
-          expect(tools.some((tool) => tool.name === "fleet_wait")).toBe(true);
+          expect(tools.some((tool) => tool.name === "fleet_status")).toBe(true);
           if (readOnly) {
             await expect(client.callTool({ name: "fleet_exec", arguments: { selector: "fixture", command: "true" } }))
               .rejects.toThrow(/fleet_exec not found/);
