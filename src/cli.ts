@@ -32,7 +32,7 @@ import { processList, processKill } from "./procs.ts";
 import type { KillResult } from "./procs.ts";
 import { format } from "node:util";
 import { loadConfig, resolveHosts } from "./config.ts";
-import { runWinSessionBroker } from "./winsession.ts";
+import { runWinSessionBroker, runWinSessionTransport } from "./winsession.ts";
 import { focusElements } from "./focus.ts";
 import {
   androidTaskBackend, desktopTaskBackend, jevTransport, loadTaskKey, parseSubtask, runTask, stepDescription,
@@ -2315,6 +2315,10 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       return 0;
     }
 
+    case "__win-session-transport": {
+      const host = rest[0] ? cfg.hosts[rest[0]] : undefined;
+      return host ? await runWinSessionTransport(host) : 2;
+    }
     case "__win-session": {
       // The kept-open PowerShell broker that exec starts for a Windows host.
       const [name] = rest;

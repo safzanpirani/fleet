@@ -19,7 +19,9 @@
  * otherwise swallow the requests that follow.
  */
 import { createHash } from "node:crypto";
-import { mkdirSync, rmSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, rmSync } from "node:fs";
+import { dlopen, FFIType } from "bun:ffi";
+import type { FileSink } from "bun";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { hostKeyOpts, type Host } from "./config.ts";
@@ -48,7 +50,20 @@ export function sessionLoopScript(): string {
   return `$ErrorActionPreference = 'Continue'
 try { $PSStyle.OutputRendering = 'PlainText' } catch {}
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
-Add-Type -Namespace FleetSession -Name Std -MemberDefinition '[DllImport("kernel32.dll")] public static extern bool SetStdHandle(int n, System.IntPtr h); [DllImport("kernel32.dll")] public static extern bool SetHandleInformation(System.IntPtr h, int mask, int flags);'
+Add-Type -Namespace FleetSession -Name Std -MemberDefinition @'
+[DllImport("kernel32.dll")] public static extern bool SetStdHandle(int n, System.IntPtr h);
+[DllImport("kernel32.dll")] public static extern System.IntPtr GetStdHandle(int n);
+[DllImport("kernel32.dll")] public static extern bool SetHandleInformation(System.IntPtr h, int mask, int flags);
+public static string Snapshot(string path) {
+  using (var stream = new System.IO.FileStream(path, System.IO.FileMode.Open, System.IO.FileAccess.Read, System.IO.FileShare.ReadWrite | System.IO.FileShare.Delete)) {
+    // Read a fixed boundary, not ReadToEnd: descendants may still append.
+    var bytes = new byte[checked((int)stream.Length)];
+    int read = 0, n;
+    while (read < bytes.Length && (n = stream.Read(bytes, read, bytes.Length - read)) > 0) read += n;
+    return System.Text.Encoding.UTF8.GetString(bytes, 0, read);
+  }
+}
+'@
 $__fsReader = New-Object System.IO.StreamReader([Console]::OpenStandardInput(), (New-Object System.Text.UTF8Encoding($false)))
 $__fsNul = [System.IO.File]::Open('NUL', 'Open', 'Read')
 # Children inherit stdin by handle value, so NUL must be inheritable, or a
@@ -58,6 +73,8 @@ $__fsNul = [System.IO.File]::Open('NUL', 'Open', 'Read')
 $__fsHome = (Get-Location).Path
 $__fsFile = Join-Path ([IO.Path]::GetTempPath()) ('fleet-session-' + $PID + '.ps1')
 $__fsEnv = @{}; Get-ChildItem env: | ForEach-Object { $__fsEnv[$_.Name] = $_.Value }
+$__fsStdOut = [FleetSession.Std]::GetStdHandle(-11); $__fsStdErr = [FleetSession.Std]::GetStdHandle(-12)
+$__fsConsoleOut = [Console]::Out; $__fsConsoleErr = [Console]::Error
 [Console]::Out.WriteLine('${READY}'); [Console]::Out.Flush()
 while ($null -ne ($__fsLine = $__fsReader.ReadLine())) {
   if (-not $__fsLine) { continue }
@@ -75,6 +92,20 @@ while ($null -ne ($__fsLine = $__fsReader.ReadLine())) {
   $global:__fleetFell = $false
   $script:__fsCode = 1
   $__fsGlobals = @{}; Get-Variable -Scope Global | Where-Object Name -NotLike '__fs*' | ForEach-Object { $__fsGlobals[$_.Name] = $_.Value }
+  # Each call gets new kernel file handles. A detached child inherits only these
+  # handles; its late output cannot reach the protocol or any later call.
+  $__fsOutPath = Join-Path ([IO.Path]::GetTempPath()) ('fleet-session-' + [Guid]::NewGuid() + '.out')
+  $__fsErrPath = Join-Path ([IO.Path]::GetTempPath()) ('fleet-session-' + [Guid]::NewGuid() + '.err')
+  $__fsOutFile = [IO.FileStream]::new($__fsOutPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete, 4096, [IO.FileOptions]::DeleteOnClose)
+  $__fsErrFile = [IO.FileStream]::new($__fsErrPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete, 4096, [IO.FileOptions]::DeleteOnClose)
+  $__fsOutWriter = [IO.StreamWriter]::new($__fsOutFile, [Text.UTF8Encoding]::new($false), 4096, $true)
+  $__fsErrWriter = [IO.StreamWriter]::new($__fsErrFile, [Text.UTF8Encoding]::new($false), 4096, $true)
+  $__fsOutWriter.AutoFlush = $true; $__fsErrWriter.AutoFlush = $true
+  [void][FleetSession.Std]::SetHandleInformation($__fsOutFile.SafeFileHandle.DangerousGetHandle(), 1, 1)
+  [void][FleetSession.Std]::SetHandleInformation($__fsErrFile.SafeFileHandle.DangerousGetHandle(), 1, 1)
+  [void][FleetSession.Std]::SetStdHandle(-11, $__fsOutFile.SafeFileHandle.DangerousGetHandle())
+  [void][FleetSession.Std]::SetStdHandle(-12, $__fsErrFile.SafeFileHandle.DangerousGetHandle())
+  [Console]::SetOut($__fsOutWriter); [Console]::SetError($__fsErrWriter)
   try {
     # Its own Out-Default, not the loop's: the whole while statement is one
     # pipeline, so a table formatter started by this program's objects would
@@ -85,9 +116,20 @@ while ($null -ne ($__fsLine = $__fsReader.ReadLine())) {
   } catch {
     [Console]::Error.WriteLine(($_ | Out-String).TrimEnd())
     $script:__fsCode = 1
+  } finally {
+    $__fsOutWriter.Flush(); $__fsErrWriter.Flush()
+    [void][FleetSession.Std]::SetStdHandle(-11, $__fsStdOut)
+    [void][FleetSession.Std]::SetStdHandle(-12, $__fsStdErr)
+    [Console]::SetOut($__fsConsoleOut); [Console]::SetError($__fsConsoleErr)
   }
-  # Sent the way program output travels (the pipeline), unlike the end markers.
-  # Its absence means the session lost this call's output.
+  try {
+    [Console]::Out.Write([FleetSession.Std]::Snapshot($__fsOutPath))
+    [Console]::Error.Write([FleetSession.Std]::Snapshot($__fsErrPath))
+  } finally {
+    $__fsOutWriter.Dispose(); $__fsErrWriter.Dispose()
+    $__fsOutFile.Dispose(); $__fsErrFile.Dispose()
+  }
+  # The pipeline probe goes through the same formatter as the program.
   '${PIPE_PROBE}' + $__fsEnd | Out-Default
   foreach ($__fsVar in @(Get-Variable -Scope Global)) {
     if ($__fsVar.Name -notlike '__fs*' -and -not $__fsGlobals.ContainsKey($__fsVar.Name)) { Remove-Variable -Name $__fsVar.Name -Scope Global -EA SilentlyContinue }
@@ -243,21 +285,27 @@ function startBroker(host: Host): void {
   } catch { /* the one-shot path still works */ }
 }
 
+// Keep the lock inode: unlinking it would let a later starter lock a different
+// file while this owner still holds the old one. The kernel releases on death.
+let lockLibrary: { symbols: { flock(fd: number, operation: number): number } } | undefined;
+export function claimBroker(path: string): (() => void) | undefined {
+  lockLibrary ??= dlopen(process.platform === "darwin" ? "libSystem.B.dylib" : "libc.so.6", {
+    flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
+  });
+  const fd = openSync(path + ".lock", "a", 0o600);
+  if (lockLibrary.symbols.flock!(fd, 2 | 4) !== 0) { closeSync(fd); return undefined; }
+  return () => closeSync(fd);
+}
+
 /** The broker: owns one pwsh session for `host` and serves one request at a
  *  time. Exits after IDLE_MS without a request. Returns false when another
  *  broker already serves the host. */
 export async function runWinSessionBroker(host: Host): Promise<boolean> {
   const path = winSessionSocket(host);
   mkdirSync(join(homedir(), ".fleet"), { recursive: true, mode: 0o700 });
-  // A socket file left by a dead broker blocks listen. A live broker answers
-  // this connect, and then this one bows out.
-  const alive = await new Promise<boolean>((resolve) => {
-    Bun.connect({ unix: path, socket: {
-      open(s) { s.end(); resolve(true); }, data() {}, error() { resolve(false); }, connectError() { resolve(false); },
-    } }).catch(() => resolve(false));
-  });
-  if (alive) return false;
-  // TODO(review): use an atomic owner lock; simultaneous starters can unlink a fresh socket.
+  const release = claimBroker(path);
+  if (!release) return false;
+  // Only the lock owner may remove a socket, including stale sockets.
   rmSync(path, { force: true });
 
   let session: Session | undefined;
@@ -269,8 +317,7 @@ export async function runWinSessionBroker(host: Host): Promise<boolean> {
     clearTimeout(idle);
     if (!busy && activeReplies === 0) idle = setTimeout(shutdown, IDLE_MS);
   };
-  // TODO(review): verify remote pwsh teardown after local broker SIGKILL on supported hosts.
-  const shutdown = () => { session?.kill(); server.stop(true); rmSync(path, { force: true }); process.exit(0); };
+  const shutdown = () => { session?.kill(); server.stop(true); rmSync(path, { force: true }); release(); process.exit(0); };
   const ensure = async () => {
     if (session && !session.dead) return session;
     if (!starting) starting = Session.start(host);
@@ -295,7 +342,7 @@ export async function runWinSessionBroker(host: Host): Promise<boolean> {
   };
   const BUSY = { busy: true, stdout: "", stderr: "", code: 0 };
 
-  const server = Bun.listen<{ buf: string; decoder: TextDecoder; handled: boolean; replyPending?: boolean; out?: Uint8Array }>({
+  const server = (() => { try { return Bun.listen<{ buf: string; decoder: TextDecoder; handled: boolean; replyPending?: boolean; out?: Uint8Array }>({
     unix: path,
     socket: {
       open(sock) { sock.data = { buf: "", decoder: new TextDecoder(), handled: false }; },
@@ -333,7 +380,7 @@ export async function runWinSessionBroker(host: Host): Promise<boolean> {
         }
       },
     },
-  });
+  }); } catch (error) { release(); throw error; } })();
   armIdle();
   process.on("SIGTERM", shutdown);
   // Warm the session now, so the call after the one that started the broker is fast.
@@ -349,17 +396,14 @@ class Session {
   private constructor(private proc: ReturnType<typeof Bun.spawn>) {}
 
   static async start(host: Host): Promise<Session> {
-    const encoded = Buffer.from(sessionLoopScript(), "utf16le").toString("base64");
-    // Its own connection, not the shared control master: killing this ssh must
-    // close the channel, so a timed-out program dies with its session.
-    const proc = Bun.spawn(["ssh", ...proxyOpts(host), ...hostKeyOpts(host), "-o", "ControlMaster=no", "-o", "ControlPath=none",
-      "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=30", host.ssh,
-      "pwsh", "-NoProfile", "-NonInteractive", "-OutputFormat", "Text", "-EncodedCommand", encoded],
+    // The transport owns ssh and watches our stdin for EOF even while a remote
+    // program is busy. Broker SIGKILL therefore cannot leave its ssh orphaned.
+    const proc = Bun.spawn([...fleetReinvocation(), "__win-session-transport", host.name],
       { stdin: "pipe", stdout: "pipe", stderr: "pipe", env: sshEnv() });
     const s = new Session(proc);
     s.pump(proc.stdout as ReadableStream<Uint8Array>, "out");
     s.pump(proc.stderr as ReadableStream<Uint8Array>, "err");
-    proc.exited.then(() => { s.dead = true; s.wake(); });
+    proc.exited.then(() => { s.kill(); });
     const ready = await s.until(() => s.out.includes(READY) || s.dead, 20_000);
     if (!ready || s.dead) { s.kill(); throw new Error("session did not start"); }
     s.out = s.out.slice(s.out.indexOf(READY) + READY.length).replace(/^\r?\n/, "");
@@ -396,11 +440,17 @@ class Session {
     });
   }
 
-  kill() { this.dead = true; try { this.proc.kill("SIGKILL"); } catch {} this.wake(); }
+  kill() {
+    if (this.dead) return;
+    this.dead = true;
+    try { (this.proc.stdin as FileSink).end(); } catch {}
+    this.wake();
+  }
 
   async run(program: string, timeoutMs: number): Promise<SessionReply> {
     const end = `__FLEET_END_${crypto.randomUUID().replaceAll("-", "")}__`;
-    // TODO(review): inherited output handles from a detached child can write after its marker into the next call.
+    // The remote loop snapshots private per-call output handles before markers;
+    // detached children retain only their old files, never the next call's pipes.
     this.out = ""; this.err = "";
     const sink = this.proc.stdin as import("bun").FileSink;
     const b64 = Buffer.from(program, "utf8").toString("base64");
@@ -434,5 +484,35 @@ class Session {
           + "the session was restarted, so run the command again if you need its output"].filter(Boolean).join("\n") };
     }
     return { stdout, stderr, code: Number(mo[1]) };
+  }
+}
+
+/** Separate transport lifetime from the broker. EOF on the broker's pipe is
+ *  observable after SIGKILL, unlike a signal handler in the broker itself. */
+export async function runWinSessionTransport(host: Host): Promise<number> {
+  const encoded = Buffer.from(sessionLoopScript(), "utf16le").toString("base64");
+  const proc = Bun.spawn(["ssh", ...proxyOpts(host), ...hostKeyOpts(host), "-o", "ControlMaster=no", "-o", "ControlPath=none",
+    "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=30", host.ssh,
+    "pwsh", "-NoProfile", "-NonInteractive", "-OutputFormat", "Text", "-EncodedCommand", encoded],
+    { stdin: "pipe", stdout: "inherit", stderr: "inherit", env: sshEnv() });
+  const stop = () => { try { proc.kill("SIGKILL"); } catch {} };
+  process.on("SIGTERM", stop);
+  process.on("SIGINT", stop);
+  const input = (async () => {
+    try {
+      for await (const chunk of Bun.stdin.stream()) {
+        proc.stdin.write(chunk);
+        await proc.stdin.flush();
+      }
+    } finally { stop(); }
+  })();
+  try {
+    await Promise.race([input, proc.exited]);
+    stop();
+    return await proc.exited;
+  } finally {
+    stop();
+    process.off("SIGTERM", stop);
+    process.off("SIGINT", stop);
   }
 }

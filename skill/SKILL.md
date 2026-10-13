@@ -171,12 +171,18 @@ jobs) instead of holding an `exec` or a backgrounded SSH session open.
   connection, and later calls take ~50-250 ms instead of ~0.6 s. Each call runs in a
   child scope from the home directory, with environment variables restored after;
   `$global:` state and imported modules carry over. Each program runs as a script file,
-  so `exit 7` reports 7 exactly (one-shot pwsh reports 1). A busy or unresponsive
-  session falls back to a one-shot pwsh, a timeout restarts it, and it closes after 10 idle minutes
-  (`FLEET_WIN_SESSION_IDLE_S`). `FLEET_WIN_SESSION=0` turns it off. A call whose
-  PowerShell output never arrived fails with "the Windows session lost this program's
-  PowerShell output" and restarts the session; the program already ran, so rerun it only
-  if it is safe to run twice.
+  so `exit 7` reports 7 exactly (one-shot pwsh reports 1). Only a missing, starting or
+  explicitly busy broker permits one-shot fallback. Losing a reply after acceptance
+  reports unknown execution status and never replays the program. A timeout restarts
+  the session; it closes after 10 idle minutes (`FLEET_WIN_SESSION_IDLE_S`).
+  `FLEET_WIN_SESSION=0` turns it off. Startup has an advisory lifetime lock, and a
+  separate transport closes SSH on broker EOF, even after broker SIGKILL. Remote
+  teardown depends on the Windows SSH server; detached processes may outlive it.
+  Each call snapshots private temporary output handles; late detached-child output
+  is discarded and cannot enter a later call. Use `spawn` for durable job output.
+  A call whose PowerShell output never arrived fails with "the Windows session lost
+  this program's PowerShell output" and restarts the session; the program already
+  ran, so rerun it only if it is safe to run twice.
 - **Local stdin is never forwarded.** The remote program travels on ssh's stdin, so
   `fleet exec host 'bash -s' < job.sh` would run nothing. A command that reads stdin
   (`bash -s`, `python3 -`, `cat > f`) with a file or pipe on local stdin is refused; use
