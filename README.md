@@ -210,6 +210,17 @@ Windows command wrapped in `powershell -Command "…"` or `wsl bash -c "…"` ge
 fleet already runs PowerShell there, and the outer session expands `$variables` in the
 double quotes first.
 
+On macOS/Linux controllers, repeat Windows execs reuse a local PowerShell broker.
+An advisory lifetime lock serializes startup and stale-socket removal. A separate
+transport owns its non-multiplexed SSH connection and closes it when the broker's
+input pipe reaches EOF, including after broker SIGKILL. Remote process teardown
+still depends on the Windows SSH server closing its session; this is not a
+guarantee that independently detached remote processes are terminated.
+Each call captures output through unique inheritable temporary file handles and
+snapshots those files before reporting completion. A detached child's later output
+is discarded, rather than mixed into the next call. Use `fleet spawn` for durable
+background output. `FLEET_WIN_SESSION=0` disables the broker.
+
 `fleet edit` treats replacement text literally, including `$&`. Omitting `--new`
 or passing `--new ""` deletes the match. A present `--new` without a value fails.
 Use `--old=--flag` for option-looking text. Edit diffs omit unchanged context and
