@@ -44,6 +44,10 @@ one, Fleet uses the safe placeholder configuration in
 Prefer not to link the command globally? Run it with
 `bun run src/cli.ts <command>`.
 
+For an opt-in, target-side prototype of durable request deduplication and explicit
+indeterminate outcomes, see the [remote dispatch spike](docs/spikes/2026-10-13-durable-dispatch-fence.md).
+It does not change normal Fleet command execution.
+
 ## Usage
 ```sh
 fleet ls                            # reachability + services (◍ = ssh-down but health-URL ok)
