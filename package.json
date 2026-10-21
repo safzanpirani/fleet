@@ -2,6 +2,7 @@
   "name": "fleet",
   "version": "0.1.0",
   "description": "Drive your whole machine fleet over SSH without quoting pain",
+  "license": "MIT",
   "type": "module",
   "bin": {
     "fleet": "./src/cli.ts",
