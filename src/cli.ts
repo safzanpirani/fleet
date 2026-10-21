@@ -45,13 +45,13 @@ import { sshInteractive } from "./ssh.ts";
 import { proxyConnectMain } from "./proxy.ts";
 import type { ExecResult } from "./ssh.ts";
 import {
-  spawnJob, listJobs, jobLog, jobTail, jobFollow, killJob, waitJob, pruneJobs,
+  spawnJob, listJobs, jobLog, jobTail, jobFollow, killJob, removeJob, waitJob, pruneJobs,
 } from "./jobs.ts";
 import type { JobRow } from "./jobs.ts";
 import {
-  pullFlag, pullVal, parseFlags, parseLeadingFlags, lsHosts, runExec, runScript, rebootRefusal, droppedStdinCheck, nestedShellNote, readScriptSource, editRemoteFile, parseEditList,
+  pullFlag, pullVal, parseFlags, parseLeadingFlags, lsHosts, runExec, runScript, rebootRefusal, droppedStdinCheck, nestedShellNote, psInterpConflict, readScriptSource, editRemoteFile, parseEditList,
   pushFile, pullFile, parseRemoteSpec, restartService, serviceLogs, svcStatus, serviceTarget,
-  gpuRows, diskRows, sudoWrap, fetchDashboard, hostStatus, runRecipe, captureScreenshot, rebootHosts,
+  gpuRows, diskRows, sudoWrap, fetchDashboard, hostStatus, runRecipe, captureScreenshot, captureWebcam, prepareWebcamStream, rebootHosts,
   cuInstall, cuRun, cuTools, cuDescribe, cuRecordStart, cuRecordStop, cuRecordStatus, cuRegions, cuPerception, bootMismatchNote,
   cuApps, cuShotWindow, browseHost, preferredImageExt, overlayGrid,
   cuSnapshot, cuResolveTargetFrom, cuResolvePoint, cuAct, cuBatch, cuBlockerNote, cuElements, cuOpen, sameRole, cuVerify,
@@ -59,6 +59,7 @@ import {
   bootState, switchMachine, firmwareEntries, hostKey, findHost, listMonitors, waitFor, routeSelector, deployHosts, diagnose, firmwareRebootHosts,
   proxyRows, proxyChecks, dropMasters,
 } from "./core.ts";
+import { currentViewport, detectWebcamVo, runWebcamStream, validateWebcamStreamOptions } from "./webcam.ts";
 import {
   fingerprint,
   fingerprintTools,
@@ -180,6 +181,27 @@ export function hoistFlags(
   const rest = pos.slice(k);
   const separated = rest[0] === "--";
   return { pos: separated ? rest.slice(1) : rest, separated };
+}
+
+/** Whether joining the remote command's words with spaces would lose what the
+ *  local shell's quoting meant. `fleet exec h -- bash -c "a; b"` arrives as
+ *  three words; joined, bash -c gets only `a` and `b` runs outside it. A later
+ *  word holding whitespace or nothing was quoted on purpose, so each word is
+ *  sent as one quoted argument. A first word with whitespace is a whole
+ *  command line (`fleet exec h 'cd /x && make'`), joined as before. */
+export function keepsArgvBoundaries(pos: string[]): boolean {
+  return pos.length > 1 && !!pos[0] && !/\s/.test(pos[0]) && pos.slice(1).some((word) => word === "" || /\s/.test(word));
+}
+
+/** exec's CLI status: 0 or 1 across hosts. With --raw on one host it is that
+ *  host's own code, so a pipe sees what ssh would have reported. A code that
+ *  is nonzero but 0 modulo 256 (a large Windows status) still reports failure. */
+function execStatus(results: ExecResult[], raw: boolean): number {
+  if (raw && results.length === 1) {
+    const code = results[0]!.code;
+    return code === 0 ? 0 : (code & 255) || 1;
+  }
+  return results.some((r) => !r.ok) ? 1 : 0;
 }
 
 /** A --cwd that the local shell already expanded: `--cwd ~/x` unquoted reaches
@@ -707,6 +729,7 @@ function printRaw(r: ExecResult): void {
 }
 
 const SUBCOMMANDS = [
+  "webcam",
   "ls", "hosts", "dt", "exec", "spawn", "jobs", "cp", "edit", "restart", "reboot", "bios", "boot", "switch", "wait",
   "gpu", "disk", "ps", "kill", "status", "top", "logs", "svc", "shot", "cu", "browse", "run", "deploy", "tools", "proxy", "doctor", "hostkey", "find", "session", "drop", "completion", "ssh", "help",
 ];
@@ -733,7 +756,7 @@ _fleet() {
   case $words[2] in
     run) compadd -- "\${recipes[@]}";;
     ${svcCmds.split(" ").join("|")}) compadd -- "\${sels[@]}" "\${svcs[@]}";;
-    boot|switch|wait|exec|spawn|cp|edit|reboot|bios|top|shot|cu|ssh|doctor|status|deploy|proxy) compadd -- "\${sels[@]}";;
+    boot|switch|wait|exec|spawn|cp|edit|reboot|bios|top|shot|webcam|cu|ssh|doctor|status|deploy|proxy) compadd -- "\${sels[@]}";;
   esac
 }
 compdef _fleet fleet`;
@@ -756,13 +779,14 @@ _fleet() {
   case "\${COMP_WORDS[1]}" in
     run) _fleet_matches "$cur" "\${recipes[@]}";;
     ${svcCmds.split(" ").join("|")}) _fleet_matches "$cur" "\${sels[@]}" "\${svcs[@]}";;
-    boot|switch|wait|exec|spawn|cp|edit|reboot|bios|top|shot|cu|ssh|doctor|status|deploy|proxy) _fleet_matches "$cur" "\${sels[@]}";;
+    boot|switch|wait|exec|spawn|cp|edit|reboot|bios|top|shot|webcam|cu|ssh|doctor|status|deploy|proxy) _fleet_matches "$cur" "\${sels[@]}";;
   esac
 }
 complete -F _fleet fleet`;
 }
 
 const PROXY_LEADING_VALUES: Record<string, readonly string[]> = {
+  webcam: ["--device", "--out", "--fps", "--width", "--for", "--vo"],
   exec: ["--cwd", "--timeout", "--script", "--interp"],
   spawn: ["--cwd", "--label"],
   jobs: ["-n", "--lines", "--until", "--timeout", "--include", "--exclude"],
@@ -787,7 +811,7 @@ const PROXY_LEADING_VALUES: Record<string, readonly string[]> = {
  * parsing remote payloads. Keep this boundary aligned with exec flag hoisting. */
 export function fleetJsonCommand(command: string | undefined, args: string[]): string | undefined {
   const canonical = command === "job" ? "jobs" : command === "service" ? "svc" : command === "push" || command === "pull" ? "cp" : command;
-  if (!canonical || !["exec", "spawn", "jobs", "cp", "edit", "tools", "restart", "logs", "svc"].includes(canonical)) return undefined;
+  if (!canonical || !["exec", "spawn", "jobs", "cp", "edit", "tools", "restart", "logs", "svc", "webcam"].includes(canonical)) return undefined;
   const values = new Set([...(PROXY_LEADING_VALUES[canonical] ?? []), "--proxy"]);
   const payload = canonical === "exec" || canonical === "spawn";
   const bools = new Set(canonical === "exec"
@@ -931,6 +955,9 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       const argv = flags["--argv"] === true;
       if (argv && (scriptPath || interp)) die("--argv cannot be combined with --script or --interp");
       if (argv && !separated) die("--argv requires -- before the program");
+      const interpConflict = interp ? psInterpConflict(interp) : undefined;
+      if (interpConflict)
+        die(`--interp ${interp!.trim().split(/\s+/, 1)[0]} cannot take ${interpConflict}; fleet runs it as <exe> [flags] -NoProfile -NonInteractive -File <temp .ps1>, so pass the PowerShell executable and options such as -ExecutionPolicy only`);
       const cmd = pos.join(" ");
       if (scriptPath) {
         if (!sel) die("usage: fleet exec --script <file|-> [--interp cmd] [--cwd dir] [--timeout S] [--wsl] [--sudo] [--raw] [--json] <sel> [--] [ARG…]");
@@ -941,7 +968,7 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
         if (json) console.log(JSON.stringify(results, null, 2));
         else if (raw) results.forEach(printRaw);
         else { results.forEach(printResult); await printBootMismatch(cfg, results); }
-        return results.some((r) => !r.ok) ? 1 : 0;
+        return execStatus(results, raw);
       }
       if (interp) die("--interp requires --script");
       if (!sel || !cmd) die("usage: fleet exec [--cwd dir] [--timeout S] [--wsl] [--sudo] [--fresh] [--confirm-reboot] [--raw] [--json] <sel> <cmd…>   |   fleet exec --script <file|-> <sel>");
@@ -962,13 +989,16 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       if (dropped.refuse) die(dropped.refuse);
       if (dropped.warn) console.error(A.y(dropped.warn));
       const target = await routeSelector(cfg, sel!);
-      const nested = nestedShellNote(cmd, resolveHosts(cfg, target), wsl);
+      // Kept boundaries reach the outer shell single-quoted, so the double
+      // parse the note warns about cannot happen.
+      const words = argv || keepsArgvBoundaries(pos);
+      const nested = words ? undefined : nestedShellNote(cmd, resolveHosts(cfg, target), wsl);
       if (nested) console.error(A.y(nested));
-      const results = await runExec(cfg, target, argv ? pos : cmd, { wsl, cwd, timeoutMs, sudo, fresh });
+      const results = await runExec(cfg, target, words ? pos : cmd, { wsl, cwd, timeoutMs, sudo, fresh });
       if (json) console.log(JSON.stringify(results, null, 2));
       else if (raw) results.forEach(printRaw);
       else { results.forEach(printResult); await printBootMismatch(cfg, results); }
-      return results.some((r) => !r.ok) ? 1 : 0;
+      return execStatus(results, raw);
     }
 
     case "spawn": {
@@ -995,7 +1025,7 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       const dropped = droppedStdinCheck(cmd);
       if (dropped.refuse) die(dropped.refuse);
       if (dropped.warn) console.error(A.y(dropped.warn));
-      const results = await spawnJob(cfg, await routeSelector(cfg, sel!), cmd, { cwd, label, wsl, elevated, fresh: flags["--fresh"] === true });
+      const results = await spawnJob(cfg, await routeSelector(cfg, sel!), keepsArgvBoundaries(pos) ? pos : cmd, { cwd, label, wsl, elevated, fresh: flags["--fresh"] === true });
       if (json) { console.log(JSON.stringify(results, null, 2)); return results.some((r) => !r.ok) ? 1 : 0; }
       for (const r of results) {
         if (r.ok) console.log(`${A.g("●")} ${A.b(r.host)} ${A.d("job")} ${A.c(r.id!)} ${A.d("· pid " + r.pid)}  ${A.d("fleet jobs tail " + r.host + ":" + r.id)}`);
@@ -1019,12 +1049,12 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       const verb = rest[0];
       const allowed: Record<string, string[]> = {
         list: ["--json"], log: ["--json"], tail: ["--json", "-n", "-f", "--include", "--exclude"],
-        kill: ["--json"], wait: ["--json", "--until", "--timeout"], prune: ["--json", "--all"],
+        kill: ["--json"], rm: ["--json"], wait: ["--json", "--until", "--timeout"], prune: ["--json", "--all"],
       };
       const action = verb && Object.hasOwn(allowed, verb) ? verb : "list";
       for (const flag of Object.keys(flags))
         if (!allowed[action]!.includes(flag)) die(`${flag} is not valid for jobs ${action}`);
-      const ADDRESSED = new Set(["log", "tail", "kill", "wait"]);
+      const ADDRESSED = new Set(["log", "tail", "kill", "rm", "wait"]);
       if (verb && ADDRESSED.has(verb)) {
         rest.shift();
         if (rest.length < 1 || rest.length > 2 || (rest[0]!.includes(":") && rest.length > 1))
@@ -1052,6 +1082,12 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
         }
         if (verb === "kill") {
           const r = await killJob(cfg, rest[0] ?? die("usage: fleet jobs kill <host:id>"), rest[1]);
+          if (json) console.log(JSON.stringify(r, null, 2));
+          else printResult(r);
+          return r.ok ? 0 : 1;
+        }
+        if (verb === "rm") {
+          const r = await removeJob(cfg, rest[0]!, rest[1]);
           if (json) console.log(JSON.stringify(r, null, 2));
           else printResult(r);
           return r.ok ? 0 : 1;
@@ -1396,6 +1432,57 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       if (!sel || pos.length !== 1) die("usage: fleet top <host>");
       const host = resolveHosts(cfg, await routeSelector(cfg, sel))[0]!.name;
       return await topLoop(cfg, host);
+    }
+
+    case "webcam": {
+      const { flags, rest: pos0 } = parseFlags(
+        rest,
+        ["--list", "--json", "--stream", "--live", "--window", "-W"],
+        ["--device", "--out", "--fps", "--width", "--for", "--vo"],
+      );
+      const pos = [...pos0];
+      let verbStream = false;
+      if (pos.length === 2 && (pos[0] === "stream" || pos[0] === "live")) { pos.shift(); verbStream = true; }
+      else if (pos.length === 2 && (pos[1] === "stream" || pos[1] === "live")) { pos.pop(); verbStream = true; }
+      const usage = "usage: fleet webcam <host|local> [--device DEVICE] [--out photo.png] [--list] [--json]\n"
+        + "       fleet webcam <host|local> --stream [--device DEVICE] [--fps N] [--width PX] [--for S] [--vo kitty|text] [--window|-W]";
+      if (pos.length !== 1) die(usage);
+      const streaming = flags["--stream"] === true || flags["--live"] === true || verbStream;
+      const windowMode = flags["--window"] === true || flags["-W"] === true;
+      const hasStreamOpts = Boolean(flags["--fps"] || flags["--width"] || flags["--for"] || flags["--vo"] || windowMode);
+      if (flags["--list"] && (flags["--device"] || flags["--out"] || streaming || hasStreamOpts))
+        die("--list cannot be combined with --device, --out, or stream options");
+      if (streaming && (flags["--out"] || flags["--json"]))
+        die("--stream cannot be combined with --out or --json");
+      if (!streaming && hasStreamOpts)
+        die("each of --fps, --width, --for, --vo, and --window requires --stream");
+      const fps = flags["--fps"] !== undefined ? numFlag(flags, "--fps", 15, 1) : undefined;
+      const width = flags["--width"] !== undefined ? numFlag(flags, "--width", 640, 16) : undefined;
+      const durationS = flags["--for"] !== undefined ? numFlag(flags, "--for", 10, 1) : undefined;
+      validateWebcamStreamOptions({ fps, width, durationS });
+      const vo = streaming ? detectWebcamVo({ vo: flags["--vo"] as string | undefined, window: windowMode }) : undefined;
+      if (streaming && vo !== "window" && !process.stdout.isTTY && !flags["--vo"] && !process.env.FLEET_WEBCAM_VO)
+        die("webcam --stream requires a terminal (or pass --window)");
+      if (flags["--out"] && !(flags["--out"] as string).toLowerCase().endsWith(".png")) die("webcam --out requires a PNG file");
+      const sel = pos[0]!;
+      const routed = sel === "local" ? sel : await routeSelector(cfg, sel);
+      if (streaming) {
+        const prepared = await prepareWebcamStream(cfg, routed, {
+          device: flags["--device"] as string | undefined,
+          fps, width, durationS, vo, window: windowMode, viewport: currentViewport(),
+        });
+        await runWebcamStream(prepared.meta, prepared.startProducer);
+        return 0;
+      }
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+      const r = await captureWebcam(cfg, routed, flags["--out"] as string ?? `webcam-${stamp}.png`,
+        { device: flags["--device"] as string | undefined, list: flags["--list"] === true });
+      if (flags["--json"]) console.log(JSON.stringify(r));
+      else if (flags["--list"]) {
+        for (const camera of r.cameras) console.log(`${camera.device}\t${camera.name}`);
+        if (!r.cameras.length) console.log("No cameras found");
+      } else console.log(`${r.host} → ${r.localPath}`);
+      return 0;
     }
 
     case "shot": case "screenshot": {

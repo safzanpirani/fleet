@@ -94,12 +94,11 @@ describe("completion marker", () => {
     expect(takeDoneMarker(err, m).code).toBe(0);
   });
 
-  test("the PowerShell wrapper ships the program base64-encoded and dot-sources it", () => {
+  test("the PowerShell wrapper ships the program base64-encoded", () => {
     const m = doneMarker();
     const wrapped = withDoneMarker("Write-Output 'héllo ✓'", "powershell", m);
     const b64 = /FromBase64String\('([^']+)'\)/.exec(wrapped)![1]!;
     expect(Buffer.from(b64, "base64").toString("utf8")).toStartWith("Write-Output 'héllo ✓'\n$__fleetOk = $?");
-    expect(wrapped).toContain(". ([scriptblock]::Create(");
     expect(wrapped).toContain(`'${m}'`);
     expect(/^[\x20-\x7e\r\n\t]*$/.test(wrapped)).toBe(true);   // the wrapper itself is pure ASCII
   });
@@ -113,9 +112,4 @@ describe("colour", () => {
     expect(useColor({ FORCE_COLOR: "1" }, false)).toBe(true);
     expect(useColor({ FORCE_COLOR: "0" }, false)).toBe(false);
   });
-});
-
-test("a one-shot Windows program flushes its formatted objects before the marker", () => {
-  const script = withDoneMarker("Get-Process | Select-Object Id", "powershell", doneMarker());
-  expect(script).toMatch(/FromBase64String\('[^']+'\)\)\)\) \| Out-Default/);
 });

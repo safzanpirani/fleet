@@ -75,7 +75,12 @@ $__fsFile = Join-Path ([IO.Path]::GetTempPath()) ('fleet-session-' + $PID + '.ps
 $__fsEnv = @{}; Get-ChildItem env: | ForEach-Object { $__fsEnv[$_.Name] = $_.Value }
 $__fsStdOut = [FleetSession.Std]::GetStdHandle(-11); $__fsStdErr = [FleetSession.Std]::GetStdHandle(-12)
 $__fsConsoleOut = [Console]::Out; $__fsConsoleErr = [Console]::Error
-[Console]::Out.WriteLine('${READY}'); [Console]::Out.Flush()
+# pwsh's console host caches [Console]::Out in its output serializer on its
+# first formatted write and never looks again. Make that first write here,
+# before any call swaps in its per-call output file: a first write during a
+# call would bind every later formatted write to that disposed file ("Cannot
+# access a closed Stream"), and each call after it would lose its output.
+'${READY}' | Out-Default
 while ($null -ne ($__fsLine = $__fsReader.ReadLine())) {
   if (-not $__fsLine) { continue }
   # A request is its end marker on one line, then the base64 program in short

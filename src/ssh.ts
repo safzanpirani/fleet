@@ -142,12 +142,13 @@ export function doneMarker(): string {
  *  installs its own EXIT trap or `exec`s away simply never reports, and exec
  *  falls back to waiting for end-of-output as before.
  *
- *  PowerShell: output is UTF-8 and uncoloured, and the program runs dot-sourced (same scope as before) inside
- *  try/catch, so a terminating error stops it and exits 1 instead of letting
- *  later statements run. `-Command -` collapses its own exit code to 0/1, so
- *  the marker carries the real one: the last native exit code when the last
- *  statement failed. `exit N` bypasses the catch and cannot be observed; the
- *  marker then says `?` and exec keeps the process's own code. */
+ *  PowerShell: output is UTF-8 and uncoloured. The program runs dot-sourced
+ *  from a private temp .ps1 inside try/catch, so a terminating error stops it
+ *  and exits 1 instead of letting later statements run. `-Command -` collapses
+ *  its own exit code to 0/1, so the marker carries the real one: the last
+ *  native exit code when the last statement failed, or N for `exit N`. In a
+ *  script file `exit N` ends only that script and sets $LASTEXITCODE; in a
+ *  scriptblock it ended pwsh, and the code collapsed to 1. */
 export function withDoneMarker(script: string, shell: Shell, marker: string): string {
   // bash -s reads the program from stdin, so a command in it that reads stdin
   // (cua-driver, ssh, ffmpeg) swallowed every line after itself. bash parses
@@ -159,21 +160,30 @@ export function withDoneMarker(script: string, shell: Shell, marker: string): st
     return `trap 'fleet_rc=$?; printf "\n%s%s\n" "${marker}" "$fleet_rc" 1>&2' EXIT\n(\n${script}\n) </dev/null`;
   // The program travels base64-encoded: pwsh decodes a stdin program in the
   // console's legacy codepage, so any non-ASCII character in it arrived
-  // garbled. Run from a scriptblock, its line numbers are also the caller's.
-  const source = `${script}\n$__fleetOk = $?; $__fleetLast = $global:LASTEXITCODE`;
+  // garbled. The temp file keeps the program's own line numbers and carries a
+  // BOM, which Windows PowerShell 5.1 needs to read it as UTF-8.
+  const source = `${script}\n$__fleetOk = $?; $__fleetLast = $global:LASTEXITCODE; $__fleetFell = $true`;
   const b64 = Buffer.from(source, "utf8").toString("base64");
-  return `try { $PSStyle.OutputRendering = 'PlainText'; [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } catch {}
+  // Windows PowerShell 5.1 has no $PSStyle, so its line must not share a try
+  // with the encoding, or 5.1 output stays in the legacy codepage.
+  return `try { $PSStyle.OutputRendering = 'PlainText' } catch {}
+try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } catch {}
 $global:LASTEXITCODE = 0
 $__fleetCode = $null
+$__fleetFell = $false
+$__fleetFile = Join-Path ([IO.Path]::GetTempPath()) ('fleet_' + [guid]::NewGuid().ToString('N') + '.ps1')
 try {
+  [IO.File]::WriteAllText($__fleetFile, [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${b64}')), (New-Object Text.UTF8Encoding $true))
   # Out-Default here ends with the program, so a table formatter holding the
   # program's objects flushes before the completion marker, not after it.
-  . ([scriptblock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${b64}')))) | Out-Default
-  $__fleetCode = if ($__fleetOk) { 0 } elseif ($__fleetLast) { $__fleetLast } else { 1 }
+  . $__fleetFile | Out-Default
+  $__fleetCode = if (-not $__fleetFell) { if ($null -ne $global:LASTEXITCODE) { $global:LASTEXITCODE } else { 0 } }
+    elseif ($__fleetOk) { 0 } elseif ($__fleetLast) { $__fleetLast } else { 1 }
 } catch {
   $__fleetCode = 1
   [Console]::Error.WriteLine(($_ | Out-String).TrimEnd())
 } finally {
+  Remove-Item -LiteralPath $__fleetFile -Force -EA SilentlyContinue
   $__fleetReport = if ($null -eq $__fleetCode) { '?' } else { [string]$__fleetCode }
   [Console]::Error.WriteLine([Environment]::NewLine + '${marker}' + $__fleetReport)
 }
@@ -226,6 +236,16 @@ export function psHiddenTaskAction(exe: string, args: string): string {
 // running in the wrong place — the footgun this exists to kill.
 export const bashEsc = (s: string) => s.replace(/'/g, `'\\''`);     // close-quote, escaped-quote, reopen
 export const psEsc = (s: string) => s.replace(/'/g, "''");          // doubled single-quote
+/** Quote an explicit argument vector for the target shell. PowerShell binds a
+ *  quoted '-Recurse' as a positional string, so a word that is only a parameter
+ *  name stays bare: a cmdlet binds it, and a native program receives the same
+ *  text either way. */
+export function buildArgvCommand(argv: string[], powershell: boolean): string {
+  if (!argv.length || !argv[0] || argv.some((arg) => arg.includes("\0")))
+    throw new Error("argv requires a nonempty program and arguments without NUL bytes");
+  return (powershell ? "& " : "") + argv.map((arg, i) =>
+    powershell && i > 0 && /^-[A-Za-z][A-Za-z0-9_]*$/.test(arg) ? arg : `'${powershell ? psEsc(arg) : bashEsc(arg)}'`).join(" ");
+}
 export function bashPathAssignment(variable: string, value: string): string {
   if (!/^[a-z_][a-z0-9_]*$/i.test(variable)) throw new Error(`invalid shell variable: ${variable}`);
   const q = bashEsc(value);
@@ -254,7 +274,7 @@ function withCwdPwsh(cmd: string, cwd: string): string {
 type WinBin = "pwsh" | "powershell";
 const winBinCache = new Map<string, WinBin>();
 
-async function resolveWinBin(host: Host, timeoutMs = 0): Promise<WinBin> {
+export async function resolveWinBin(host: Host, timeoutMs = 0): Promise<WinBin> {
   const forced = process.env.FLEET_WIN_SHELL as WinBin | undefined;
   if (forced === "pwsh" || forced === "powershell") return forced;
   if (host.winShell) return host.winShell;
@@ -313,9 +333,10 @@ export function buildArgs(host: Host, command: string, shell: Shell, winBin: Win
     }
     // Native PowerShell reads the entire program from stdin. This keeps command
     // text and secrets out of both the local ssh argv and the remote process argv,
-    // and removes Windows' EncodedCommand length ceiling.
+    // and removes Windows' EncodedCommand length ceiling. The done-marker wrapper
+    // runs the program from a temp .ps1, which a Restricted policy would refuse.
     const script = cwd ? withCwdPwsh(command, cwd) : command;
-    return { args: [...ssh, winBin, "-NoProfile", "-NonInteractive", "-Command", "-"],
+    return { args: [...ssh, winBin, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", "-"],
       // -Command - needs an empty line to submit a final multiline statement.
       stdin: new TextEncoder().encode(script + "\n\n") };
   }
@@ -441,7 +462,9 @@ export async function exec(
   if (timer) clearTimeout(timer);
   if (graceTimer) clearTimeout(graceTimer);
   const done = takeDoneMarker(rawErr, marker);
-  const stderr = done.stderr;
+  // Two concurrent calls can both try to become the master; the loser says so
+  // and runs unmultiplexed. That is ssh's bookkeeping, not the command's stderr.
+  const stderr = done.stderr.replace(/^ControlSocket .* already exists, disabling multiplexing\r?\n?/gm, "");
   const err = host.os === "windows" ? stripClixml(stderr.trimEnd()) : stderr.trimEnd();
   if (timedOut) return { host: host.name, ok: false, code: 124,
     stdout,
@@ -507,15 +530,20 @@ export async function probe(host: Host, capMs?: number): Promise<boolean> {
   return (await probeDetail(host, capMs)).up;
 }
 
-/** Stream a bash command's output live to the local terminal (inherited stdout/
- *  stderr) — for `fleet jobs tail -f`, where we want a long-lived follow rather
- *  than a buffered round-trip. Linux/mac only; the command is fixed + safe
- *  (our own `tail -n N -f <spool>`), so stdin-piping isn't needed. Ctrl-C kills
- *  the local ssh, which ends the remote tail. */
+/** Stream a remote program's output live to the local terminal (inherited
+ *  stdout/stderr), for `fleet jobs tail -f`. The program is fleet's own fixed
+ *  script: bash on POSIX, PowerShell on Windows. From a terminal it gets a pty,
+ *  so Ctrl-C hangs up the remote side too. Without one (a pipe, a monitor, a
+ *  closed stdin) it gets none: a pty whose stdin hits EOF ended the Windows
+ *  console session before the first line. */
 export function execStream(host: Host, command: string): Promise<number> {
-  const proc = Bun.spawn(["ssh", "-tt", ...connOpts(host), "-o", "BatchMode=yes", "-o", "ConnectTimeout=15",
-    host.ssh, "bash", "-lc", `'${bashEsc(command)}'`],
-    { stdin: "inherit", stdout: "inherit", stderr: "inherit", env: sshEnv() });
+  const tty = process.stdin.isTTY === true;
+  const remote = host.os === "windows"
+    ? ["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand", b64utf16le(command)]
+    : ["bash", "-lc", `'${bashEsc(command)}'`];
+  const proc = Bun.spawn(["ssh", tty ? "-tt" : "-T", ...connOpts(host), "-o", "BatchMode=yes", "-o", "ConnectTimeout=15",
+    host.ssh, ...remote],
+    { stdin: tty ? "inherit" : "ignore", stdout: "inherit", stderr: "inherit", env: sshEnv() });
   return proc.exited;
 }
 
@@ -563,17 +591,6 @@ export async function sshDiagnose(host: Host, timeoutS = 8): Promise<{ ok: boole
     clearTimeout(timer);
     if (cancelTimer) clearTimeout(cancelTimer);
   }
-}
-
-/** Windows equivalent of `execStream`: live-follow a PowerShell command (e.g.
- *  `Get-Content … -Wait`) with inherited stdio. The command is fixed + safe (our
- *  own spool path), so no encoding is needed. Uses the always-present
- *  `powershell` (5.1) for portability. */
-export function execStreamWin(host: Host, psCommand: string): Promise<number> {
-  const proc = Bun.spawn(["ssh", "-tt", ...connOpts(host), "-o", "BatchMode=yes", "-o", "ConnectTimeout=15",
-    host.ssh, "powershell", "-NoProfile", "-NonInteractive", "-Command", psCommand],
-    { stdin: "inherit", stdout: "inherit", stderr: "inherit", env: sshEnv() });
-  return proc.exited;
 }
 
 /** Interactive ssh with inherited stdio (for `fleet ssh <host>`). */

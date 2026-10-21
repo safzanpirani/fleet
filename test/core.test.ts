@@ -1,12 +1,13 @@
 import { test, expect, describe } from "bun:test";
 import {
   deployHosts, deployScript, logsCmd, parseLeadingFlags, parseRecipeStep, resolveDeploySourceRoot,
-  restartCmd, routeSelector, statusCmd, waitFor, writeRemoteFile, pickPreferred, splitArgs,
+  restartCmd, routeSelector, statusCmd, waitFor, writeRemoteFile, pickPreferred, splitArgs, psInterpConflict,
 } from "../src/core.ts";
 import type { FleetConfig, Host } from "../src/config.ts";
 import { lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { buildArgvCommand } from "../src/ssh.ts";
 
 const routeHost = (name: string): Host => ({ name, ssh: name, os: "windows" });
 
@@ -389,15 +390,29 @@ describe("pickPreferred", () => {
 });
 
 test("argv execution preserves empty whitespace unicode and metacharacter arguments", async () => {
-  const core = await import("../src/core.ts");
   const args = ["", "two words", "雪", "a'b", '"quoted"', "$HOME", "$(false)", "x;y", "a\\b", "--json"];
-  const script = core.buildArgvCommand(["python3", "-c", "import sys,json; print(json.dumps(sys.argv[1:],ensure_ascii=False))", ...args], false);
+  const script = buildArgvCommand(["python3", "-c", "import sys,json; print(json.dumps(sys.argv[1:],ensure_ascii=False))", ...args], false);
   const proc = Bun.spawn(["bash", "-c", script], { stdout: "pipe", stderr: "pipe" });
   expect(JSON.parse(await new Response(proc.stdout).text())).toEqual(args);
   expect(await proc.exited).toBe(0);
-  const win = core.buildArgvCommand(["C:\\Program Files\\fixture.exe", ...args], true);
+  const win = buildArgvCommand(["C:\\Program Files\\fixture.exe", ...args], true);
   expect(win).toStartWith("& 'C:\\Program Files\\fixture.exe' '' 'two words' '雪' 'a''b'");
-  expect(core.buildArgvCommand(["/path with spaces/tool", "arg"], false)).toBe("'/path with spaces/tool' 'arg'");
+  expect(buildArgvCommand(["/path with spaces/tool", "arg"], false)).toBe("'/path with spaces/tool' 'arg'");
+});
+
+test("PowerShell argv leaves parameter names for the cmdlet to bind", () => {
+  // A quoted '-Filter' is a positional string: Get-ChildItem then refuses the call.
+  expect(buildArgvCommand(["Get-ChildItem", "C:\\Program Files", "-Directory", "-Filter", "Win*", "--json", "-1", "-a;b", "-x y"], true))
+    .toBe("& 'Get-ChildItem' 'C:\\Program Files' -Directory -Filter 'Win*' '--json' '-1' '-a;b' '-x y'");
+  expect(buildArgvCommand(["-Recurse"], true)).toBe("& '-Recurse'");
+  expect(buildArgvCommand(["ls", "-la"], false)).toBe("'ls' '-la'");
+});
+
+test("a PowerShell --interp refuses only flags that replace the script file", () => {
+  for (const interp of ["pwsh -Command", "pwsh -c", "powershell.exe -ec", "pwsh -EncodedCommand", "pwsh -File", "pwsh -f", "pwsh -", "pwsh -NoLogo -cwa"])
+    expect(psInterpConflict(interp), interp).toBeDefined();
+  for (const interp of ["pwsh", "powershell -ExecutionPolicy Bypass", "pwsh -NoLogo -NoProfile", "python3 -c", "bash -e"])
+    expect(psInterpConflict(interp), interp).toBeUndefined();
 });
 
 test("configured service aliases retain per-host mapping and skip rules", async () => {

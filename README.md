@@ -145,7 +145,7 @@ answers instead.
 
 ### Command options
 
-Use `exec --argv <selector> -- <program> <arguments...>` to preserve argument boundaries. Quote values for the local shell. Argv mode cannot combine with script mode.
+Use `exec --argv <selector> -- <program> <arguments...>` to preserve argument boundaries. Quote values for the local shell. Argv mode cannot combine with script mode. Without `--argv`, Fleet also keeps every boundary when a word after the program is empty or contains whitespace, so `fleet exec <selector> -- bash -c "a; b"` passes `a; b` to bash as one argument. Otherwise it joins the words with spaces. On PowerShell hosts a word that is only a parameter name, such as `-Recurse`, stays unquoted so cmdlets bind it.
 
 `jobs tail --include REGEX --exclude REGEX -n N` filters on the host before the line limit. Inclusion runs before exclusion. Filters and `jobs wait --until` patterns are case-sensitive. POSIX hosts use ERE; Windows uses .NET regex. Filtered output has a 64 KiB limit and reports truncation. Filters cannot combine with follow.
 
@@ -272,6 +272,7 @@ fleet jobs log  web:<id>             # full output
 fleet jobs tail web:<id> -n 40 -f    # last N lines, optionally follow live
 fleet jobs wait web:<id> --until '<regex>' [--timeout S]   # block on match or exit
 fleet jobs kill web:<id>             # kill the whole process tree (TERM, escalates to KILL)
+fleet jobs rm web:<id>               # remove one finished job's spool
 fleet jobs prune [<sel>] [--all]        # remove finished spools (--all also drops dead)
 ```
 
@@ -521,6 +522,27 @@ The desktop contracts carry over:
 On a test phone over Wi-Fi, `elements` takes about 1 s and an input 2 to 3 s.
 Over Tailscale's relay on mobile data (10 to 15 KB/s), replies are gzipped:
 `elements` takes about 1.7 s, an input 2 s, and a screenshot 8 s at 400 px wide.
+
+## Webcam photos and live stream
+
+`fleet webcam` lists cameras, saves one PNG photo, or plays a live stream from a desktop host. FFmpeg must be installed on the target. Fleet uses AVFoundation on macOS, DirectShow on Windows, and video4linux2 on Linux.
+
+```sh
+fleet webcam local --list
+fleet webcam local --device 0 --out photo.png
+fleet webcam local --stream
+fleet webcam workstation --list
+fleet webcam workstation --device "Integrated Camera" --out photo.png
+fleet webcam workstation --stream --fps 15 --for 10
+```
+
+`local` targets the controller computer without SSH. Remote capture uses one configured host. The default camera is the first listed device. Photos fit within 1280×720 pixels. `--json` returns structured results for `--list` and photo capture.
+
+`--stream` (or `stream`) plays a live feed in the terminal. In Kitty, Ghostty, and WezTerm it sends double-buffered Kitty graphics frames and scales them to the terminal cell box. In other terminals it draws true-color half-blocks. Space pauses and resumes, `q`, `Esc`, `Backspace`, and `Ctrl-C` exit, `--for S` stops after `S` seconds, and `--window` (`-W`) opens a local `mpv` or `ffplay` window.
+
+Stream flags take integers: `--fps` is 1–60, `--width` is 16–1280, and `--for` is 1–2147482 seconds. The duration deadline also covers stalled cameras and window playback. Closing playback cancels its producer; an unexpected camera, SSH, or player failure is an error even after frames have arrived.
+
+The operating system must grant camera access. macOS capture over SSH may lack camera permission; use `local` on the Mac. An application can hold exclusive access to a camera. Fleet reports capture failure and leaves that application running. Each photo capture has a 20-second process limit. Fleet installs no camera software.
 
 ## Agent setup
 

@@ -24,7 +24,7 @@
  */
 import { resolveHosts } from "./config.ts";
 import type { FleetConfig, Host } from "./config.ts";
-import { exec, execStream, execStreamWin, bashEsc, psEsc, psHiddenTaskAction } from "./ssh.ts";
+import { buildArgvCommand, exec, execStream, bashEsc, psEsc, psHiddenTaskAction } from "./ssh.ts";
 import type { ExecResult, Shell } from "./ssh.ts";
 
 const b64 = (s: string) => Buffer.from(s, "utf8").toString("base64");
@@ -221,7 +221,8 @@ function windowsSpawnScript(id: string, cmd: string, cwd?: string, elevated = fa
     `New-Item -ItemType Directory -Force -Path $base | Out-Null`,
     `if (Test-Path $dir) { throw "fleet: job id collision: $id" }`,
     `New-Item -ItemType Directory -Path $dir | Out-Null`,
-    `[IO.File]::WriteAllText("$dir\\cmd.ps1", [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${b64(cmd)}')))`,
+    // A BOM, or Windows PowerShell 5.1 reads a non-ASCII command as ANSI and fails to parse it.
+    `[IO.File]::WriteAllText("$dir\\cmd.ps1", [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${b64(cmd)}')), (New-Object Text.UTF8Encoding $true))`,
     `$cwd = '${cwd ? b64(cwd) : ""}'`,
     `$cwd = if ($cwd) { [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($cwd)) } else { $env:USERPROFILE }`,
     `if ($cwd -eq '~') { $cwd = $env:USERPROFILE } elseif ($cwd.StartsWith('~/') -or $cwd.StartsWith('~\\')) { $cwd = Join-Path $env:USERPROFILE $cwd.Substring(2) }`,
@@ -246,7 +247,6 @@ function windowsSpawnScript(id: string, cmd: string, cwd?: string, elevated = fa
   ].join("\n");
 }
 
-/** Launch a detached job on each host the selector resolves to. */
 /** A Windows job's command that runs inside WSL. The bash program travels
  *  base64-encoded, so its redirects, pipes and quotes are bash's, never
  *  PowerShell's: `> /home/u/x.log` writes inside Linux instead of creating
@@ -262,8 +262,10 @@ export function wslJobCommand(cmd: string, distro: string, cwd?: string): string
   return `& wsl.exe -d '${distro.replace(/'/g, "''")}' -- bash -c 'printf %s ${b64(program)} | base64 -d | bash -ls'\nexit $LASTEXITCODE`;
 }
 
+/** Launch a detached job on each host the selector resolves to. An argv
+ *  vector is quoted per host, so `bash -c "a; b"` keeps its one argument. */
 export async function spawnJob(
-  cfg: FleetConfig, sel: string, cmd: string, opts: { cwd?: string; label?: string; wsl?: boolean; elevated?: boolean; fresh?: boolean } = {},
+  cfg: FleetConfig, sel: string, cmd: string | string[], opts: { cwd?: string; label?: string; wsl?: boolean; elevated?: boolean; fresh?: boolean } = {},
   dependencies: { exec?: typeof exec; newId?: typeof newId } = {},
 ): Promise<SpawnResult[]> {
   const hosts = resolveHosts(cfg, sel);
@@ -277,24 +279,42 @@ export async function spawnJob(
   }
   return Promise.all(hosts.map(async (h): Promise<SpawnResult> => {
     const id = (dependencies.newId ?? newId)(opts.label);
+    const command = Array.isArray(cmd) ? buildArgvCommand(cmd, h.os === "windows" && !opts.wsl) : cmd;
     const script = h.os === "windows"
       ? (opts.wsl
-        ? windowsSpawnScript(id, wslJobCommand(cmd, h.wsl ?? "Ubuntu", opts.cwd), undefined, opts.elevated)
-        : windowsSpawnScript(id, cmd, opts.cwd, opts.elevated))
-      : unixSpawnScript(h, id, cmd, opts.cwd);
+        ? windowsSpawnScript(id, wslJobCommand(command, h.wsl ?? "Ubuntu", opts.cwd), undefined, opts.elevated)
+        : windowsSpawnScript(id, command, opts.cwd, opts.elevated))
+      : unixSpawnScript(h, id, command, opts.cwd);
+    const run = dependencies.exec ?? exec;
+    let detail = "";
     try {
-      const r = await (dependencies.exec ?? exec)(h, script, shellFor(h), opts.fresh ? { fresh: true } : undefined);
+      const r = await run(h, script, shellFor(h), opts.fresh ? { fresh: true } : undefined);
       const m = r.stdout.match(/^OK ([a-z0-9-]+) ([1-9]\d*)\r?$/m);
-      if (!r.ok || !m || m[1] !== id) {
-        const detail = r.stderr || (r.stdout.includes("ERR no pid")
-          ? "Windows runner did not record a PID; check interactive login and task status" : "");
-        return { host: h.name, ok: false, id, pid: null, error: "launch unconfirmed; inspect this job before retrying" + (detail ? `: ${detail}` : "") };
-      }
-      return { host: h.name, ok: true, id, pid: Number(m[2]) };
-    } catch {
-      return { host: h.name, ok: false, id, pid: null, error: "launch unconfirmed; inspect this job before retrying" };
-    }
+      if (r.ok && m && m[1] === id) return { host: h.name, ok: true, id, pid: Number(m[2]) };
+      detail = r.stderr || (r.stdout.includes("ERR no pid")
+        ? "Windows runner did not record a PID; check interactive login and task status" : "");
+    } catch { /* the reply is unknown; the spool decides below */ }
+    // A lost reply does not mean a failed launch. The runner records its PID
+    // first, so a PID in the spool proves the job started.
+    const pid = await recordedPid(run, h, id);
+    if (pid) return { host: h.name, ok: true, id, pid };
+    return { host: h.name, ok: false, id, pid: null, error: "launch unconfirmed; inspect this job before retrying" + (detail ? `: ${detail}` : "") };
   }));
+}
+
+/** The PID a job's runner recorded in its spool, read once over a new login
+ *  so a broken shared connection or Windows session cannot hide it. Null when
+ *  there is none or the read fails. Never launches anything. */
+async function recordedPid(run: typeof exec, h: Host, id: string): Promise<number | null> {
+  assertId(id);
+  const script = h.os === "windows"
+    ? `$p = "$env:USERPROFILE\\.fleet\\jobs\\${id}\\pid"; if (Test-Path -LiteralPath $p) { [Console]::Out.WriteLine('PID ' + ([IO.File]::ReadAllText($p).Trim())) }`
+    : `p="$HOME/.fleet/jobs/${id}/pid"; if [ -s "$p" ]; then printf 'PID %s\\n' "$(cat "$p")"; fi`;
+  try {
+    const r = await run(h, script, shellFor(h), { fresh: true, timeoutMs: 30_000 });
+    const m = r.ok ? r.stdout.match(/^PID ([1-9]\d*)\r?$/m) : null;
+    return m ? Number(m[1]) : null;
+  } catch { return null; }
 }
 
 // ── list ──────────────────────────────────────────────────────────────────────
@@ -456,14 +476,76 @@ if [ -f "$d/out" ]; then tail -n ${lines} "$d/out"; fi`;
   return { host: host.name, output, ...(truncated ? { truncated: true } : {}) };
 }
 
-/** Live follow (`tail -f`) — streams to the local terminal until ctrl-c or the
- *  job's spool is removed. Returns the ssh exit code. */
+/** The program `jobs tail -f` runs on the host: the last `lines` lines, then
+ *  new output until the job records an exit or its runner is gone. A bare
+ *  `tail -f` never ended, so a monitor following a finished job hung. Exported
+ *  for tests; it never writes to the spool. */
+export function followScript(host: Host, id: string, lines: number): string {
+  assertId(id);
+  // Progress records from the CIM check would reach a piped stderr as CLIXML.
+  if (host.os === "windows") return `$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'
+try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } catch {}
+${WIN_OWNED_FN}
+$d="$env:USERPROFILE\\.fleet\\jobs\\${id}"
+if (!(Test-Path -LiteralPath $d -PathType Container)) { [Console]::Error.WriteLine('fleet: no such job: ${id}'); exit 1 }
+$o=Join-Path $d 'out'
+$rd=$null; $tick=0
+try {
+  while ($true) {
+    $over=$null -ne (Get-FleetJobExit $d)
+    # A process check costs a CIM query, so only every few ticks.
+    $tick++
+    if (-not $over -and ($tick % 5) -eq 0) {
+      $jpid=(Get-Content -LiteralPath "$d\\pid" -EA SilentlyContinue | Select-Object -First 1)
+      if ($jpid -and -not (Test-FleetJobProcess ([int]$jpid) "$d\\run.ps1")) { $over=$true }
+    }
+    if (-not $rd -and (Test-Path -LiteralPath $o -PathType Leaf)) {
+      # Shared read, BOM detection: Windows PowerShell writes the spool as UTF-16.
+      $rd=New-Object IO.StreamReader((New-Object IO.FileStream($o,[IO.FileMode]::Open,[IO.FileAccess]::Read,([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))),$true)
+      $text=$rd.ReadToEnd()
+      if ($text) {
+        $ends=$text.EndsWith("\`n")
+        $all=@($text -split "\`n")
+        if ($ends) { $all=@($all | Select-Object -SkipLast 1) }
+        [Console]::Out.Write((@($all | Select-Object -Last ${lines}) -join "\`n") + $(if ($ends) { "\`n" } else { '' }))
+      }
+    } elseif ($rd) {
+      $text=$rd.ReadToEnd()
+      if ($text) { [Console]::Out.Write($text) }
+    }
+    [Console]::Out.Flush()
+    if ($over) {
+      if ($rd) { [Console]::Out.Write($rd.ReadToEnd()); [Console]::Out.Flush() }
+      break
+    }
+    Start-Sleep -Milliseconds 500
+  }
+} finally { if ($rd) { $rd.Dispose() } }`;
+  return `${UNIX_OWNED_FN}
+d="$HOME/.fleet/jobs/${id}"
+[ -d "$d" ] || { echo "fleet: no such job: ${id}" 1>&2; exit 1; }
+job_over() {
+  read_exit "$d" >/dev/null && return 0
+  local p; p="$(cat "$d/pid" 2>/dev/null)"
+  [ -n "$p" ] && ! is_owned "$p" "$d/run"
+}
+until [ -e "$d/out" ]; do job_over && exit 0; sleep 0.5; done
+if job_over; then tail -n ${lines} "$d/out"; exit 0; fi
+tail -n ${lines} -f "$d/out" & follower=$!
+trap 'kill "$follower" 2>/dev/null' EXIT
+trap 'exit 0' HUP INT TERM
+# Without a pty an ssh hangup sends no HUP; the follower dies of SIGPIPE on its
+# next write, and the loop must not outlive it until the job ends.
+until job_over; do kill -0 "$follower" 2>/dev/null || exit 1; sleep 1; done
+# tail -f polls about once a second; let it print the last lines.
+sleep 1.2`;
+}
+
+/** Live follow (`tail -f`): streams to the local terminal until the job
+ *  finishes or ctrl-c. Returns the ssh exit code. */
 export function jobFollow(cfg: FleetConfig, a: string, b: string | undefined, n: number): Promise<number> {
   const { host, id } = resolveJobRef(cfg, a, b);
-  const lines = lineCount(n);
-  return host.os === "windows"
-    ? execStreamWin(host, `Get-Content "$env:USERPROFILE\\.fleet\\jobs\\${id}\\out" -Tail ${lines} -Wait`)
-    : execStream(host, `tail -n ${lines} -f "$HOME/.fleet/jobs/${id}/out"`);
+  return execStream(host, followScript(host, id, lineCount(n)));
 }
 
 // ── kill ──────────────────────────────────────────────────────────────────────
@@ -501,13 +583,14 @@ export function killScript(host: Host, id: string): string {
     `    ps -p "$1" -o lstart= -o command= 2>/dev/null\n` +
     `  fi\n` +
     `}\n` +
+    // Parents first: a loop shell signalled after its current child would reap
+    // it and start the next one, which this capture never saw.
     `capture_tree() {\n` +
     `  local tree_pid="$1" child identity children listed\n` +
+    `  if identity="$(process_identity "$tree_pid")"; then tree_pids+=("$tree_pid"); tree_identities+=("$identity"); fi\n` +
     `  children="$(pgrep -P "$tree_pid" 2>/dev/null)"; listed=$?\n` +
     `  [ "$listed" -le 1 ] || return 1\n` +
     `  for child in $children; do capture_tree "$child" || return 1; done\n` +
-    `  identity="$(process_identity "$tree_pid")" || return 0\n` +
-    `  tree_pids+=("$tree_pid"); tree_identities+=("$identity")\n` +
     `}\n` +
     `tree_owned() {\n` +
     `  local identity\n` +
@@ -519,8 +602,14 @@ export function killScript(host: Host, id: string): string {
     `  for i in "\${!tree_pids[@]}"; do tree_owned "$i" && return 0; done\n` +
     `  return 1\n` +
     `}\n` +
+    // A Linux runner started by setsid leads its own process group, which also
+    // holds children started after the capture. Signal the group only while
+    // the captured runner still owns that id.
+    `group_pid=""\n` +
+    `[ "$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')" = "$pid" ] && group_pid="$pid"\n` +
     `signal_tree() {\n` +
     `  local tree_signal="$1" i\n` +
+    `  if [ -n "$group_pid" ] && [ "\${tree_pids[0]}" = "$group_pid" ] && tree_owned 0; then kill "-$tree_signal" -- "-$group_pid" 2>/dev/null || true; fi\n` +
     `  for i in "\${!tree_pids[@]}"; do\n` +
     `    if tree_owned "$i"; then kill "-$tree_signal" "\${tree_pids[$i]}" 2>/dev/null || true; fi\n` +
     `  done\n` +
@@ -753,4 +842,39 @@ export async function pruneJobs(
     if (!r.ok) return { host: h.name, removed: 0, error: r.stderr || `exit ${r.code}` };
     return { host: h.name, removed: Number(r.stdout.trim()) || 0 };
   }));
+}
+
+/** Remove one job's spool, the way prune does for every finished job on a host.
+ *  Refuses a running job, and a job that has not recorded a PID yet, since its
+ *  launch may still start it. Exported for tests. */
+export function removeScript(host: Host, id: string): string {
+  assertId(id);
+  if (host.os === "windows") return `$ErrorActionPreference='Stop'
+${WIN_OWNED_FN}
+$d="$env:USERPROFILE\\.fleet\\jobs\\${id}"
+if (!(Test-Path -LiteralPath $d -PathType Container)) { [Console]::Error.WriteLine('fleet: no such job: ${id}'); exit 1 }
+if ($null -eq (Get-FleetJobExit $d)) {
+  $jpid=(Get-Content -LiteralPath "$d\\pid" -EA SilentlyContinue | Select-Object -First 1)
+  if (-not $jpid) { [Console]::Error.WriteLine('fleet: job ${id} has not recorded a PID and may still start; inspect it before removing'); exit 1 }
+  # Test-FleetJobProcess reads a failed query as "not running"; rm must not.
+  try { [void](Get-CimInstance Win32_Process -Filter "ProcessId=$PID" -EA Stop) } catch { [Console]::Error.WriteLine('fleet: cannot inspect processes, so job ${id} may still be running; not removing'); exit 1 }
+  if (Test-FleetJobProcess ([int]$jpid) "$d\\run.ps1") { [Console]::Error.WriteLine('fleet: job ${id} is running; fleet jobs kill it first'); exit 1 }
+}
+Remove-Item -Recurse -Force -LiteralPath $d
+'removed ${id}'`;
+  return `${UNIX_OWNED_FN}
+d="$HOME/.fleet/jobs/${id}"
+[ -d "$d" ] || { echo "fleet: no such job: ${id}" 1>&2; exit 1; }
+if ! read_exit "$d" >/dev/null; then
+  pid="$(cat "$d/pid" 2>/dev/null)"
+  [ -n "$pid" ] || { echo "fleet: job ${id} has not recorded a PID and may still start; inspect it before removing" 1>&2; exit 1; }
+  ! is_owned "$pid" "$d/run" || { echo "fleet: job ${id} is running; fleet jobs kill it first" 1>&2; exit 1; }
+fi
+rm -rf -- "$d" || exit 1
+echo "removed ${id}"`;
+}
+
+export async function removeJob(cfg: FleetConfig, a: string, b?: string): Promise<ExecResult> {
+  const { host, id } = resolveJobRef(cfg, a, b);
+  return exec(host, removeScript(host, id), shellFor(host));
 }

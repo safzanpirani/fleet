@@ -10,7 +10,7 @@ import {
 } from "../src/core.ts";
 import { hostKeyOpts, validateConfig } from "../src/config.ts";
 import type { FleetConfig, Host } from "../src/config.ts";
-import type { ExecResult } from "../src/ssh.ts";
+import type { ExecOptions, ExecResult } from "../src/ssh.ts";
 
 // A trimmed `bcdedit /enum firmware` from a dual-boot box with a stale second
 // disk: two entries share the Windows Boot Manager label.
@@ -207,18 +207,20 @@ describe("switchMachine", () => {
   function box(opts: { trigger?: ExecResult; flips?: boolean }) {
     let live = "win", sourceProbes = 0, triggered = false;
     const execs: string[] = [];
-    const exec = async (h: Host, cmd: string): Promise<ExecResult> => {
+    let triggerOpts: ExecOptions | undefined;
+    const exec = async (h: Host, cmd: string, _shell: unknown, execOpts?: ExecOptions): Promise<ExecResult> => {
       execs.push(cmd);
       if (cmd === "bcdedit /enum firmware") return ok(BCD);
       if (cmd.includes("Get-Partition")) return ok("ESP\t0e5f0001\t\\Device\\HarddiskVolume3\n");
       triggered = true;
+      triggerOpts = execOpts;
       return opts.trigger ?? ok("fleet: one-time boot set");
     };
     const probe = async (h: Host) => {
       if (h.name === "win" && triggered && opts.flips !== false && ++sourceProbes >= 2) live = "lin";
       return h.name === live;
     };
-    return { exec: exec as any, probe, execs };
+    return { exec: exec as any, probe, execs, triggerOpts: () => triggerOpts };
   }
 
   test("a firmware switch reports every phase and arrives", async () => {
@@ -233,6 +235,8 @@ describe("switchMachine", () => {
     expect(r.landedIn).toBe("linux");
     expect(r.plan).toMatchObject({ kind: "firmware", label: "Arcadia" });
     expect(b.execs.some((c) => c.includes("bootsequence '{aaaaaaa2-0000-11f1-8000-000000000002}'"))).toBe(true);
+    // The trigger cannot be replayed, so it never rides the kept-open Windows session.
+    expect(b.triggerOpts()).toMatchObject({ fresh: true });
     expect([...new Set(phases)]).toEqual(["probe", "plan", "trigger", "reboot", "wait", "done"]);
   });
 

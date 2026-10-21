@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { applyProxyFlags, completionScript, fleetJsonCommand, trailingFleetFlag } from "../src/cli.ts";
+import { applyProxyFlags, completionScript, fleetJsonCommand, keepsArgvBoundaries, trailingFleetFlag } from "../src/cli.ts";
 import type { FleetConfig } from "../src/config.ts";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -72,6 +72,7 @@ describe("proxy CLI flags", () => {
       ["edit", ["--old", "before", "--new", ""]],
       ["ps", ["--sort", "cpu", "-n", "2"]],
       ["screenshot", ["--out", "/tmp/shot.png"]],
+      ["webcam", ["--device", "Camera", "--out", "/tmp/photo.png", "--fps", "24", "--width", "640", "--for", "5", "--vo", "kitty"]],
       ["computer", ["--settle", "0"]],
       ["wait", ["--http", "https://example.invalid", "--status", "200"]],
     ];
@@ -281,7 +282,7 @@ describe("machine-readable CLI output", () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
-  test("raw command and script failures expose stderr without contaminating stdout", async () => {
+  test("raw command and script failures pass the remote status and expose stderr without contaminating stdout", async () => {
     const { root, bin, config } = fixture();
     try {
       executable(join(bin, "ssh"), "#!/bin/sh\ncat >/dev/null\nprintf 'partial  \\n'\nprintf 'permission denied\\n' >&2\nexit 7\n");
@@ -289,7 +290,7 @@ describe("machine-readable CLI output", () => {
       writeFileSync(script, "true\n");
       for (const args of [["exec", "--raw", "local", "ignored"], ["exec", "--raw", "--script", script, "local"]]) {
         const r = await runCli(args, config, bin);
-        expect(r.code).toBe(1);
+        expect(r.code).toBe(7);
         expect(r.stdout).toBe("partial  \n");
         expect(r.stderr).toBe("permission denied\n");
       }
@@ -526,7 +527,7 @@ describe("machine-readable CLI output", () => {
       executable(join(bin, "ssh"), `#!${process.execPath}\nawait Bun.sleep(150);\nconsole.log('done');\n`);
       const env = { FLEET_EXEC_TIMEOUT: "0.05" };
       const capped = await runCli(["exec", "--raw", "local", "ignored"], config, bin, env);
-      expect(capped.code).toBe(1);
+      expect(capped.code).toBe(124);
       expect(capped.stderr).toContain("timed out");
       const uncapped = await runCli(["exec", "--timeout", "0", "--raw", "local", "ignored"], config, bin, env);
       expect(uncapped.code, uncapped.stderr).toBe(0);
@@ -853,6 +854,18 @@ describe("trailingFleetFlag", () => {
   });
 });
 
+describe("keepsArgvBoundaries", () => {
+  test("a later word the local shell quoted keeps its boundary", () => {
+    expect(keepsArgvBoundaries(["bash", "-c", "mkdir -p x && echo one; echo two"])).toBe(true);
+    expect(keepsArgvBoundaries(["grep", "", "file"])).toBe(true);
+  });
+  test("one command line, or plain words, is still joined", () => {
+    expect(keepsArgvBoundaries(["cd /srv && make"])).toBe(false);
+    expect(keepsArgvBoundaries(["cd /srv &&", "make all"])).toBe(false);
+    expect(keepsArgvBoundaries(["echo", "hello", "world"])).toBe(false);
+  });
+});
+
 test("jobs tail validates filters before routing and emits one JSON value", async () => {
   const { root, bin, config } = fixture();
   try {
@@ -1006,4 +1019,62 @@ test("json host failures preserve existing result arrays and exit statuses", asy
     expect(r.code).toBe(1);
     expect(JSON.parse(r.stdout)).toEqual([{ host: "local", ok: false, code: 7, stdout: "partial\n", stderr: "failed" }]);
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+describe("webcam CLI", () => {
+  test("JSON ownership preserves values and reports incompatible stream options", async () => {
+    expect(fleetJsonCommand("webcam", ["camera", "--stream", "--json"])).toBe("webcam");
+    expect(fleetJsonCommand("webcam", ["--device=--json", "camera"])).toBeUndefined();
+    expect(fleetJsonCommand("webcam", ["--out", "--json", "camera"])).toBe("webcam");
+    const { root, bin, config } = fixture();
+    try {
+      for (const args of [
+        ["--stream", "--json"], ["stream", "--json"], ["live", "--json"],
+        ["--list", "--stream", "--json"], ["--list", "--device", "Camera", "--json"],
+        ["--fps", "24", "--json"], ["--stream", "--fps", "--json"], ["--unknown", "--json"],
+      ]) {
+        const r = await runCli(["webcam", "local", ...args], config, bin);
+        expect(r.code, args.join(" ")).toBe(1);
+        expect(JSON.parse(r.stdout)).toMatchObject({ ok: false, command: "webcam", error: { code: "INVALID_ARGUMENT" } });
+        expect(r.stderr).toBe("");
+      }
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test("invalid webcam values fail before configured route probing", async () => {
+    const { root, bin, config } = fixture();
+    try {
+      const marker = join(root, "ssh-called");
+      executable(join(bin, "ssh"), `#!/bin/sh\ntouch '${marker}'\nexit 99\n`);
+      writeFileSync(config, JSON.stringify({ hosts: { camera: { ssh: "fake-camera", os: "linux" } }, groups: { route: ["camera"] } }));
+      for (const args of [
+        ["--stream", "--window", "--fps", "0"], ["--stream", "--window", "--fps", "61"],
+        ["--stream", "--window", "--fps", "1.5"], ["--stream", "--window", "--width", "4294967296"],
+        ["--stream", "--window", "--for", "0.5"], ["--stream", "--window", "--for", "2147484"],
+        ["--stream", "--vo", "invalid"], ["--out", "photo.jpg"],
+      ]) {
+        const r = await runCli(["webcam", "route", ...args], config, bin);
+        expect(r.code, args.join(" ")).toBe(1);
+        expect(r.stderr).not.toContain("ssh");
+      }
+      expect(await Bun.file(marker).exists()).toBe(false);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test("stream and live positional aliases work on either side of a host", async () => {
+    const { root, bin, config } = fixture();
+    try {
+      writeFileSync(config, JSON.stringify({ hosts: { camera: { ssh: "fake-camera", os: "linux" } } }));
+      const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=", "base64");
+      const escaped = [...png].map(byte => `\\${byte.toString(8).padStart(3, "0")}`).join("");
+      executable(join(bin, "ssh"), `#!/bin/sh\nprintf '${escaped}'\n`);
+      for (const verb of ["stream", "live"]) {
+        for (const positionals of [[verb, "camera"], ["camera", verb]]) {
+          const r = await runCli(["webcam", ...positionals, "--device", "/dev/video0", "--vo", "kitty"], config, bin);
+          expect(r.code, r.stderr).toBe(0);
+          expect(r.stdout).toContain("a=T,f=100");
+        }
+      }
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
 });

@@ -7,7 +7,7 @@
  */
 import { hostKeyOpts, resolveHosts, REPO_ROOT, lookupProxy, normalizeProxy, resolveProxy } from "./config.ts";
 import type { FleetConfig, Host, Service, ServiceType, Machine } from "./config.ts";
-import { connOpts, exec, probe, probeDetail, scp, scpPull, sshDiagnose, bashEsc, bashPathAssignment, psEsc, psHiddenLaunch } from "./ssh.ts";
+import { buildArgs, buildArgvCommand, connOpts, exec, probe, probeDetail, resolveWinBin, scp, scpPull, sshDiagnose, sshEnv, bashEsc, bashPathAssignment, psEsc, psHiddenLaunch } from "./ssh.ts";
 import { checkProxy, proxyCommandFor } from "./proxy.ts";
 import type { ProxyCheck } from "./proxy.ts";
 import type { ExecResult, Shell, TransferOptions } from "./ssh.ts";
@@ -19,6 +19,10 @@ import { mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:f
 import { createHash } from "node:crypto";
 import { fstatSync, readFileSync, statSync } from "node:fs";
 import { installLockScript } from "./install-lock.ts";
+import {
+  detectWebcamVo, parseCameras, renderSize, validateWebcamDevice, validateWebcamStreamOptions, webcamScript, webcamStreamScript,
+  type Camera, type WebcamStreamProc, type WebcamViewport, type WebcamVo,
+} from "./webcam.ts";
 import { stopBroker as stopWinSessionBroker } from "./winsession.ts";
 import {
   LINUX_MONITORS_SH, MAC_MONITORS_SH, mainMonitor, parseMonitors, parseRegion, pickMonitor, regionRect,
@@ -236,12 +240,6 @@ async function writeLsState(path: string, state: Record<string, boolean>): Promi
 }
 
 // ── exec ──────────────────────────────────────────────────────────────────────
-/** Quote an explicit argument vector for the target shell. */
-export function buildArgvCommand(argv: string[], powershell: boolean): string {
-  if (!argv.length || !argv[0] || argv.some((arg) => arg.includes("\0")))
-    throw new Error("argv requires a nonempty program and arguments without NUL bytes");
-  return (powershell ? "& " : "") + argv.map((arg) => `'${powershell ? psEsc(arg) : bashEsc(arg)}'`).join(" ");
-}
 
 export async function runExec(
   cfg: FleetConfig, sel: string, cmd: string | string[],
@@ -249,12 +247,24 @@ export async function runExec(
 ): Promise<ExecResult[]> {
   const hosts = resolveHosts(cfg, sel);
   const shell: Shell = opts.wsl ? "wsl" : "auto";
-  return Promise.all(hosts.map(async (h) => {
+  return withWslHints(await Promise.all(hosts.map(async (h) => {
     const command = Array.isArray(cmd) ? buildArgvCommand(cmd, h.os === "windows" && !opts.wsl) : cmd;
     const sudo = opts.sudo ? await sudoWrap(h, command, !!opts.wsl) : { cmd: command };
     if ("error" in sudo) return sudo.error;
     return exec(h, sudo.cmd, shell, { cwd: opts.cwd, timeoutMs: opts.timeoutMs, fresh: opts.fresh });
-  }));
+  })));
+}
+
+/** wsl.exe fails every launch with Wsl/Service/0x80072747 (WSAENOBUFS) once
+ *  its service runs out of socket buffers, while `wsl -l -v` still reports the
+ *  distro Running. Say what the code means and what clears it; fleet never
+ *  runs `wsl --shutdown` itself, since it stops every distro. wsl.exe can write
+ *  UTF-16, so NULs are dropped before matching. */
+function withWslHints(results: ExecResult[]): ExecResult[] {
+  return results.map((r) => !r.ok && /0x80072747/i.test(r.stderr.replace(/\0/g, ""))
+    ? { ...r, stderr: `${r.stderr.trimEnd()}\nfleet: ${r.host}'s WSL service is out of socket buffers (WSAENOBUFS); `
+      + "this is the host, not the command. Running `wsl --shutdown` there (it stops every distro) or a reboot clears it." }
+    : r);
 }
 
 /** Wrap a POSIX command to run as root, or explain per host why it cannot. */
@@ -444,6 +454,21 @@ function isPowerShell(interp: string): boolean {
   return /^(pwsh|powershell)(\.exe)?$/i.test(bin.split(/[\\/]/).pop()!);
 }
 
+/** The flag in a PowerShell --interp that would replace the `-File <temp .ps1>`
+ *  fleet appends (-Command, -File, -EncodedCommand, -CommandWithArgs, any
+ *  prefix PowerShell accepts for them, or a bare `-`), or undefined. Other
+ *  flags such as -ExecutionPolicy Bypass or -NoLogo combine with it. */
+export function psInterpConflict(interp: string): string | undefined {
+  if (!isPowerShell(interp)) return undefined;
+  const takesProgram = ["command", "file", "encodedcommand", "commandwithargs"];
+  return interp.trim().split(/\s+/).slice(1).find((word) => {
+    const m = /^(?:--?|\/)([a-z]*)$/i.exec(word);
+    if (!m) return false;
+    const name = m[1]!.toLowerCase();
+    return !name || name === "ec" || name === "cwa" || takesProgram.some((flag) => flag.startsWith(name));
+  });
+}
+
 export interface ScriptSource { source: string; ext: string; label: string }
 
 /** Infer a script type from a conventional shebang. This keeps stdin scripts
@@ -488,7 +513,7 @@ export async function runScript(
     throw new Error("fleet: --script - needs --interp <command> unless stdin starts with a supported shebang");
   const hosts = resolveHosts(cfg, sel);
   const shell: Shell = opts.wsl ? "wsl" : "auto";
-  return Promise.all(hosts.map((h) => {
+  return withWslHints(await Promise.all(hosts.map((h) => {
     // a WSL target is a linux box wearing a Windows host entry — pick its interpreter as such
     const os = opts.wsl ? "linux" : h.os;
     const interp = opts.interp ?? interpreterFor(script.ext, os);
@@ -496,7 +521,7 @@ export async function runScript(
     const eo = { cwd: opts.cwd, timeoutMs: opts.timeoutMs, fresh: opts.fresh };
     if (!opts.sudo) return exec(h, cmd, shell, eo);
     return sudoWrap(h, cmd, !!opts.wsl).then((sudo) => "error" in sudo ? sudo.error : exec(h, sudo.cmd, shell, eo));
-  }));
+  })));
 }
 
 // ── cp ────────────────────────────────────────────────────────────────────────
@@ -505,6 +530,10 @@ export async function pushFile(
   deps: { exec?: typeof exec; scp?: typeof scp } & TransferOptions = {},
 ): Promise<ExecResult[]> {
   const hosts = resolveHosts(cfg, sel);
+  if (!recursive) {
+    const dir = (Array.isArray(local) ? local : [local]).find((p) => { try { return statSync(p).isDirectory(); } catch { return false; } });
+    if (dir) throw new Error(`${dir} is a directory; pass -r to copy it`);
+  }
   const run = deps.exec ?? exec;
   const copy = deps.scp ?? scp;
   // scp needs the destination directory to exist. A trailing slash states the
@@ -539,7 +568,11 @@ export async function pullFile(
 ): Promise<ExecResult> {
   const hosts = resolveHosts(cfg, sel);
   if (hosts.length !== 1) throw new Error(`pull needs exactly one source host (got ${hosts.length} from '${sel}')`);
-  return scpPull(hosts[0]!, remote, local, recursive, opts);
+  const r = await scpPull(hosts[0]!, remote, local, recursive, opts);
+  // scp's own words for a remote directory say nothing about the fix.
+  if (!r.ok && !recursive && /not a regular file/i.test(r.stderr))
+    return { ...r, stderr: `${r.stderr.trimEnd()}\nfleet: the remote path is a directory; pass -r to copy it` };
+  return r;
 }
 
 // ── edit ──────────────────────────────────────────────────────────────────────
@@ -1722,7 +1755,10 @@ export async function switchMachine(
   }
 
   report("trigger", `sending the switch to ${liveHost.name}`);
-  const triggered = await run(liveHost, plan.command, "auto", { timeoutMs: SWITCH_TRIGGER_MS });
+  // A new login, not the shared master or the kept-open Windows session: the
+  // trigger runs once and cannot be replayed, so its reply must not depend on
+  // a long-lived connection's state.
+  const triggered = await run(liveHost, plan.command, "auto", { timeoutMs: SWITCH_TRIGGER_MS, fresh: true });
   // A reboot may cut the link before the reply: 255 is ssh's own failure code.
   const dropped = triggered.code === 255 || triggered.code === 124;
   const said = (triggered.stdout + "\n" + triggered.stderr).trim().split("\n").filter(Boolean).slice(-3).join(" | ");
@@ -1979,6 +2015,7 @@ async function probeOnce(
   c: WaitCond,
   remainingMs: number,
   probeHost: typeof probe = probe,
+  portAddrs: Map<string, string> = new Map(),
 ): Promise<{ ok: boolean; detail: string }> {
   const deadlineAt = Date.now() + remainingMs;
   const timeLeft = () => Math.max(1, deadlineAt - Date.now());
@@ -2000,9 +2037,16 @@ async function probeOnce(
     const name = await resolveLiveHostOrSelf(cfg, target, boundedProbe);
     if (!cfg.hosts[name] && (cfg.routes?.[target] || cfg.machines?.[target]))
       return { ok: false, detail: "no reachable transport" };
-    const addr = cfg.hosts[name]?.ssh ?? target;
+    // A host's ssh field is often an ssh_config alias that DNS cannot resolve;
+    // ssh -G names the address ssh itself would dial. The detail names it, so a
+    // service bound to another interface (a Tailscale-only listener) reads as
+    // such: pass that address as the target instead. One lookup per wait:
+    // ssh -G is a process, and the answer does not change between polls.
+    const h = cfg.hosts[name];
+    let addr = portAddrs.get(name);
+    if (!addr) portAddrs.set(name, addr = h ? ((await sshEffective(h))?.hostname || h.ssh) : target);
     const open = await probePort(addr, c.port, timeLeft());
-    return { ok: open, detail: `:${c.port} ${open ? "open" : "closed"}` };
+    return { ok: open, detail: `${addr}:${c.port} ${open ? "open" : "closed"}` };
   }
   const name = await resolveLiveHostOrSelf(cfg, target, boundedProbe);
   const h = cfg.hosts[name];
@@ -2021,10 +2065,11 @@ export async function waitFor(
   if (!c.http && c.port == null && !cfg.hosts[target] && !cfg.routes?.[target] && !cfg.machines?.[target])
     throw new Error(`unknown host, route, or machine: ${target}`);
   const start = Date.now(); let attempts = 0, lastDetail = "";
+  const portAddrs = new Map<string, string>();
   while (Date.now() - start < timeoutMs) {
     attempts++;
     const remaining = Math.max(1, timeoutMs - (Date.now() - start));
-    const { ok, detail } = await probeOnce(cfg, target, c, remaining, deps.probe);
+    const { ok, detail } = await probeOnce(cfg, target, c, remaining, deps.probe, portAddrs);
     lastDetail = detail;
     const elapsed = Date.now() - start;
     c.onTick?.(detail, elapsed);
@@ -2443,8 +2488,19 @@ export function captureCmd(os: Host["os"], target: CaptureTarget = {}): { cmd: s
     `set -e`,
     `p="/tmp/fleet_shot_$$.png"`,
     ...(names.length ? [`trap '${power("off").replace(/'/g, `'\\''`)}' EXIT`, `${power("on")}`, `sleep 1`] : []),
-    `if [ -n "\${WAYLAND_DISPLAY:-}" ] && command -v grim >/dev/null 2>&1; then`,
-    `  timeout ${LINUX_CAPTURE_TIMEOUT_S} ${grim} || { rc=$?; [ "$rc" = 124 ] && echo "grim got no frame in ${LINUX_CAPTURE_TIMEOUT_S}s; a monitor may be off (fleet shot --wake)" >&2; exit "$rc"; }`,
+    // KDE Plasma's KWin has no wlr-screencopy, so grim cannot capture there and
+    // spectacle can. X tools under Wayland see only XWayland: never fall back to them.
+    // The user manager may not carry XDG_CURRENT_DESKTOP; KWin's process says the same.
+    `fleet_kde=""; case "\${XDG_CURRENT_DESKTOP:-}" in *KDE*) fleet_kde=1;; esac`,
+    `[ -n "$fleet_kde" ] || ! pgrep -x -u "$(id -u)" kwin_wayland >/dev/null 2>&1 || fleet_kde=1`,
+    `fleet_grim() { timeout ${LINUX_CAPTURE_TIMEOUT_S} ${grim} || { rc=$?; [ "$rc" = 124 ] && echo "grim got no frame in ${LINUX_CAPTURE_TIMEOUT_S}s; a monitor may be off (fleet shot --wake)" >&2; exit "$rc"; }; }`,
+    `if [ -n "\${WAYLAND_DISPLAY:-}" ]; then`,
+    `  if [ -z "$fleet_kde" ] && command -v grim >/dev/null 2>&1; then fleet_grim`,
+    r
+      ? `  elif command -v spectacle >/dev/null 2>&1; then echo "spectacle captures only the whole desktop; drop --output/--region on this KDE session" >&2; exit 3`
+      : `  elif command -v spectacle >/dev/null 2>&1; then timeout ${LINUX_CAPTURE_TIMEOUT_S} spectacle -b -n -f -o "$p" >/dev/null 2>&1 || { echo "spectacle failed to capture the desktop" >&2; exit 3; }`,
+    `  elif command -v grim >/dev/null 2>&1; then fleet_grim`,
+    `  else echo "no Wayland screenshot tool: install grim (Hyprland, sway) or spectacle (KDE Plasma)" >&2; exit 3; fi`,
     ...x11,
     `else echo "no screenshot tool (install grim, scrot, or imagemagick)" >&2; exit 3; fi`,
     `[ -s "$p" ] || { echo "capture produced no image" >&2; exit 4; }`,
@@ -2523,6 +2579,133 @@ async function linuxCaptureTarget(
 export interface ScreenshotResult {
   host: string; localPath: string; remotePath: string;
   capture: ExecResult; pull: ExecResult;
+}
+
+/** List or photograph one camera. Local capture avoids SSH's macOS permission context. */
+export async function captureWebcam(
+  cfg: FleetConfig, sel: string, localPath?: string,
+  opts: { device?: string; list?: boolean } = {},
+  deps: { exec?: typeof exec } = {},
+): Promise<{ host: string; cameras: Camera[]; device?: string; localPath?: string }> {
+  const local = sel === "local";
+  const hosts = local ? [] : resolveHosts(cfg, sel);
+  if (!local && hosts.length !== 1) throw new Error("webcam requires exactly one host");
+  const host = hosts[0];
+  const os = host?.os ?? (process.platform === "darwin" ? "mac" : process.platform === "win32" ? "windows" : "linux");
+  if (host?.android) throw new Error("webcam supports desktop hosts; Android cameras are not supported");
+  if (!opts.list && (!localPath || !localPath.toLowerCase().endsWith(".png"))) throw new Error("webcam --out must name a PNG file");
+  const run = async (device?: string): Promise<ExecResult> => {
+    const script = webcamScript(os, device);
+    if (host) return (deps.exec ?? exec)(host, script.cmd, script.shell, { timeoutMs: 30000 });
+    const proc = Bun.spawn(os === "windows" ? ["powershell", "-NoProfile", "-Command", "-"] : ["bash", "-s"], {
+      stdin: "pipe", stdout: "pipe", stderr: "pipe", timeout: 30000, killSignal: "SIGKILL",
+    });
+    proc.stdin.write(script.cmd + "\n\n");
+    proc.stdin.end();
+    const [stdout, stderr, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
+    return { host: "local", stdout, stderr, code, ok: code === 0 };
+  };
+  let cameras: Camera[] = [];
+  if (opts.list || opts.device === undefined) {
+    const result = await run();
+    if (!result.ok) throw new Error(result.stderr || "Camera discovery failed");
+    cameras = parseCameras(os, result.stdout);
+    if (opts.list) return { host: host?.name ?? "local", cameras };
+  }
+  const device = opts.device ?? cameras[0]?.device;
+  validateWebcamDevice(os, device);
+  const result = await run(device);
+  if (!result.ok) throw new Error(result.stderr || "Camera unavailable, busy, or permission denied");
+  const data = result.stdout.replace(/\s/g, "");
+  if (!data || !/^[A-Za-z0-9+/]+={0,2}$/.test(data)) throw new Error("Camera produced no valid image data");
+  const path = resolve(localPath!);
+  const staging = `${path}.fleet-${crypto.randomUUID()}.png`;
+  try {
+    await writeFile(staging, Buffer.from(data, "base64"), { mode: 0o600 });
+    await validateImageArtifact(staging);
+    await rename(staging, path);
+  } finally { await rm(staging, { force: true }); }
+  return { host: host?.name ?? "local", cameras, device, localPath: path };
+}
+
+/** Prepare a camera producer without terminal output or interactive process-global state. */
+export async function prepareWebcamStream(
+  cfg: FleetConfig, sel: string,
+  opts: { device?: string; fps?: number; width?: number; durationS?: number; vo?: string; window?: boolean; viewport: WebcamViewport },
+  deps: {
+    exec?: typeof exec;
+    startProducer?: (host: Host | undefined, script: { cmd: string; shell: Shell }) => WebcamStreamProc;
+    env?: (key: string) => string | undefined;
+  } = {},
+): Promise<{
+  meta: { host: string; device: string; vo: WebcamVo; width: number; height: number; fps: number; durationS?: number };
+  cameras: Camera[]; startProducer: () => WebcamStreamProc;
+}> {
+  validateWebcamStreamOptions(opts);
+  const local = sel === "local";
+  const hosts = local ? [] : resolveHosts(cfg, sel);
+  if (!local && hosts.length !== 1) throw new Error("webcam requires exactly one host");
+  const host = hosts[0];
+  const os = host?.os ?? (process.platform === "darwin" ? "mac" : process.platform === "win32" ? "windows" : "linux");
+  if (host?.android) throw new Error("webcam supports desktop hosts; Android cameras are not supported");
+  const vo = detectWebcamVo({ vo: opts.vo, window: opts.window }, deps.env);
+  let cameras: Camera[] = [];
+  if (opts.device === undefined) {
+    const listScript = webcamScript(os);
+    const res = host
+      ? await (deps.exec ?? exec)(host, listScript.cmd, listScript.shell, { timeoutMs: 30000 })
+      : await (async () => {
+          const proc = Bun.spawn(os === "windows" ? ["powershell", "-NoProfile", "-Command", "-"] : ["bash", "-s"], {
+            stdin: "pipe", stdout: "pipe", stderr: "pipe", timeout: 30000, killSignal: "SIGKILL",
+          });
+          proc.stdin.write(listScript.cmd + "\n\n");
+          proc.stdin.end();
+          const [stdout, stderr, code] = await Promise.all([
+            new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited,
+          ]);
+          return { host: "local", stdout, stderr, code, ok: code === 0 };
+        })();
+    if (!res.ok) throw new Error(res.stderr || "Camera discovery failed");
+    cameras = parseCameras(os, res.stdout);
+  }
+  const device = opts.device ?? cameras[0]?.device;
+  validateWebcamDevice(os, device);
+  const view = opts.viewport;
+  const maxW = opts.width ?? (vo === "window" || local ? 1280 : 640);
+  const maxH = opts.width ? Math.max(2, Math.round((opts.width * 9) / 16) & ~1) : (vo === "window" || local ? 720 : 360);
+  const surface = vo === "text"
+    ? {
+        width: opts.width ?? Math.max(20, Math.min(120, view.columns - 2)),
+        height: Math.max(10, Math.min(100, (view.rows > 2 ? view.rows - 2 : view.rows) * 2)) & ~1,
+      }
+    : renderSize(view, maxW, maxH);
+  const script = webcamStreamScript(os, device, {
+    vo, fps: opts.fps, width: surface.width, height: surface.height, durationS: opts.durationS,
+  });
+  const winBin = host?.os === "windows" && !deps.startProducer ? await resolveWinBin(host, 30000) : undefined;
+  const startProducer = (): WebcamStreamProc => {
+    if (deps.startProducer) return deps.startProducer(host, script);
+    const built = host ? buildArgs(host, script.cmd, script.shell, winBin) : undefined;
+    const proc = Bun.spawn(built?.args ?? (os === "windows" ? ["powershell", "-NoProfile", "-NonInteractive", "-Command", "-"] : ["bash", "-s"]), {
+      stdin: "pipe", stdout: "pipe", stderr: "pipe", ...(host ? { env: sshEnv() } : {}),
+    });
+    proc.stdin.write(built?.stdin ?? script.cmd + "\n\n");
+    // The producer owns stdin until cancellation; EOF is its disconnect signal.
+    let closing = false;
+    let finished = false;
+    let killTimer: NodeJS.Timeout | undefined;
+    const exited = proc.exited.finally(() => { finished = true; clearTimeout(killTimer); });
+    return { stdout: proc.stdout, stderr: proc.stderr, exited, kill: () => {
+      if (closing || finished) return;
+      closing = true;
+      try { proc.stdin.end(); } catch {}
+      killTimer = setTimeout(() => { try { proc.kill("SIGKILL"); } catch {} }, 2000);
+    } };
+  };
+  return {
+    meta: { host: host?.name ?? "local", device, vo, width: script.width, height: script.height, fps: script.fps, durationS: opts.durationS },
+    cameras, startProducer,
+  };
 }
 /** Capture a screenshot on the first selected host and pull it to `localPath`. */
 export async function captureScreenshot(

@@ -1,5 +1,5 @@
 import { test, expect, describe, spyOn } from "bun:test";
-import { jobLog, jobTail, killScript, listJobs, pruneJobs, resolveJobRef, parseRows, newId, spawnJob, unixSpawnScript, waitJob, waitPoll } from "../src/jobs.ts";
+import { followScript, jobLog, jobTail, killScript, listJobs, pruneJobs, removeScript, resolveJobRef, parseRows, newId, spawnJob, unixSpawnScript, waitJob, waitPoll } from "../src/jobs.ts";
 import * as ssh from "../src/ssh.ts";
 import type { FleetConfig, Host } from "../src/config.ts";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
@@ -306,6 +306,97 @@ describe("detached job lifecycle", () => {
     }
   }, 15_000);
 
+  test.each(["mac", "linux"] as const)("%s kill stops a loop before it starts its next child", async (os) => {
+    const fixtureHome = mkdtempSync(join(tmpdir(), "fleet-job-kill-loop-"));
+    const local = host("local", os);
+    const children = join(fixtureHome, "children");
+    const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+    const pids = () => (Bun.file(children).size ? readFileSync(children, "utf8").trim().split("\n").map(Number) : []);
+    try {
+      // Each child the loop starts records its pid. A loop shell that outlives
+      // its current child for a moment starts the next one, which nobody kills.
+      const launch = await runBash(unixSpawnScript({ ...local, os: "mac" }, "loop-job",
+        'while :; do sleep 30 & echo $! >> "$HOME/children"; wait $!; done'), fixtureHome);
+      expect(launch.code, launch.stderr).toBe(0);
+      for (let i = 0; i < 100 && !pids().length; i++) await Bun.sleep(10);
+      const killed = await runBash(killScript(local, "loop-job"), fixtureHome);
+      expect(killed.code, killed.stderr).toBe(0);
+      // Real processes: give a surviving loop time to start the child it would leak.
+      await Bun.sleep(200);
+      expect(pids().filter(alive)).toEqual([]);
+    } finally {
+      for (const pid of pids()) { try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ } }
+      rmSync(fixtureHome, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  test("follow prints new output and ends when the job exits", async () => {
+    const fixtureHome = mkdtempSync(join(tmpdir(), "fleet-job-follow-"));
+    const local = host("local", "mac");
+    try {
+      const launch = await runBash(unixSpawnScript(local, "follow-job",
+        'echo one; echo two; until [ -f "$HOME/release" ]; do sleep 0.05; done; echo three'), fixtureHome);
+      expect(launch.code, launch.stderr).toBe(0);
+      const follow = runBash(followScript(local, "follow-job", 1), fixtureHome);
+      // Real processes: let the follower reach tail -f before the job finishes.
+      await Bun.sleep(1000);
+      writeFileSync(join(fixtureHome, "release"), "");
+      const followed = await follow;
+      expect(followed.code, followed.stderr).toBe(0);
+      expect(followed.stdout).toEndWith("three\n");
+      expect(followed.stdout).not.toContain("one");
+      // A finished job prints its tail and returns at once.
+      expect((await runBash(followScript(local, "follow-job", 2), fixtureHome)).stdout).toBe("two\nthree\n");
+    } finally {
+      rmSync(fixtureHome, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  test("follow stops once its reader is gone, while the job still runs", async () => {
+    const fixtureHome = mkdtempSync(join(tmpdir(), "fleet-job-follow-gone-"));
+    const local = host("local", "mac");
+    const jobDir = join(fixtureHome, ".fleet", "jobs", "chatty-job");
+    try {
+      const launch = await runBash(unixSpawnScript(local, "chatty-job",
+        'until [ -f "$HOME/release" ]; do echo tick; sleep 0.1; done'), fixtureHome);
+      expect(launch.code, launch.stderr).toBe(0);
+      writeFileSync(join(fixtureHome, "follow.sh"), followScript(local, "chatty-job", 1));
+      // `head` stands in for an ssh session that hung up without a pty: no HUP
+      // arrives, only a closed pipe.
+      const follow = runBash('bash "$HOME/follow.sh" | head -n 1', fixtureHome);
+      // Real processes: a deadline, not a wait. The old loop polled until the job ended.
+      const ended = await Promise.race([follow.then(() => true), Bun.sleep(8000).then(() => false)]);
+      expect(ended).toBe(true);
+      expect(Bun.file(join(jobDir, "exit")).size).toBe(0);
+    } finally {
+      writeFileSync(join(fixtureHome, "release"), "");
+      for (let i = 0; i < 200 && !Bun.file(join(jobDir, "exit")).size; i++) await Bun.sleep(10);
+      rmSync(fixtureHome, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  test("rm removes only the named finished job and refuses a running one", async () => {
+    const fixtureHome = mkdtempSync(join(tmpdir(), "fleet-job-rm-"));
+    const local = host("local", "mac");
+    const jobs = join(fixtureHome, ".fleet", "jobs");
+    try {
+      for (const id of ["done-one", "done-two"]) {
+        expect((await runBash(unixSpawnScript(local, id, "true"), fixtureHome)).code).toBe(0);
+        for (let i = 0; i < 200 && !Bun.file(join(jobs, id, "exit")).size; i++) await Bun.sleep(10);
+      }
+      expect((await runBash(unixSpawnScript(local, "busy", 'until [ -f "$HOME/release" ]; do sleep 0.05; done'), fixtureHome)).code).toBe(0);
+      const refused = await runBash(removeScript(local, "busy"), fixtureHome);
+      expect(refused.code).toBe(1);
+      expect(refused.stderr).toContain("is running");
+      expect((await runBash(removeScript(local, "done-one"), fixtureHome)).code).toBe(0);
+      expect(readdirSync(jobs).sort()).toEqual(["busy", "done-two"]);
+    } finally {
+      writeFileSync(join(fixtureHome, "release"), "");
+      for (let i = 0; i < 200 && !Bun.file(join(jobs, "busy", "exit")).size; i++) await Bun.sleep(10);
+      rmSync(fixtureHome, { recursive: true, force: true });
+    }
+  }, 15_000);
+
   test("exit publication exposes only the complete code, even when rename is delayed", async () => {
     const fixtureHome = mkdtempSync(join(tmpdir(), "fleet-job-exit-publish-"));
     const local = host("local", "mac");
@@ -367,20 +458,52 @@ describe("detached job lifecycle", () => {
   });
 
   test("unconfirmed launches retain each attempted id and never retry", async () => {
-    const attempts: string[] = [];
+    const launches: string[] = [];
     const results = await spawnJob(cfg, "@cloud", "echo fixture", {}, {
       newId: () => "attempt-id",
-      exec: async (h) => {
-        attempts.push(h.name);
+      exec: async (h, script) => {
+        // The spool read after a lost reply is not a launch.
+        if (script.includes("PID ")) return { host: h.name, ok: true, code: 0, stdout: "", stderr: "" };
+        launches.push(h.name);
         if (h.os === "windows") throw new Error("transport disconnected");
         return { host: h.name, ok: false, code: 255, stdout: "", stderr: "connection lost" };
       },
     });
-    expect(attempts).toEqual(["web", "winbox"]);
+    expect(launches).toEqual(["web", "winbox"]);
     expect(results).toHaveLength(2);
     for (const r of results) {
       expect(r).toMatchObject({ ok: false, id: "attempt-id", pid: null });
       expect(r.error).toContain("inspect this job before retrying");
+    }
+  });
+
+  test("a launch whose reply was lost succeeds once its runner's PID is in the spool", async () => {
+    const fixtureHome = mkdtempSync(join(tmpdir(), "fleet-job-lost-reply-"));
+    const local = host("local", "mac");
+    const dir = join(fixtureHome, ".fleet", "jobs", "lost-reply");
+    const launches: string[] = [];
+    try {
+      const [r] = await spawnJob({ hosts: { local }, groups: {} }, "local",
+        'for i in {1..100}; do [ -f "$HOME/release" ] && break; sleep 0.05; done', {}, {
+          newId: () => "lost-reply",
+          exec: async (h, script, _shell, opts) => {
+            const run = await runBash(script, fixtureHome);
+            if (script.includes("PID ")) {
+              expect(opts?.fresh).toBe(true);
+              return { host: h.name, ok: run.code === 0, ...run };
+            }
+            launches.push(script);
+            // The job started, but the reply never arrived.
+            return { host: h.name, ok: false, code: 1, stdout: "", stderr: "Cannot access a closed Stream." };
+          },
+        });
+      expect(launches).toHaveLength(1);
+      expect(r).toMatchObject({ ok: true, id: "lost-reply", pid: Number(readFileSync(join(dir, "pid"), "utf8")) });
+    } finally {
+      writeFileSync(join(fixtureHome, "release"), "");
+      // A real detached runner: poll its exit record before removing its spool.
+      for (let i = 0; i < 200 && !Bun.file(join(dir, "exit")).size; i++) await Bun.sleep(10);
+      rmSync(fixtureHome, { recursive: true, force: true });
     }
   });
 

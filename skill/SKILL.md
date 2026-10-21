@@ -27,18 +27,20 @@ fleet exec win-box "nvidia-smi"
 
 | Command | Use |
 |---|---|
-| `fleet exec [--cwd dir] [--wsl] [--sudo] [--fresh] [--confirm-reboot] [--raw] [--json] <sel> "<cmd>"` | Run a command on host(s) and wait for it (returns the exit code). `--cwd` expands a leading `~` and fails fast (exit 127) if the directory is missing. `--wsl` runs inside WSL on Windows boxes. `--raw` prints only remote stdout. `--sudo` runs it as root on POSIX hosts (passwordless sudo, or `hosts.<h>.sudo.passwordFile` sent over ssh stdin). `--fresh` logs in again instead of reusing the shared connection. Reboot-looking commands need `--confirm-reboot`. |
+| `fleet exec [--cwd dir] [--wsl] [--sudo] [--fresh] [--confirm-reboot] [--raw] [--json] <sel> "<cmd>"` | Run a command on host(s) and wait for it. Exits 0 or 1; with `--raw` on one host it exits with the remote code. `--cwd` expands a leading `~` and fails fast (exit 127) if the directory is missing. `--wsl` runs inside WSL on Windows boxes. `--raw` prints only remote stdout. `--sudo` runs it as root on POSIX hosts (passwordless sudo, or `hosts.<h>.sudo.passwordFile` sent over ssh stdin). `--fresh` logs in again instead of reusing the shared connection. Reboot-looking commands need `--confirm-reboot`. |
 | `fleet exec --script <file\|-> [--interp cmd] <sel> [ARG…]` | Run a local script file or stdin on host(s). Fleet infers file extensions and supported stdin shebangs. Untyped stdin requires `--interp`. Tokens after `<sel>` reach the script as `$1…`, PowerShell `$args`/`param()`, or argv. |
 | `fleet spawn [--wsl] [--elevated] [--fresh] [--cwd dir] [--json] <sel> "<cmd>"` | Launch a detached job that outlives the SSH session and returns a `host:id`. `--wsl` runs it under `bash -l` in a Windows box's WSL distro, so `> /tmp/x` lands in WSL. `--elevated` gives a Windows job the administrator token (storage/CIM cmdlets need it). |
 | `fleet jobs [<sel>]` | List detached jobs across the fleet (starting ○ / running ● / exited ○ / dead ✗). |
 | `fleet jobs log <host:id>` | Full captured output of a job. |
-| `fleet jobs tail <host:id> [-n N] [-f]` | Last N lines; `-f` streams live (foreground until Ctrl-C). |
+| `fleet jobs tail <host:id> [-n N] [-f]` | Last N lines; `-f` streams live until the job exits (or Ctrl-C), from a terminal or a pipe. |
 | `fleet jobs wait <host:id> [--until <regex>] [--timeout S]` | Block until the job exits (or its output matches `--until`). Scriptable exit code: job's own code on exit, `0` on match, `124` on timeout, `1` for a dead runner or `launch-unconfirmed`. |
 | `fleet jobs kill <host:id>` | TERM the verified job process tree and escalate against surviving descendants. |
+| `fleet jobs rm <host:id>` | Remove one finished or dead job's spool. Refuses a running job and one that has not recorded a PID yet. |
 | `fleet jobs prune [<sel>] [--all]` | Remove finished job spools (`--all` also drops dead ones; never touches running). |
 | `fleet cp [-r] [--resume] <local> <sel>:<remote>` | Copy a file to host(s), fanning out across a group. `fleet push` and `fleet pull` are aliases of `cp`. `--resume` copies with rsync `--partial`, so rerunning after a drop continues the partial file (POSIX hosts only). A single-host copy on a terminal shows a progress meter. |
 | `fleet edit <sel>:<path> --old S --new S` | Edit a remote file in place, reject ambiguous matches, and print the diff. `--old-file`/`--new-file <file or ->` read multi-line text from a file or stdin; fleet never unescapes `\n`. `--edits <file or ->` applies a JSON array of `{"old","new","all"}` to one file: one read, one write, nothing written if any edit fails. In a file that is CRLF (or LF) throughout, newlines in `--old`/`--new` are converted to match it. A miss names its likely cause by line number. `--sudo` edits root-owned files as root (POSIX; passwordless sudo or the host's configured sudo password). |
 | `fleet shot <host> [--output NAME\|main\|N] [--region top-right\|…\|X,Y,W,H] [--wake] [--out f] [--grid] [--no-open]` | Screenshot the remote desktop to a local image (WebP by default; `--grid` overlays a coordinate ruler). `--output` captures one monitor and `--region` part of it (the main monitor when `--output` is omitted); `--list` shows the layout. `--wake` switches powered-off Wayland monitors on for the capture. Alias: `fleet screenshot`. |
+| `fleet webcam <host\|local> [--device D] [--out f.png] [--list] [--stream [--fps N] [--width PX] [--for S] [--vo kitty\|text] [--window\|-W]]` | List cameras, save a PNG photo, or play a live camera stream in the terminal (Kitty graphics or half-blocks) or a local `mpv`/`ffplay` window. |
 | `fleet session <sel>` | Logged in, **locked**, or at the login screen; idle time where the desktop reports it; which displays are off. Check it before `cu` or `shot`. Several hosts take one comma selector (`fleet session web,laptop`); a second positional is a usage error. |
 | `fleet drop <sel>` | Close the shared ssh connection (and a Windows host's kept-open session) so the next call logs in fresh, e.g. after `usermod -aG docker`. |
 | `fleet boot <machine> [--entries]` · `fleet switch <machine> --to <os> [--dry-run] [--yes]` | Which boot of a dual-boot machine is live, its UEFI entries, and reboot into another boot with every phase printed (see **Dual-boot machines**). |
@@ -79,7 +81,7 @@ probe LAN first too.
 
 ### Command options
 
-Use `exec --argv <selector> -- <program> <arguments...>` to preserve argument boundaries. Quote values for the local shell. Argv mode cannot combine with script mode.
+Use `exec --argv <selector> -- <program> <arguments...>` to preserve argument boundaries. Quote values for the local shell. Argv mode cannot combine with script mode. Without `--argv`, Fleet also keeps every boundary when a word after the program is empty or contains whitespace, so `fleet exec <selector> -- bash -c "a; b"` passes `a; b` to bash as one argument. Otherwise it joins the words with spaces. On PowerShell hosts a word that is only a parameter name, such as `-Recurse`, stays unquoted so cmdlets bind it.
 
 `jobs tail --include REGEX --exclude REGEX -n N` filters on the host before the line limit. Inclusion runs before exclusion. Filters and `jobs wait --until` patterns are case-sensitive. POSIX hosts use ERE; Windows uses .NET regex. Filtered output has a 64 KiB limit and reports truncation. Filters cannot combine with follow.
 
@@ -152,7 +154,11 @@ jobs) instead of holding an `exec` or a backgrounded SSH session open.
   so `fleet jobs wait gpu-box:<id> && deploy` works.
 - A typical flow: `fleet spawn --cwd /srv/app gpu-box "./train.sh"`, then `fleet jobs`,
   then `fleet jobs tail gpu-box:<id> -f` or `fleet jobs wait gpu-box:<id> --until '<rx>'`, then
-  `fleet jobs prune` when done. MCP can list jobs and read their logs; everything else is CLI only.
+  `fleet jobs rm gpu-box:<id>` when done. `fleet jobs prune` removes every finished job on the
+  host, including other sessions' logs. MCP can list jobs and read their logs; everything else is CLI only.
+- When a launch reply is lost, `spawn` reads the job's spool once over a new login. A PID the
+  runner recorded means the job started, and spawn reports success. Otherwise it returns
+  `ok: false` with the attempted ID; inspect that spool before resubmitting. Fleet never retries a launch.
 
 ## Exec behavior you can rely on
 
@@ -182,7 +188,9 @@ jobs) instead of holding an `exec` or a backgrounded SSH session open.
   is discarded and cannot enter a later call. Use `spawn` for durable job output.
   A call whose PowerShell output never arrived fails with "the Windows session lost
   this program's PowerShell output" and restarts the session; the program already
-  ran, so rerun it only if it is safe to run twice.
+  ran, so rerun it only if it is safe to run twice. The session makes its first
+  formatted write before it serves any call, so pwsh never binds its output writer
+  to a per-call file. `fleet switch` sends its reboot trigger over a new login.
 - **Local stdin is never forwarded.** The remote program travels on ssh's stdin, so
   `fleet exec host 'bash -s' < job.sh` would run nothing. A command that reads stdin
   (`bash -s`, `python3 -`, `cat > f`) with a file or pipe on local stdin is refused; use
