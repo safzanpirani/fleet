@@ -20,7 +20,7 @@ import { createConnection } from "node:net";
 import { dirname, join } from "node:path";
 import type { FleetConfig, Host } from "./config.ts";
 import { resolveHosts } from "./config.ts";
-import { exec, probe, type ExecResult } from "./ssh.ts";
+import { exec, probe, sshEnv, type ExecResult } from "./ssh.ts";
 import { emitImage, takeInlineImages, validateImageArtifact } from "./core.ts";
 import { UI_JAR_B64, UI_JAR_MD5 } from "./android-ui-jar.ts";
 
@@ -1776,7 +1776,8 @@ export async function androidNotifications(
 type LocalRun = (cmd: string[], timeoutMs?: number) => Promise<{ code: number; stdout: string; stderr: string }>;
 
 const localRun: LocalRun = async (cmd, timeoutMs = 20_000) => {
-  const proc = Bun.spawn(cmd, { stdout: "pipe", stderr: "pipe", stdin: "ignore", timeout: timeoutMs, killSignal: "SIGKILL" });
+  // It runs `ssh -G` too, which needs the ssh-family environment.
+  const proc = Bun.spawn(cmd, { stdout: "pipe", stderr: "pipe", stdin: "ignore", timeout: timeoutMs, killSignal: "SIGKILL", env: sshEnv() });
   const [stdout, stderr, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
   return { code, stdout, stderr };
 };

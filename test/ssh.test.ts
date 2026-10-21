@@ -470,4 +470,33 @@ describe("ssh children see the environment as fleet left it", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  // Win32-OpenSSH's sshd exports its fd-type table to the login session. An
+  // ssh.exe below that login applies the stale table to its own stdio pipes
+  // and hangs, so fleet run inside an ssh login to Windows hung on every call.
+  test("ssh children never inherit an sshd session's POSIX fd state", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "fleet-ssh-fdstate-"));
+    try {
+      const fakeSsh = join(dir, "ssh");
+      writeFileSync(fakeSsh, `#!/bin/sh\nenv | grep -c '_POSIX_FD_STATE=' || true\nprintf '%s\\n' "$FLEET_TEST_KEEP"\n`);
+      chmodSync(fakeSsh, 0o755);
+      const snippet = `
+        import { exec } from "${import.meta.dir}/../src/ssh.ts";
+        const run = await exec({ name: "h", ssh: "h", os: "linux" }, "true");
+        console.log(JSON.stringify(run.stdout.trim().split("\\n")));
+      `;
+      const proc = Bun.spawn(["bun", "-e", snippet], {
+        env: { ...process.env, PATH: dir + delimiter + (process.env.PATH ?? ""), FLEET_NO_SSH_MUX: "1",
+          c28fc6f98a2c44abbbd89d6a3037d0d9_POSIX_FD_STATE: "AAAAAAICAgA=", FLEET_TEST_KEEP: "kept" },
+        stdout: "pipe", stderr: "pipe",
+      });
+      const [stdout, stderr, code] = await Promise.all([
+        new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited,
+      ]);
+      expect(code, stderr).toBe(0);
+      expect(JSON.parse(stdout)).toEqual(["0", "kept"]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

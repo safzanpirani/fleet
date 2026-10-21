@@ -54,6 +54,21 @@ Add-Type -Namespace FleetSession -Name Std -MemberDefinition @'
 [DllImport("kernel32.dll")] public static extern bool SetStdHandle(int n, System.IntPtr h);
 [DllImport("kernel32.dll")] public static extern System.IntPtr GetStdHandle(int n);
 [DllImport("kernel32.dll")] public static extern bool SetHandleInformation(System.IntPtr h, int mask, int flags);
+[DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFileW(string name, uint access, uint share, System.IntPtr sa, uint disposition, uint flags, System.IntPtr template);
+// A per-call output file is written through two routes: native children write
+// through the inherited handle, and [Console]::Out writes through a FileStream
+// that remembers its own offset. With write access each route overwrote the
+// other's bytes, and Windows PowerShell 5.1 threw instead. Append-only access
+// (FILE_APPEND_DATA without FILE_WRITE_DATA) makes the kernel put every write
+// at the end of the file, in the order the writes happen.
+public static System.IO.FileStream AppendOnly(string path) {
+  // FILE_APPEND_DATA | FILE_READ_ATTRIBUTES | DELETE | SYNCHRONIZE; share read, write, delete;
+  // CREATE_NEW; FILE_ATTRIBUTE_NORMAL | FILE_FLAG_DELETE_ON_CLOSE.
+  var handle = CreateFileW(path, 0x4 | 0x80 | 0x10000 | 0x100000, 7, System.IntPtr.Zero, 1, 0x80 | 0x04000000, System.IntPtr.Zero);
+  if (handle.IsInvalid) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+  return new System.IO.FileStream(handle, System.IO.FileAccess.Write, 1);
+}
 public static string Snapshot(string path) {
   using (var stream = new System.IO.FileStream(path, System.IO.FileMode.Open, System.IO.FileAccess.Read, System.IO.FileShare.ReadWrite | System.IO.FileShare.Delete)) {
     // Read a fixed boundary, not ReadToEnd: descendants may still append.
@@ -62,6 +77,19 @@ public static string Snapshot(string path) {
     while (read < bytes.Length && (n = stream.Read(bytes, read, bytes.Length - read)) > 0) read += n;
     return System.Text.Encoding.UTF8.GetString(bytes, 0, read);
   }
+}
+// The writer pwsh's console host keeps for good. Each call points it at that
+// call's file, so formatted output, Write-Host and [Console]::Out land in the
+// same file as native output, in order, and the host never holds a disposed one.
+public sealed class Switch : System.IO.TextWriter {
+  public System.IO.TextWriter Inner;
+  public Switch(System.IO.TextWriter inner) { Inner = inner; }
+  public override System.Text.Encoding Encoding { get { return Inner.Encoding; } }
+  public override void Write(char value) { Inner.Write(value); }
+  public override void Write(string value) { Inner.Write(value); }
+  public override void Write(char[] buffer, int index, int count) { Inner.Write(buffer, index, count); }
+  public override void WriteLine(string value) { Inner.WriteLine(value); }
+  public override void Flush() { Inner.Flush(); }
 }
 '@
 $__fsReader = New-Object System.IO.StreamReader([Console]::OpenStandardInput(), (New-Object System.Text.UTF8Encoding($false)))
@@ -75,11 +103,13 @@ $__fsFile = Join-Path ([IO.Path]::GetTempPath()) ('fleet-session-' + $PID + '.ps
 $__fsEnv = @{}; Get-ChildItem env: | ForEach-Object { $__fsEnv[$_.Name] = $_.Value }
 $__fsStdOut = [FleetSession.Std]::GetStdHandle(-11); $__fsStdErr = [FleetSession.Std]::GetStdHandle(-12)
 $__fsConsoleOut = [Console]::Out; $__fsConsoleErr = [Console]::Error
+$__fsOut = [FleetSession.Std+Switch]::new($__fsConsoleOut); $__fsErr = [FleetSession.Std+Switch]::new($__fsConsoleErr)
+[Console]::SetOut($__fsOut); [Console]::SetError($__fsErr)
 # pwsh's console host caches [Console]::Out in its output serializer on its
 # first formatted write and never looks again. Make that first write here,
-# before any call swaps in its per-call output file: a first write during a
-# call would bind every later formatted write to that disposed file ("Cannot
-# access a closed Stream"), and each call after it would lose its output.
+# while [Console]::Out is the switch: a first write during a call would bind
+# every later formatted write to that call's disposed file ("Cannot access a
+# closed Stream"), and each call after it would lose its output.
 '${READY}' | Out-Default
 while ($null -ne ($__fsLine = $__fsReader.ReadLine())) {
   if (-not $__fsLine) { continue }
@@ -101,8 +131,8 @@ while ($null -ne ($__fsLine = $__fsReader.ReadLine())) {
   # handles; its late output cannot reach the protocol or any later call.
   $__fsOutPath = Join-Path ([IO.Path]::GetTempPath()) ('fleet-session-' + [Guid]::NewGuid() + '.out')
   $__fsErrPath = Join-Path ([IO.Path]::GetTempPath()) ('fleet-session-' + [Guid]::NewGuid() + '.err')
-  $__fsOutFile = [IO.FileStream]::new($__fsOutPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete, 4096, [IO.FileOptions]::DeleteOnClose)
-  $__fsErrFile = [IO.FileStream]::new($__fsErrPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete, 4096, [IO.FileOptions]::DeleteOnClose)
+  $__fsOutFile = [FleetSession.Std]::AppendOnly($__fsOutPath)
+  $__fsErrFile = [FleetSession.Std]::AppendOnly($__fsErrPath)
   $__fsOutWriter = [IO.StreamWriter]::new($__fsOutFile, [Text.UTF8Encoding]::new($false), 4096, $true)
   $__fsErrWriter = [IO.StreamWriter]::new($__fsErrFile, [Text.UTF8Encoding]::new($false), 4096, $true)
   $__fsOutWriter.AutoFlush = $true; $__fsErrWriter.AutoFlush = $true
@@ -110,7 +140,7 @@ while ($null -ne ($__fsLine = $__fsReader.ReadLine())) {
   [void][FleetSession.Std]::SetHandleInformation($__fsErrFile.SafeFileHandle.DangerousGetHandle(), 1, 1)
   [void][FleetSession.Std]::SetStdHandle(-11, $__fsOutFile.SafeFileHandle.DangerousGetHandle())
   [void][FleetSession.Std]::SetStdHandle(-12, $__fsErrFile.SafeFileHandle.DangerousGetHandle())
-  [Console]::SetOut($__fsOutWriter); [Console]::SetError($__fsErrWriter)
+  $__fsOut.Inner = $__fsOutWriter; $__fsErr.Inner = $__fsErrWriter
   try {
     # Its own Out-Default, not the loop's: the whole while statement is one
     # pipeline, so a table formatter started by this program's objects would
@@ -125,7 +155,8 @@ while ($null -ne ($__fsLine = $__fsReader.ReadLine())) {
     $__fsOutWriter.Flush(); $__fsErrWriter.Flush()
     [void][FleetSession.Std]::SetStdHandle(-11, $__fsStdOut)
     [void][FleetSession.Std]::SetStdHandle(-12, $__fsStdErr)
-    [Console]::SetOut($__fsConsoleOut); [Console]::SetError($__fsConsoleErr)
+    $__fsOut.Inner = $__fsConsoleOut; $__fsErr.Inner = $__fsConsoleErr
+    [Console]::SetOut($__fsOut); [Console]::SetError($__fsErr)
   }
   try {
     [Console]::Out.Write([FleetSession.Std]::Snapshot($__fsOutPath))

@@ -117,22 +117,3 @@ test("the pipeline probe is stripped exactly, and its absence is reported", () =
   expect(takePipeProbe("x\r\n", end).probed).toBe(false);
   expect(takePipeProbe(`echo __FLEET_PIPE__${end}\r\n`, end).probed).toBe(false);
 });
-
-test("each program gets its own Out-Default, so formatted objects flush before the end marker", () => {
-  // The loop is one long pipeline. Objects from Select-Object used to sit in
-  // its table formatter until a later call, and the call reported lost output.
-  const loop = sessionLoopScript();
-  expect(loop).toContain("& $__fsFile | Out-Default");
-  expect(loop).toContain(`'__FLEET_PIPE__' + $__fsEnd | Out-Default`);
-});
-
-test("the host's first formatted write happens before any call swaps the output", () => {
-  // pwsh caches [Console]::Out on its first formatted write. When that write
-  // came from a call, the cache held the call's disposed output file, and every
-  // later call failed with "Cannot access a closed Stream" and lost its output.
-  const loop = sessionLoopScript();
-  const ready = loop.indexOf("'__FLEET_SESSION_READY__' | Out-Default");
-  expect(ready).toBeGreaterThan(0);
-  expect(ready).toBeLessThan(loop.indexOf("[Console]::SetOut("));
-  expect(loop.indexOf("Out-Default")).toBeGreaterThan(ready);
-});

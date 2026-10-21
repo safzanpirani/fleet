@@ -188,9 +188,12 @@ jobs) instead of holding an `exec` or a backgrounded SSH session open.
   is discarded and cannot enter a later call. Use `spawn` for durable job output.
   A call whose PowerShell output never arrived fails with "the Windows session lost
   this program's PowerShell output" and restarts the session; the program already
-  ran, so rerun it only if it is safe to run twice. The session makes its first
-  formatted write before it serves any call, so pwsh never binds its output writer
-  to a per-call file. `fleet switch` sends its reboot trigger over a new login.
+  ran, so rerun it only if it is safe to run twice. Native command output,
+  `Write-Host`, `[Console]::Out` and formatted objects arrive in the order the program
+  wrote them. `fleet switch` sends its reboot trigger over a new login.
+- **Fleet works inside an ssh login to Windows.** sshd hands that login an OpenSSH fd
+  table (`<guid>_POSIX_FD_STATE`), and an ssh.exe that inherits it hangs on piped stdio.
+  Fleet drops the variable from every ssh, scp and ssh-keygen it starts.
 - **Local stdin is never forwarded.** The remote program travels on ssh's stdin, so
   `fleet exec host 'bash -s' < job.sh` would run nothing. A command that reads stdin
   (`bash -s`, `python3 -`, `cat > f`) with a file or pipe on local stdin is refused; use

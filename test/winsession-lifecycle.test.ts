@@ -96,18 +96,7 @@ await child.exited;`;
   }
 });
 
-test("per-call files snapshot a fixed boundary and restore protocol handles before markers", () => {
-  const loop = sessionLoopScript();
-  expect(loop).toContain("[IO.FileMode]::CreateNew");
-  expect(loop).toContain("[IO.FileOptions]::DeleteOnClose");
-  expect(loop).toContain("SetHandleInformation($__fsOutFile.SafeFileHandle.DangerousGetHandle(), 1, 1)");
-  expect(loop).toContain("SetHandleInformation($__fsErrFile.SafeFileHandle.DangerousGetHandle(), 1, 1)");
-  expect(loop).toContain("new byte[checked((int)stream.Length)]");
-  expect(loop.indexOf("SetStdHandle(-11, $__fsStdOut)")).toBeLessThan(loop.indexOf("Snapshot($__fsOutPath)"));
-  expect(loop.indexOf("Snapshot($__fsErrPath)")).toBeLessThan(loop.indexOf("[Console]::Error.WriteLine($__fsEnd"));
-});
-
-test.skipIf(process.platform !== "win32")("late native descendants cannot write into a later Windows call", async () => {
+test.skipIf(process.platform !== "win32")("a Windows call keeps native output in order and late descendants out", async () => {
   const proc = Bun.spawn(["pwsh", "-NoProfile", "-NonInteractive", "-EncodedCommand",
     Buffer.from(sessionLoopScript(), "utf16le").toString("base64")], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
   let out = "", err = "";
@@ -132,6 +121,11 @@ test.skipIf(process.platform !== "win32")("late native descendants cannot write 
     expect(out.slice(boundary)).toContain("formatted");
     expect(out.slice(boundary)).not.toContain("late-out");
     expect(err.slice(errorBoundary)).not.toContain("late-err");
+    // Native children, [Console]::Out, Write-Host and formatted output all
+    // reach one file; each keeps its place and none overwrites another.
+    const third = out.length;
+    await send("__FLEET_END_third__", "'formatted-1'; [Console]::Out.WriteLine('direct-1'); cmd /c echo native-1; Write-Host host-1; 'formatted-2'");
+    expect(out.slice(third)).toMatch(/formatted-1\s+direct-1\s+native-1\s+host-1\s+formatted-2/);
   } finally {
     proc.kill("SIGKILL");
     await proc.exited;

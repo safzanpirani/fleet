@@ -61,11 +61,22 @@ export function muxOpts(host: Host): string[] {
     "-o", `ControlPersist=${muxPersist()}`];
 }
 
-/** The environment for any ssh, scp or rsync that may run fleet's
- *  ProxyCommand. Bun.spawn hands a child the environment fleet started with
+/** Win32-OpenSSH's sshd hands its session a table of POSIX fd types in a
+ *  `<guid>_POSIX_FD_STATE` environment variable. An ssh.exe started anywhere
+ *  below that session applies the inherited table to its own stdio, which are
+ *  different handles: with a pipe on stdin it never sends its input, and with
+ *  a pipe on stdout it never exits. Fleet run inside an ssh login to Windows
+ *  hung on every connection until this variable was dropped. */
+const INHERITED_FD_STATE = /_POSIX_FD_STATE$/;
+
+/** The environment for every ssh-family child (ssh, scp, rsync, ssh-keygen,
+ *  ssh-keyscan). Bun.spawn hands a child the environment fleet started with
  *  and ignores later process.env changes, and argvRef publishes an inline
- *  proxy URL's password in process.env for that ProxyCommand. Pass it. */
-export const sshEnv = (): Record<string, string | undefined> => process.env;
+ *  proxy URL's password in process.env for fleet's ProxyCommand. Pass it. */
+export function sshEnv(): Record<string, string | undefined> {
+  if (!Object.keys(process.env).some((k) => INHERITED_FD_STATE.test(k))) return process.env;
+  return Object.fromEntries(Object.entries(process.env).filter(([k]) => !INHERITED_FD_STATE.test(k)));
+}
 
 /** Every connection option fleet adds to an ssh/scp argv, in one place: the
  *  route first, then the host key identity, then the control socket that

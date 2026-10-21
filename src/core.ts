@@ -1209,7 +1209,7 @@ function classifySsh(stderr: string): { reason: string; hints: string[] } {
 interface SshEffective { hostname: string; port: string; alias?: string; strict: string; knownHosts: string[] }
 
 async function sshEffective(h: Host): Promise<SshEffective | null> {
-  const proc = Bun.spawn(["ssh", "-G", ...hostKeyOpts(h), h.ssh], { stdin: "ignore", stdout: "pipe", stderr: "ignore" });
+  const proc = Bun.spawn(["ssh", "-G", ...hostKeyOpts(h), h.ssh], { stdin: "ignore", stdout: "pipe", stderr: "ignore", env: sshEnv() });
   const [out, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
   if (code !== 0) return null;
   const get = (k: string) => new RegExp(`^${k} (.*)$`, "m").exec(out)?.[1]?.trim();
@@ -1231,7 +1231,7 @@ async function knownKeys(name: string, files: string[]): Promise<string[]> {
   const keys: string[] = [];
   for (const f of files) {
     if (f === "/dev/null") continue;
-    const proc = Bun.spawn(["ssh-keygen", "-F", name, "-f", f], { stdin: "ignore", stdout: "pipe", stderr: "ignore" });
+    const proc = Bun.spawn(["ssh-keygen", "-F", name, "-f", f], { stdin: "ignore", stdout: "pipe", stderr: "ignore", env: sshEnv() });
     const out = await new Response(proc.stdout).text();
     await proc.exited;
     for (const line of out.split("\n")) {
@@ -1322,7 +1322,7 @@ export async function hostKey(cfg: FleetConfig, name: string, opts: { pin?: bool
   if (resolveProxy(host)) throw new Error(`${name} is reached through a proxy; ssh-keyscan cannot follow it`);
   const eff = await sshEffective(host);
   if (!eff?.hostname) throw new Error(`ssh -G ${host.ssh} failed`);
-  const scan = Bun.spawn(["ssh-keyscan", "-T", "5", "-p", eff.port, eff.hostname], { stdin: "ignore", stdout: "pipe", stderr: "ignore" });
+  const scan = Bun.spawn(["ssh-keyscan", "-T", "5", "-p", eff.port, eff.hostname], { stdin: "ignore", stdout: "pipe", stderr: "ignore", env: sshEnv() });
   const scanned = await new Response(scan.stdout).text();
   await scan.exited;
   const presented = [...new Set(scanned.split("\n").filter((l) => !l.startsWith("#"))
@@ -1362,7 +1362,7 @@ export async function hostKey(cfg: FleetConfig, name: string, opts: { pin?: bool
   if (!files.length) throw new Error(`ssh config for ${host.ssh} has no usable UserKnownHostsFile`);
   const target = files[0]!;
   if (pinned.length) {
-    const rm = Bun.spawn(["ssh-keygen", "-R", host.hostKeyAlias, "-f", target], { stdout: "ignore", stderr: "ignore" });
+    const rm = Bun.spawn(["ssh-keygen", "-R", host.hostKeyAlias, "-f", target], { stdout: "ignore", stderr: "ignore", env: sshEnv() });
     await rm.exited;
   }
   const lines = presented.map((k) => `${host.hostKeyAlias} ${k}`).join("\n") + "\n";
@@ -1438,7 +1438,7 @@ export async function proxyChecks(cfg: FleetConfig, names?: string[]): Promise<P
 export async function dropMasters(cfg: FleetConfig, sel: string): Promise<{ host: string; dropped: boolean; detail: string }[]> {
   const hosts = resolveHosts(cfg, sel).filter((h) => h.transport !== "daytona");
   return Promise.all(hosts.map(async (h) => {
-    const proc = Bun.spawn(["ssh", ...connOpts(h), "-O", "exit", h.ssh], { stdout: "pipe", stderr: "pipe" });
+    const proc = Bun.spawn(["ssh", ...connOpts(h), "-O", "exit", h.ssh], { stdout: "pipe", stderr: "pipe", env: sshEnv() });
     const [err, code] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
     const detail = err.trim();
     // A Windows host's kept-open pwsh is a login of its own; stop its broker too.
