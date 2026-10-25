@@ -21,6 +21,7 @@ import { join, basename, dirname, relative } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { copyFile, chmod, lstat, mkdir, mkdtemp, readFile, readlink, readdir, rm, stat, symlink } from "node:fs/promises";
 import type { Dirent } from "node:fs";
+import { didYouMean } from "./suggest.ts";
 import type { FleetConfig, Host, ToolSpec } from "./config.ts";
 import { resolveHosts } from "./config.ts";
 import { exec, scp } from "./ssh.ts";
@@ -106,7 +107,7 @@ export function resolveTool(cfg: FleetConfig, name: string): ToolSpec & { name: 
   const spec = cfg.tools?.[name];
   if (!spec) {
     const known = Object.keys(cfg.tools ?? {});
-    throw new Error(`unknown tool '${name}'${known.length ? ` (have: ${known.join(", ")})` : " — no `tools` block in config"}`);
+    throw new Error(`unknown tool '${name}'${known.length ? ` (have: ${known.join(", ")})${didYouMean(name, known)}` : " — no `tools` block in config"}`);
   }
   return { ...spec, name, root: expandHome(spec.root) };
 }

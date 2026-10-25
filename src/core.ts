@@ -9,6 +9,7 @@ import { hostKeyOpts, resolveHosts, REPO_ROOT, lookupProxy, normalizeProxy, reso
 import type { FleetConfig, Host, Service, ServiceType, Machine } from "./config.ts";
 import { buildArgs, buildArgvCommand, connOpts, exec, probe, probeDetail, resolveWinBin, scp, scpPull, sshDiagnose, sshEnv, bashEsc, bashPathAssignment, psEsc, psHiddenLaunch } from "./ssh.ts";
 import { checkProxy, proxyCommandFor } from "./proxy.ts";
+import { didYouMean } from "./suggest.ts";
 import type { ProxyCheck } from "./proxy.ts";
 import type { ExecResult, Shell, TransferOptions } from "./ssh.ts";
 import { homedir, networkInterfaces, tmpdir } from "node:os";
@@ -17,8 +18,9 @@ import { createConnection } from "node:net";
 import { createSocket } from "node:dgram";
 import { mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
-import { fstatSync, readFileSync, statSync } from "node:fs";
+import { fstatSync, readFileSync, statSync, type Stats } from "node:fs";
 import { installLockScript } from "./install-lock.ts";
+import { DIFF_MAX_BYTES, decodeDiffText, unifiedDiff } from "./diff.ts";
 import {
   detectWebcamVo, parseCameras, renderSize, validateWebcamDevice, validateWebcamStreamOptions, webcamScript, webcamStreamScript,
   type Camera, type WebcamStreamProc, type WebcamViewport, type WebcamVo,
@@ -90,7 +92,7 @@ export function parseFlags(
       flags[t] = value;
       continue;
     }
-    if (t.startsWith("-")) throw new Error(`unknown option: ${t} (try fleet help)`);
+    if (t.startsWith("-")) throw new Error(`unknown option: ${t} (try fleet help)${didYouMean(t, [...boolFlags, ...valFlags])}`);
     if (leadingOnly) { rest.push(...argv.slice(i)); break; }
     rest.push(token);
   }
@@ -136,6 +138,16 @@ export function logsCmd(svc: Service, n: number): { cmd: string; shell: Shell } 
     case "systemd-user": return { cmd: `journalctl --user -u '${bashEsc(svc.name)}' -n ${lineCount(n)} --no-pager`, shell: "bash" };
     case "schtask": return { cmd: `schtasks /Query /TN '${psEsc(svc.name)}' /V /FO LIST`, shell: "powershell" };
     default: return { cmd: `Get-Service -Name '${psEsc(svc.name)}' | Format-List Name,Status,StartType`, shell: "powershell" };
+  }
+}
+/** The streaming form of logsCmd for `fleet logs -f`: the last `n` lines, then
+ *  new ones until the caller hangs up. Only journald backs a followable source;
+ *  the Windows types print a status listing, not a log, so they refuse. */
+export function logsFollowCmd(svc: Service, n: number): string {
+  switch (svc.type) {
+    case "systemd": return `journalctl -u '${bashEsc(svc.name)}' -n ${lineCount(n)} -f --no-pager`;
+    case "systemd-user": return `journalctl --user -u '${bashEsc(svc.name)}' -n ${lineCount(n)} -f --no-pager`;
+    default: throw new Error(`logs -f: ${svc.type} services have no followable log source; run fleet logs without -f`);
   }
 }
 /** A command that prints a single status token to stdout, for at-a-glance health. */
@@ -677,6 +689,64 @@ base64 < "$p" | tr -d '\\n'`;
   return { text, b64 };
 }
 
+/** Read a remote file's bytes for `fleet diff`, refusing anything over
+ *  `maxBytes` on the host so a large file never crosses the wire. */
+export async function readRemoteBytes(
+  host: Host, path: string, maxBytes: number, deps: { exec?: typeof exec } = {},
+): Promise<Buffer> {
+  const run = deps.exec ?? exec;
+  const cmd = host.os === "windows"
+    ? [
+        `$f = Get-Item -LiteralPath '${psEsc(path)}' -Force -ErrorAction Stop`,
+        `if ($f.PSIsContainer) { throw 'not a regular file' }`,
+        `if ($f.Length -gt ${maxBytes}) { throw "file is $($f.Length) bytes, over the ${maxBytes}-byte diff limit" }`,
+        `[Convert]::ToBase64String([IO.File]::ReadAllBytes($f.FullName))`,
+      ].join("\n")
+    : `${bashPathAssignment("p", path)}
+[ -e "$p" ] || { echo "no such file" 1>&2; exit 2; }
+[ -f "$p" ] || { echo "not a regular file" 1>&2; exit 2; }
+[ -r "$p" ] || { echo "permission denied" 1>&2; exit 2; }
+n=$(wc -c < "$p" | tr -d ' ')
+[ "$n" -le ${maxBytes} ] || { echo "file is $n bytes, over the ${maxBytes}-byte diff limit" 1>&2; exit 3; }
+set -o pipefail
+base64 < "$p" | tr -d '\\n'`;
+  const r = await run(host, cmd);
+  if (!r.ok) throw new Error(`${host.name}:${path}: ${r.stderr.trim() || "exit " + r.code}`);
+  return Buffer.from(r.stdout.replace(/\s/g, ""), "base64");
+}
+
+/** One side of `fleet diff`: a remote `sel` (resolving to exactly one host) or a local path. */
+export interface DiffSide { label: string; path: string; sel?: string }
+export interface DiffResult { identical: boolean; a: string; b: string; diff: string }
+
+/** Fetch both sides concurrently and return their unified diff. Throws on a
+ *  missing, binary, oversized or multi-host side. */
+export async function diffFiles(
+  cfg: FleetConfig, a: DiffSide, b: DiffSide, context = 3,
+  deps: { exec?: typeof exec } = {},
+): Promise<DiffResult> {
+  const load = async (side: DiffSide): Promise<string> => {
+    let bytes: Uint8Array;
+    if (side.sel === undefined) {
+      let st: Stats;
+      try { st = statSync(side.path); }
+      catch { throw new Error(`${side.label}: no such file`); }
+      if (!st.isFile()) throw new Error(`${side.label}: not a regular file`);
+      if (st.size > DIFF_MAX_BYTES) throw new Error(`${side.label}: ${st.size} bytes exceeds the ${DIFF_MAX_BYTES / 1024 / 1024} MiB diff limit`);
+      bytes = await readFile(side.path);
+    } else {
+      const hosts = resolveHosts(cfg, side.sel);
+      if (hosts.length !== 1)
+        throw new Error(`${side.label}: '${side.sel}' selects ${hosts.length} hosts; fleet diff needs exactly one per side`);
+      bytes = await readRemoteBytes(hosts[0]!, side.path, DIFF_MAX_BYTES, deps);
+    }
+    return decodeDiffText(bytes, side.label);
+  };
+  const [ta, tb] = await Promise.all([load(a), load(b)]);
+  const diff = unifiedDiff(ta, tb, a.label, b.label, context);
+  return { identical: diff === "", a: a.label, b: b.label, diff };
+}
+
 /** Write text to a remote file, but only if it still matches `expectB64` — so a
  *  change made on the host between our read and our write aborts instead of
  *  being silently overwritten. */
@@ -1153,7 +1223,7 @@ export async function deployHosts(
   for (const host of hosts) {
     const service = deployRestartName(host, opts.restart ?? true);
     if (service && !host.services?.[service])
-      throw new Error(`cannot deploy ${host.name}: restart service '${service}' is not configured (available: ${Object.keys(host.services ?? {}).join(", ") || "none"})`);
+      throw new Error(`cannot deploy ${host.name}: restart service '${service}' is not configured (available: ${Object.keys(host.services ?? {}).join(", ") || "none"})${didYouMean(service, Object.keys(host.services ?? {}))}`);
   }
   const sourceRoot = await resolveDeploySourceRoot();
   const staging = await mkdtemp(join(tmpdir(), "fleet-deploy-"));
@@ -1465,7 +1535,7 @@ export interface BootState {
 
 function getMachine(cfg: FleetConfig, name: string): Machine {
   const m = cfg.machines?.[name];
-  if (!m) throw new Error(`unknown machine: ${name} (have: ${Object.keys(cfg.machines ?? {}).join(", ") || "none"})`);
+  if (!m) throw new Error(`unknown machine: ${name} (have: ${Object.keys(cfg.machines ?? {}).join(", ") || "none"})${didYouMean(name, Object.keys(cfg.machines ?? {}))}`);
   return m;
 }
 
@@ -5249,8 +5319,8 @@ function serviceHosts(cfg: FleetConfig, sel: string, target: ServiceTarget): { h
     return svc ? [{ host, svc }] : [];
   });
   if (!matched.length) {
-    const opts = hosts.flatMap((h) => Object.keys(h.services ?? {}));
-    throw new Error(`no host in '${sel}' has service '${target}' (available: ${[...new Set(opts)].join(", ") || "none"})`);
+    const opts = [...new Set(hosts.flatMap((h) => Object.keys(h.services ?? {})))];
+    throw new Error(`no host in '${sel}' has service '${target}' (available: ${opts.join(", ") || "none"})${didYouMean(target, opts)}`);
   }
   return matched;
 }
@@ -5268,6 +5338,17 @@ export async function restartService(cfg: FleetConfig, sel: string, target: Serv
 }
 export async function serviceLogs(cfg: FleetConfig, sel: string, target: ServiceTarget, n: number): Promise<ServiceAction[]> {
   return serviceAction(cfg, sel, target, (svc) => logsCmd(svc, n));
+}
+/** Resolve `fleet logs -f` to one host and its streaming command. Following
+ *  holds a live connection, so a selector must match exactly one host. */
+export function serviceLogsFollow(cfg: FleetConfig, sel: string, target: ServiceTarget, n: number):
+  { host: Host; service: string; type: ServiceType; cmd: string } {
+  const matched = serviceHosts(cfg, sel, target);
+  if (matched.length !== 1)
+    throw new Error(`logs -f follows one host; '${sel}' matches ${matched.length}: ${matched.map((m) => m.host.name).join(", ")}`);
+  const { host, svc, error } = matched[0]!;
+  if (error) throw new Error(error);
+  return { host, service: serviceName(target), type: svc.type, cmd: logsFollowCmd(svc, n) };
 }
 
 // ── reboot the whole machine ──────────────────────────────────────────────────
@@ -5463,6 +5544,264 @@ export async function diskRows(cfg: FleetConfig, sel: string): Promise<DiskRow[]
   return per.flat();
 }
 
+// ── du (largest children of one remote directory) ────────────────────────────
+/** The largest immediate children of a remote directory, measured live.
+ *
+ *  Both scripts print one line per measured child as soon as it is measured, so
+ *  a timeout still leaves every finished child in stdout:
+ *    D<TAB>absolute path   N<TAB>child count   E<TAB>bytes<TAB>partial 0|1<TAB>type d|f|l<TAB>name
+ *  Unix: `du -skx` per child (stays on the child's filesystem, never follows a
+ *  symlink). du exits nonzero when part of a tree is unreadable but still prints
+ *  the size it could read, so that child is marked partial instead of failing.
+ *  Windows: file lengths summed per child with -Force -ErrorAction
+ *  SilentlyContinue; any collected error marks the child partial. */
+export function duCmd(host: Host, path: string): { cmd: string; shell: Shell } {
+  if (host.os === "windows") {
+    const dir = "'" + (path || ".").replace(/'/g, "''") + "'";
+    return { shell: "powershell", cmd: [
+      `$item = Get-Item -LiteralPath ${dir} -Force -ErrorAction SilentlyContinue`,
+      `if (-not $item -or -not $item.PSIsContainer) { [Console]::Error.WriteLine("fleet du: not a readable directory: " + ${dir}); exit 2 }`,
+      `"D\`t" + $item.FullName`,
+      `$kids = @(Get-ChildItem -LiteralPath $item.FullName -Force -ErrorAction SilentlyContinue)`,
+      `"N\`t" + $kids.Count`,
+      `foreach ($k in $kids) {`,
+      `  $err = @(); $type = 'f'`,
+      `  if ($k.Attributes -band [IO.FileAttributes]::ReparsePoint) { $type = 'l'; $sum = 0 }`,
+      `  elseif ($k.PSIsContainer) {`,
+      `    $type = 'd'`,
+      `    $sum = (Get-ChildItem -LiteralPath $k.FullName -Recurse -Force -File -ErrorAction SilentlyContinue -ErrorVariable err | Measure-Object -Property Length -Sum).Sum`,
+      `  } else { $sum = $k.Length }`,
+      `  if ($null -eq $sum) { $sum = 0 }`,
+      `  "E\`t{0}\`t{1}\`t{2}\`t{3}" -f [int64]$sum, [int]($err.Count -gt 0), $type, $k.Name`,
+      `}`,
+    ].join("\n") };
+  }
+  // A leading ~ must expand, so it becomes "$HOME"; the rest stays single-quoted.
+  const q = (s: string) => "'" + s.replace(/'/g, "'\\''") + "'";
+  const dir = path === "" || path === "~" ? `"$HOME"`
+    : path.startsWith("~/") ? `"$HOME"/${q(path.slice(2))}` : q(path);
+  return { shell: "bash", cmd: [
+    `cd -- ${dir} 2>/dev/null || { echo "fleet du: not a readable directory: "${q(path)} >&2; exit 2; }`,
+    `shopt -s nullglob dotglob`,
+    `kids=(*)`,
+    `printf 'D\\t%s\\n' "$(pwd -P)"`,
+    `printf 'N\\t%s\\n' "\${#kids[@]}"`,
+    `for f in "\${kids[@]}"; do`,
+    `  kb=$(du -skx -- "$f" 2>/dev/null | awk 'NR==1{print $1}'); rc=\${PIPESTATUS[0]}`,
+    `  [ -L "$f" ] && t=l || { [ -d "$f" ] && t=d || t=f; }`,
+    `  p=0; { [ "$rc" != 0 ] || [ -z "$kb" ]; } && p=1`,
+    `  printf 'E\\t%s\\t%s\\t%s\\t%s\\n' "$(( \${kb:-0} * 1024 ))" "$p" "$t" "\${f//$'\\n'/?}"`,
+    `done`,
+  ].join("\n") };
+}
+
+export interface DuEntry { name: string; type: "d" | "f" | "l"; bytes: number; partial: boolean }
+export interface DuResult {
+  host: string; os: string; ok: boolean;
+  /** The directory as given, and as the host resolved it (absent when it could not be opened). */
+  path: string; resolved?: string;
+  /** Sum of every measured child: a lower bound when `complete` is false or any entry is partial. */
+  total_bytes: number;
+  /** Children in the directory, and how many of them were measured before any timeout. */
+  count: number; measured: number;
+  /** The largest measured children, largest first, at most `limit`. */
+  entries: DuEntry[];
+  /** Measured children beyond the limit, folded together. */
+  rest: { count: number; bytes: number };
+  /** False when the host stopped before measuring every child (timeout). */
+  complete: boolean;
+  /** Some child had contents the host could not read; its size is what was readable. */
+  partial: boolean;
+  error?: string;
+}
+
+/** Parse a duCmd's stdout. Both OSes print the same line format. */
+export function parseDu(out: string): { resolved?: string; count?: number; entries: DuEntry[] } {
+  let resolved: string | undefined, count: number | undefined;
+  const entries: DuEntry[] = [];
+  for (const raw of out.split("\n")) {
+    const line = raw.replace(/\r$/, "");
+    const f = line.split("\t");
+    if (f[0] === "D" && f.length >= 2) resolved = f.slice(1).join("\t");
+    else if (f[0] === "N" && /^\d+$/.test(f[1] ?? "")) count = Number(f[1]);
+    else if (f[0] === "E" && f.length >= 5 && /^\d+$/.test(f[1]!) && (f[2] === "0" || f[2] === "1")
+      && (f[3] === "d" || f[3] === "f" || f[3] === "l"))
+      entries.push({ name: f.slice(4).join("\t"), type: f[3], bytes: Number(f[1]), partial: f[2] === "1" });
+  }
+  return { resolved, count, entries };
+}
+
+/** Validate a du limit before any target is resolved. */
+export function duLimit(n: unknown): number {
+  if (typeof n !== "number" || !Number.isSafeInteger(n) || n < 1) throw new Error(`-n needs an integer ≥ 1 (got '${String(n)}')`);
+  return n;
+}
+
+export function summarizeDu(host: Host, path: string, r: ExecResult, limit: number): DuResult {
+  const p = parseDu(r.stdout);
+  const sorted = p.entries.toSorted((a, b) => b.bytes - a.bytes || a.name.localeCompare(b.name));
+  const shown = sorted.slice(0, limit), hidden = sorted.slice(limit);
+  const timedOut = r.code === 124;
+  const count = p.count ?? p.entries.length;
+  const complete = !timedOut && p.count !== undefined && p.entries.length >= count;
+  const error = r.ok ? (complete ? undefined : "the host stopped before every child was measured")
+    : timedOut ? `timed out after measuring ${p.entries.length} of ${p.count ?? "?"} children`
+    : r.stderr.replace(/\nfleet: command timed out.*$/s, "").trim() || `exit ${r.code}`;
+  return {
+    host: host.name, os: host.os, ok: r.ok && complete, path, ...(p.resolved !== undefined ? { resolved: p.resolved } : {}),
+    total_bytes: sorted.reduce((s, e) => s + e.bytes, 0), count, measured: p.entries.length,
+    entries: shown, rest: { count: hidden.length, bytes: hidden.reduce((s, e) => s + e.bytes, 0) },
+    complete, partial: p.entries.some((e) => e.partial), ...(error ? { error } : {}),
+  };
+}
+
+/** `fleet du`: the `limit` largest children of `path` on every selected host. */
+export async function duRows(
+  cfg: FleetConfig, sel: string, path: string, opts: { limit?: number; timeoutMs?: number } = {},
+): Promise<DuResult[]> {
+  const limit = duLimit(opts.limit ?? 15);
+  return Promise.all(resolveHosts(cfg, sel).map(async (h) => {
+    const { cmd, shell } = duCmd(h, path);
+    return summarizeDu(h, path, await exec(h, cmd, shell, { timeoutMs: opts.timeoutMs }), limit);
+  }));
+}
+
+// ── which (where a program resolves, per host) ────────────────────────────────
+/** A plain program name: letters, digits, `.`, `_`, `+`, `-`, not starting with `-`.
+ *  Checked before any remote program is built, so the name can sit in the
+ *  (stdin-delivered) program as a single-quoted literal on every shell. */
+export function assertProgramName(name: string): void {
+  if (!/^[A-Za-z0-9._+][A-Za-z0-9._+-]*$/.test(name) || name.length > 128)
+    throw new Error("command must be a plain program name ([A-Za-z0-9._+-], not starting with -)");
+}
+
+const WHICH = "__FLEET_WHICH__";
+/** Seconds a `--version` probe may run before it is killed. */
+export const WHICH_VERSION_TIMEOUT_S = 5;
+
+/** The lookup program for one host. Output: one sentinel line per fact, tab-separated:
+ *  `found <kind> <path>` or `missing`, then (with version) `version <line>` or `version-timeout`. */
+export function whichCmd(host: Host, name: string, version: boolean): { cmd: string; shell: Shell } {
+  assertProgramName(name);
+  const t = WHICH_VERSION_TIMEOUT_S;
+  if (host.os === "windows")
+    return {
+      shell: "powershell",
+      // Get-Command follows PATHEXT (.exe/.cmd/.bat), finds .ps1 scripts, and aliases resolve
+      // to their target. The probe runs through Process with both pipes read asynchronously
+      // and stdin closed, so WaitForExit bounds it on 5.1 and 7 alike.
+      cmd: [
+        `$c = '${name}'; $t = "\`t"`,
+        `$m = @(Get-Command -Name $c -ErrorAction SilentlyContinue) | Select-Object -First 1`,
+        `if ($m -and $m.CommandType -eq 'Alias' -and $m.ResolvedCommand) { $m = $m.ResolvedCommand }`,
+        `if (-not $m) { [Console]::Out.WriteLine('${WHICH}' + $t + 'missing'); return }`,
+        `$kind = switch ([string]$m.CommandType) { 'Application' { 'file' } 'ExternalScript' { 'file' } 'Cmdlet' { 'cmdlet' } 'Function' { 'function' } 'Filter' { 'function' } default { ([string]$m.CommandType).ToLower() } }`,
+        `$p = if ($kind -eq 'file') { [string]$m.Path } else { [string]$m.Name }`,
+        `[Console]::Out.WriteLine('${WHICH}' + $t + 'found' + $t + $kind + $t + $p)`,
+        ...(version ? [
+          `if ($kind -ne 'file') { return }`,
+          `$si = New-Object System.Diagnostics.ProcessStartInfo`,
+          `$ext = [IO.Path]::GetExtension($p).ToLower()`,
+          `if ($ext -eq '.cmd' -or $ext -eq '.bat') { $si.FileName = $env:ComSpec; $si.Arguments = '/d /c ""' + $p + '" --version"' }`,
+          `elseif ($ext -eq '.ps1') { $si.FileName = (Get-Process -Id $PID).Path; $si.Arguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $p + '" --version' }`,
+          `else { $si.FileName = $p; $si.Arguments = '--version' }`,
+          `$si.UseShellExecute = $false; $si.CreateNoWindow = $true`,
+          `$si.RedirectStandardOutput = $true; $si.RedirectStandardError = $true; $si.RedirectStandardInput = $true`,
+          `try { $pr = [System.Diagnostics.Process]::Start($si) } catch { return }`,
+          `$pr.StandardInput.Close()`,
+          `$o = $pr.StandardOutput.ReadToEndAsync(); $e = $pr.StandardError.ReadToEndAsync()`,
+          // Kill($true) takes the tree (a .cmd's child) on pwsh 7; 5.1 only has Kill().
+          `if (-not $pr.WaitForExit(${t * 1000})) { try { $pr.Kill($true) } catch { try { $pr.Kill() } catch {} }; [Console]::Out.WriteLine('${WHICH}' + $t + 'version-timeout'); return }`,
+          `[void]$o.Wait(1000); [void]$e.Wait(1000)`,
+          `$text = ''; if ($o.IsCompleted) { $text = $o.Result }; if (-not $text.Trim() -and $e.IsCompleted) { $text = $e.Result }`,
+          `$line = @($text -split "\`r?\`n" | Where-Object { $_.Trim() }) | Select-Object -First 1`,
+          `if ($line) { [Console]::Out.WriteLine('${WHICH}' + $t + 'version' + $t + $line.Trim()) }`,
+        ] : []),
+      ].join("\n"),
+    };
+  return {
+    shell: "bash",
+    // command -v prints a path for programs and the bare name for builtins/functions.
+    // Only a file gets probed. The watchdog's output goes to /dev/null so it never
+    // holds the pipe open after the probe exits (macOS has no timeout(1)).
+    cmd: [
+      `c='${name}'`,
+      `p=$(command -v -- "$c" 2>/dev/null) || p=`,
+      `if [ -z "$p" ]; then printf '${WHICH}\\tmissing\\n'; exit 0; fi`,
+      `case "$p" in /*) k=file ;; *) k=$(type -t -- "$c" 2>/dev/null || echo builtin) ;; esac`,
+      `printf '${WHICH}\\tfound\\t%s\\t%s\\n' "$k" "$p"`,
+      ...(version ? [
+        `[ "$k" = file ] || exit 0`,
+        `f=$(mktemp "\${TMPDIR:-/tmp}/fleet-which.XXXXXX") || exit 0`,
+        `"$p" --version </dev/null >"$f" 2>&1 & pid=$!`,
+        `( sleep ${t}; kill -9 "$pid" 2>/dev/null && : >"$f.t" ) >/dev/null 2>&1 & w=$!`,
+        `wait "$pid" 2>/dev/null`,
+        `kill "$w" 2>/dev/null; wait "$w" 2>/dev/null`,
+        `l=$(grep -m1 '[^[:space:]]' "$f" | tr -d '\\r')`,
+        `if [ -n "$l" ]; then printf '${WHICH}\\tversion\\t%s\\n' "$l"; elif [ -e "$f.t" ]; then printf '${WHICH}\\tversion-timeout\\n'; fi`,
+        `rm -f "$f" "$f.t"`,
+      ] : []),
+    ].join("\n"),
+  };
+}
+
+export interface WhichRow {
+  host: string; os: string; ok: boolean; cmd: string;
+  /** Absolute path for a file; the name itself for a builtin, function or cmdlet; null when missing. */
+  path: string | null;
+  kind?: string;
+  /** Present only when a version was asked for: the first output line, or null. */
+  version?: string | null;
+  version_timeout?: true;
+  error?: string;
+}
+
+const ANSI = /\x1b\[[0-9;?]*[A-Za-z]/g;
+
+/** Parse a whichCmd's stdout. Same sentinel protocol on every OS. */
+export function parseWhich(host: Host, name: string, out: string, version: boolean): WhichRow {
+  const row: WhichRow = { host: host.name, os: host.os, ok: true, cmd: name, path: null };
+  if (version) row.version = null;
+  let seen = false;
+  for (const raw of out.split(/\r?\n/)) {
+    if (!raw.startsWith(WHICH + "\t")) continue;
+    const [tag, ...f] = raw.slice(WHICH.length + 1).split("\t");
+    if (tag === "missing") seen = true;
+    else if (tag === "found" && f.length >= 2) { seen = true; row.kind = f[0]!; row.path = f.slice(1).join("\t"); }
+    else if (tag === "version" && version) row.version = f.join("\t").replace(ANSI, "").trim().slice(0, 200) || null;
+    else if (tag === "version-timeout" && version) row.version_timeout = true;
+  }
+  if (!seen) return { ...row, ok: false, error: "no lookup result" };
+  return row;
+}
+
+/** Where `name` resolves on every host the selector names. A failed host keeps its row
+ *  with ok:false and the error. With `reachableOnly` (the default `all` of `fleet which`)
+ *  hosts that fail a reachability probe are left out and named in `skipped`. */
+export async function whichRows(
+  cfg: FleetConfig, sel: string, name: string, opts: { version?: boolean; reachableOnly?: boolean } = {},
+  deps: { exec?: typeof exec; probe?: (host: Host) => Promise<boolean> } = {},
+): Promise<{ rows: WhichRow[]; skipped: string[] }> {
+  assertProgramName(name);
+  const version = opts.version === true;
+  const run = deps.exec ?? exec;
+  const isUp = deps.probe ?? ((h: Host) => probe(h));
+  const hosts = resolveHosts(cfg, sel);
+  const per = await Promise.all(hosts.map(async (h): Promise<WhichRow | string> => {
+    if (opts.reachableOnly && !(await isUp(h))) return h.name;
+    const { cmd, shell } = whichCmd(h, name, version);
+    const r = await run(h, cmd, shell, { timeoutMs: (WHICH_VERSION_TIMEOUT_S + 25) * 1000 });
+    if (!r.ok && !r.stdout.includes(WHICH + "\t"))
+      return { host: h.name, os: h.os, ok: false, cmd: name, path: null,
+        error: (r.stderr.trim().split("\n").pop() || `exit ${r.code}`).slice(0, 300) };
+    return parseWhich(h, name, r.stdout, version);
+  }));
+  return {
+    rows: per.filter((r): r is WhichRow => typeof r !== "string"),
+    skipped: per.filter((r): r is string => typeof r === "string"),
+  };
+}
+
 // ── dashboard (gpu / status) ──────────────────────────────────────────────────
 export async function fetchDashboard(cfg: FleetConfig): Promise<any> {
   const base = cfg.dashboard;
@@ -5624,7 +5963,7 @@ export async function runRecipe(
 ): Promise<RecipeRun> {
   const steps = cfg.recipes?.[name];
   if (!steps) throw new Error(
-    `unknown recipe '${name}' (have: ${Object.keys(cfg.recipes ?? {}).join(", ") || "none"})`);
+    `unknown recipe '${name}' (have: ${Object.keys(cfg.recipes ?? {}).join(", ") || "none"})${didYouMean(name, Object.keys(cfg.recipes ?? {}))}`);
   const out: StepResult[] = [];
   let ok = true;
   for (let i = 0; i < steps.length; i++) {

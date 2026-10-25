@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { realpathSync } from "node:fs";
+import { didYouMean } from "./suggest.ts";
 
 export type OS = "linux" | "windows" | "mac";
 export type ServiceType = "systemd" | "systemd-user" | "nssm" | "winservice" | "schtask";
@@ -536,7 +537,8 @@ function groupHosts(cfg: FleetConfig, g: string): Host[] {
     if (!h) throw new Error(`group @${g} references unknown host '${n}' (have: ${Object.keys(cfg.hosts).join(", ")})`);
     return h;
   });
-  throw new Error(`unknown group @${g} (built-in: @linux @windows @mac @gpu; custom: ${Object.keys(cfg.groups ?? {}).join(", ") || "none"})`);
+  const groups = ["linux", "windows", "mac", "gpu", ...Object.keys(cfg.groups ?? {})].map((name) => `@${name}`);
+  throw new Error(`unknown group @${g} (built-in: @linux @windows @mac @gpu; custom: ${Object.keys(cfg.groups ?? {}).join(", ") || "none"})${didYouMean(`@${g}`, groups)}`);
 }
 
 /** Expand a selector: comma list of hostnames | @groups | all | dt:<sandbox>.
@@ -565,7 +567,7 @@ export function resolveHosts(cfg: FleetConfig, sel: string): Host[] {
         throw new Error(`there is no --shell flag; use --wsl for a bash command on a Windows host`);
       if (!h && t.startsWith("-"))
         throw new Error(`'${t}' looks like a flag, not a host — flags must come BEFORE the host selector (e.g. \`fleet exec ${t} <host> <cmd…>\`)`);
-      if (!h) throw new Error(`unknown host: ${t} (have: ${Object.keys(cfg.hosts).join(", ")})`);
+      if (!h) throw new Error(`unknown host: ${t} (have: ${Object.keys(cfg.hosts).join(", ")})${didYouMean(t, Object.keys(cfg.hosts))}`);
       set.set(t, h);
     }
   }

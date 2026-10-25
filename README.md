@@ -64,6 +64,7 @@ fleet exec --sudo web "systemctl restart nginx"  # as root; a sudo password come
 fleet exec --wsl --sudo win-box "apt-get update"  # as WSL root through wsl -u root, no password
 fleet exec --fresh web "id -Gn"    # new ssh login (after usermod -aG); `fleet drop web` closes shared ones
 # a timeout returns within a second with the output printed so far; --json adds timedOut: true
+fleet watch -n 5 --until '^active' --timeout 120 web -- systemctl is-active nginx  # rerun until the output matches
 fleet spawn --cwd /srv/app web "./train.sh"  # detached job that outlives ssh -> job id
 fleet jobs                          # every detached job across the fleet
 fleet jobs tail web:mqtn19-9px -f # stream a job's output live
@@ -71,6 +72,7 @@ fleet jobs wait web:mqtn19-9px --until 'Recovered.*1/1'   # block until match (o
 fleet jobs kill web:mqtn19-9px   # signal the whole job process-group
 fleet jobs prune                    # GC finished job spools
 fleet cp -r ./dist web:~/dist    # copy a dir (recursive); pull with  cp web:~/f.log ./
+fleet diff web:/etc/nginx/nginx.conf ./nginx.conf   # unified diff of two files, each remote or local; exit 1 if they differ
 fleet cp --resume big.tar web:~/   # rsync --partial: rerun after a drop to continue
 fleet restart @linux cloudflared   # restart a configured service (fans out across the selector)
 fleet bios windows-auto --yes      # reboot directly into UEFI/BIOS firmware setup
@@ -78,11 +80,13 @@ fleet svc cloudflared              # up/down of one service on every host that h
 fleet deploy gpu-box              # ship fleet source -> host, bun install, restart fleet-mcp
 fleet status                        # live CPU/mem/disk/gpu from your status dashboard
 fleet disk                          # live free space on every mounted volume
+fleet du web:/var/log -n 10       # largest children of a remote directory, the same on every OS
+fleet which git                    # where a program resolves on every reachable host; --version adds its version
 fleet ps web python --sort cpu     # processes, the same columns on every OS
 fleet ports web 5432               # listening ports with pid and process name; --udp for UDP
 fleet kill web 4242 --dry-run      # show the stop plan; --tree, --force, --all
 fleet status vps                    # one host
-fleet logs web cloudflared -n 50
+fleet logs web cloudflared -n 50   # -f streams new lines from one host until Ctrl-C
 fleet shot web                 # screenshot the remote desktop -> local PNG
 fleet shot web --grid          # overlay a labeled pixel-coordinate grid (--grid-step N)
 fleet shot web --output DP-1 --region top-right   # one monitor, or part of it (--list shows the layout)
@@ -203,7 +207,9 @@ Help works without configuration or network access: `fleet help exec`,
 `fleet jobs --help`, and `fleet help tools`. Fleet validates its own flags before
 contacting a host. They go before the selector or directly after it
 (`fleet exec web --cwd /srv ls`); once the remote command starts, fleet reads no more
-flags. A fleet flag at the end of the command, or one given twice, is refused. Value
+flags. A fleet flag at the end of the command, or one given twice, is refused. A
+misspelled command, host, group, option, recipe, service or tool name fails as
+before and ends with up to three near matches (`did you mean: exec?`). Value
 flags support `--flag=value`; integer timeouts reject fractional values. `exec` and
 `spawn` accept `--` after the selector, and everything after it belongs to the remote
 command, including flags such as `--json`. An unquoted `--cwd ~/x` that the local

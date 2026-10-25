@@ -1,5 +1,5 @@
 import { expect, spyOn, test } from "bun:test";
-import { restartService, serviceLogs, svcStatus } from "../src/core.ts";
+import { logsFollowCmd, restartService, serviceLogs, serviceLogsFollow, svcStatus } from "../src/core.ts";
 import * as ssh from "../src/ssh.ts";
 import type { FleetConfig } from "../src/config.ts";
 
@@ -36,4 +36,17 @@ test("explicit units reject wildcard names and incompatible host backends before
     expect(execute.mock.calls).toHaveLength(1);
     expect((await svcStatus(cfg, "win", { unit: "fixture", type: "systemd" }))[0]).toMatchObject({ up: false });
   } finally { execute.mockRestore(); }
+});
+
+test("logs follow streams journald on exactly one host and refuses the rest", () => {
+  expect(logsFollowCmd({ name: "a'b", type: "systemd" }, 50)).toBe("journalctl -u 'a'\\''b' -n 50 -f --no-pager");
+  expect(logsFollowCmd({ name: "svc", type: "systemd-user" }, 0)).toBe("journalctl --user -u 'svc' -n 30 -f --no-pager");
+  for (const type of ["winservice", "nssm", "schtask"] as const)
+    expect(() => logsFollowCmd({ name: "svc", type }, 5)).toThrow("no followable log source");
+  const one = serviceLogsFollow(cfg, "unix", { unit: "fixture.service", type: "systemd" }, 7);
+  expect(one).toMatchObject({ host: { name: "unix" }, service: "fixture.service", type: "systemd" });
+  expect(one.cmd).toContain("-n 7 -f");
+  expect(() => serviceLogsFollow(cfg, "all", { unit: "fixture.service", type: "systemd" }, 7)).toThrow("follows one host");
+  expect(() => serviceLogsFollow(cfg, "win", { unit: "fixture.service", type: "systemd" }, 7)).toThrow("incompatible");
+  expect(() => serviceLogsFollow(cfg, "win", { unit: "Spooler", type: "winservice" }, 7)).toThrow("no followable log source");
 });

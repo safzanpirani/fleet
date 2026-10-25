@@ -12,9 +12,10 @@
  *   fleet reboot <sel> [--yes]        reboot the whole machine(s)
  *   fleet gpu [--json]                every GPU: util / free VRAM / temp / loaded model
  *   fleet disk [sel] [--json]         every volume: free space / % used (live, not the dashboard)
+ *   fleet which <cmd> [sel] [--version] [--json]   where a program resolves on each host
  *   fleet status [host] [--json]      live CPU/mem/disk from dash.example.com
  *   fleet top <host>                  live terminal btop for one host
- *   fleet logs <host> <svc> [-n N]    recent logs / status for a service
+ *   fleet logs <host> <svc> [-n N] [-f] recent logs / status for a service; -f streams
  *   fleet tools status [tool] [sel]   which boxes run a stale CLI tool / skill
  *   fleet run <recipe>                run a saved playbook from config
  *   fleet ssh <host>                  interactive shell
@@ -33,6 +34,7 @@ import type { KillResult } from "./procs.ts";
 import { portList } from "./ports.ts";
 import { format } from "node:util";
 import { loadConfig, resolveHosts } from "./config.ts";
+import { parseWatchInterval, watchLoop, type WatchRun } from "./watch.ts";
 import { runWinSessionBroker, runWinSessionTransport } from "./winsession.ts";
 import { focusElements } from "./focus.ts";
 import {
@@ -42,7 +44,8 @@ import {
 import { sessionStates, formatIdle } from "./session.ts";
 import type { FleetConfig, Host } from "./config.ts";
 import { helpText } from "./help.ts";
-import { sshInteractive } from "./ssh.ts";
+import { didYouMean } from "./suggest.ts";
+import { execStream, sshInteractive } from "./ssh.ts";
 import { proxyConnectMain } from "./proxy.ts";
 import type { ExecResult } from "./ssh.ts";
 import {
@@ -50,9 +53,9 @@ import {
 } from "./jobs.ts";
 import type { JobRow } from "./jobs.ts";
 import {
-  pullFlag, pullVal, parseFlags, parseLeadingFlags, lsHosts, runExec, runScript, rebootRefusal, droppedStdinCheck, nestedShellNote, psInterpConflict, readScriptSource, editRemoteFile, parseEditList,
-  pushFile, pullFile, parseRemoteSpec, restartService, serviceLogs, svcStatus, serviceTarget,
-  gpuRows, diskRows, sudoWrap, fetchDashboard, hostStatus, runRecipe, captureScreenshot, captureWebcam, prepareWebcamStream, rebootHosts,
+  pullFlag, pullVal, parseFlags, parseLeadingFlags, lsHosts, runExec, runScript, rebootRefusal, droppedStdinCheck, nestedShellNote, psInterpConflict, readScriptSource, editRemoteFile, parseEditList, diffFiles,
+  pushFile, pullFile, parseRemoteSpec, restartService, serviceLogs, serviceLogsFollow, svcStatus, serviceTarget,
+  gpuRows, diskRows, duRows, duLimit, whichRows, assertProgramName, sudoWrap, fetchDashboard, hostStatus, runRecipe, captureScreenshot, captureWebcam, prepareWebcamStream, rebootHosts,
   cuInstall, cuRun, cuTools, cuDescribe, cuRecordStart, cuRecordStop, cuRecordStatus, cuRegions, cuPerception, bootMismatchNote,
   cuApps, cuShotWindow, browseHost, preferredImageExt, overlayGrid,
   cuSnapshot, cuResolveTargetFrom, cuResolvePoint, cuAct, cuBatch, cuBlockerNote, cuElements, cuOpen, sameRole, cuVerify,
@@ -71,7 +74,7 @@ import {
   toolSyncParallelism,
   stampSkill,
 } from "./tools.ts";
-import type { ServiceAction, CuTarget, GridOptions, CuElementLocator, EditSpec } from "./core.ts";
+import type { ServiceAction, CuTarget, GridOptions, CuElementLocator, EditSpec, DuResult, WhichRow } from "./core.ts";
 import type { CuRegionLocator } from "./perception.ts";
 import {
   isAndroidHost, androidState, androidDoctor, androidElementsOf, androidShot, androidAct, androidOpen, androidApps,
@@ -237,6 +240,25 @@ async function confirm(prompt: string, yes: boolean): Promise<boolean> {
 }
 const heat = (p: number | null | undefined, t: string) =>
   p == null ? A.d(t) : p < 60 ? A.g(t) : p < 85 ? A.y(t) : A.r(t);
+/** 1024-based size with one decimal under 10 (4.2G, 512M, 0B). */
+export function humanSize(bytes: number): string {
+  const units = ["B", "K", "M", "G", "T", "P"];
+  let v = bytes, i = 0;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return (i && v < 10 ? v.toFixed(1) : Math.round(v).toString()) + units[i];
+}
+/** One host's `fleet du` listing: total, then the largest children, largest first. */
+function renderDu(r: DuResult): void {
+  const where = r.resolved ?? r.path;
+  if (!r.measured && r.error) { console.log(`${A.r("✗")} ${A.b(r.host)} ${A.d(where)}  ${A.y(r.error)}`); return; }
+  const of = r.complete ? `${r.count} entr${r.count === 1 ? "y" : "ies"}` : `${r.measured} of ${r.count} entries measured`;
+  const total = r.complete && !r.partial ? humanSize(r.total_bytes) : "≥" + humanSize(r.total_bytes);
+  console.log(`${A.b(r.host)} ${A.c(where)}  ${A.b(total)} ${A.d("total · " + of)}`);
+  for (const e of r.entries)
+    console.log(`  ${humanSize(e.bytes).padStart(6)}  ${e.type === "d" ? e.name + "/" : e.type === "l" ? e.name + A.d(" →") : e.name}${e.partial ? "  " + A.y("! partly unreadable") : ""}`);
+  if (r.rest.count) console.log(A.d(`  ${humanSize(r.rest.bytes).padStart(6)}  (${r.rest.count} more)`));
+  if (r.error) console.log(`  ${A.y(r.error)}${r.complete ? "" : A.d(" · total is a lower bound")}`);
+}
 const BLK = " ▁▂▃▄▅▆▇█";
 const blk = (p: number | null | undefined): string =>
   p == null ? " " : (BLK[Math.max(1, Math.min(8, Math.round(p / 100 * 8)))] ?? " ");
@@ -731,8 +753,8 @@ function printRaw(r: ExecResult): void {
 
 const SUBCOMMANDS = [
   "webcam",
-  "ls", "hosts", "dt", "exec", "spawn", "jobs", "cp", "edit", "restart", "reboot", "bios", "boot", "switch", "wait",
-  "gpu", "disk", "ps", "ports", "kill", "status", "top", "logs", "svc", "shot", "cu", "browse", "run", "deploy", "tools", "proxy", "doctor", "hostkey", "find", "session", "drop", "completion", "ssh", "help",
+  "ls", "hosts", "dt", "exec", "spawn", "watch", "jobs", "cp", "edit", "diff", "restart", "reboot", "bios", "boot", "switch", "wait",
+  "gpu", "disk", "du", "which", "ps", "ports", "kill", "status", "top", "logs", "svc", "shot", "cu", "browse", "run", "deploy", "tools", "proxy", "doctor", "hostkey", "find", "session", "drop", "completion", "ssh", "help",
 ];
 /** Emit a bash/zsh completion script with this config's hosts/groups/recipes/
  *  services baked in. Source it: `eval "$(fleet completion zsh)"`. */
@@ -757,7 +779,7 @@ _fleet() {
   case $words[2] in
     run) compadd -- "\${recipes[@]}";;
     ${svcCmds.split(" ").join("|")}) compadd -- "\${sels[@]}" "\${svcs[@]}";;
-    boot|switch|wait|exec|spawn|cp|edit|reboot|bios|top|shot|webcam|cu|ssh|doctor|status|deploy|proxy|ports) compadd -- "\${sels[@]}";;
+    boot|switch|wait|exec|spawn|watch|cp|edit|diff|reboot|bios|top|shot|webcam|cu|ssh|doctor|status|deploy|proxy|ports) compadd -- "\${sels[@]}";;
   esac
 }
 compdef _fleet fleet`;
@@ -780,7 +802,7 @@ _fleet() {
   case "\${COMP_WORDS[1]}" in
     run) _fleet_matches "$cur" "\${recipes[@]}";;
     ${svcCmds.split(" ").join("|")}) _fleet_matches "$cur" "\${sels[@]}" "\${svcs[@]}";;
-    boot|switch|wait|exec|spawn|cp|edit|reboot|bios|top|shot|webcam|cu|ssh|doctor|status|deploy|proxy|ports) _fleet_matches "$cur" "\${sels[@]}";;
+    boot|switch|wait|exec|spawn|watch|cp|edit|diff|reboot|bios|top|shot|webcam|cu|ssh|doctor|status|deploy|proxy|ports) _fleet_matches "$cur" "\${sels[@]}";;
   esac
 }
 complete -F _fleet fleet`;
@@ -790,8 +812,10 @@ const PROXY_LEADING_VALUES: Record<string, readonly string[]> = {
   webcam: ["--device", "--out", "--fps", "--width", "--for", "--vo"],
   exec: ["--cwd", "--timeout", "--script", "--interp"],
   spawn: ["--cwd", "--label"],
+  watch: ["-n", "--interval", "--until", "--timeout"],
   jobs: ["-n", "--lines", "--until", "--timeout", "--include", "--exclude"],
   edit: ["--old", "--new", "--old-file", "--new-file", "--edits"],
+  diff: ["-U"],
   logs: ["-n", "--unit", "--type"],
   restart: ["--unit", "--type"],
   svc: ["--unit", "--type"],
@@ -1002,6 +1026,87 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       return execStatus(results, raw);
     }
 
+    case "watch": {
+      const WATCH_BOOLS = ["--diff", "--wsl"];
+      const WATCH_VALUES = ["-n", "--interval", "--until", "--timeout"];
+      const { flags, rest: lead } = parseLeadingFlags(rest, WATCH_BOOLS, WATCH_VALUES);
+      const sel = lead.shift();
+      const { pos, separated } = hoistFlags(flags, lead, WATCH_BOOLS, WATCH_VALUES);
+      if (flags["--interval"] !== undefined) {
+        if (flags["-n"] !== undefined) die("duplicate option: -n and --interval");
+        flags["-n"] = flags["--interval"]!;
+      }
+      const interval = parseWatchInterval(flags["-n"]);
+      if (typeof interval === "string") die(interval);
+      const untilSrc = flags["--until"];
+      if (untilSrc === true || untilSrc === "") die("--until needs a regex");
+      let until: RegExp | undefined;
+      // Multiline, like grep: ^ and $ anchor each output line.
+      try { until = untilSrc === undefined ? undefined : new RegExp(untilSrc, "m"); }
+      catch (e) { die(`--until: ${(e as Error).message}`); }
+      if (flags["--timeout"] !== undefined && !until) die("--timeout requires --until");
+      const timeoutS = flags["--timeout"] === undefined ? undefined : numFlag(flags, "--timeout", 0, 1);
+      const diff = flags["--diff"] === true;
+      const wsl = flags["--wsl"] === true;
+      const cmd = pos.join(" ");
+      if (!sel || !cmd) die("usage: fleet watch [-n SECONDS] [--diff] [--until REGEX [--timeout S]] [--wsl] <host> [--] <cmd…>");
+      const trailing = separated ? undefined : trailingFleetFlag(pos, WATCH_BOOLS, WATCH_VALUES);
+      if (trailing) die(`'${trailing}' must come BEFORE the host selector: fleet watch ${trailing} ${sel} <cmd…>`);
+      const refusal = rebootRefusal(cmd, "--confirm-reboot to fleet exec; watch never repeats one");
+      if (refusal) die(refusal);
+      const target = await routeSelector(cfg, sel!);
+      const hosts = resolveHosts(cfg, target);
+      if (hosts.length !== 1) die(`fleet watch takes one host; '${sel}' selects ${hosts.length}`);
+      const words = keepsArgvBoundaries(pos);
+      const tty = Boolean(process.stdout.isTTY);
+      const restore = () => { if (tty) process.stdout.write("\x1b[?25h\x1b[?1049l"); };
+      // Ctrl-C ends the watch at once, even with a run in flight, and is not a failure.
+      const onSignal = () => { restore(); process.exit(0); };
+      process.on("SIGINT", onSignal);
+      process.on("SIGTERM", onSignal);
+      if (tty) process.stdout.write("\x1b[?1049h\x1b[?25l");
+      const render = (run: WatchRun) => {
+        const r = run.result;
+        const status = r.code === 0 ? A.g("exit 0") : A.r(`exit ${r.code}`);
+        if (!tty) {
+          console.log(A.d(`── ${new Date().toISOString()} · ${r.host} · run ${run.n} · `) + status + A.d(" ──"));
+          if (r.stdout) process.stdout.write(r.stdout.endsWith("\n") ? r.stdout : r.stdout + "\n");
+          if (r.stderr) process.stderr.write(r.stderr.endsWith("\n") ? r.stderr : r.stderr + "\n");
+          return;
+        }
+        const marks = new Set(diff ? run.changed : []);
+        const when = new Date().toLocaleTimeString([], { hour12: false });
+        const body = r.stdout.replace(/\n$/, "").split("\n")
+          .map((line, i) => (marks.has(i) && COLOR ? `\x1b[7m${line}\x1b[27m` : line));
+        if (r.stderr) body.push(...r.stderr.replace(/\n$/, "").split("\n").map(A.y));
+        const head = `${A.b(r.host)}  ${A.d(`every ${interval}s:`)} ${cmd}  ${A.d(when)}  ${status}`;
+        // Like watch(1), show what fits: a redraw that scrolls leaves a torn screen.
+        const room = Math.max(1, (process.stdout.rows || 24) - 2);
+        process.stdout.write(`\x1b[H\x1b[2J${head}\n\n${body.slice(0, room).join("\n")}`);
+      };
+      const outcome = await watchLoop({ intervalMs: interval * 1000, until, timeoutMs: timeoutS === undefined ? undefined : timeoutS * 1000 }, {
+        exec: async (timeoutMs) => (await runExec(cfg, target, words ? pos : cmd, { wsl, timeoutMs }))[0]!,
+        now: Date.now,
+        sleep: Bun.sleep,
+        render,
+        stopped: () => false,
+      });
+      restore();
+      process.off("SIGINT", onSignal);
+      process.off("SIGTERM", onSignal);
+      // The alternate screen is gone; leave the final run in the scrollback.
+      if (tty && outcome.last?.result.stdout) {
+        const out = outcome.last.result.stdout;
+        process.stdout.write(out.endsWith("\n") ? out : out + "\n");
+      }
+      if (outcome.reason === "timeout") {
+        console.error(A.r(`✗ --until '${untilSrc}' did not match within ${timeoutS}s (${outcome.runs} runs)`));
+        return 1;
+      }
+      if (outcome.reason === "matched") console.error(A.g(`✓ matched --until after ${outcome.runs} run${outcome.runs === 1 ? "" : "s"}`));
+      return 0;
+    }
+
     case "spawn": {
       const SPAWN_BOOLS = ["--json", "--wsl", "--elevated", "--confirm-reboot", "--fresh"];
       const SPAWN_VALUES = ["--cwd", "--label"];
@@ -1184,6 +1289,37 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       return die(usage);
     }
 
+    case "diff": {
+      // diff(1) exit codes: 0 identical, 1 different, 2 trouble — usage errors included.
+      let flags: Record<string, string | true>, pos: string[];
+      const usage = "usage: fleet diff [-U N] [--json] <A> <B>   (each side is <sel>:<path> or a local path)";
+      const json = rest.includes("--json");
+      const fail = (message: string) => {
+        if (json) console.log(JSON.stringify({ ok: false, error: message }));
+        else console.error(A.r("✗ " + message));
+        return 2;
+      };
+      try { ({ flags, rest: pos } = parseFlags(rest, ["--json"], ["-U"])); }
+      catch (e) { return fail(e instanceof Error ? e.message : String(e)); }
+      if (pos.length !== 2) return fail(usage);
+      const u = flags["-U"] === undefined ? 3 : Number(flags["-U"]);
+      if (!Number.isSafeInteger(u) || u < 0) return fail(`-U needs an integer ≥ 0 (got '${flags["-U"]}')`);
+      try {
+        const sides = await Promise.all(pos.map(async (token) => {
+          const spec = parseRemoteSpec(cfg, token);
+          return spec ? { label: token, sel: await routeSelector(cfg, spec.sel), path: spec.path } : { label: token, path: token };
+        }));
+        const r = await diffFiles(cfg, sides[0]!, sides[1]!, u);
+        if (json) console.log(JSON.stringify(r, null, 2));
+        else for (const [k, line] of r.diff.split("\n").slice(0, -1).entries())
+          console.log(k < 2 ? A.b(line) : line.startsWith("@@") ? A.c(line) : line.startsWith("-") ? A.r(line)
+            : line.startsWith("+") ? A.g(line) : line.startsWith("\\") ? A.d(line) : line);
+        return r.identical ? 0 : 1;
+      } catch (e) {
+        return fail(e instanceof Error ? e.message : String(e));
+      }
+    }
+
     case "edit": {
       // Unlike exec there is no free-form remote command here, so flags are safe
       // to accept anywhere — `fleet edit host:/path --old X --new Y` reads best.
@@ -1297,12 +1433,19 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
     }
 
     case "logs": {
-      const { flags, rest: pos } = parseFlags(rest, ["--json", "--raw"], ["-n", "--unit", "--type"]);
+      const { flags, rest: pos } = parseFlags(rest, ["--json", "--raw", "-f", "--follow"], ["-n", "--unit", "--type"]);
       if (flags["--json"] && flags["--raw"]) die("choose either --raw or --json");
+      if (flags["-f"] && flags["--follow"]) die("duplicate option: -f and --follow");
+      const follow = flags["-f"] === true || flags["--follow"] === true;
+      if (follow && flags["--json"]) die("--json cannot be combined with --follow");
       const n = numFlag(flags, "-n", 30);
       const [sel, alias] = pos;
       const target = serviceTarget(alias, flags["--unit"] as string | undefined, flags["--type"] as string | undefined);
-      if (!sel || pos.length > 2) die("usage: fleet logs <sel> <service> | <sel> --unit NAME --type TYPE [-n N] [--raw | --json]");
+      if (!sel || pos.length > 2) die("usage: fleet logs <sel> <service> | <sel> --unit NAME --type TYPE [-n N] [-f] [--raw | --json]");
+      if (follow) {
+        const { host, cmd } = serviceLogsFollow(cfg, await routeSelector(cfg, sel), target, n);
+        return await execStream(host, cmd);
+      }
       const actions = await serviceLogs(cfg, await routeSelector(cfg, sel), target, n);
       if (flags["--json"]) console.log(JSON.stringify(actions, null, 2));
       else if (flags["--raw"]) actions.forEach((a) => printRaw(a.result));
@@ -1357,6 +1500,51 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
         console.log(`${head} ${A.c(r.mount.padEnd(w))} ${bar} used  ${size}${r.label ? "  " + A.d(r.label) : ""}`);
       }
       return 0;
+    }
+
+    case "du": {
+      const usage = "usage: fleet du <sel>:<dir> [-n N] [--timeout S] [--json]";
+      const { flags, rest: pos } = parseFlags(rest, ["--json"], ["-n", "--timeout"]);
+      if (pos.length !== 1) die(usage);
+      const json = flags["--json"] === true;
+      let limit = 15;
+      try { if (flags["-n"] !== undefined) limit = duLimit(flags["-n"] === true ? NaN : Number(flags["-n"])); }
+      catch (e) { die((e as Error).message); }
+      const timeoutMs = flags["--timeout"] === undefined ? undefined : numFlag(flags, "--timeout", 0, 0) * 1000;
+      const spec = parseRemoteSpec(cfg, pos[0]!);
+      if (!spec) die(`fleet du needs a <sel>:<dir> target (got '${pos[0]}')\n${usage}`);
+      const results = await duRows(cfg, await routeSelector(cfg, spec!.sel), spec!.path, { limit, timeoutMs });
+      if (json) { console.log(JSON.stringify(results, null, 2)); return results.some((r) => !r.ok) ? 1 : 0; }
+      for (const r of results) renderDu(r);
+      return results.some((r) => !r.ok) ? 1 : 0;
+    }
+
+    case "which": {
+      const { flags, rest: pos } = parseFlags(rest, ["--json", "--version"], []);
+      if (pos.length < 1 || pos.length > 2) die("usage: fleet which <cmd> [<sel>] [--version] [--json]");
+      const [name, given] = pos as [string, string | undefined];
+      try { assertProgramName(name); } catch (e) { die((e as Error).message); }
+      const json = flags["--json"] === true;
+      const version = flags["--version"] === true;
+      const { rows, skipped } = await whichRows(cfg, given ? await routeSelector(cfg, given) : "all", name,
+        { version, reachableOnly: !given });
+      if (skipped.length) console.error(A.d(`skipped unreachable: ${skipped.join(", ")}`));
+      const status = !rows.length || rows.some((r) => !r.ok) || !rows.some((r) => r.path) ? 1 : 0;
+      if (json) { console.log(JSON.stringify(rows, null, 2)); return status; }
+      if (!rows.length) die(`no reachable hosts for ${given ?? "all"}`);
+      const cell = (r: WhichRow) => !r.ok ? `error: ${r.error}` : r.path === null ? "missing"
+        : r.kind && r.kind !== "file" ? `${r.path} (${r.kind})` : r.path;
+      const hw = Math.max(4, ...rows.map((r) => r.host.length));
+      const pw = Math.max(4, ...rows.map((r) => cell(r).length));
+      console.log(A.d(`${"host".padEnd(hw)}  ${version ? "path".padEnd(pw) + "  version" : "path"}`));
+      for (const r of rows) {
+        const text = cell(r);
+        const shown = !r.ok ? A.r(text) : r.path === null ? A.y(text) : A.c(text);
+        const ver = !version || !r.ok || r.path === null ? ""
+          : "  " + " ".repeat(pw - text.length) + (r.version ?? A.d(r.version_timeout ? "timed out" : "—"));
+        console.log(`${A.b(r.host.padEnd(hw))}  ${shown}${ver}`);
+      }
+      return status;
     }
 
     case "ps": {
@@ -2268,7 +2456,7 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
           ? "\n  run executes a named recipe. To run a local script on a host: fleet exec --script <file> <host>" : ""));
       }
       const steps = cfg.recipes?.[name!];
-      if (!steps) die(`unknown recipe '${name}' (have: ${Object.keys(cfg.recipes ?? {}).join(", ") || "none"})`
+      if (!steps) die(`unknown recipe '${name}' (have: ${Object.keys(cfg.recipes ?? {}).join(", ") || "none"})${didYouMean(name!, Object.keys(cfg.recipes ?? {}))}`
         + (await Bun.file(name!).exists() ? `\n  run executes a named recipe. To run this local script on a host: fleet exec --script ${name} <host>` : ""));
       console.log(A.c(`▶ recipe ${name} (${steps!.length} steps)`));
       const run = await runRecipe(cfg, name!, {
@@ -2338,7 +2526,7 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
         const args = options.rest;
         const toolList = "(tools: " + known.join(", ") + ")";
         if (args.length > 1 && !known.includes(args[0]!))
-          die("unknown tool '" + args[0] + "' in 'fleet tools status <tool> <sel>' " + toolList);
+          die("unknown tool '" + args[0] + "' in 'fleet tools status <tool> <sel>' " + toolList + didYouMean(args[0]!, known));
         if (args.length === 1) {
           const word = args[0]!;
           const selector = word.split(",").map((t) => t.trim()).filter(Boolean).every((t) => t === "all" || t === "*"
@@ -2408,7 +2596,7 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       if (sub === "stamp") {
         // Write the current version + today's date into each skill's frontmatter.
         const args = options.rest;
-        if (args[0] && !known.includes(args[0])) die(`unknown tool '${args[0]}'`);
+        if (args[0] && !known.includes(args[0])) die(`unknown tool '${args[0]}'${didYouMean(args[0], known)}`);
         const tools = args[0] && known.includes(args[0]) ? [args[0]!] : known;
         const today = new Date().toISOString().slice(0, 10);
         let failed = 0;
@@ -2479,7 +2667,7 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       const json = flags["--json"] === true;
       if (sub === "check") {
         for (const name of pos) if (!cfg.proxies?.[name] && !name.includes("://"))
-          die(`unknown proxy: ${name} (have: ${Object.keys(cfg.proxies ?? {}).join(", ") || "none"})`);
+          die(`unknown proxy: ${name} (have: ${Object.keys(cfg.proxies ?? {}).join(", ") || "none"})${didYouMean(name, Object.keys(cfg.proxies ?? {}))}`);
         const checks = await proxyChecks(cfg, pos);
         if (json) { console.log(JSON.stringify(checks, null, 2)); return checks.every((c) => c.reachable && (c.verify?.ok ?? true)) ? 0 : 1; }
         if (!checks.length) { console.log(A.d("no proxies configured")); return 0; }
@@ -2595,7 +2783,7 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
 
     case "script": return die("there is no fleet script; run a local file with fleet exec --script <file|-> <sel> [ARG…]");
     case "job": return dispatch("jobs", rest, cfg);
-    default: return die(`unknown command: ${command} (try: fleet help)`);
+    default: return die(`unknown command: ${command} (try: fleet help)${didYouMean(command, SUBCOMMANDS)}`);
   }
 }
 

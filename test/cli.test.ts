@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { applyProxyFlags, completionScript, fleetJsonCommand, keepsArgvBoundaries, trailingFleetFlag } from "../src/cli.ts";
 import type { FleetConfig } from "../src/config.ts";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { cuaFixture } from "./helpers/cua-driver.ts";
@@ -395,6 +395,14 @@ describe("machine-readable CLI output", () => {
         ["ports", "local", "22", "extra"],
         ["ports", "local", " "],
         ["ports"],
+        ["du", "local:/tmp", "extra"],
+        ["du", "local:/tmp", "-n", "0"],
+        ["du", "local:/tmp", "-n", "1.5"],
+        ["du", "local:/tmp", "-n"],
+        ["du", "local:/tmp", "--timeout", "0.5"],
+        ["du", "local:/tmp", "--jso"],
+        ["du", "/tmp"],
+        ["du"],
         ["status", "local", "--jso"],
         ["top", "local", "extra"],
         ["boot", "local", "--jso"],
@@ -431,6 +439,35 @@ describe("machine-readable CLI output", () => {
       expect(result.stderr).toContain(`fleet exec --script ${script} <host>`);
       const missing = await runCli(["run", "nope"], config);
       expect(missing.stderr).not.toContain("exec --script");
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test("du lists the largest children as one JSON value and as text", async () => {
+    const { root, bin, config } = fixture();
+    try {
+      executable(join(bin, "ssh"), "#!/bin/sh\nexec /bin/bash -s\n");
+      const dir = join(root, "tree");
+      mkdirSync(join(dir, "big"), { recursive: true });
+      writeFileSync(join(dir, "big", "blob"), Buffer.alloc(512 * 1024, 1));
+      writeFileSync(join(dir, "mid"), Buffer.alloc(128 * 1024, 1));
+      writeFileSync(join(dir, "tiny"), "x");
+      const json = await runCli(["du", `local:${dir}`, "-n", "2", "--json"], config, bin);
+      expect(json.code, json.stderr).toBe(0);
+      const [r] = JSON.parse(json.stdout);
+      expect(r).toMatchObject({ host: "local", ok: true, path: dir, count: 3, measured: 3, complete: true, partial: false,
+        rest: { count: 1 } });
+      expect(r.entries.map((e: { name: string }) => e.name)).toEqual(["big", "mid"]);
+      expect(r.total_bytes).toBe(r.entries[0].bytes + r.entries[1].bytes + r.rest.bytes);
+      const text = await runCli(["du", `local:${dir}`, "-n", "2"], config, bin);
+      expect(text.code, text.stderr).toBe(0);
+      const lines = text.stdout.trimEnd().split("\n");
+      expect(lines[0]).toMatch(/^local .*tree {2}\S+ total · 3 entries$/);
+      expect(lines[1]).toMatch(/^ +\d.*[KM] {2}big\/$/);
+      expect(lines[2]).toMatch(/^ +\d.*K {2}mid$/);
+      expect(lines[3]).toMatch(/^ +\S+ {2}\(1 more\)$/);
+      const missing = await runCli(["du", `local:${join(root, "absent")}`, "--json"], config, bin);
+      expect(missing.code).toBe(1);
+      expect(JSON.parse(missing.stdout)[0]).toMatchObject({ ok: false, measured: 0 });
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
@@ -1017,6 +1054,25 @@ test("service json retains host status and raw logs preserve stdout", async () =
       const r = await runCli(["logs", "unknown", "--unit", "fixture", "--type", "systemd", ...args], config, bin);
       expect(r.code).toBe(1);
       expect(r.stderr).not.toContain("unknown host");
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("logs follow streams one host without a pty and validates before routing", async () => {
+  const { root, bin, config } = fixture();
+  try {
+    const argv = join(root, "argv");
+    executable(join(bin, "ssh"), `#!/bin/sh\nprintf '%s\\n' "$@" > '${argv}'\nprintf 'line one\\n'\nexit 0\n`);
+    const r = await runCli(["logs", "local", "--unit", "fixture.service", "--type", "systemd", "-f", "-n", "5"], config, bin);
+    expect(r.code, r.stderr).toBe(0);
+    expect(r.stdout).toBe("line one\n");
+    const sent = readFileSync(argv, "utf8");
+    expect(sent).toContain("-T\n");
+    expect(sent).toContain("journalctl -u '\\''fixture.service'\\'' -n 5 -f --no-pager");
+    for (const args of [["-f", "--json"], ["--follow", "--json"], ["-f", "--follow"]]) {
+      const bad = await runCli(["logs", "unknown", "--unit", "fixture", "--type", "systemd", ...args], config, bin);
+      expect(bad.code).toBe(1);
+      expect(bad.stderr + bad.stdout).not.toContain("unknown host");
     }
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
