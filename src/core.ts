@@ -5587,7 +5587,9 @@ export function duCmd(host: Host, path: string): { cmd: string; shell: Shell } {
     `printf 'D\\t%s\\n' "$(pwd -P)"`,
     `printf 'N\\t%s\\n' "\${#kids[@]}"`,
     `for f in "\${kids[@]}"; do`,
-    `  kb=$(du -skx -- "$f" 2>/dev/null | awk 'NR==1{print $1}'); rc=\${PIPESTATUS[0]}`,
+    // $? after `o=$(du …)` is du's own status; PIPESTATUS after a command
+    // substitution only holds the substitution's status, so it hid du's errors.
+    `  o=$(du -skx -- "$f" 2>/dev/null); rc=$?; kb=\${o%%[[:space:]]*}`,
     `  [ -L "$f" ] && t=l || { [ -d "$f" ] && t=d || t=f; }`,
     `  p=0; { [ "$rc" != 0 ] || [ -z "$kb" ]; } && p=1`,
     `  printf 'E\\t%s\\t%s\\t%s\\t%s\\n' "$(( \${kb:-0} * 1024 ))" "$p" "$t" "\${f//$'\\n'/?}"`,
