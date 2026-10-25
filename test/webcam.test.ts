@@ -1,8 +1,8 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import {
   MAX_WEBCAM_FRAME_BYTES, WEBCAM_IMAGE_IDS, PngFrameReader, currentViewport, deleteKittyVideo, detectWebcamVo,
   encodeHalfBlockFrame, encodeKittyPngFrame, kittyGraphics, parseCameras, placement,
-  renderSize, runWebcamStream, validateWebcamDevice, webcamKeyInput, webcamScript, webcamStreamScript,
+  renderSize, runWebcamStream, validateWebcamDevice, webcamKeyInput, webcamPowerShellSubmission, webcamScript, webcamStreamScript,
 } from "../src/webcam.ts";
 import { captureWebcam, prepareWebcamStream } from "../src/core.ts";
 import type { FleetConfig } from "../src/config.ts";
@@ -224,7 +224,7 @@ test("webcamStreamScript configures low-latency pipes for kitty, text, and windo
   expect(webcamStreamScript("linux", "/dev/video0", { vo: "text", fps: 12 }).cmd).toContain("rawvideo");
   const windows = powerShellSource(webcamStreamScript("windows", "Camera", { vo: "window", fps: 24 }).cmd);
   expect(windows).toContain("OpenStandardOutput");
-  expect(windows).toContain("OpenStandardInput");
+  expect(windows).toContain("$fleetControl.CopyToAsync");
   expect(windows).toContain("CopyToAsync");
   expect(windows).toContain("[FleetWebcamJob]::Assign");
   const args = JSON.parse(Buffer.from(windows.match(/FromBase64String\('([^']+)'\)/)![1]!, "base64").toString()) as string[];
@@ -455,4 +455,82 @@ test("POSIX photo capture signals reap a silent FFmpeg before returning", async 
     if (pid) { try { process.kill(pid, "SIGKILL"); } catch {} }
     await stderr.cancel();
   }
+});
+
+test("quit restores the terminal before teardown even when exit and pipe cancellation never settle", async () => {
+  let input!: (chunk: Uint8Array) => void;
+  let inputRemoved = false;
+  let resizeRemoved = false;
+  let stdoutCancelled = false;
+  let stderrCancelled = false;
+  let restored = false;
+  const never = new Promise<never>(() => {});
+  await runWebcamStream(meta, () => ({
+    stdout: new ReadableStream<Uint8Array>({ start(c) { c.enqueue(ONE_PX_PNG); }, cancel() { stdoutCancelled = true; return never; } }),
+    stderr: new ReadableStream<Uint8Array>({ cancel() { stderrCancelled = true; return never; } }),
+    exited: never,
+    kill() { expect(inputRemoved).toBe(true); expect(resizeRemoved).toBe(true); expect(restored).toBe(true); },
+  }), {
+    onInput(handler) { input = handler; return () => { inputRemoved = true; }; },
+    onResize() { return () => { resizeRemoved = true; }; },
+    write(text) {
+      if (text.includes("?1049l")) restored = true;
+      if (text.includes("a=T")) queueMicrotask(() => input(new Uint8Array([0x71])));
+    },
+  });
+  expect(stdoutCancelled).toBe(true);
+  expect(stderrCancelled).toBe(true);
+});
+
+test("closing a window does not wait for retained producer pipes or an unresolved SSH exit", async () => {
+  let stderrCancelled = false;
+  let killed = false;
+  const never = new Promise<never>(() => {});
+  const result = await runWebcamStream({ ...meta, vo: "window" }, () => ({
+    stdout: new ReadableStream<Uint8Array>(),
+    stderr: new ReadableStream<Uint8Array>({ cancel() { stderrCancelled = true; return never; } }),
+    exited: never,
+    kill() { killed = true; },
+  }), { spawnWindowPlayer: async () => ({ code: 0, stderr: "" }) });
+  expect(result.vo).toBe("window");
+  expect(killed).toBe(true);
+  expect(stderrCancelled).toBe(true);
+});
+
+test("Windows webcam bootstrap reads only a framed source line before giving stdin to control", () => {
+  const command = "Write-Output 'camera ç'";
+  const submission = webcamPowerShellSubmission(command);
+  expect(submission.args[0]).toBe("-EncodedCommand");
+  const bootstrap = Buffer.from(submission.args[1]!, "base64").toString("utf16le");
+  expect(bootstrap).toContain("$fleetControl.ReadByte()");
+  expect(bootstrap).not.toContain("ReadLine");
+  expect(bootstrap).not.toContain(command);
+  expect(Buffer.from(new TextDecoder().decode(submission.stdin).trim(), "base64").toString()).toBe(command);
+  const windows = powerShellSource(webcamStreamScript("windows", "Camera", { vo: "kitty" }).cmd);
+  expect(windows).not.toContain("OpenStandardInput");
+  expect(windows).toContain("$fleetControl.CopyToAsync");
+  expect(windows.indexOf("$job.Dispose()", windows.indexOf("} finally {"))).toBeLessThan(windows.indexOf("$proc.Dispose()"));
+  expect(windows).toContain("/T /F");
+  expect(webcamStreamScript("mac", "0", { vo: "kitty" }).cmd).not.toContain("-vsync");
+});
+
+test("webcam producer uses a fresh SSH session and a separate Windows control bootstrap", async () => {
+  const winCfg = { hosts: { win: { name: "win", ssh: "fake-webcam-win", os: "windows", winShell: "powershell" } } } as FleetConfig;
+  const prepared = await prepareWebcamStream(winCfg, "win", { device: "Camera", vo: "kitty", viewport: currentViewport() });
+  const completed = Bun.spawn(["true"], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+  await completed.exited;
+  let sent: string | Uint8Array | undefined;
+  const spawn = spyOn(Bun, "spawn").mockReturnValue({
+    stdout: completed.stdout, stderr: completed.stderr, exited: completed.exited, kill() {},
+    stdin: { write(data: string | Uint8Array) { sent = data; return data.length; }, end() { return 0; } },
+  } as typeof completed);
+  try {
+    prepared.startProducer();
+    const argv = spawn.mock.calls[0]![0] as string[];
+    expect(argv).toContain("ControlMaster=no");
+    expect(argv).toContain("ControlPath=none");
+    expect(argv).toContain("-EncodedCommand");
+    expect(argv).not.toContain("-Command");
+    expect(sent).toBeInstanceOf(Uint8Array);
+  } finally { spawn.mockRestore(); }
 });

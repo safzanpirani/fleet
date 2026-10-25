@@ -553,6 +553,8 @@ fleet webcam workstation --stream --fps 15 --for 10
 
 Stream flags take integers: `--fps` is 1–60, `--width` is 16–1280, and `--for` is 1–2147482 seconds. The duration deadline also covers stalled cameras and window playback. Closing playback cancels its producer; an unexpected camera, SSH, or player failure is an error even after frames have arrived.
 
+A live stream uses its own SSH session. Quitting restores the terminal before the remote side is torn down, without waiting for inherited output pipes. On Windows, cancelling ends the whole FFmpeg process tree, including launcher shims.
+
 The operating system must grant camera access. macOS capture over SSH may lack camera permission; use `local` on the Mac. An application can hold exclusive access to a camera. Fleet reports capture failure and leaves that application running. Each photo capture has a 20-second process limit. Fleet installs no camera software.
 
 ## Agent setup

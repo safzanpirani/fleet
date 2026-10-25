@@ -22,7 +22,7 @@ import { fstatSync, readFileSync, statSync, type Stats } from "node:fs";
 import { installLockScript } from "./install-lock.ts";
 import { DIFF_MAX_BYTES, decodeDiffText, unifiedDiff } from "./diff.ts";
 import {
-  detectWebcamVo, parseCameras, renderSize, validateWebcamDevice, validateWebcamStreamOptions, webcamScript, webcamStreamScript,
+  detectWebcamVo, parseCameras, renderSize, validateWebcamDevice, validateWebcamStreamOptions, webcamPowerShellSubmission, webcamScript, webcamStreamScript,
   type Camera, type WebcamStreamProc, type WebcamViewport, type WebcamVo,
 } from "./webcam.ts";
 import { stopBroker as stopWinSessionBroker } from "./winsession.ts";
@@ -2792,11 +2792,15 @@ export async function prepareWebcamStream(
   const winBin = host?.os === "windows" && !deps.startProducer ? await resolveWinBin(host, 30000) : undefined;
   const startProducer = (): WebcamStreamProc => {
     if (deps.startProducer) return deps.startProducer(host, script);
-    const built = host ? buildArgs(host, script.cmd, script.shell, winBin) : undefined;
-    const proc = Bun.spawn(built?.args ?? (os === "windows" ? ["powershell", "-NoProfile", "-NonInteractive", "-Command", "-"] : ["bash", "-s"]), {
+    const built = host ? buildArgs(host, script.cmd, script.shell, winBin, undefined, true) : undefined;
+    const windows = os === "windows" ? webcamPowerShellSubmission(script.cmd) : undefined;
+    const argv = windows
+      ? [...(built ? built.args.slice(0, -2) : ["powershell", "-NoProfile", "-NonInteractive"]), ...windows.args]
+      : built?.args ?? ["bash", "-s"];
+    const proc = Bun.spawn(argv, {
       stdin: "pipe", stdout: "pipe", stderr: "pipe", ...(host ? { env: sshEnv() } : {}),
     });
-    proc.stdin.write(built?.stdin ?? script.cmd + "\n\n");
+    proc.stdin.write(windows?.stdin ?? built?.stdin ?? script.cmd + "\n\n");
     // The producer owns stdin until cancellation; EOF is its disconnect signal.
     let closing = false;
     let finished = false;

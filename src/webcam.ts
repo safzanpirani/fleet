@@ -47,6 +47,22 @@ function powershellProgram(source: string): string {
   return `$ProgressPreference='SilentlyContinue'; $ErrorActionPreference='Stop'; try { . ([scriptblock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encoded}')))) } catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }\n`;
 }
 
+/** A fixed -EncodedCommand bootstrap consumes one source line, leaving stdin exclusively for cancellation. */
+export function webcamPowerShellSubmission(command: string): { args: string[]; stdin: Uint8Array } {
+  const bootstrap = `$ErrorActionPreference='Stop'
+$fleetControl=[Console]::OpenStandardInput()
+$source=New-Object IO.MemoryStream
+while(($b=$fleetControl.ReadByte()) -ge 0 -and $b -ne 10){$source.WriteByte([byte]$b)}
+try {
+  . ([scriptblock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([Text.Encoding]::ASCII.GetString($source.ToArray())))))
+} catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }
+finally { $source.Dispose() }`;
+  return {
+    args: ["-EncodedCommand", Buffer.from(bootstrap, "utf16le").toString("base64")],
+    stdin: new TextEncoder().encode(Buffer.from(command).toString("base64") + "\n"),
+  };
+}
+
 // Closing the owning PowerShell process also closes this job and kills FFmpeg.
 // TODO(review): Suspended Windows process creation is needed to eliminate the shell-death race between Start and job assignment.
 const WINDOWS_WEBCAM_JOB = `
@@ -83,6 +99,22 @@ public static class FleetWebcamJob {
 '@
 }
 $job=[FleetWebcamJob]::Create()
+function Stop-FleetWebcamTree($proc,$job) {
+  try {
+    # /T also covers a shim child created in the small interval before job assignment.
+    if($proc -and -not $proc.HasExited){
+      $ki=New-Object Diagnostics.ProcessStartInfo
+      $ki.FileName=Join-Path $env:SystemRoot 'System32\\taskkill.exe'
+      $ki.Arguments='/PID '+$proc.Id+' /T /F'; $ki.UseShellExecute=$false; $ki.CreateNoWindow=$true
+      $ki.RedirectStandardOutput=$true; $ki.RedirectStandardError=$true
+      $killer=[Diagnostics.Process]::Start($ki)
+      try { if(-not $killer.WaitForExit(1000)){$killer.Kill()} } finally { $killer.Dispose() }
+    }
+  } catch {} finally {
+    # Kill the whole job before any wait/drain; PowerShell 5.1 Process.Kill only kills the shim.
+    $job.Dispose()
+  }
+}
 `;
 
 /** A Mac camera runs one format for every app using it. Without a size,
@@ -123,11 +155,12 @@ try {
   $proc=[Diagnostics.Process]::Start($si)
   [FleetWebcamJob]::Assign($job,$proc)
   $err=$proc.StandardError.ReadToEndAsync(); $out=$proc.StandardOutput.ReadToEndAsync()
-  if(-not $proc.WaitForExit(20000)){$proc.Kill(); throw 'Webcam timed out; the camera may be busy or permission may be denied'}
+  if(-not $proc.WaitForExit(20000)){throw 'Webcam timed out; the camera may be busy or permission may be denied'}
+  Stop-FleetWebcamTree $proc $job
   if(${list ? "$true" : "$false"}){[Console]::Write($err.Result); exit 0}
   if($proc.ExitCode -ne 0){throw ('Camera unavailable, busy, or permission denied: '+$err.Result)}
   [Console]::Write([Convert]::ToBase64String([IO.File]::ReadAllBytes($p)))
-} finally {if($proc){if(-not $proc.HasExited){$proc.Kill(); $proc.WaitForExit()}; $proc.Dispose()}; $job.Dispose(); Remove-Item -LiteralPath $p -ErrorAction SilentlyContinue}
+} finally {Stop-FleetWebcamTree $proc $job; if($proc){$proc.Dispose()}; Remove-Item -LiteralPath $p -ErrorAction SilentlyContinue}
 `) };
   }
   if (list && os === "linux") return { shell: "bash", cmd: `command -v ffmpeg >/dev/null || { echo 'Webcam capture requires ffmpeg on this host' >&2; exit 1; }; for p in /dev/video*; do [ -c "$p" ] && printf '%s\\n' "$p"; done; true` };
@@ -451,18 +484,15 @@ try {
   $err=$proc.StandardError.ReadToEndAsync()
   $out=[Console]::OpenStandardOutput()
   $copy=$proc.StandardOutput.BaseStream.CopyToAsync($out)
-  $control=[Console]::OpenStandardInput().CopyToAsync([IO.Stream]::Null)
+  $control=$fleetControl.CopyToAsync([IO.Stream]::Null)
   $done=[Threading.Tasks.Task]::WaitAny([Threading.Tasks.Task[]]@($copy,$control))
   if($done -eq 1){return}
   $copy.GetAwaiter().GetResult()
   $proc.WaitForExit()
   if($proc.ExitCode -ne 0){throw ('Camera unavailable, busy, or permission denied: '+$err.Result)}
 } finally {
-  if($proc){
-    if(-not $proc.HasExited){try{$proc.Kill()}catch{}}
-    $proc.Dispose()
-  }
-  $job.Dispose()
+  Stop-FleetWebcamTree $proc $job
+  if($proc){[void]$proc.WaitForExit(1000); $proc.Dispose()}
 }
 `),
     };
@@ -521,30 +551,54 @@ export async function runWebcamStream(
   let offResize = () => {};
   let offDeadline = () => {};
   let enteredScreen = false;
+  let restored = false;
+  let stderrText = "";
+  let resolveStop = () => {};
+  const stopRequested = new Promise<undefined>(resolve => { resolveStop = () => resolve(undefined); });
   let producerCode: number | undefined;
   const exited = proc.exited.then(code => { producerCode = code; return code; });
+  void exited.catch(() => {});
+  const onExit = () => proc.kill();
+  const signals = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
+  const restoreTerminal = () => {
+    if (restored) return;
+    restored = true;
+    offDeadline();
+    for (const signal of signals) process.off(signal, stopStream);
+    process.off("exit", onExit);
+    try { offResize(); } finally {
+      try { offInput(); } finally {
+        if (enteredScreen) write((meta.vo === "kitty" ? deleteKittyVideo() : "") + "\x1b[?25h\x1b[?1049l\x1b[0m");
+      }
+    }
+  };
+  const cancelReaders = () => {
+    // Cancellation can itself remain pending on inherited SSH pipe handles.
+    void (reader ? reader.cancel() : proc.stdout.cancel()).catch(() => {});
+    void (errReader ? errReader.cancel() : proc.stderr.cancel()).catch(() => {});
+  };
   const stopStream = () => {
     if (stopped) return;
     stopped = true;
+    restoreTerminal();
+    resolveStop();
     abort.abort();
+    cancelReaders();
     proc.kill();
-    void reader?.cancel().catch(() => {});
   };
-  const onExit = () => proc.kill();
-  const signals = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
   for (const signal of signals) process.on(signal, stopStream);
   process.on("exit", onExit);
   try {
     errReader = proc.stderr.getReader();
     const stderrPromise = (async () => {
       const dec = new TextDecoder();
-      let out = "";
       for (;;) {
         const { value, done } = await errReader!.read();
         if (done) break;
-        if (value) out = (out + dec.decode(value, { stream: true })).slice(-65536);
+        if (value) stderrText = (stderrText + dec.decode(value, { stream: true })).slice(-65536);
       }
-      return out + dec.decode();
+      stderrText += dec.decode();
+      return stderrText;
     })();
     // Always observe drain errors, including when renderer setup fails first.
     void stderrPromise.catch(() => {});
@@ -575,10 +629,15 @@ export async function runWebcamStream(
           await player.exited;
         }
       });
-      const result = await runPlayer(`fleet webcam · ${meta.host} (${meta.device})`, proc.stdout, abort.signal);
+      const playing = runPlayer(`fleet webcam · ${meta.host} (${meta.device})`, proc.stdout, abort.signal);
+      const result = await Promise.race([playing, stopRequested]);
       const completedCode = producerCode;
+      const stderr = stderrText;
+      // Closing the local player is cancellation, not a request to drain remote pipes.
+      restoreTerminal();
+      cancelReaders();
       proc.kill();
-      const [, stderr] = await Promise.all([exited, stderrPromise]);
+      if (!result) return { host: meta.host, device: meta.device, vo: meta.vo, frames };
       if (!stopped) {
         if (completedCode !== undefined && completedCode !== 0)
           throw new Error(stderr.trim() || `Webcam producer exited with code ${completedCode}`);
@@ -686,23 +745,16 @@ export async function runWebcamStream(
       }
       if (!stopped && length) throw new Error("Camera produced an incomplete RGB frame");
     }
-    const [code, stderr] = await Promise.all([exited, stderrPromise]);
-    if (!stopped && (code !== 0 || frames === 0))
-      throw new Error(stderr.trim() || (code !== 0 ? `Webcam producer exited with code ${code}` : "Camera produced no complete frames"));
+    if (stopped) return { host: meta.host, device: meta.device, vo: meta.vo, frames };
+    const completion = await Promise.race([Promise.all([exited, stderrPromise]), stopRequested]);
+    if (completion && (completion[0] !== 0 || frames === 0))
+      throw new Error(completion[1].trim() || (completion[0] !== 0 ? `Webcam producer exited with code ${completion[0]}` : "Camera produced no complete frames"));
     return { host: meta.host, device: meta.device, vo: meta.vo, frames };
   } finally {
-    offDeadline();
+    // Restore raw mode, signal semantics, and the alternate screen before any teardown.
+    restoreTerminal();
     abort.abort();
+    cancelReaders();
     proc.kill();
-    await exited.catch(() => {});
-    await reader?.cancel().catch(() => {});
-    await errReader?.cancel().catch(() => {});
-    for (const signal of signals) process.off(signal, stopStream);
-    process.off("exit", onExit);
-    try { offResize(); } finally {
-      try { offInput(); } finally {
-        if (enteredScreen) write((meta.vo === "kitty" ? deleteKittyVideo() : "") + "\x1b[?25h\x1b[?1049l\x1b[0m");
-      }
-    }
   }
 }
