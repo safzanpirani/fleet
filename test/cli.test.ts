@@ -224,6 +224,18 @@ describe("machine-readable CLI output", () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
+  test("exec delivers $_, nested quotes and newlines exactly as fleet received them", async () => {
+    const { root, bin, config } = fixture();
+    writeFileSync(config, JSON.stringify({ hosts: { local: { ssh: "local", os: "mac" } } }));
+    executable(join(bin, "ssh"), "#!/bin/sh\nexec /bin/bash -s\n");
+    try {
+      // One argv word, as a quoted heredoc or single quotes hand it to fleet.
+      const program = `printf '%s|' '{$_.Name}' "say \\"hi\\" '$HOME'"\nprintf '%s\\n' 'line two'`;
+      const r = await runCli(["exec", "--raw", "local", program], config, bin, { HOME: "/h" });
+      expect(r).toEqual({ code: 0, stdout: `{$_.Name}|say "hi" '/h'|line two\n`, stderr: "" });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   test("raw cu click JSON remains a driver passthrough", async () => {
     const { root, bin, config } = fixture();
     executable(join(bin, "ssh"), "#!/bin/sh\ncat\n");
@@ -348,7 +360,7 @@ describe("machine-readable CLI output", () => {
   const invalidNonPassthroughCases = [
         ["edit", "local:/fixture", "--old", "before", "--new"],
         ["edit", "local:/fixture", "--old", "before", "--new", "after", "--dryrun"],
-        ["edit", "local:/fixture", "--old", "before", "--new", "--json"],
+        ["edit", "local:/fixture", "--new", "after", "--old"],
         ["edit", "local:/fixture", "extra", "--old", "before"],
         ["deploy", "local", "--no-restartt"],
         ["deploy", "local", "--restart"],
@@ -379,6 +391,10 @@ describe("machine-readable CLI output", () => {
         ["dt", "extra"],
         ["gpu", "--jso"],
         ["disk", "local", "extra"],
+        ["ports", "local", "--jso"],
+        ["ports", "local", "22", "extra"],
+        ["ports", "local", " "],
+        ["ports"],
         ["status", "local", "--jso"],
         ["top", "local", "extra"],
         ["boot", "local", "--jso"],
@@ -404,6 +420,20 @@ describe("machine-readable CLI output", () => {
     },
   );
 
+  test("run with a local script path points at exec --script", async () => {
+    const { root, config } = fixture();
+    try {
+      const script = join(root, "job.sh");
+      writeFileSync(script, "echo hi\n");
+      const result = await runCli(["run", script], config);
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain("unknown recipe");
+      expect(result.stderr).toContain(`fleet exec --script ${script} <host>`);
+      const missing = await runCli(["run", "nope"], config);
+      expect(missing.stderr).not.toContain("exec --script");
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   test("edit distinguishes missing replacement values and preserves literal replacement bytes", async () => {
     const { root, bin, config } = fixture();
     try {
@@ -414,6 +444,10 @@ describe("machine-readable CLI output", () => {
       expect(missing.code).toBe(1);
       expect(missing.stderr).toContain("--new requires a value");
       expect(await Bun.file(target).text()).toBe("before\n");
+      const trailingOld = await runCli(["edit", `local:${target}`, "--new", "after", "--old"], config, bin);
+      expect(trailingOld.code).toBe(1);
+      expect(trailingOld.stderr).toContain("--old requires a value");
+      expect(await Bun.file(target).text()).toBe("before\n");
       const cases: { before: string; args: string[]; after: string }[] = [
         { before: "before\n", args: ["--old", "before", "--new", "$&"], after: "$&\n" },
         { before: "before before\n", args: ["--all", "--old", "before", "--new", "$&"], after: "$& $&\n" },
@@ -422,6 +456,9 @@ describe("machine-readable CLI output", () => {
         { before: "before\n", args: ["--old", "before", "--new="], after: "\n" },
         { before: "before\n", args: ["--old", "before", "--new=--json"], after: "--json\n" },
         { before: "--json\n", args: ["--old=--json", "--new", "after"], after: "after\n" },
+        { before: "--foo\n", args: ["--old", "--foo", "--new", "bar"], after: "bar\n" },
+        { before: "before\n", args: ["--old", "before", "--new", "--json"], after: "--json\n" },
+        { before: "-x\n", args: ["--new", "-y", "--old", "-x"], after: "-y\n" },
       ];
       for (const { before, args, after } of cases) {
         await Bun.write(target, before);
@@ -535,6 +572,23 @@ describe("machine-readable CLI output", () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
+  test("a timed-out exec keeps the output that arrived and says it timed out", async () => {
+    const { root, bin, config } = fixture();
+    try {
+      executable(join(bin, "ssh"), `#!${process.execPath}\nconsole.log('partial line');\nconsole.error('warn so far');\nsetInterval(() => {}, 1000);\n`);
+      const json = await runCli(["exec", "--timeout", "1", "--json", "local", "ignored"], config, bin);
+      expect(json.code, json.stderr).toBe(1);
+      const [r] = JSON.parse(json.stdout);
+      expect(r).toMatchObject({ ok: false, code: 124, timedOut: true, stdout: "partial line\n" });
+      expect(r.stderr).toContain("warn so far");
+      expect(r.stderr).toContain("timed out after 1s");
+      const plain = await runCli(["exec", "--timeout", "1", "local", "ignored"], config, bin);
+      expect(plain.code).toBe(1);
+      expect(plain.stdout).toContain("partial line");
+      expect(plain.stdout + plain.stderr).toContain("timed out after 1s");
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }, 20_000);
+
   test("interrupting the CLI observer leaves a detached job available for a new wait", async () => {
     const { root, bin, config } = fixture();
     let observer: ReturnType<typeof Bun.spawn> | undefined;
@@ -629,6 +683,9 @@ describe("machine-readable CLI output", () => {
       const trailing = await runCli(["spawn", "local", "echo", "ok", "--cwd", "/tmp"], config, bin);
       expect(trailing.code).toBe(1);
       expect(trailing.stderr).toContain("must come BEFORE the host selector");
+      const execTrailing = await runCli(["exec", "local", "make", "--cwd", "/tmp"], config, bin);
+      expect(execTrailing.code).toBe(1);
+      expect(execTrailing.stderr).toContain("'--cwd' must come BEFORE the host selector");
       expect(await Bun.file(marker).exists()).toBe(false);
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -716,6 +773,32 @@ describe("machine-readable CLI output", () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  test("tools status reads a lone word as a tool, else a selector, and refuses ambiguity", async () => {
+    const { root, bin, config } = fixture();
+    try {
+      writeFileSync(join(root, "package.json"), JSON.stringify({ name: "demo", version: "1.0.0" }));
+      writeFileSync(config, JSON.stringify({
+        hosts: { local: { ssh: "local", os: "linux" }, both: { ssh: "both", os: "linux" } },
+        tools: { demo: { root, hosts: "local" }, both: { root, hosts: "local" } },
+      }));
+      executable(join(bin, "ssh"), "#!/bin/sh\ncat >/dev/null\nexit 0\n");
+      const asTool = await runCli(["tools", "status", "demo", "--json"], config, bin);
+      expect(asTool.code, asTool.stderr).toBe(1);
+      expect(JSON.parse(asTool.stdout).map((r: { tool: string; host: string }) => `${r.tool}@${r.host}`)).toEqual(["demo@local"]);
+      const asSelector = await runCli(["tools", "status", "local", "--json"], config, bin);
+      expect(asSelector.code, asSelector.stderr).toBe(1);
+      expect(JSON.parse(asSelector.stdout).map((r: { tool: string }) => r.tool)).toEqual(["demo", "both"]);
+      const ambiguous = await runCli(["tools", "status", "both"], config, bin);
+      expect(ambiguous.code).toBe(1);
+      expect(ambiguous.stderr).toContain("names both a tool and a host");
+      const hostOnly = await runCli(["tools", "status", "both,", "--json"], config, bin);
+      expect(JSON.parse(hostOnly.stdout).map((r: { host: string }) => r.host)).toEqual(["both", "both"]);
+      const neither = await runCli(["tools", "status", "deja"], config, bin);
+      expect(neither.code).toBe(1);
+      expect(neither.stderr).toContain("'deja' is neither a tool (tools: demo, both)");
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
   test("wait --json keeps progress off stdout", async () => {

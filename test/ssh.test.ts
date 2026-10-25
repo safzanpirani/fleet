@@ -184,6 +184,14 @@ describe("buildArgs — wsl (bash inside windows)", () => {
     expect(new TextDecoder().decode(built.stdin!)).toBe("uname -a\n");
   });
 
+  test("wslRoot runs the fixed wrapper as root, script still over stdin", () => {
+    const built = buildArgs(win, "apt-get update", "wsl", "powershell", undefined, false, true);
+    const inner = decodeUtf16le(valAfter(built.args, "-EncodedCommand"));
+    expect(inner).toContain("wsl -d 'Ubuntu' -u root -- bash -s");
+    expect(built.args.join(" ")).not.toContain("apt-get");
+    expect(new TextDecoder().decode(built.stdin!)).toBe("apt-get update\n");
+  });
+
   test("honors a custom wsl distro", () =>
     expect(decodeUtf16le(valAfter(buildArgs({ ...win, wsl: "Debian" }, "x", "wsl").args, "-EncodedCommand")))
       .toContain("wsl -d 'Debian'"));
@@ -195,9 +203,23 @@ describe("buildArgs — wsl (bash inside windows)", () => {
 
 describe("Windows scp paths", () => {
   test("normalizes only the remote side of Windows copies", () => {
-    expect(scpRemotePath(win, "D:\\Downloads\\clip.mp4")).toBe("D:/Downloads/clip.mp4");
-    expect(scpRemotePath(win, "C:/Windows/win.ini")).toBe("C:/Windows/win.ini");
     expect(scpRemotePath(linux, String.raw`dir\literal`)).toBe(String.raw`dir\literal`);
+    expect(scpRemotePath(linux, "/C:/x")).toBe("/C:/x");
+  });
+
+  test("a drive path in either slash form becomes the absolute SFTP form", () => {
+    expect(scpRemotePath(win, "D:\\Downloads\\clip.mp4")).toBe("/D:/Downloads/clip.mp4");
+    expect(scpRemotePath(win, "C:/Windows/win.ini")).toBe("/C:/Windows/win.ini");
+    expect(scpRemotePath(win, "c:\\")).toBe("/c:/");
+    expect(scpRemotePath(win, "D:")).toBe("/D:");
+    expect(scpRemotePath(win, "D:\\Some Dir\\")).toBe("/D:/Some Dir/");
+  });
+
+  test("home-relative, relative and already-absolute Windows paths keep their meaning", () => {
+    expect(scpRemotePath(win, "~\\dir\\a.txt")).toBe("~/dir/a.txt");
+    expect(scpRemotePath(win, "out\\a.txt")).toBe("out/a.txt");
+    expect(scpRemotePath(win, "/C:/Users/me/a.txt")).toBe("/C:/Users/me/a.txt");
+    expect(scpRemotePath(win, "C:a.txt")).toBe("C:a.txt");
   });
 });
 
@@ -321,6 +343,39 @@ describe("probe deadline cleanup", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  test("a capped probe lets fleet exit while a mux master still holds the ssh pipe", async () => {
+    // A ControlMaster keeps a killed mux client's stdout until the remote
+    // command ends. On a stalled master that is minutes, and an uncancelled
+    // read kept `fleet boot --entries` alive long after it had finished.
+    const dir = mkdtempSync(join(tmpdir(), "fleet-probe-linger-"));
+    const holderPid = join(dir, "holder-pid");
+    try {
+      const fakeSsh = join(dir, "ssh");
+      writeFileSync(fakeSsh, `#!/bin/sh\nsleep 20 &\nprintf "%s" "$!" > "${holderPid}"\nexec sleep 20\n`);
+      chmodSync(fakeSsh, 0o755);
+      const script = join(dir, "probe.ts"), out = join(dir, "out");
+      writeFileSync(script, `
+        import { probe } from "${import.meta.dir}/../src/ssh.ts";
+        console.log(await probe({ name: "h", ssh: "h", os: "linux" }, 300));
+      `);
+      // Piped like `fleet boot winbox --entries | tail`, where the stall showed.
+      const started = performance.now();
+      const proc = Bun.spawn(["sh", "-c", `"${process.execPath}" "${script}" | cat > "${out}"`], {
+        env: { ...process.env, PATH: dir + delimiter + (process.env.PATH ?? "") },
+        stdout: "ignore", stderr: "pipe", timeout: 10_000, killSignal: "SIGKILL",
+      });
+      const [stderr, code] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+      expect(code, stderr).toBe(0);
+      expect((await Bun.file(out).text()).trim()).toBe("false");
+      expect(performance.now() - started).toBeLessThan(5000);
+    } finally {
+      if (await Bun.file(holderPid).exists()) {
+        try { process.kill(Number(await Bun.file(holderPid).text()), "SIGKILL"); } catch { /* already ended */ }
+      }
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 15_000);
 
   test("a failed ssh process cannot claim reachability by printing 'not ok'", async () => {
     const dir = mkdtempSync(join(tmpdir(), "fleet-probe-fail-"));

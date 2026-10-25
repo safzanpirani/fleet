@@ -32,8 +32,13 @@ const READY = "__FLEET_SESSION_READY__";
 const PIPE_PROBE = "__FLEET_PIPE__";
 
 /** Remove the pipeline probe the session prints before its end marker. Its
- *  absence means the program's pipeline output never reached stdout. */
+ *  absence means the program's pipeline output never reached stdout. The probe
+ *  starts a line; when the program's output did not end in a newline, the
+ *  session wrote one before a `PIPE_PROBE + "N"` probe, and that newline is
+ *  removed again so stdout keeps the program's exact bytes. */
 export function takePipeProbe(stdout: string, end: string): { stdout: string; probed: boolean } {
+  const added = stdout.lastIndexOf(`\n${PIPE_PROBE}N${end}`);
+  if (added >= 0) return { stdout: stdout.slice(0, added), probed: true };
   const at = stdout.lastIndexOf(PIPE_PROBE + end);
   if (at < 0 || (at > 0 && stdout[at - 1] !== "\n")) return { stdout, probed: false };
   return { stdout: stdout.slice(0, at), probed: true };
@@ -158,15 +163,21 @@ while ($null -ne ($__fsLine = $__fsReader.ReadLine())) {
     $__fsOut.Inner = $__fsConsoleOut; $__fsErr.Inner = $__fsConsoleErr
     [Console]::SetOut($__fsOut); [Console]::SetError($__fsErr)
   }
+  $__fsNl = ''
   try {
-    [Console]::Out.Write([FleetSession.Std]::Snapshot($__fsOutPath))
+    $__fsSnap = [FleetSession.Std]::Snapshot($__fsOutPath)
+    [Console]::Out.Write($__fsSnap)
+    # Output without a final newline (curl.exe's body) would glue the probe to
+    # its last line. Start the probe's line here and flag it with N, so the
+    # broker finds the probe and drops this newline again.
+    $__fsNl = if ($__fsSnap.Length -gt 0 -and -not $__fsSnap.EndsWith("\`n")) { [Console]::Out.Write("\`n"); 'N' } else { '' }
     [Console]::Error.Write([FleetSession.Std]::Snapshot($__fsErrPath))
   } finally {
     $__fsOutWriter.Dispose(); $__fsErrWriter.Dispose()
     $__fsOutFile.Dispose(); $__fsErrFile.Dispose()
   }
   # The pipeline probe goes through the same formatter as the program.
-  '${PIPE_PROBE}' + $__fsEnd | Out-Default
+  '${PIPE_PROBE}' + $__fsNl + $__fsEnd | Out-Default
   foreach ($__fsVar in @(Get-Variable -Scope Global)) {
     if ($__fsVar.Name -notlike '__fs*' -and -not $__fsGlobals.ContainsKey($__fsVar.Name)) { Remove-Variable -Name $__fsVar.Name -Scope Global -EA SilentlyContinue }
   }

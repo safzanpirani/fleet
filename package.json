@@ -14,7 +14,7 @@
     "mcp": "bun run src/mcp.ts",
     "serve": "bun run src/http.ts",
     "test": "bun test --timeout 30000",
-    "typecheck": "tsrs --noEmit",
+    "typecheck": "bun --check",
     "check": "bun run typecheck && bun test --timeout 30000",
     "build:linux": "bun build --compile --target=bun-linux-x64 src/cli.ts --outfile dist/fleet-linux-x64",
     "build:local": "bun scripts/build-local.ts"
@@ -22,7 +22,6 @@
   "devDependencies": {
     "@modelcontextprotocol/client": "^2.3.1",
     "@types/bun": "latest",
-    "tsrs": "0.16.0-ts7.1.0-dev.20260929",
     "typescript": "^5"
   },
   "dependencies": {

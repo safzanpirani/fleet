@@ -1,5 +1,5 @@
 import { describe, expect, spyOn, test } from "bun:test";
-import { doneMarker, exec, takeDoneMarker, withDoneMarker } from "../src/ssh.ts";
+import { buildArgs, doneMarker, exec, takeDoneMarker, withDoneMarker } from "../src/ssh.ts";
 import { useColor } from "../src/cli.ts";
 
 describe("completion marker", () => {
@@ -101,6 +101,16 @@ describe("completion marker", () => {
     expect(Buffer.from(b64, "base64").toString("utf8")).toStartWith("Write-Output 'héllo ✓'\n$__fleetOk = $?");
     expect(wrapped).toContain(`'${m}'`);
     expect(/^[\x20-\x7e\r\n\t]*$/.test(wrapped)).toBe(true);   // the wrapper itself is pure ASCII
+  });
+
+  test("a PowerShell program keeps $_, nested double quotes and newlines through the wrapper", () => {
+    const program = `Get-ChildItem | ForEach-Object {$_.Name}\npowershell -NoProfile -Command "Write-Output \\"a $($_) b\\""`;
+    const wrapped = withDoneMarker(program, "powershell", doneMarker());
+    const b64 = /FromBase64String\('([^']+)'\)/.exec(wrapped)![1]!;
+    expect(Buffer.from(b64, "base64").toString("utf8")).toStartWith(program + "\n$__fleetOk = $?");
+    const { args, stdin } = buildArgs({ name: "w", ssh: "w", os: "windows" }, wrapped, "powershell");
+    expect(args.join(" ")).not.toContain("$_");
+    expect(new TextDecoder().decode(stdin!)).toBe(wrapped + "\n\n");
   });
 });
 

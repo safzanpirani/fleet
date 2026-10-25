@@ -61,8 +61,9 @@ fleet exec --cwd /srv/app web "./build.sh"   # run in a dir; fails fast if missi
 fleet exec --timeout 60 vps "slow-thing"        # wall-clock cap; a hung command exits 124
 fleet exec --script ./deploy.sh web v2 --dry    # a local script; tokens after the host are its $1 $2
 fleet exec --sudo web "systemctl restart nginx"  # as root; a sudo password comes from a 0600 file
+fleet exec --wsl --sudo win-box "apt-get update"  # as WSL root through wsl -u root, no password
 fleet exec --fresh web "id -Gn"    # new ssh login (after usermod -aG); `fleet drop web` closes shared ones
-# a timeout returns within a second and keeps the output printed so far
+# a timeout returns within a second with the output printed so far; --json adds timedOut: true
 fleet spawn --cwd /srv/app web "./train.sh"  # detached job that outlives ssh -> job id
 fleet jobs                          # every detached job across the fleet
 fleet jobs tail web:mqtn19-9px -f # stream a job's output live
@@ -78,6 +79,7 @@ fleet deploy gpu-box              # ship fleet source -> host, bun install, rest
 fleet status                        # live CPU/mem/disk/gpu from your status dashboard
 fleet disk                          # live free space on every mounted volume
 fleet ps web python --sort cpu     # processes, the same columns on every OS
+fleet ports web 5432               # listening ports with pid and process name; --udp for UDP
 fleet kill web 4242 --dry-run      # show the stop plan; --tree, --force, --all
 fleet status vps                    # one host
 fleet logs web cloudflared -n 50
@@ -208,7 +210,9 @@ command, including flags such as `--json`. An unquoted `--cwd ~/x` that the loca
 shell expanded to this machine's home is sent as `~/x`. `fleet push` and `fleet pull`
 are aliases of `fleet cp`.
 
-`exec --script` passes the tokens after the selector to the script: `$1…` in shells,
+`exec --script` picks the interpreter from the file extension, else from the `#!` line,
+so an extensionless script with `#!/usr/bin/env python3` runs under python3. It passes
+the tokens after the selector to the script: `$1…` in shells,
 `$args` or `param()` in PowerShell, and argv for Python, Node, Bun and the rest. A
 Windows command wrapped in `powershell -Command "…"` or `wsl bash -c "…"` gets a note:
 fleet already runs PowerShell there, and the outer session expands `$variables` in the
@@ -228,8 +232,9 @@ background output. `FLEET_WIN_SESSION=0` disables the broker.
 `fleet edit` treats replacement text literally, including `$&`. Omitting `--new`
 or passing `--new ""` deletes the match. A present `--new` without a value fails.
 Use `--old=--flag` for option-looking text. Edit diffs omit unchanged context and
-return a content-free summary when line alignment exceeds its work limit. Fleet never turns the two
-characters `\n` into a newline. Pass multi-line text with `--old-file` or
+return a content-free summary when line alignment exceeds its work limit. `--old` and
+`--new` are literal; `--escapes` turns `\n`, `\t` and `\\` in them into a newline, a tab
+and a backslash. Pass multi-line text with `--old-file` or
 `--new-file`, which read a local file or `-` for stdin. In a file that uses CRLF
 or LF throughout, newlines in `--old` and `--new` are converted to match it.
 `--edits <file|->` takes a JSON array of `{"old", "new", "all"}` objects and

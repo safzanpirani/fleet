@@ -140,6 +140,15 @@ describe("readScriptSource", () => {
     return readScriptSource(p).then((s) => expect(s.ext).toBe(""));
   });
 
+  test("an extensionless file takes its language from its shebang", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "fleet-script-"));
+    const p = join(dir, "job");
+    writeFileSync(p, "#!/usr/bin/env python3\nprint(1)\n");
+    const s = await readScriptSource(p);
+    expect(s.ext).toBe(".py");
+    expect(interpreterFor(s.ext, "linux")).toBe("python3");
+  });
+
   test("a missing file fails fast", async () => {
     await expect(readScriptSource("/nope/does-not-exist.sh")).rejects.toThrow(/script not found/);
   });
@@ -150,6 +159,7 @@ describe("stdin script language", () => {
     expect(extensionFromShebang("#!/usr/bin/env python3\nprint(1)\n")).toBe(".py");
     expect(extensionFromShebang("#!/usr/bin/env -S bun run\nconsole.log(1)\n")).toBe(".ts");
     expect(extensionFromShebang("#!/bin/bash\necho ok\n")).toBe(".sh");
+    expect(extensionFromShebang("#!/usr/bin/python3.12\nprint(1)\n")).toBe(".py");
   });
 
   test("requires an interpreter for untyped stdin before contacting a host", async () => {
@@ -452,6 +462,28 @@ describe("edit review regressions", () => {
     } finally { execute.mockRestore(); }
   });
 
+  test("a .env dry run prints the changed URL but never an unchanged API key beside it", async () => {
+    const cfg = { hosts: { local: { name: "local", ssh: "unused", os: "linux" } } } as FleetConfig;
+    const key = "sk-live-PRIVATE_PLACEHOLDER";
+    const text = `OPENAI_API_KEY=${key}\nAPI_URL=https://old.example\nSECRET_TOKEN=${key}\n`;
+    const b64 = Buffer.from(text).toString("base64");
+    const execute = spyOn(ssh, "exec").mockImplementation(async (host, command) => ({
+      host: host.name, ok: true, code: 0, stderr: "", ms: 0,
+      stdout: command.includes("base64 <") && !command.includes("fleet-tmp") ? b64 : "",
+    }));
+    try {
+      for (const edit of [
+        { old: "API_URL=https://old.example", new: "API_URL=https://new.example" },
+        // An --old that spans the key line still reports only the line that changes.
+        { old: `OPENAI_API_KEY=${key}\nAPI_URL=https://old.example`, new: `OPENAI_API_KEY=${key}\nAPI_URL=https://new.example` },
+      ]) {
+        const [preview] = await editRemoteFile(cfg, "local", ".env.local", [edit], { dryRun: true });
+        expect(preview!.diff).toBe("- 2 API_URL=https://old.example\n+ 2 API_URL=https://new.example");
+        expect(JSON.stringify(preview)).not.toContain(key);
+      }
+    } finally { execute.mockRestore(); }
+  });
+
   test("edit-list validation rejects invalid items and nullable fields", () => {
     for (const json of ['[null]', '[[]]', '[1]', '[{}]', '[{"old":1}]', '[{"old":"a","new":null}]', '[{"old":"a","all":null}]'])
       expect(() => parseEditList(json, "fixture")).toThrow();
@@ -509,6 +541,40 @@ describe("edit CLI lists", () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
     // Eleven cold CLI starts in sequence; a loaded machine needs the headroom.
   }, 60_000);
+
+  test("--old/--new keep a literal backslash-n unless --escapes interprets \\n, \\t and \\\\", async () => {
+    const root = mkdtempSync(join(tmpdir(), "fleet-edit-escapes-"));
+    const bin = join(root, "bin");
+    mkdirSync(bin);
+    const fakeSsh = join(bin, "ssh");
+    writeFileSync(fakeSsh, "#!/bin/sh\nexec /bin/bash -s\n");
+    chmodSync(fakeSsh, 0o755);
+    const config = join(root, "config.json"), target = join(root, "target");
+    writeFileSync(config, JSON.stringify({ hosts: { local: { ssh: "unused", os: "mac" } } }));
+    const edit = async (args: string[]) => {
+      const proc = Bun.spawn([process.execPath, join(import.meta.dir, "../src/cli.ts"), "edit", `local:${target}`, ...args], {
+        env: { ...process.env, FLEET_CONFIG: config, PATH: `${bin}${delimiter}${process.env.PATH ?? ""}` },
+        stdin: "ignore", stdout: "pipe", stderr: "pipe", timeout: 10_000, killSignal: "SIGKILL",
+      });
+      const [stdout, stderr, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
+      return { stdout, stderr, code };
+    };
+    try {
+      writeFileSync(target, '{"a": 1}\n');
+      let r = await edit(["--old", '"a": 1', "--new", '"a": "x\\ny"']);
+      expect(r.code, r.stderr).toBe(0);
+      expect(await Bun.file(target).text()).toBe('{"a": "x\\ny"}\n');
+
+      writeFileSync(target, "k\\tv\nend\n");
+      r = await edit(["--escapes", "--old", "k\\\\tv\\nend", "--new", "a\\n\\tb\\\\n\\q"]);
+      expect(r.code, r.stderr).toBe(0);
+      expect(await Bun.file(target).text()).toBe("a\n\tb\\n\\q\n");
+
+      r = await edit(["--escapes", "--edits", "-"]);
+      expect(r.code).toBe(1);
+      expect(r.stderr).toContain("--escapes applies to --old/--new");
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }, 30_000);
 });
 
 test("ordinary shell commands still support pipelines and redirection", async () => {

@@ -12,7 +12,6 @@
       "devDependencies": {
         "@modelcontextprotocol/client": "^2.3.1",
         "@types/bun": "latest",
-        "tsrs": "0.16.0-ts7.1.0-dev.20260929",
         "typescript": "^5",
       },
     },
@@ -27,16 +26,6 @@
     "@modelcontextprotocol/node": ["@modelcontextprotocol/node@2.1.1", "", { "dependencies": { "@hono/node-server": "^1.19.9", "hono": "^4.11.4" }, "peerDependencies": { "@modelcontextprotocol/server": "^2.3.0" } }, "sha512-EY92OAXN2xYL7tNS/MVsWJW1v8VHAPwl9B4Ca3pCrjmvqyC+S1C/6UHsMxF2GoFPraS5Yyg56vFz9brVpFojMA=="],
 
     "@modelcontextprotocol/server": ["@modelcontextprotocol/server@2.3.1", "", { "dependencies": { "@modelcontextprotocol/core": "2.3.1", "zod": "^4.2.0" } }, "sha512-e59MfWuSssj6DoQ96JCTqdW1AXT5/XtnTl0WWd6MU1Ka434fFUGGosCLJbGNySDhHGvxQWoRWK137FXYFkYNWw=="],
-
-    "@tsrs/darwin-arm64": ["@tsrs/darwin-arm64@0.16.0-ts7.1.0-dev.20260929", "", { "os": "darwin", "cpu": "arm64" }, "sha512-9e7ZeELv0Fq06PL7xr0w7jeU45cd2UcDAejH3uloTPD37Vm6h099u/hAj90CPbY88ky15eXCiKE5hJzqvSvCBA=="],
-
-    "@tsrs/linux-arm64-gnu": ["@tsrs/linux-arm64-gnu@0.16.0-ts7.1.0-dev.20260929", "", { "os": "linux", "cpu": "arm64" }, "sha512-+pWQ4gnuIVeDJsUYKxwRuSF9smST209Srto2B0LrCwnomgbMHENB7hzN+kAOe+HGWvmss9sjoQiwNHME3C9nNA=="],
-
-    "@tsrs/linux-arm64-musl": ["@tsrs/linux-arm64-musl@0.16.0-ts7.1.0-dev.20260929", "", { "os": "linux", "cpu": "arm64" }, "sha512-T2whHu5XbgEAnre71GVHBavdypwZu4tD/vEZDWTctfKrQ2LDbtt5QTbWhxN1SOkNS9i8EqWYaRUKQEDPjFntZg=="],
-
-    "@tsrs/linux-x64-gnu": ["@tsrs/linux-x64-gnu@0.16.0-ts7.1.0-dev.20260929", "", { "os": "linux", "cpu": "x64" }, "sha512-hPsRzR/oG4+wQwiCFSLM7Vct70yO1C4mHjDebEUAqyzyVlhRzZsqJVDpy+xYVyB1eebDD9VJ+c5UEzA2PuKDiw=="],
-
-    "@tsrs/linux-x64-musl": ["@tsrs/linux-x64-musl@0.16.0-ts7.1.0-dev.20260929", "", { "os": "linux", "cpu": "x64" }, "sha512-oW49ztnYwI0uOc/Yf8PCcXqAaVlkbvYJByLcz3u1cT2I7R8D649jDdegHWrqDfPPCa9yM7Q7WdNKstZIaQCjeg=="],
 
     "@types/bun": ["@types/bun@1.3.14", "", { "dependencies": { "bun-types": "1.3.14" } }, "sha512-h1hFqFVcvAvD9j9K7ZW7vd82aSA+rTdznZa+5bwvCwqSB1jmmfLcbIWhOLx1/+boy/xmjgCs/OMUL8hRJSmnPw=="],
 
@@ -63,8 +52,6 @@
     "shebang-command": ["shebang-command@2.0.0", "", { "dependencies": { "shebang-regex": "^3.0.0" } }, "sha512-kHxr2zZpYtdmrN1qDjrrX/Z1rR1kG8Dx+gkpK1G4eXmvXswmcE1hTWBWYUzlraYw1/yZp6YuDY77YtvbN0dmDA=="],
 
     "shebang-regex": ["shebang-regex@3.0.0", "", {}, "sha512-7++dFhtcx3353uBaq8DDR4NuxBetBzC7ZQOhmTQInHEd6bSrXdiEyzCvG07Z44UYdLShWUyXt5M/yhz8ekcb1A=="],
-
-    "tsrs": ["tsrs@0.16.0-ts7.1.0-dev.20260929", "", { "optionalDependencies": { "@tsrs/darwin-arm64": "0.16.0-ts7.1.0-dev.20260929", "@tsrs/linux-arm64-gnu": "0.16.0-ts7.1.0-dev.20260929", "@tsrs/linux-arm64-musl": "0.16.0-ts7.1.0-dev.20260929", "@tsrs/linux-x64-gnu": "0.16.0-ts7.1.0-dev.20260929", "@tsrs/linux-x64-musl": "0.16.0-ts7.1.0-dev.20260929" }, "bin": { "tsrs": "./bin/tsrs" } }, "sha512-/SfYc9iIH353Fj1evYYtiRWbz+/+ieYhlHuu2A3iDvA2DLjzlV1vKMzyh2eXuACPNsmFI2hc3w9EPPx6B+E8OA=="],
 
     "typescript": ["typescript@5.9.3", "", { "bin": { "tsc": "bin/tsc", "tsserver": "bin/tsserver" } }, "sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw=="],
 

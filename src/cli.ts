@@ -30,6 +30,7 @@ import { writeSync } from "node:fs";
 import { homedir } from "node:os";
 import { processList, processKill } from "./procs.ts";
 import type { KillResult } from "./procs.ts";
+import { portList } from "./ports.ts";
 import { format } from "node:util";
 import { loadConfig, resolveHosts } from "./config.ts";
 import { runWinSessionBroker, runWinSessionTransport } from "./winsession.ts";
@@ -731,7 +732,7 @@ function printRaw(r: ExecResult): void {
 const SUBCOMMANDS = [
   "webcam",
   "ls", "hosts", "dt", "exec", "spawn", "jobs", "cp", "edit", "restart", "reboot", "bios", "boot", "switch", "wait",
-  "gpu", "disk", "ps", "kill", "status", "top", "logs", "svc", "shot", "cu", "browse", "run", "deploy", "tools", "proxy", "doctor", "hostkey", "find", "session", "drop", "completion", "ssh", "help",
+  "gpu", "disk", "ps", "ports", "kill", "status", "top", "logs", "svc", "shot", "cu", "browse", "run", "deploy", "tools", "proxy", "doctor", "hostkey", "find", "session", "drop", "completion", "ssh", "help",
 ];
 /** Emit a bash/zsh completion script with this config's hosts/groups/recipes/
  *  services baked in. Source it: `eval "$(fleet completion zsh)"`. */
@@ -756,7 +757,7 @@ _fleet() {
   case $words[2] in
     run) compadd -- "\${recipes[@]}";;
     ${svcCmds.split(" ").join("|")}) compadd -- "\${sels[@]}" "\${svcs[@]}";;
-    boot|switch|wait|exec|spawn|cp|edit|reboot|bios|top|shot|webcam|cu|ssh|doctor|status|deploy|proxy) compadd -- "\${sels[@]}";;
+    boot|switch|wait|exec|spawn|cp|edit|reboot|bios|top|shot|webcam|cu|ssh|doctor|status|deploy|proxy|ports) compadd -- "\${sels[@]}";;
   esac
 }
 compdef _fleet fleet`;
@@ -779,7 +780,7 @@ _fleet() {
   case "\${COMP_WORDS[1]}" in
     run) _fleet_matches "$cur" "\${recipes[@]}";;
     ${svcCmds.split(" ").join("|")}) _fleet_matches "$cur" "\${sels[@]}" "\${svcs[@]}";;
-    boot|switch|wait|exec|spawn|cp|edit|reboot|bios|top|shot|webcam|cu|ssh|doctor|status|deploy|proxy) _fleet_matches "$cur" "\${sels[@]}";;
+    boot|switch|wait|exec|spawn|cp|edit|reboot|bios|top|shot|webcam|cu|ssh|doctor|status|deploy|proxy|ports) _fleet_matches "$cur" "\${sels[@]}";;
   esac
 }
 complete -F _fleet fleet`;
@@ -796,7 +797,7 @@ const PROXY_LEADING_VALUES: Record<string, readonly string[]> = {
   svc: ["--unit", "--type"],
   ps: ["--sort", "-n"],
   kill: ["--grace"],
-  shot: ["--grid-step", "--out", "--output", "--monitor", "--region"],
+  shot: ["--grid-step", "--out", "-o", "--output", "--monitor", "--region"],
   cu: ["--grid-step", "--grid-minor", "--for", "--probe", "--space", "--button", "--count", "--settle",
     "--out", "--element", "--label", "--role", "--nth", "--region", "--region-at", "--kind"],
   switch: ["--to", "--timeout"],
@@ -1187,21 +1188,28 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       // Unlike exec there is no free-form remote command here, so flags are safe
       // to accept anywhere — `fleet edit host:/path --old X --new Y` reads best.
       const { flags, rest: pos } = parseFlags(rest,
-        ["--json", "--wsl", "--all", "--dry-run", "--sudo"],
-        ["--old", "--new", "--old-file", "--new-file", "--edits"], false, ["--new"]);
+        ["--json", "--wsl", "--all", "--dry-run", "--sudo", "--escapes"],
+        ["--old", "--new", "--old-file", "--new-file", "--edits"], false, ["--new"], ["--old", "--new"]);
       const json = flags["--json"] === true;
       const wsl = flags["--wsl"] === true;
       const all = flags["--all"] === true;
       const dryRun = flags["--dry-run"] === true;
       const sudo = flags["--sudo"] === true;
       // Multi-line text is easiest from a file or stdin: the shell never gets a
-      // chance to keep `\n` literal. Fleet never unescapes --old/--new itself.
+      // chance to keep `\n` literal. --old/--new stay byte-exact (JSON values hold
+      // a literal `\n`) unless --escapes asks for \n, \t and \\ to be interpreted.
+      const unescape = flags["--escapes"] === true
+        ? (s: string) => s.replace(/\\([nt\\])/g, (_, c: string) => c === "n" ? "\n" : c === "t" ? "\t" : "\\")
+        : (s: string) => s;
       const fromFile = async (flag: "--old-file" | "--new-file", inline: "--old" | "--new") => {
         const src = flags[flag] as string | undefined;
-        if (src === undefined) return flags[inline] as string | undefined;
+        if (src === undefined) {
+          const text = flags[inline] as string | undefined;
+          return text === undefined ? undefined : unescape(text);
+        }
         return src === "-" ? await Bun.stdin.text() : await readFile(src, "utf8");
       };
-      const usage = "usage: fleet edit [--all] [--dry-run] [--sudo] [--wsl] [--json] <sel>:<path> --old <str>|--old-file <file|-> [--new <str>|--new-file <file|->]\n"
+      const usage = "usage: fleet edit [--all] [--dry-run] [--sudo] [--wsl] [--json] [--escapes] <sel>:<path> --old <str>|--old-file <file|-> [--new <str>|--new-file <file|->]\n"
         + "       fleet edit [--dry-run] [--sudo] [--wsl] [--json] <sel>:<path> --edits <file|->";
       const [target] = pos;
       if (!target || pos.length !== 1) die(usage);
@@ -1212,6 +1220,7 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       if (flags["--edits"] !== undefined) {
         const clash = ["--old", "--new", "--old-file", "--new-file", "--all"].filter((f) => flags[f] !== undefined);
         if (clash.length) die(`fleet edit: --edits replaces ${clash.join(", ")}; put old, new and all inside each edit`);
+        if (flags["--escapes"]) die("fleet edit: --escapes applies to --old/--new; JSON strings in --edits already decode \\n");
         const src = flags["--edits"] as string;
         edits = parseEditList(src === "-" ? await Bun.stdin.text() : await readFile(src, "utf8"), src === "-" ? "stdin" : src);
       } else {
@@ -1372,6 +1381,26 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       return lists.some((l) => !l.ok) ? 1 : 0;
     }
 
+    case "ports": {
+      const { flags, rest: pos } = parseFlags(rest, ["--json", "--udp"], []);
+      if (pos.length < 1 || pos.length > 2) die("usage: fleet ports <sel> [FILTER] [--udp] [--json]");
+      const [sel, filter] = pos as [string, string | undefined];
+      if (filter !== undefined && !filter.trim()) die("fleet ports: FILTER must be a port number or a process name");
+      const lists = await portList(cfg, await routeSelector(cfg, sel), { filter, udp: flags["--udp"] === true });
+      if (flags["--json"] === true) { console.log(JSON.stringify(lists, null, 2)); return lists.some((l) => !l.ok) ? 1 : 0; }
+      const proto = flags["--udp"] === true ? "udp" : "tcp";
+      for (const l of lists) {
+        if (!l.ok) { console.log(`${A.r("✗")} ${A.b(l.host)} ${A.d(l.error ?? "")}`); continue; }
+        console.log(`${A.b(l.host)} ${A.d(`· ${l.rows.length} ${proto} port${l.rows.length === 1 ? "" : "s"}`)}`);
+        const w = Math.max(4, ...l.rows.map((r) => r.addr.length));
+        for (const r of l.rows) {
+          const pid = r.pid === null ? "—" : String(r.pid);
+          console.log(`  ${A.c(String(r.port).padStart(5))} ${r.addr.padEnd(w)} ${pid.padStart(7)} ${r.name === null ? A.d("— (owner hidden; needs root)") : A.b(r.name)}`);
+        }
+      }
+      return lists.some((l) => !l.ok) ? 1 : 0;
+    }
+
     case "kill": {
       const { flags, rest: pos } = parseFlags(rest,
         ["--tree", "--force", "--all", "--system", "--dry-run", "--sudo", "--yes", "-y", "--json"], ["--grace"]);
@@ -1486,17 +1515,18 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
     }
 
     case "shot": case "screenshot": {
-      const { flags, rest: pos } = parseFlags(rest, ["--no-open", "--grid", "--list", "--json", "--wake"], ["--grid-step", "--out", "--output", "--monitor", "--region"]);
+      const { flags, rest: pos } = parseFlags(rest, ["--no-open", "--grid", "--list", "--json", "--wake"], ["--grid-step", "--out", "-o", "--output", "--monitor", "--region"]);
       const noOpen = flags["--no-open"] === true;
       const grid = flags["--grid"] === true;
       const gridStep = numFlag(flags, "--grid-step", 100);
-      const out = flags["--out"] as string | undefined;
+      if (flags["--out"] !== undefined && flags["-o"] !== undefined) die("-o is another name for --out; pass one");
+      const out = (flags["--out"] ?? flags["-o"]) as string | undefined;
       if (flags["--output"] !== undefined && flags["--monitor"] !== undefined) die("--monitor is another name for --output; pass one");
       const output = (flags["--output"] ?? flags["--monitor"]) as string | undefined;
       const region = flags["--region"] as string | undefined;
       const [sel] = pos;
       if (!sel || pos.length !== 1)
-        die("usage: fleet shot <host> [--output NAME|main|focused|N] [--region top-right|…|X,Y,W,H] [--wake] [--out file.png] [--grid [--grid-step N]] [--no-open]\n       fleet shot <host> --list [--json]");
+        die("usage: fleet shot <host> [--output NAME|main|focused|N] [--region top-right|…|X,Y,W,H] [--wake] [--out|-o file.png] [--grid [--grid-step N]] [--no-open]\n       fleet shot <host> --list [--json]");
       const routed = await routeSelector(cfg, sel);
       if (flags["--list"] === true) {
         const l = await listMonitors(cfg, routed);
@@ -2038,12 +2068,15 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
           if (!Number.isInteger(amount) || amount < 1 || amount > 50) die("scroll amount must be an integer from 1 to 50");
           payload = { direction: rest[2], amount, by };
           summary = `scroll ${rest[2]} ${amount} ${by}`;
-        } else if (verb === "hotkey") {
-          if (rest.length < 4) die("usage: fleet cu <host> hotkey <app> <modifier> <key> [key…]");
-          payload = { keys: rest.slice(2) };
-          summary = `hotkey ${rest.slice(2).join("+")}`;
+        } else if (verb === "hotkey" || (verb === "key" && rest.length === 3 && /\w\+\w/.test(rest[2]!))) {
+          // `alt enter`, `alt+enter` and `ctrl+shift s` all name the same chord.
+          const keys = rest.slice(2).flatMap((k) => (k.length > 1 ? k.split("+") : [k])).map((k) => k.trim()).filter(Boolean);
+          if (keys.length < 2) die("usage: fleet cu <host> hotkey <app> <modifier> <key> [key…]  (or one token: alt+enter)");
+          tool = "hotkey";
+          payload = { keys };
+          summary = `hotkey ${keys.join("+")}`;
         } else if (verb === "key") {
-          if (rest.length !== 3) die("usage: fleet cu <host> key <app> <key>");
+          if (rest.length !== 3) die("usage: fleet cu <host> key <app> <key>  (a chord such as ctrl+s goes through hotkey)");
           tool = "press_key";
           payload = { key: rest[2] };
           summary = `press_key ${rest[2]}`;
@@ -2235,7 +2268,8 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
           ? "\n  run executes a named recipe. To run a local script on a host: fleet exec --script <file> <host>" : ""));
       }
       const steps = cfg.recipes?.[name!];
-      if (!steps) die(`unknown recipe '${name}' (have: ${Object.keys(cfg.recipes ?? {}).join(", ") || "none"})`);
+      if (!steps) die(`unknown recipe '${name}' (have: ${Object.keys(cfg.recipes ?? {}).join(", ") || "none"})`
+        + (await Bun.file(name!).exists() ? `\n  run executes a named recipe. To run this local script on a host: fleet exec --script ${name} <host>` : ""));
       console.log(A.c(`▶ recipe ${name} (${steps!.length} steps)`));
       const run = await runRecipe(cfg, name!, {
         onStepStart: (i, total, step) => console.log(A.d(`\n[${i + 1}/${total}] fleet ${step}`)),
@@ -2298,11 +2332,22 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       }
 
       if (sub === "status") {
-        // `fleet tools status [tool] [sel]` — both optional. A leading arg that
-        // names a registered tool selects that tool; anything else is a selector.
+        // `fleet tools status [tool] [sel]` — both optional. With two words the
+        // first must be a tool. A lone word is a tool if it names one, else a
+        // selector; a word that names both a tool and a host/route/machine is ambiguous.
         const args = options.rest;
+        const toolList = "(tools: " + known.join(", ") + ")";
         if (args.length > 1 && !known.includes(args[0]!))
-          die("unknown tool '" + args[0] + "' in 'fleet tools status <tool> <sel>' (tools: " + known.join(", ") + ")");
+          die("unknown tool '" + args[0] + "' in 'fleet tools status <tool> <sel>' " + toolList);
+        if (args.length === 1) {
+          const word = args[0]!;
+          const selector = word.split(",").map((t) => t.trim()).filter(Boolean).every((t) => t === "all" || t === "*"
+            || t.startsWith("@") || t.startsWith("dt:") || !!cfg.hosts[t] || !!cfg.routes?.[t] || !!cfg.machines?.[t]);
+          if (known.includes(word) && selector)
+            die(`'${word}' names both a tool and a host; use 'fleet tools status ${word} <sel>' for the tool or 'fleet tools status ${word},' for the host`);
+          if (!known.includes(word) && !selector)
+            die(`'${word}' is neither a tool ${toolList} nor a host, group, route or machine`);
+        }
         const tools = args[0] && known.includes(args[0]) ? [args.shift()!] : known;
         // No selector → each tool checks its own configured hosts (see toolsStatus).
         const rows = await toolsStatus(cfg, tools, args[0] ? await routeSelector(cfg, args[0]) : undefined);

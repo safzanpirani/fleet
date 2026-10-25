@@ -67,7 +67,7 @@ export function parseLeadingFlags(
 /** Parse owned options. Use leadingOnly when the remaining tokens are a remote command. */
 export function parseFlags(
   argv: string[], boolFlags: readonly string[], valFlags: readonly string[], leadingOnly = false,
-  allowEmptyValues: readonly string[] = [],
+  allowEmptyValues: readonly string[] = [], verbatimValues: readonly string[] = [],
 ): { flags: Record<string, string | true>; rest: string[] } {
   const flags: Record<string, string | true> = {};
   const rest: string[] = [];
@@ -84,7 +84,8 @@ export function parseFlags(
     if (valFlags.includes(t)) {
       const value = equals > 0 ? token.slice(equals + 1) : argv[++i];
       if (value === undefined || (value === "" && !allowEmptyValues.includes(t)) ||
-          (equals < 0 && (value.startsWith("--") || boolFlags.includes(value) || valFlags.includes(value))))
+          (equals < 0 && !verbatimValues.includes(t) &&
+            (value.startsWith("--") || boolFlags.includes(value) || valFlags.includes(value))))
         throw new Error(`${t} requires a value`);
       flags[t] = value;
       continue;
@@ -251,7 +252,7 @@ export async function runExec(
     const command = Array.isArray(cmd) ? buildArgvCommand(cmd, h.os === "windows" && !opts.wsl) : cmd;
     const sudo = opts.sudo ? await sudoWrap(h, command, !!opts.wsl) : { cmd: command };
     if ("error" in sudo) return sudo.error;
-    return exec(h, sudo.cmd, shell, { cwd: opts.cwd, timeoutMs: opts.timeoutMs, fresh: opts.fresh });
+    return exec(h, sudo.cmd, shell, { cwd: opts.cwd, timeoutMs: opts.timeoutMs, fresh: opts.fresh, wslRoot: sudo.wslRoot });
   })));
 }
 
@@ -267,13 +268,16 @@ function withWslHints(results: ExecResult[]): ExecResult[] {
     : r);
 }
 
-/** Wrap a POSIX command to run as root, or explain per host why it cannot. */
-export async function sudoWrap(h: Host, cmd: string, wsl: boolean): Promise<{ cmd: string } | { error: ExecResult }> {
+/** Wrap a POSIX command to run as root, or explain per host why it cannot.
+ *  WSL on a Windows host needs no wrapping or password: `wsl -u root` runs the
+ *  script as root, so the caller passes `wslRoot` on to exec. */
+export async function sudoWrap(h: Host, cmd: string, wsl: boolean): Promise<{ cmd: string; wslRoot?: boolean } | { error: ExecResult }> {
   const fail = (stderr: string) => ({ error: { host: h.name, ok: false, code: 1, stdout: "", stderr } });
   if (h.os === "windows" && !wsl)
     return fail(`${h.name}: --sudo needs a POSIX shell; an elevated Windows session is already what fleet exec runs as an administrator`);
+  if (h.os === "windows") return { cmd, wslRoot: true };
   if (h.transport === "daytona") return fail(`${h.name}: --sudo is not supported on daytona sandboxes`);
-  try { return { cmd: asRoot(cmd, { password: wsl ? undefined : await sudoPassword(h), host: h.name }) }; }
+  try { return { cmd: asRoot(cmd, { password: await sudoPassword(h), host: h.name }) }; }
   catch (e) { return fail((e as Error).message); }
 }
 
@@ -479,7 +483,7 @@ export function extensionFromShebang(source: string): string {
   const bin = match?.[1]?.toLowerCase();
   if (!bin) return "";
   if (["sh", "bash", "zsh"].includes(bin)) return ".sh";
-  if (["python", "python3"].includes(bin)) return ".py";
+  if (/^python[\d.]*$/.test(bin)) return ".py";
   if (["pwsh", "powershell"].includes(bin)) return ".ps1";
   if (bin === "node") return ".js";
   if (bin === "bun") return ".ts";
@@ -488,7 +492,8 @@ export function extensionFromShebang(source: string): string {
   return "";
 }
 
-/** Read a script from a local path, or from stdin when `path` is "-". */
+/** Read a script from a local path, or from stdin when `path` is "-". An
+ *  extensionless file takes its language from its shebang, like stdin. */
 export async function readScriptSource(path: string): Promise<ScriptSource> {
   if (path === "-") {
     const source = await new Response(Bun.stdin.stream()).text();
@@ -500,7 +505,7 @@ export async function readScriptSource(path: string): Promise<ScriptSource> {
   const source = await file.text();
   const dot = path.lastIndexOf(".");
   const slash = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
-  return { source, ext: dot > slash ? path.slice(dot) : "", label: path };
+  return { source, ext: dot > slash ? path.slice(dot) : extensionFromShebang(source), label: path };
 }
 
 /** Run a local script on every selected host. `interp` overrides the
@@ -520,7 +525,7 @@ export async function runScript(
     const cmd = buildScriptCommand(script.source, interp, os, shell, opts.args);
     const eo = { cwd: opts.cwd, timeoutMs: opts.timeoutMs, fresh: opts.fresh };
     if (!opts.sudo) return exec(h, cmd, shell, eo);
-    return sudoWrap(h, cmd, !!opts.wsl).then((sudo) => "error" in sudo ? sudo.error : exec(h, sudo.cmd, shell, eo));
+    return sudoWrap(h, cmd, !!opts.wsl).then((sudo) => "error" in sudo ? sudo.error : exec(h, sudo.cmd, shell, { ...eo, wslRoot: sudo.wslRoot }));
   })));
 }
 
@@ -1787,6 +1792,8 @@ export async function switchMachine(
     return { ...base, triggered, wentDown, arrived: false, waitedMs: Date.now() - start, landedIn: now.live };
   }
   report("reboot", `${liveHost.name} stopped answering; reboot under way`);
+  const want = m.boots[target]!;
+  report("wait", `waiting for ${target} on ${want.lan ? `${want.lan} (LAN) or ${want.host} (Tailscale)` : want.host}`);
 
   let lastDetail = "", lastAt = 0;
   const w = await waitFor(cfg, machine, {
@@ -1809,10 +1816,14 @@ export async function switchMachine(
     }
     return probeHost(h, cap);
   } });
-  const landedIn = w.ok ? target : (await bootState(cfg, machine, { probe: (h) => probeHost(h) })).live;
-  report("done", w.ok ? `${machine} is in ${target}` : landedIn
-    ? `${machine} came back in ${landedIn}, not ${target}` : `${machine} answers in no boot yet`);
-  return { ...base, triggered, wentDown, arrived: w.ok, waitedMs: Date.now() - start, landedIn };
+  // The last poll can miss a boot that answers right at the deadline; the
+  // machine is where it was sent, so that is an arrival, not a failure.
+  const after = w.ok ? null : await bootState(cfg, machine, { probe: (h) => probeHost(h) });
+  const arrived = w.ok || after?.live === target;
+  const landedIn = arrived ? target : after!.live;
+  report("done", arrived ? `${machine} is in ${target}${w.ok ? "" : ` via ${after!.transport} (${after!.liveHost}), answering as the wait ended`}`
+    : landedIn ? `${machine} came back in ${landedIn}, not ${target}` : `${machine} answers in no boot yet`);
+  return { ...base, triggered, wentDown, arrived, waitedMs: Date.now() - start, landedIn };
 }
 
 export interface FirmwareReport {
@@ -2009,6 +2020,9 @@ export interface WaitCond {
   timeoutMs?: number; intervalMs?: number; onTick?: (detail: string, ms: number) => void;
 }
 
+/** Per-attempt cap for the ssh probes inside `waitFor`; matches waitHostState's attempts. */
+export const WAIT_PROBE_ATTEMPT_MS = 4000;
+
 async function probeOnce(
   cfg: FleetConfig,
   target: string,
@@ -2019,7 +2033,10 @@ async function probeOnce(
 ): Promise<{ ok: boolean; detail: string }> {
   const deadlineAt = Date.now() + remainingMs;
   const timeLeft = () => Math.max(1, deadlineAt - Date.now());
-  const boundedProbe = (host: Host) => probeHost(host, timeLeft());
+  // One attempt gets the usual probe cap, not the whole wait: a host that drops SYNs while it reboots
+  // would otherwise hold the first attempt (ssh ConnectTimeout = the remaining wait) until the deadline,
+  // and a boot that came up meanwhile was reported as a timeout.
+  const boundedProbe = (host: Host) => probeHost(host, Math.min(WAIT_PROBE_ATTEMPT_MS, timeLeft()));
   if (c.boot) {
     const st = await bootState(cfg, target, { probe: boundedProbe });
     return { ok: st.live === c.boot, detail: `live=${st.live ?? "off"}` };
@@ -2363,6 +2380,8 @@ Image.alpha_composite(im.convert("RGBA"), ov).convert("RGB").save(path)
 export interface CaptureTarget {
   rect?: Rect; scale?: number; output?: string; wholeOutput?: boolean;
   winOutput?: string; winRegion?: [number, number, number, number];
+  /** Windows: switch sleeping monitors on before the capture (they stay on). */
+  winWake?: boolean;
   macDisplay?: number;
   /** Wayland outputs that are powered off: turned on for the capture, then off again. */
   wake?: { source: MonitorSource; outputs: string[] };
@@ -2385,7 +2404,7 @@ export function captureCmd(os: Host["os"], target: CaptureTarget = {}): { cmd: s
     `$ErrorActionPreference='Stop'`,
     `$out=[IO.Path]::ChangeExtension($MyInvocation.MyCommand.Path,'png')`,
     `$code=0; $bmp=$null; $g=$null`,
-    `$fleetOutput='${psEsc(target.winOutput ?? "")}'; $fleetRegion='${target.winRegion ? target.winRegion.join(",") : ""}'`,
+    `$fleetOutput='${psEsc(target.winOutput ?? "")}'; $fleetRegion='${target.winRegion ? target.winRegion.join(",") : ""}'; $fleetWake=$${target.winWake ? "true" : "false"}`,
     `try {`,
     // Windows PowerShell is not DPI aware, so under display scaling Windows
     // reports a shrunken screen and CopyFromScreen copies only its top-left
@@ -2399,6 +2418,23 @@ export function captureCmd(os: Host["os"], target: CaptureTarget = {}): { cmd: s
     `    try { $aware=$dpi::SetProcessDpiAwarenessContext([IntPtr](-4)) } catch {}`,
     `    if (-not $aware) { [void]$dpi::SetProcessDPIAware() }`,
     `  } catch {}`,
+    // --wake: Windows captures fine with the monitors asleep, so this is for the
+    // person in front of them. Broadcast monitor power-on, nudge the mouse one
+    // pixel and back (real input resets the idle timer), and ask for the display.
+    `  if ($fleetWake) {`,
+    `    try {`,
+    `      $wb=[Reflection.Emit.AssemblyBuilder]::DefineDynamicAssembly((New-Object Reflection.AssemblyName 'FleetWake'),'Run').DefineDynamicModule('FleetWake').DefineType('FleetWake','Public,Class')`,
+    `      $def={ param($dll,$name,$ret,$types) [void]$wb.DefinePInvokeMethod($name,$dll,'Public,Static,PinvokeImpl',[Reflection.CallingConventions]::Standard,$ret,$types,[Runtime.InteropServices.CallingConvention]::Winapi,[Runtime.InteropServices.CharSet]::Auto) }`,
+    `      & $def 'user32.dll' 'SendMessageTimeoutW' ([IntPtr]) ([Type[]]@([IntPtr],[uint32],[IntPtr],[IntPtr],[uint32],[uint32],[IntPtr]))`,
+    `      & $def 'user32.dll' 'mouse_event' ([void]) ([Type[]]@([uint32],[int],[int],[uint32],[IntPtr]))`,
+    `      & $def 'kernel32.dll' 'SetThreadExecutionState' ([uint32]) ([Type[]]@([uint32]))`,
+    `      $wk=$wb.CreateType()`,
+    `      [void]$wk::SendMessageTimeoutW([IntPtr]0xffff,0x0112,[IntPtr]0xF170,[IntPtr](-1),2,2000,[IntPtr]::Zero)`,
+    `      $wk::mouse_event(1,1,0,0,[IntPtr]::Zero); Start-Sleep -Milliseconds 80; $wk::mouse_event(1,-1,0,0,[IntPtr]::Zero)`,
+    `      [void]$wk::SetThreadExecutionState(2)`,
+    `      Start-Sleep -Milliseconds 1500`,
+    `    } catch {}`,
+    `  }`,
     `  Add-Type -AssemblyName System.Windows.Forms,System.Drawing`,
     `  $vs=[System.Windows.Forms.SystemInformation]::VirtualScreen`,
     `  $r=New-Object System.Drawing.Rectangle($vs.X,$vs.Y,$vs.Width,$vs.Height)`,
@@ -2538,12 +2574,13 @@ export async function captureTarget(
   cfg: FleetConfig, host: Host, opts: { output?: string; region?: string; wake?: boolean }, deps: { exec?: typeof exec } = {},
 ): Promise<CaptureTarget> {
   if (host.os === "linux" && !host.android) return linuxCaptureTarget(cfg, host, opts, deps);
-  if (!opts.output && !opts.region) return {};
+  const winWake = host.os === "windows" && opts.wake ? { winWake: true } : {};
+  if (!opts.output && !opts.region) return winWake;
   const fractions = opts.region ? parseRegion(opts.region) : undefined;
   if (host.os === "windows") {
     const out = opts.output ?? "main";
     if (!/^[A-Za-z0-9._\\-]+$/.test(out)) throw new Error(`--output must be main, a number, or a device name like DISPLAY2 (got '${out}')`);
-    return { winOutput: out, winRegion: fractions };
+    return { winOutput: out, winRegion: fractions, ...winWake };
   }
   const { monitors } = await listMonitors(cfg, host.name, deps);
   const m = pickMonitor(monitors, opts.output ?? "main");

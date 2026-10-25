@@ -1,7 +1,7 @@
 import { test, expect, describe } from "bun:test";
 import {
   deployHosts, deployScript, logsCmd, parseLeadingFlags, parseRecipeStep, resolveDeploySourceRoot,
-  restartCmd, routeSelector, statusCmd, waitFor, writeRemoteFile, pickPreferred, splitArgs, psInterpConflict,
+  restartCmd, routeSelector, statusCmd, waitFor, writeRemoteFile, pickPreferred, splitArgs, psInterpConflict, nestedShellNote, WAIT_PROBE_ATTEMPT_MS, sudoWrap,
 } from "../src/core.ts";
 import type { FleetConfig, Host } from "../src/config.ts";
 import { lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
@@ -249,6 +249,20 @@ describe("hard deadlines and deploy source", () => {
     await expect(waitFor(cfg, "typo", { timeoutMs: 100 })).rejects.toThrow("unknown host");
   });
 
+  test("a boot wait caps each probe attempt, so one stalled attempt cannot use up the whole wait", async () => {
+    const cfg: FleetConfig = {
+      hosts: { box: { name: "box", ssh: "unused", os: "windows" }, boxts: { name: "boxts", ssh: "unused", os: "windows" } },
+      machines: { box: { boots: { windows: { host: "boxts", lan: "box" } } } },
+    };
+    const caps: (number | undefined)[] = [];
+    let rounds = 0;
+    const result = await waitFor(cfg, "box", { boot: "windows", timeoutMs: 300_000, intervalMs: 1 }, {
+      probe: async (_h, cap) => { caps.push(cap); return ++rounds > 2; },
+    });
+    expect(result.ok).toBe(true);
+    expect(caps.every((c) => c !== undefined && c <= WAIT_PROBE_ATTEMPT_MS)).toBe(true);
+  });
+
   test("--sudo ships the whole write through sudo and refuses Windows shells", async () => {
     let sent = "";
     await writeRemoteFile({ name: "box", ssh: "box", os: "linux" }, "/etc/x", "new", null, "auto", {
@@ -260,6 +274,18 @@ describe("hard deadlines and deploy source", () => {
     expect(sent).toContain("fleet_root_script | sudo -n bash");
     await expect(writeRemoteFile({ name: "win", ssh: "win", os: "windows" }, "C:/x", "new", null, "auto", { sudo: true }))
       .rejects.toThrow("--sudo needs a POSIX shell");
+  });
+
+  test("--wsl --sudo on Windows runs as WSL root without a password lookup", async () => {
+    // A missing passwordFile would throw if sudoPassword were consulted.
+    const h: Host = { name: "winbox", ssh: "winbox", os: "windows", sudo: { passwordFile: "/nonexistent/fleet-sudo-pw" } };
+    expect(await sudoWrap(h, "id -u", true)).toEqual({ cmd: "id -u", wslRoot: true });
+    expect(await sudoWrap({ name: "winbox", ssh: "winbox", os: "windows" }, "id -u", true)).toEqual({ cmd: "id -u", wslRoot: true });
+  });
+
+  test("--sudo without --wsl on Windows is still refused", async () => {
+    const r = await sudoWrap({ name: "winbox", ssh: "winbox", os: "windows" }, "id -u", false);
+    expect("error" in r && r.error.stderr).toContain("--sudo needs a POSIX shell");
   });
 
   test("remote writes refuse to replace POSIX symlinks", async () => {
@@ -413,6 +439,15 @@ test("a PowerShell --interp refuses only flags that replace the script file", ()
     expect(psInterpConflict(interp), interp).toBeDefined();
   for (const interp of ["pwsh", "powershell -ExecutionPolicy Bypass", "pwsh -NoLogo -NoProfile", "python3 -c", "bash -e"])
     expect(psInterpConflict(interp), interp).toBeUndefined();
+});
+
+test("a powershell -Command wrapper on Windows gets the double-parse note", () => {
+  const win = [routeHost("w")];
+  const multiline = `powershell -NoProfile -Command "\n  Get-Process | % { \\"$($_.Name)\\" }\n"`;
+  expect(nestedShellNote(multiline, win)).toContain("parses the command a second time");
+  expect(nestedShellNote(`wsl bash -c "echo $HOME"`, win)).toContain("--wsl");
+  expect(nestedShellNote("Get-Process | % { $_.Name }", win)).toBeUndefined();
+  expect(nestedShellNote(multiline, [{ name: "l", ssh: "l", os: "linux" }])).toBeUndefined();
 });
 
 test("configured service aliases retain per-host mapping and skip rules", async () => {

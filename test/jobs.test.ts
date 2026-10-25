@@ -120,6 +120,19 @@ describe("Windows spawn", () => {
     expect(r).toMatchObject({ ok: true, pid: 42 });
     expect(scripts[0]).toContain(`$action = ${ssh.psHiddenTaskAction("$psexe", "$arg")}`);
   });
+
+  test("the runner gives Python tools a UTF-8 console unless the job chose an encoding", async () => {
+    const scripts: string[] = [];
+    await spawnJob(cfg, "winbox", "hf download x", {}, {
+      newId: () => "job-2",
+      exec: async (h, script) => { scripts.push(script); return { host: h.name, ok: true, code: 0, stdout: "OK job-2 42\n", stderr: "" }; },
+    });
+    const runnerB64 = scripts[0]!.match(/run\.ps1", \[Text\.Encoding\]::UTF8\.GetString\(\[Convert\]::FromBase64String\('([^']+)'\)/)?.[1];
+    const runner = Buffer.from(runnerB64!, "base64").toString("utf8");
+    expect(runner).toContain("if (-not $env:PYTHONUTF8) { $env:PYTHONUTF8 = '1' }");
+    expect(runner).toContain("if (-not $env:PYTHONIOENCODING) { $env:PYTHONIOENCODING = 'utf-8' }");
+    expect(runner.indexOf("PYTHONUTF8")).toBeLessThan(runner.indexOf("cmd.ps1"));
+  });
 });
 
 async function runBash(script: string, home: string): Promise<{ code: number; stdout: string; stderr: string }> {
@@ -693,6 +706,25 @@ describe("detached job lifecycle", () => {
       expect(readFileSync(join(badDir, "exit"), "utf8").trim()).toBe("127");
       expect(readFileSync(join(badDir, "out"), "utf8")).toContain("cwd not found: " + join(home, "nope"));
     } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test("a live runner with busy children is not reported dead", async () => {
+    const home = mkdtempSync(join(tmpdir(), "fleet-job-live-"));
+    const id = "live-runner";
+    const dir = join(home, ".fleet", "jobs", id);
+    let proc: Bun.Subprocess | undefined;
+    try {
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "run"), "sleep 30 & sleep 30 & wait\n");
+      proc = Bun.spawn(["bash", join(dir, "run")], { stdout: "ignore", stderr: "ignore" });
+      writeFileSync(join(dir, "pid"), `${proc.pid}\n`);
+      const result = await runBash(waitPoll(host("linux", "linux"), id), home);
+      expect(result.code, result.stderr).toBe(0);
+      expect(result.stdout).not.toMatch(/DEAD|EXIT:|MISSING/);
+    } finally {
+      proc?.kill("SIGKILL");
       rmSync(home, { recursive: true, force: true });
     }
   });

@@ -97,6 +97,9 @@ export interface ExecResult {
   code: number;
   stdout: string;
   stderr: string;
+  /** Set when fleet stopped waiting at the deadline; stdout/stderr hold what
+   *  arrived before it. */
+  timedOut?: true;
 }
 
 export interface ExecOptions {
@@ -105,6 +108,8 @@ export interface ExecOptions {
   /** A new connection that neither reuses nor leaves a shared master, and no
    *  kept-open Windows session: a login that picks up fresh group membership. */
   fresh?: boolean;
+  /** With shell "wsl": run the script as root via `wsl -u root`, which needs no password. */
+  wslRoot?: boolean;
 }
 
 // ── completion marker ────────────────────────────────────────────────────────
@@ -323,7 +328,7 @@ export async function resolveWinBin(host: Host, timeoutMs = 0): Promise<WinBin> 
   return detected ?? "powershell";
 }
 
-export function buildArgs(host: Host, command: string, shell: Shell, winBin: WinBin = "powershell", cwd?: string, fresh = false): {
+export function buildArgs(host: Host, command: string, shell: Shell, winBin: WinBin = "powershell", cwd?: string, fresh = false, wslRoot = false): {
   args: string[];
   stdin?: Uint8Array;
 } {
@@ -337,7 +342,7 @@ export function buildArgs(host: Host, command: string, shell: Shell, winBin: Win
       const script = cwd ? withCwdBash(command, cwd) : command;
       // distro is quoted for PowerShell so a name with spaces/quotes can't
       // break out of the (otherwise fixed) wrapper line
-      const inner = `& wsl -d '${psEsc(distro)}' -- bash -s`;
+      const inner = `& wsl -d '${psEsc(distro)}'${wslRoot ? " -u root" : ""} -- bash -s`;
       return { args: [...ssh, winBin, "-NoProfile", "-NonInteractive",
         "-EncodedCommand", b64utf16le(inner)],
         stdin: new TextEncoder().encode(script + "\n") };
@@ -408,7 +413,7 @@ export async function exec(
     ? await resolveWinBin(host, timeoutMs) : "powershell";
   const remainingMs = timeoutMs > 0 ? timeoutMs - (Date.now() - startedAt) : 0;
   if (timeoutMs > 0 && remainingMs <= 0)
-    return { host: host.name, ok: false, code: 124, stdout: "",
+    return { host: host.name, ok: false, code: 124, stdout: "", timedOut: true,
       stderr: `fleet: command timed out after ${Math.round(timeoutMs / 1000)}s` };
   const marker = doneMarker();
   const reportShell: Shell = resolved === "powershell" ? "powershell" : "bash";
@@ -419,12 +424,12 @@ export async function exec(
     const s = await trySessionExec(host, located, remainingMs);
     if (s) {
       const err = stripClixml(s.stderr.trimEnd());
-      if (s.timedOut) return { host: host.name, ok: false, code: 124, stdout: s.stdout,
+      if (s.timedOut) return { host: host.name, ok: false, code: 124, stdout: s.stdout, timedOut: true,
         stderr: (err + `\nfleet: command timed out after ${Math.round(timeoutMs / 1000)}s`).trim() };
       return { host: host.name, ok: s.code === 0, code: s.code, stdout: s.stdout, stderr: err.trim() };
     }
   }
-  const { args, stdin } = buildArgs(host, withDoneMarker(located, reportShell, marker), resolved, winBin, undefined, opts.fresh);
+  const { args, stdin } = buildArgs(host, withDoneMarker(located, reportShell, marker), resolved, winBin, undefined, opts.fresh, opts.wslRoot);
 
   const proc = Bun.spawn(args, {
     stdin: stdin ?? "ignore",
@@ -477,7 +482,7 @@ export async function exec(
   // and runs unmultiplexed. That is ssh's bookkeeping, not the command's stderr.
   const stderr = done.stderr.replace(/^ControlSocket .* already exists, disabling multiplexing\r?\n?/gm, "");
   const err = host.os === "windows" ? stripClixml(stderr.trimEnd()) : stderr.trimEnd();
-  if (timedOut) return { host: host.name, ok: false, code: 124,
+  if (timedOut) return { host: host.name, ok: false, code: 124, timedOut: true,
     stdout,
     stderr: (err + `\nfleet: command timed out after ${Math.round(timeoutMs / 1000)}s`).trim() };
   // The marker's status wins when it has one: it survives a session fleet had
@@ -518,16 +523,14 @@ export async function probeDetail(host: Host, capMs?: number): Promise<ProbeResu
   const connectTimeout = Math.max(1, Math.ceil(cap / 1000));
   const proc = Bun.spawn(["ssh", ...connOpts(host), "-o", "BatchMode=yes", "-o", `ConnectTimeout=${connectTimeout}`,
     host.ssh, "echo ok"], { stdin: "ignore", stdout: "pipe", stderr: "ignore", env: sshEnv() });
-  const ran = (async () => {
-    const [out, code] = await Promise.all([
-      new Response(proc.stdout).text(),
-      proc.exited,
-    ]);
-    return code === 0 && out.trim() === "ok";
-  })();
+  // A killed mux client's stdout stays open in its ControlMaster until the
+  // remote command ends, so the cap cancels the read too: an abandoned read
+  // kept fleet alive for minutes behind a stalled master.
+  const out = drain(proc.stdout);
+  const ran = Promise.all([out.done, proc.exited]).then(([, code]) => code === 0 && out.text().trim() === "ok");
   let timer: ReturnType<typeof setTimeout> | undefined;
   const capped = new Promise<boolean>((resolve) => {
-    timer = setTimeout(() => { proc.kill(); resolve(false); }, Math.max(0, cap));
+    timer = setTimeout(() => { proc.kill(); out.cancel(); resolve(false); }, Math.max(0, cap));
   });
   try {
     const up = await Promise.race([ran, capped]);
@@ -675,9 +678,14 @@ async function runRsync(host: Host, argv: string[], recursive: boolean, progress
 }
 
 /** Win32 OpenSSH/SFTP accepts forward-slash remote paths. Native backslashes
- * are consumed or misinterpreted before the server opens the file. */
+ * are consumed or misinterpreted before the server opens the file. A drive path
+ * gets the leading `/` of the SFTP form (`/C:/a/b`, what the server's realpath
+ * reports): scp treats a path without one as relative and prefixes the remote
+ * home directory. */
 export function scpRemotePath(host: Host, remote: string): string {
-  return host.os === "windows" ? remote.replaceAll("\\", "/") : remote;
+  if (host.os !== "windows") return remote;
+  const path = remote.replaceAll("\\", "/");
+  return /^[A-Za-z]:(\/|$)/.test(path) ? `/${path}` : path;
 }
 
 /** Join N per-source results into one. Used for the daytona fallback, which has
@@ -691,8 +699,8 @@ function mergeScpResults(host: Host, rs: ExecResult[]): ExecResult {
   };
 }
 
-/** scp local file(s)/dir(s) to host:remote. Remote path passed through verbatim
- *  (forward slashes work on Windows OpenSSH; `C:\…` absolute paths work too).
+/** scp local file(s)/dir(s) to host:remote. A Windows remote path goes through
+ *  `scpRemotePath` (`C:\…` and `C:/…` both become `/C:/…`).
  *  `recursive` (scp -r) copies a directory tree. With more than one source,
  *  `remote` must be an existing directory — scp itself enforces that. */
 export async function scp(
@@ -713,7 +721,7 @@ export async function scp(
 }
 
 /** scp host:remote → local (pull). Mirror of `scp`, for retrieving file(s)/dir(s)
- *  the remote produced (e.g. a screenshot). Remote path passed through verbatim.
+ *  the remote produced (e.g. a screenshot). Remote paths as in `scp`.
  *  With more than one source, `local` must be an existing directory. */
 export async function scpPull(
   host: Host, remote: string | string[], local: string, recursive = false, opts: TransferOptions = {},

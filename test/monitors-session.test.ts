@@ -73,6 +73,15 @@ describe("monitor layouts", () => {
     expect(aware).toBeLessThan(cmd.indexOf("SystemInformation]::VirtualScreen"));
     expect(cmd).not.toContain("-MemberDefinition");
   });
+
+  test("a Windows --wake turns the monitors on inside the user's session, before the capture", () => {
+    const cmd = captureCmd("windows", { winWake: true }).cmd;
+    expect(cmd).toContain("$fleetWake=$true");
+    const wake = cmd.indexOf("SendMessageTimeoutW([IntPtr]0xffff,0x0112,[IntPtr]0xF170,[IntPtr](-1)");
+    expect(wake).toBeGreaterThan(cmd.indexOf("$script = @'"));
+    expect(wake).toBeLessThan(cmd.indexOf("CopyFromScreen"));
+    expect(captureCmd("windows").cmd).toContain("$fleetWake=$false");
+  });
 });
 
 describe("session state", () => {

@@ -197,7 +197,7 @@ export async function dtExec(
     })(), timeoutMs);
   } catch (err) {
     if ((err instanceof DaytonaHttpError && err.status === 408) || err instanceof DaytonaTimeoutError)
-      return { host: host.name, ok: false, code: 124, stdout: "",
+      return { host: host.name, ok: false, code: 124, stdout: "", timedOut: true,
         stderr: `fleet: command timed out after ${timeoutS}s (daytona deadline)` };
     return { host: host.name, ok: false, code: 1, stdout: "",
       stderr: err instanceof Error ? err.message : String(err) };

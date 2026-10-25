@@ -261,6 +261,29 @@ describe("switchMachine", () => {
     expect(r.landedIn).toBe("windows");
   });
 
+  test("a target that answers only after the last poll counts as arrived, not 'came back in X, not X'", async () => {
+    let triggered = false, targetProbes = 0;
+    const exec = async (_h: Host, cmd: string): Promise<ExecResult> => {
+      if (cmd === "bcdedit /enum firmware") return ok(BCD);
+      if (cmd.includes("Get-Partition")) return ok("ESP\t0e5f0001\t\\Device\\HarddiskVolume3\n");
+      triggered = true;
+      return ok("fleet: one-time boot set");
+    };
+    // The source drops at once; the target misses waitFor's only poll and
+    // answers the follow-up probe.
+    const probe = async (h: Host) => h.name === "win" ? !triggered : triggered && ++targetProbes > 1;
+    const details: string[] = [];
+    const r = await switchMachine(cfg, "box", "linux", {
+      intervalMs: 10_000, timeoutMs: 100, deps: { exec, probe },
+      onProgress: (p) => details.push(p.detail),
+    });
+    expect(r.arrived).toBe(true);
+    expect(r.landedIn).toBe("linux");
+    expect(details).toContain("waiting for linux on lin");
+    expect(details.at(-1)).toMatch(/^box is in linux via ts \(lin\), answering as the wait ended$/);
+    expect(details.join("\n")).not.toMatch(/not linux/);
+  });
+
   test("a missing firmware label refuses before any reboot", async () => {
     const c = structuredClone(cfg);
     c.machines!.box!.boots.linux!.firmware = "Nope";

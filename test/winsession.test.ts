@@ -109,11 +109,22 @@ test("a lost reply after the broker accepted a request cannot trigger one-shot r
 
 test("the pipeline probe is stripped exactly, and its absence is reported", () => {
   const end = "__FLEET_END_abc__";
-  expect(sessionLoopScript()).toContain("'__FLEET_PIPE__' + $__fsEnd");
   expect(takePipeProbe(`a\r\nb\r\n__FLEET_PIPE__${end}\r\n`, end)).toEqual({ stdout: "a\r\nb\r\n", probed: true });
   expect(takePipeProbe(`__FLEET_PIPE__${end}\r\n`, end)).toEqual({ stdout: "", probed: true });
   // Output that only reached stdout through [Console] or a native child, with
   // the pipeline broken: no probe, so the call must not pass as a success.
   expect(takePipeProbe("x\r\n", end).probed).toBe(false);
   expect(takePipeProbe(`echo __FLEET_PIPE__${end}\r\n`, end).probed).toBe(false);
+});
+
+test("output without a final newline keeps its bytes and still finds the probe", () => {
+  const end = "__FLEET_END_abc__";
+  // The loop writes "\n" and flags the probe with N when the program's output
+  // did not end in a newline (curl.exe printing a body).
+  expect(sessionLoopScript()).toContain("'__FLEET_PIPE__' + $__fsNl + $__fsEnd");
+  expect(sessionLoopScript()).toContain("$__fsNl = ''");
+  expect(takePipeProbe(`{"ok":true}\n__FLEET_PIPE__N${end}\r\n`, end)).toEqual({ stdout: `{"ok":true}`, probed: true });
+  expect(takePipeProbe(`line\r\nbody\n__FLEET_PIPE__N${end}\r\n`, end)).toEqual({ stdout: "line\r\nbody", probed: true });
+  // An unflagged probe glued to a line is still not a probe.
+  expect(takePipeProbe(`body__FLEET_PIPE__${end}\r\n`, end).probed).toBe(false);
 });
