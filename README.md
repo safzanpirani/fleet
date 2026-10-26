@@ -235,7 +235,11 @@ guarantee that independently detached remote processes are terminated.
 Each call captures output through unique inheritable temporary file handles and
 snapshots those files before reporting completion. A detached child's later output
 is discarded, rather than mixed into the next call. Use `fleet spawn` for durable
-background output. `FLEET_WIN_SESSION=0` disables the broker.
+background output. `FLEET_WIN_SESSION=0` disables the broker. A host that refuses
+`exec` (config or policy file) gets no broker: fleet's own reads there (`status`,
+`ps`, `disk`, …) take the one-shot path, the hidden `__win-session` and
+`__win-session-transport` entry points refuse it before ssh starts, and a running
+broker re-reads the policy file and refuses every request once it refuses exec.
 
 `fleet edit` treats replacement text literally, including `$&`. Omitting `--new`
 or passing `--new ""` deletes the match. A present `--new` without a value fails.
@@ -330,9 +334,16 @@ fleet cu @windows install       # a whole group, in parallel
 fleet cu all install            # the entire fleet
 ```
 
-Each selected host runs its OS's official current-release installer (`install.ps1`
-on Windows, `install.sh` elsewhere). Re-run `install` to update. Windows registers
-the autostart task and starts it with `autostart kick`; UAC elevation is required
+Each host runs its OS's official installer (`install.ps1` on Windows, `install.sh`
+elsewhere), pinned. Fleet downloads upstream's five installer scripts from one fixed
+trycua/cua commit into a temporary directory on the host, checks one sha256 over
+them, and refuses without running anything when it differs. The entry script then
+runs from that directory, so it loads its helpers from disk instead of fetching them
+unpinned, and installs the pinned cua-driver release (`CUA_DRIVER_RS_VERSION`); the
+installer itself checks the release archive against the release's `SHA256SUMS`. The
+first output line names the commit, digest and driver version. Re-run `install` to
+reinstall; a newer driver comes with a newer pin (`CUA_INSTALLER` in `src/core.ts`).
+Windows registers the autostart task and starts it with `autostart kick`; UAC elevation is required
 once for RunLevel=Highest. Linux creates and enables a missing systemd user unit,
 then rewrites a `fleet-session.conf` drop-in and a start script on every install.
 The start script finds the live Wayland socket and Hyprland instance at each
@@ -346,11 +357,22 @@ a monitor is powered off is refused at once instead of waiting for a frame that
 never comes; `fleet shot --wake` switches such monitors on for the capture.
 
 Fleet reports a result for each host and returns a non-zero exit if a download,
-installation, or daemon restart fails.
+the digest check, installation, or daemon restart fails.
 
 Cua-driver 0.24 supports `include_accessibility_tree:false` for screenshot-only
 window previews and `max_dimension` for thumbnails. Inspect the installed schema
 with `fleet cu <host> describe get_window_state`, then pass these options as JSON.
+
+To install from another ref for one call, pass both `--ref` and `--sha256`. The
+digest covers the scripts concatenated in this order:
+
+```sh
+ref=<tag-or-commit>
+for f in install.sh _install-rust.sh _install-common.sh install.ps1 _install-common.psm1; do
+  curl -fsSL "https://raw.githubusercontent.com/trycua/cua/$ref/libs/cua-driver/scripts/$f"
+done | shasum -a 256
+fleet cu @windows install --ref "$ref" --sha256 <digest>
+```
 
 ### Driving a desktop
 
@@ -903,6 +925,7 @@ host, and `hosts.<h>.enable` re-allows a feature the top level refuses:
 | `webcam` | `webcam` (never `webcam local`) |
 | `cu` | `cu` on desktops and Android, perception, recording |
 | `shot` | `shot`, the MCP `screenshot` tool |
+| `ai` | `cu … task`, `cu … elements --task` (both send window content to an AI service) |
 | `browse` | `browse` |
 | `exec` | `exec`, `exec --script`, `spawn`, `watch`, `ssh`, the MCP `exec` tool |
 | `files` | `cp`/`push`/`pull`, `edit`, `diff` (the remote sides) |
@@ -920,11 +943,70 @@ validation, and so does a route whose transports allow different features.
 Read-only commands such as `status`, `ps`, `disk`, `which` and `tools status`
 are never gated.
 
+`ai` follows `shot`: a host that refuses `shot` refuses `ai` too, unless its
+own `enable` lists `ai`. `fleet config` and `fleet ls` show such a refusal with
+the source `host disable shot` or `top-level disable shot`. With `ai` refused,
+`cu … task` refuses before it reads the window, and `elements --task` sends
+nothing and lists every row with a note saying focus was skipped.
+
 This is a policy on fleet's own commands, not a sandbox. Anyone holding the
 host's ssh login can still run cua-driver or ffmpeg directly, and so can
 `fleet exec`. To stop an agent from doing something through fleet, disable
 `exec` (and `files`) as well.
-Blocking all computer use means disabling `cu` and `shot`.
+Blocking all computer use means disabling `cu`, `shot` and `ai`.
+
+### Policy file
+
+`fleet.config.json` belongs to the user, so an agent with that user's shell can
+edit its gates away. A policy file at a fixed path adds refusals the config
+cannot lift: `/etc/fleet/policy.json` on macOS and Linux,
+`C:\ProgramData\fleet\policy.json` on Windows. No environment variable or flag
+moves or disables it.
+
+```json
+{
+  "disable": ["power"],
+  "hosts": { "office-win": { "disable": ["exec", "files", "cu", "shot"] } }
+}
+```
+
+It can only refuse. A policy refusal beats `hosts.<h>.enable` and anything else
+in the config, and a policy that refuses `shot` on a host refuses `ai` there too.
+Unknown keys and feature names are errors. A host name the config does not
+define is allowed (the policy may outlive a config edit); `fleet config` lists
+it as a warning. No file means no policy. A file that exists but cannot be read
+or parsed fails closed: every gated feature is refused on every host, and the
+refusal names the file and the error. Ungated commands such as `fleet config`
+and `fleet ls` keep working, so you can see what is wrong.
+
+A key under `hosts` matches a config host by its name, its `ssh` destination
+(as written, or without the `user@` part) or its `hostKeyAlias`. Key entries by
+`hostKeyAlias` or ssh destination rather than by name: a name entry is bypassed
+by adding a second config host under a new name that points at the same box,
+while the destination and the pinned host key survive a rename. In the example
+above `office-win` is the host's `hostKeyAlias`. One gap remains: an alias in
+`~/.ssh/config`, which the user controls, can point a new destination at the
+same box. Only the top-level `disable` is a hard guarantee for every host.
+For `dt:` Daytona hosts, entries match the selector as typed (`dt:<name>`,
+`dt:<id>` or a prefix are different keys) because the sandbox is resolved only
+after the gate; refuse a feature for Daytona hosts with the top-level `disable`.
+
+Refusals from the policy name the policy file, and `fleet config` and
+`fleet ls --json` give them the source `policy`. `fleet config` also prints
+`policy: <path> (protected)` when the file and its directory are owned by root
+and not writable by group or others, and `(NOT protected: <reason>)` otherwise.
+The file is honoured either way. On Windows it reports the path only.
+
+Install it as root:
+
+```sh
+sudo mkdir -p /etc/fleet
+sudo install -m 644 -o root -g wheel policy.json /etc/fleet/policy.json   # macOS
+sudo install -m 644 -o root -g root policy.json /etc/fleet/policy.json    # Linux
+```
+
+The policy stops fleet. It does not stop an agent that already holds the
+host's ssh login, or root on the controller.
 
 ### Proxies
 
@@ -998,6 +1080,39 @@ Daytona (`dt:`) hosts speak HTTP, not ssh; a proxy configured for one is ignored
 Override the config path with `FLEET_CONFIG=/path/to.json`. Keep a personal,
 git-ignored `fleet.config.local.json` if you don't want hosts in git.
 
+### File permissions
+
+The config decides what fleet runs on every host, so fleet treats it like code,
+the way ssh treats `~/.ssh/config`. On a macOS or Linux controller, every
+command that loads the config refuses it when another user could have changed it:
+
+- the file is group- or other-writable;
+- the file is owned by someone other than you or root;
+- its directory, or the directory holding any symlink on the way to it, is writable
+  by every user and lacks the sticky bit.
+
+A symlinked config is checked at its target. Fleet checks the file it opened and
+parses what it read from that same open file, so a config swapped in after the
+check is never loaded. The error names the reason and the fix:
+
+```text
+✗ refusing to load fleet config /home/me/fleet/fleet.config.json: it is group- or other-writable (mode 664). The config decides what fleet runs on every host, so another user who can change it can run commands as you. Fix: chmod go-w /home/me/fleet/fleet.config.json
+```
+
+`fleet help` and other commands that read no config are unaffected. A fleet
+deployed to a host checks its own config the same way.
+
+A sudo or proxy `passwordFile` must be private: one that other users can read,
+or that you do not own, is refused before fleet reads it, with
+`fix: chmod 600 <file>`. Its contents never appear in output.
+
+Fleet creates `~/.fleet` (control sockets, the Windows session broker, `ls` and
+Android caches) as `0700` and narrows an existing wider `~/.fleet` or
+`~/.fleet/ssh` to `0700` the first time it uses them. Screenshots, window and
+phone captures and webcam photos are written `0600`, including the WebP
+transcode and its PNG fallback. A pulled `cu record` directory is created `0700`.
+A Windows controller skips these mode checks.
+
 ### Defaults and per-host settings
 
 A top-level `defaults` object sets knobs for every host, and `hosts.<h>.settings`
@@ -1058,6 +1173,29 @@ the host. It reads the config only and contacts nothing.
 | `FLEET_NO_SSH_MUX` | `1` disables SSH connection multiplexing, beating the `sshMux` setting. By default fleet reuses one master connection per host (`ControlMaster=auto`, `ControlPersist=60s`, sockets under `~/.fleet/ssh/`) so fan-outs and poll loops don't re-handshake; a wedged socket is fixed by this flag or `rm ~/.fleet/ssh/cm-*` |
 | `FLEET_SSH_MUX` | `config` defers multiplexing to `~/.ssh/config` (no fleet Control options) |
 | `FLEET_SSH_PERSIST` | `ControlPersist` of fleet's control masters (default `60s`; beats `sshPersist`) |
+### Lockfiles
+
+When the shipped files include `bun.lock` (or `bun.lockb`), tool sync and `fleet deploy`
+run `bun install --frozen-lockfile` on the host. If Bun refuses because the lockfile is
+out of date, the install fails and the previous launcher and manifest stay. A tool whose
+`package.json` ships without a lockfile installs with plain `bun install`; `tools list`,
+the sync result and the deploy result mark it `unlocked`.
+
+### Secret check
+
+`tools sync` and `skills sync` copy what they ship into a private local snapshot, then
+read those staged bytes, the ones archived and sent, and refuse the whole tool or skill
+set when a file looks secret. Nothing is archived or sent. A symlinked `SKILL.md` is
+judged by its target's bytes, which is what ships; a symlink among a tool's files ships
+as a link and is judged by name. A `skills sync --dry-run` reads the source files. The refusal names each file and the rule it broke, never the matched value.
+By name, in any case (`.ENV`, `vault.P12`): `.env` and `.env.*` (not `.env.example` or `.env.sample`), `*.pem`, `*.key`,
+`*.p12`, `*.pfx`, `id_rsa`, `id_ed25519`, `id_ecdsa`, `credentials.json`, `auth.json`,
+`*.kdbx`, and an `.npmrc` holding a literal auth token. By content, in text files under
+1 MiB: PEM private key blocks, AWS access key ids, GitHub tokens, OpenAI- and
+Anthropic-style API keys, Slack bot and user tokens and Google API keys. After checking a file, list it in
+`allowFiles` to ship it anyway: `tools.<name>.allowFiles` takes paths or globs relative
+to the tool root, `skills.<set>.allowFiles` takes `<skill>/<path>` or globs.
+
 
 ## Agent skill sets
 

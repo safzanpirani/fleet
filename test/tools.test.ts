@@ -225,7 +225,7 @@ describe("bounded deterministic concurrency", () => {
       tool: "demo", version: "1.0.0", hash: "abc123", syncedAt: "2026-08-31T00:00:00Z", dir: "$HOME/demo",
     };
     const posix = installScript(host("web", "linux"), { name: "demo" }, "$HOME/demo", manifest, "demo").cmd;
-    expect(posix).toContain('(cd "$dir" && "$bun" install >/dev/null 2>&1)');
+    expect(posix).toContain('if ! install_out=$(cd "$dir" && "$bun" install 2>&1); then');
     expect(posix).not.toContain("|| true");
     expect(posix.indexOf('"$bun" install')).toBeLessThan(posix.indexOf("LAUNCHER"));
 
@@ -233,8 +233,128 @@ describe("bounded deterministic concurrency", () => {
     expect(windows).toContain("$installCode=$LASTEXITCODE");
     expect(windows).toContain('if ($LASTEXITCODE -ne 0) { throw "tar extraction failed with exit $LASTEXITCODE" }');
     expect(windows.indexOf("tar extraction failed")).toBeLessThan(windows.indexOf("$installCode=0"));
-    expect(windows).toContain('if ($installCode -ne 0) { throw "bun install failed with exit $installCode" }');
+    expect(windows).toContain('if ($installCode -ne 0) { throw ("bun install failed with exit $installCode"');
     expect(windows.indexOf("$installCode -ne 0")).toBeLessThan(windows.indexOf("Set-Content -Path"));
+  });
+
+  test("a shipped lockfile installs frozen; Bun refusing keeps the previous launcher and manifest", async () => {
+    const home = mkdtempSync(join(tmpdir(), "fleet frozen "));
+    try {
+      mkdirSync(join(home, "bin"));
+      mkdirSync(join(home, ".local/bin"), { recursive: true });
+      mkdirSync(join(home, ".fleet-tools"));
+      const launcher = join(home, ".local/bin/demo");
+      const manifestPath = join(home, ".fleet-tools/demo.json");
+      writeFileSync(launcher, "#!/bin/sh\necho previous\n", { mode: 0o755 });
+      writeFileSync(manifestPath, '{"hash":"prior"}\n');
+      // A Bun whose lockfile is out of date: it refuses only a frozen install.
+      writeFileSync(join(home, "bin", "bun"),
+        '#!/bin/sh\nfor a in "$@"; do [ "$a" = --frozen-lockfile ] && { echo "error: lockfile had changes, but lockfile is frozen" >&2; exit 1; }; done\nexit 0\n',
+        { mode: 0o755 });
+      writeFileSync(join(home, "bin", "tar"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+      const manifest = { tool: "demo", version: "1.0.0", hash: "new", syncedAt: "2026-10-26", dir: "unused" };
+
+      const locked = installScript(host("fixture", "linux"), { name: "demo", lockfile: "bun.lock" }, "$HOME/demo", manifest, "demo");
+      const refused = await localScript(home, locked.cmd);
+      expect(refused.ok).toBe(false);
+      expect(refused.stderr).toContain("bun install --frozen-lockfile failed");
+      expect(refused.stderr).toContain("lockfile is frozen");
+      expect(await Bun.file(launcher).text()).toBe("#!/bin/sh\necho previous\n");
+      expect(await Bun.file(manifestPath).text()).toBe('{"hash":"prior"}\n');
+
+      const unlocked = installScript(host("fixture", "linux"), { name: "demo" }, "$HOME/demo", manifest, "demo");
+      expect(unlocked.cmd).not.toContain("--frozen-lockfile");
+      const installed = await localScript(home, unlocked.cmd);
+      expect(installed.ok, installed.stderr).toBe(true);
+      expect((await Bun.file(manifestPath).json()).hash).toBe("new");
+
+      const windows = installScript(host("main", "windows"), { name: "demo", lockfile: "bun.lockb" }, "$env:USERPROFILE\\demo", manifest, "demo").cmd;
+      expect(windows).toContain("& $bun install --frozen-lockfile 2>&1");
+      expect(windows.indexOf("--frozen-lockfile")).toBeLessThan(windows.indexOf("Set-Content -Path"));
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+
+  test("sync reports a tool without a lockfile as unlocked and freezes one that has it", async () => {
+    const root = makeTool();
+    const scripts: string[] = [];
+    const execute = spyOn(ssh, "exec").mockImplementation(async (h, cmd) => {
+      if (cmd.includes("tar -xzf")) scripts.push(cmd);
+      return { host: h.name, ok: true, code: 0, stdout: "", stderr: "" };
+    });
+    const transfer = spyOn(ssh, "scp").mockImplementation(async (h) =>
+      ({ host: h.name, ok: true, code: 0, stdout: "", stderr: "" }));
+    try {
+      expect((await fingerprint(cfgFor(root), "demo")).unlocked).toBe(true);
+      const [unlocked] = await syncTool(cfgFor(root), "demo", "web", { skill: false });
+      expect(unlocked?.ok, unlocked?.error).toBe(true);
+      expect(unlocked?.unlocked).toBe(true);
+      expect(scripts[0]).not.toContain("--frozen-lockfile");
+
+      writeFileSync(join(root, "bun.lock"), "{}\n");
+      const fp = await fingerprint(cfgFor(root), "demo");
+      expect(fp.lockfile).toBe("bun.lock");
+      expect(fp.unlocked).toBeUndefined();
+      const [locked] = await syncTool(cfgFor(root), "demo", "web", { skill: false });
+      expect(locked?.unlocked).toBeUndefined();
+      expect(scripts[1]).toContain('"$bun" install --frozen-lockfile');
+    } finally {
+      execute.mockRestore(); transfer.mockRestore(); rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("sync refuses a tool shipping a secret-looking file before any exec or scp", async () => {
+    const root = makeTool();
+    writeFileSync(join(root, ".env"), "TOKEN=1\n");
+    mkdirSync(join(root, "keys"));
+    writeFileSync(join(root, "keys", "deploy.pem"), "certificate\n");
+    writeFileSync(join(root, "src", "config.ts"), `export const id = "${"AKIA" + "QWERTYUIOPASDFGH"}";\n`);
+    const execute = spyOn(ssh, "exec").mockImplementation(async (h) =>
+      ({ host: h.name, ok: true, code: 0, stdout: "", stderr: "" }));
+    const transfer = spyOn(ssh, "scp").mockImplementation(async (h) =>
+      ({ host: h.name, ok: true, code: 0, stdout: "", stderr: "" }));
+    try {
+      const refusal = syncTool(cfgFor(root), "demo", "web,main", { skill: false });
+      await expect(refusal).rejects.toThrow(/refusing to sync tool demo: 3 files look secret; nothing was sent/);
+      const message = await refusal.catch((error: Error) => error.message);
+      expect(message).toContain("  .env: env file");
+      expect(message).toContain("  keys/deploy.pem: PEM file");
+      expect(message).toContain("  src/config.ts: AWS access key id");
+      expect(message).not.toContain("QWERTYUIOPASDFGH");
+      expect(execute).not.toHaveBeenCalled();
+      expect(transfer).not.toHaveBeenCalled();
+
+      const allowed = cfgFor(root, { allowFiles: [".env", "keys/*.pem", "src/config.ts"] });
+      const [result] = await syncTool(allowed, "demo", "web", { skill: false });
+      expect(result?.ok, result?.error).toBe(true);
+      expect(transfer).toHaveBeenCalled();
+    } finally {
+      execute.mockRestore(); transfer.mockRestore(); rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("sync scans the dereferenced bytes of a symlinked SKILL.md before any exec or scp", async () => {
+    const root = makeTool();
+    const outside = mkdtempSync(join(tmpdir(), "fleet-tool-outside-"));
+    const key = join(outside, "notes.md");
+    writeFileSync(key, `${"-----BEGIN " + "OPENSSH PRIVATE KEY-----"}\nAAAA\n`);
+    unlinkSync(join(root, "skills", "demo", "SKILL.md"));
+    symlinkSync(key, join(root, "skills", "demo", "SKILL.md"));
+    // A source file that is a link ships as the link, so its target is not read.
+    symlinkSync(key, join(root, "src", "link.md"));
+    const execute = spyOn(ssh, "exec").mockImplementation(async (h) =>
+      ({ host: h.name, ok: true, code: 0, stdout: "", stderr: "" }));
+    const transfer = spyOn(ssh, "scp").mockImplementation(async (h) =>
+      ({ host: h.name, ok: true, code: 0, stdout: "", stderr: "" }));
+    try {
+      const refusal = syncTool(cfgFor(root), "demo", "web", {});
+      await expect(refusal).rejects.toThrow(/refusing to sync tool demo: 1 file looks secret; nothing was sent/);
+      expect(await refusal.catch((error: Error) => error.message)).toContain("  skills/demo/SKILL.md: private key block");
+      expect(execute).not.toHaveBeenCalled();
+      expect(transfer).not.toHaveBeenCalled();
+    } finally {
+      execute.mockRestore(); transfer.mockRestore();
+      rmSync(root, { recursive: true, force: true }); rmSync(outside, { recursive: true, force: true });
+    }
   });
 
   test("toolsStatus bounds fingerprint and unique-host fan-out while preserving order", async () => {

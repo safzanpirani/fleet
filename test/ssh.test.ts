@@ -1,5 +1,5 @@
 import { test, expect, describe, spyOn } from "bun:test";
-import { bashEsc, bashPathAssignment, buildArgs, exec, execStream, scpRemotePath, sshDiagnose } from "../src/ssh.ts";
+import { bashEsc, bashPathAssignment, buildArgs, exec, execStream, localOperand, scp, scpPull, scpRemotePath, sshDiagnose } from "../src/ssh.ts";
 import type { Host } from "../src/config.ts";
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -220,6 +220,51 @@ describe("Windows scp paths", () => {
     expect(scpRemotePath(win, "out\\a.txt")).toBe("out/a.txt");
     expect(scpRemotePath(win, "/C:/Users/me/a.txt")).toBe("/C:/Users/me/a.txt");
     expect(scpRemotePath(win, "C:a.txt")).toBe("C:a.txt");
+  });
+});
+
+describe("copier operands", () => {
+  /** Run one copy with Bun.spawn stubbed and return the copier's argv. */
+  async function copierArgv(run: () => Promise<unknown>): Promise<string[]> {
+    const done = Bun.spawn(["true"], { stdout: "pipe", stderr: "pipe" });
+    await done.exited;
+    const spawn = spyOn(Bun, "spawn").mockReturnValue(done);
+    try {
+      await run();
+      return spawn.mock.calls[0]![0] as string[];
+    } finally { spawn.mockRestore(); }
+  }
+  const afterDashes = (argv: string[]) => argv.slice(argv.indexOf("--") + 1);
+  const beforeDashes = (argv: string[]) => argv.slice(0, argv.indexOf("--"));
+
+  test("a leading-dash local source is an operand after --, never an scp option", async () => {
+    const argv = await copierArgv(() => scp(linux, ["-S./payload", "a:b", "/abs/-x"], "/tmp/dst"));
+    expect(argv[0]).toBe("scp");
+    expect(argv).toContain("--");
+    expect(beforeDashes(argv).some((a) => a.includes("payload"))).toBe(false);
+    expect(afterDashes(argv)).toEqual(["./-S./payload", "./a:b", "/abs/-x", "vps:/tmp/dst"]);
+  });
+
+  test("a pull's local destination and recursive flag stay on their sides of --", async () => {
+    const argv = await copierArgv(() => scpPull(linux, "/var/log/x", "-oProxyCommand=evil", true));
+    expect(beforeDashes(argv)).toContain("-r");
+    expect(afterDashes(argv)).toEqual(["vps:/var/log/x", "./-oProxyCommand=evil"]);
+  });
+
+  test("rsync gets the same separator", async () => {
+    const argv = await copierArgv(() => scp(linux, "-e./payload", "dst", false, { resume: true }));
+    expect(argv[0]).toBe("rsync");
+    expect(beforeDashes(argv).some((a) => a.includes("payload"))).toBe(false);
+    // openrsync quotes the remote path for the remote shell; GNU rsync does not.
+    expect(afterDashes(argv)).toEqual(["./-e./payload", expect.stringMatching(/^vps:'?dst'?$/)]);
+  });
+
+  test("absolute and Windows drive paths are left alone", () => {
+    expect(localOperand("/a:b")).toBe("/a:b");
+    expect(localOperand("plain/file")).toBe("plain/file");
+    expect(localOperand("C:\\Users\\me\\f", "win32")).toBe("C:\\Users\\me\\f");
+    expect(localOperand("C:\\Users\\me\\f", "darwin")).toBe("./C:\\Users\\me\\f");
+    expect(localOperand("-x", "win32")).toBe("./-x");
   });
 });
 

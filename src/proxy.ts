@@ -18,12 +18,13 @@
 import net from "node:net";
 import { createHash } from "node:crypto";
 import { lookup } from "node:dns/promises";
-import { statSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import type { Host, ProxySpec, ResolvedProxy } from "./config.ts";
 import { lookupProxy, normalizeProxy, proxyIdentity, redactProxy, resolveProxy } from "./config.ts";
 import { FdError, adoptSocket, closeFd, fdIO, fdpassSupported, sendFd } from "./fdpass.ts";
+import { assertPrivateSecret } from "./perms.ts";
 
 /** Distinct exit codes so a failed connection names the leg that broke. */
 export const PROXY_EXIT = {
@@ -45,9 +46,8 @@ function expandHome(p: string): string {
   return p;
 }
 
-/** The password for a spec, or undefined. A world/group-readable password file
- *  is a warning, not a failure — refusing to connect over a permission bit would
- *  be a worse outcome than saying so. */
+/** The password for a spec, or undefined. A password file another user can
+ *  read, or that another user owns, is refused before it is read. */
 export async function proxyPassword(
   spec: ProxySpec, env: Record<string, string | undefined> = process.env,
 ): Promise<string | undefined> {
@@ -60,12 +60,10 @@ export async function proxyPassword(
   if (spec.passwordFile) {
     const path = expandHome(spec.passwordFile);
     if (!isAbsolute(path)) throw new ProxyError(`proxy passwordFile must be an absolute or ~ path (got '${spec.passwordFile}')`, PROXY_EXIT.usage);
-    try {
-      if ((statSync(path).mode & 0o077) !== 0)
-        console.error(`fleet: warning: ${path} is readable by other users (chmod 600 it)`);
-    } catch { /* the read below produces the real error */ }
+    if (!existsSync(path)) throw new ProxyError(`proxy passwordFile not found: ${path}`, PROXY_EXIT.auth);
+    try { assertPrivateSecret(path, "proxy passwordFile"); }
+    catch (error) { throw new ProxyError(error instanceof Error ? error.message : String(error), PROXY_EXIT.usage); }
     const file = Bun.file(path);
-    if (!await file.exists()) throw new ProxyError(`proxy passwordFile not found: ${path}`, PROXY_EXIT.auth);
     const text = (await file.text()).split("\n")[0]!.trim();
     if (!text) throw new ProxyError(`proxy passwordFile is empty: ${path}`, PROXY_EXIT.auth);
     return text;
@@ -481,7 +479,12 @@ export async function proxyVerify(
   const config = [`proxy = "${curlQuote(`${scheme}://${n.host}:${n.port}`)}"`, "silent", "show-error",
     `max-time = ${timeoutS}`, `url = "${curlQuote(url)}"`];
   if (n.user) {
-    const password = await proxyPassword(spec).catch(() => undefined);
+    let password: string | undefined;
+    try { password = await proxyPassword(spec); }
+    catch (error) {
+      // A refused password file is the answer; trying without it would only say "auth failed".
+      if (error instanceof ProxyError && error.code === PROXY_EXIT.usage) return { url, expect, ok: false, error: error.message };
+    }
     config.push(`proxy-user = "${curlQuote(`${n.user}:${password ?? ""}`)}"`);
   }
   const proc = Bun.spawn(["curl", "--config", "-"], {

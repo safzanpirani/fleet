@@ -19,15 +19,16 @@
  * otherwise swallow the requests that follow.
  */
 import { createHash } from "node:crypto";
-import { closeSync, mkdirSync, openSync, rmSync } from "node:fs";
+import { closeSync, openSync, rmSync } from "node:fs";
 import { dlopen, FFIType } from "bun:ffi";
 import type { FileSink } from "bun";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { hostKeyOpts, type Host } from "./config.ts";
+import { activeConfig, activePolicy, assertFeature, featureRefusal, hostKeyOpts, loadPolicy, POLICY_PATH, type FleetConfig, type FleetPolicy, type Host } from "./config.ts";
 import { sshEnv } from "./ssh.ts";
 import { fleetReinvocation, proxyControlKey, proxyOpts } from "./proxy.ts";
 import { winSessionIdleMs } from "./settings.ts";
+import { fleetStateDir } from "./perms.ts";
 
 const READY = "__FLEET_SESSION_READY__";
 const PIPE_PROBE = "__FLEET_PIPE__";
@@ -197,11 +198,27 @@ while ($null -ne ($__fsLine = $__fsReader.ReadLine())) {
 }
 
 /** The session is on unless turned off, and never inside tests or on a
- *  Windows controller (no unix sockets there). */
-export function winSessionEnabled(host: Host, env: NodeJS.ProcessEnv = process.env): boolean {
+ *  Windows controller (no unix sockets there). The broker runs whatever
+ *  program reaches its socket, so a host that refuses `exec` gets no session:
+ *  fleet's own reads there (status, ps, disk, …) take the one-shot path. */
+export function winSessionEnabled(
+  host: Host, env: NodeJS.ProcessEnv = process.env,
+  cfg: FleetConfig | null = activeConfig(), policy: FleetPolicy | null = activePolicy(),
+): boolean {
   if (env.FLEET_WIN_SESSION === "0" || env.NODE_ENV === "test") return false;
   if (process.platform === "win32") return false;
-  return host.os === "windows" && host.transport !== "daytona";
+  if (host.os !== "windows" || host.transport === "daytona") return false;
+  return featureRefusal(host, "exec", cfg, policy) === null;
+}
+
+/** Why the session must not run programs on `host`, or undefined when it may:
+ *  the config's `exec` gate, and the policy file as it reads now, since root
+ *  can refuse exec after a broker started. `policyFile` is a test seam only. */
+export async function sessionRefusal(
+  host: Host, cfg: FleetConfig | null = activeConfig(), policyFile: string = POLICY_PATH,
+): Promise<string | undefined> {
+  try { assertFeature([host], "exec", cfg, await loadPolicy(policyFile)); return undefined; }
+  catch (error) { return error instanceof Error ? error.message : String(error); }
 }
 
 /** One socket per host identity, resolved route and session program, so a fleet
@@ -344,21 +361,39 @@ export function claimBroker(path: string): (() => void) | undefined {
   return () => closeSync(fd);
 }
 
+/** What the broker needs from a session. */
+export interface BrokerSession {
+  readonly dead: boolean;
+  run(program: string, timeoutMs: number): Promise<SessionReply>;
+  kill(): void;
+}
+/** Test seams only: the CLI passes none. */
+export interface BrokerDeps {
+  socket?: string;
+  policyFile?: string;
+  startSession?: (host: Host) => Promise<BrokerSession>;
+}
+
 /** The broker: owns one pwsh session for `host` and serves one request at a
  *  time. Exits after the host's idle timeout (FLEET_WIN_SESSION_IDLE_S, then
  *  settings.winSessionIdleS, default 600 s) without a request. The broker runs
  *  `fleet __win-session <host>`, which loads the same config and inherits the
- *  environment. Returns false when another broker already serves the host. */
-export async function runWinSessionBroker(host: Host): Promise<boolean> {
-  const path = winSessionSocket(host);
-  mkdirSync(join(homedir(), ".fleet"), { recursive: true, mode: 0o700 });
+ *  environment. Returns false when another broker already serves the host.
+ *  Throws before claiming anything when the host refuses `exec`, and refuses
+ *  each request while it does, since the socket accepts any program. */
+export async function runWinSessionBroker(host: Host, deps: BrokerDeps = {}): Promise<boolean> {
+  const refusedAtStart = await sessionRefusal(host, activeConfig(), deps.policyFile);
+  if (refusedAtStart) throw new Error(refusedAtStart);
+  const startSession = deps.startSession ?? Session.start;
+  const path = deps.socket ?? winSessionSocket(host);
+  fleetStateDir();
   const release = claimBroker(path);
   if (!release) return false;
   // Only the lock owner may remove a socket, including stale sockets.
   rmSync(path, { force: true });
 
-  let session: Session | undefined;
-  let starting: Promise<Session> | undefined;
+  let session: BrokerSession | undefined;
+  let starting: Promise<BrokerSession> | undefined;
   let busy = false;
   let activeReplies = 0;
   let idle: ReturnType<typeof setTimeout>;
@@ -370,7 +405,7 @@ export async function runWinSessionBroker(host: Host): Promise<boolean> {
   const shutdown = () => { session?.kill(); server.stop(true); rmSync(path, { force: true }); release(); process.exit(0); };
   const ensure = async () => {
     if (session && !session.dead) return session;
-    if (!starting) starting = Session.start(host);
+    if (!starting) starting = startSession(host);
     try { session = await starting; return session; }
     finally { starting = undefined; }
   };
@@ -413,9 +448,13 @@ export async function runWinSessionBroker(host: Host): Promise<boolean> {
         clearTimeout(idle);
         const acceptedAt = Date.now();
         try {
+          // Root may refuse exec after this broker started. Nothing has run,
+          // so the busy reply is honest, and the session's login goes too.
+          const refused = await sessionRefusal(host, activeConfig(), deps.policyFile);
+          if (refused) { session?.kill(); reply(sock, { ...BUSY, stderr: `fleet: ${refused}`, code: 1 }); return; }
           // A session that cannot start has run nothing, so the caller may
           // safely fall back to the one-shot path.
-          let s: Session;
+          let s: BrokerSession;
           try { s = await ensure(); } catch { reply(sock, BUSY); return; }
           const left = req.timeoutMs > 0 ? req.timeoutMs - (Date.now() - acceptedAt) : 0;
           if (req.timeoutMs > 0 && left <= 0) {
@@ -538,8 +577,12 @@ class Session {
 }
 
 /** Separate transport lifetime from the broker. EOF on the broker's pipe is
- *  observable after SIGKILL, unlike a signal handler in the broker itself. */
-export async function runWinSessionTransport(host: Host): Promise<number> {
+ *  observable after SIGKILL, unlike a signal handler in the broker itself.
+ *  The remote loop runs every program its stdin carries, so a host that
+ *  refuses `exec` gets an error before ssh starts. `policyFile` is a test seam. */
+export async function runWinSessionTransport(host: Host, policyFile?: string): Promise<number> {
+  const refused = await sessionRefusal(host, activeConfig(), policyFile);
+  if (refused) throw new Error(refused);
   const encoded = Buffer.from(sessionLoopScript(), "utf16le").toString("base64");
   const proc = Bun.spawn(["ssh", ...proxyOpts(host), ...hostKeyOpts(host), "-o", "ControlMaster=no", "-o", "ControlPath=none",
     "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=30", host.ssh,

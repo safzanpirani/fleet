@@ -42,7 +42,9 @@ test("ls lists the features the config refuses on each host, and nothing for an 
     const probe: typeof probeDetail = async () => ({ up: true });
     const rows = await lsHosts(cfg, undefined, { statePath: join(dir, "ls-state.json"), probe });
     expect(rows.find((r) => r.name === "open")).not.toHaveProperty("disabled");
-    expect(rows.find((r) => r.name === "locked")?.disabled).toEqual(["webcam", "cu", "shot"]);
+    // ai follows shot: refusing shot refuses ai too.
+    expect(rows.find((r) => r.name === "locked")?.disabled).toEqual(["webcam", "cu", "shot", "ai"]);
+    expect(rows.find((r) => r.name === "locked")?.refused?.at(-1)).toEqual({ feature: "ai", source: "host disable shot" });
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

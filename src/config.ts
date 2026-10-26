@@ -2,8 +2,10 @@
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
-import { realpathSync } from "node:fs";
+import { lstatSync, realpathSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { didYouMean } from "./suggest.ts";
+import { readTrustedConfig } from "./perms.ts";
 
 export type OS = "linux" | "windows" | "mac";
 export type ServiceType = "systemd" | "systemd-user" | "nssm" | "winservice" | "schtask";
@@ -40,6 +42,7 @@ export const HOST_FEATURES = [
   "webcam",   // fleet webcam
   "cu",       // fleet cu (desktop and Android, perception, record)
   "shot",     // fleet shot, MCP screenshot
+  "ai",       // fleet cu … task, fleet cu … elements --task: send window content to an AI service
   "browse",   // fleet browse
   "exec",     // fleet exec, spawn, watch, ssh, exec --script, MCP exec
   "files",    // fleet cp/push/pull, edit, diff
@@ -82,6 +85,7 @@ export interface SkillSetSpec {
   include: string[];        // skill directory names or globs under root ("*" = all)
   exclude?: string[];       // names or globs removed after include
   root?: string;            // controller skill root (default ~/.agents/skills)
+  allowFiles?: string[];    // <skill>/<path> or globs the secret check lets through
 }
 /** The sudo password for `--sudo`, read on the controller and sent over ssh
  *  stdin. It never reaches an argv or a log. */
@@ -146,6 +150,7 @@ export interface ToolSpec {
   dir?: string;         // install dir on hosts (default: ~/<name> | %USERPROFILE%\<name>)
   hosts?: string;       // default selector for `fleet tools sync <name>` (default: none — must be explicit)
   exclude?: string[];   // portable glob exclusions on top of node_modules/.git/dist
+  allowFiles?: string[]; // paths or globs, relative to root, the secret check lets through
 }
 export interface FleetConfig {
   $comment?: string;
@@ -247,21 +252,184 @@ export function activeConfig(): FleetConfig | null { return _activeConfig; }
 
 // ── features and settings ────────────────────────────────────────────────────
 
-/** Whether fleet may run `feature` on `host`: the host's own `disable` refuses,
- *  its `enable` allows, and otherwise the top-level `disable` decides. */
-export function featureEnabled(host: Pick<Host, "disable" | "enable">, feature: HostFeature, cfg: FleetConfig | null = _activeConfig): boolean {
-  if (host.disable?.includes(feature)) return false;
-  if (host.enable?.includes(feature)) return true;
-  return !cfg?.disable?.includes(feature);
+/** Where a refusal comes from. `policy` is the policy file; `host` and
+ *  `top-level` are fleet.config.json's lists. `ai` follows `shot`, so the
+ *  `… disable shot` sources name a shot refusal that also refuses ai. */
+export type FeatureSource = "policy" | "policy disable shot" | "host" | "top-level" | "host disable shot" | "top-level disable shot";
+
+/** The policy host keys that name `host`: its config label, its `ssh`
+ *  destination, that destination without `user@`, and its `hostKeyAlias`.
+ *  Root keys a policy entry by destination or host-key alias because those
+ *  survive a config rename; a label alone is bypassed by a second config
+ *  host pointing at the same box. */
+export function policyHostKeys(host: PolicyHostRef): string[] {
+  const keys = new Set<string>();
+  if (host.name !== undefined) keys.add(host.name);
+  if (host.ssh) { keys.add(host.ssh); keys.add(host.ssh.slice(host.ssh.lastIndexOf("@") + 1)); }
+  if (host.hostKeyAlias) keys.add(host.hostKeyAlias);
+  return [...keys];
+}
+
+/** What a feature check needs to know about a host. */
+export type PolicyHostRef = Pick<Host, "disable" | "enable"> & { name?: string; ssh?: string; hostKeyAlias?: string };
+
+function policyRefuses(host: PolicyHostRef, feature: HostFeature, policy: FleetPolicy | null): boolean {
+  if (!policy) return false;
+  if (policy.error !== undefined) return true;
+  return policy.disable.includes(feature) || policyHostKeys(host).some((key) => !!policy.hosts[key]?.disable.includes(feature));
+}
+
+function configRefusal(host: Pick<Host, "disable" | "enable">, feature: HostFeature, cfg: FleetConfig | null): "host" | "top-level" | null {
+  if (host.disable?.includes(feature)) return "host";
+  if (host.enable?.includes(feature)) return null;
+  return cfg?.disable?.includes(feature) ? "top-level" : null;
+}
+
+/** Why fleet refuses `feature` on `host`, or null when it may run. The policy
+ *  file refuses first and nothing in the config lifts it. Then the host's own
+ *  `disable` refuses, its `enable` allows, and otherwise the top-level
+ *  `disable` decides. A host that refuses `shot` refuses `ai` too, unless its
+ *  `enable` lists `ai`. */
+export function featureRefusal(
+  host: PolicyHostRef, feature: HostFeature,
+  cfg: FleetConfig | null = _activeConfig, policy: FleetPolicy | null = _activePolicy,
+): FeatureSource | null {
+  if (policyRefuses(host, feature, policy)) return "policy";
+  if (feature === "ai" && policyRefuses(host, "shot", policy)) return "policy disable shot";
+  const own = configRefusal(host, feature, cfg);
+  if (own || feature !== "ai" || host.enable?.includes("ai")) return own;
+  const shot = configRefusal(host, "shot", cfg);
+  return shot && (`${shot} disable shot` as const);
+}
+
+/** Whether fleet may run `feature` on `host` (see featureRefusal). */
+export function featureEnabled(
+  host: PolicyHostRef, feature: HostFeature,
+  cfg: FleetConfig | null = _activeConfig, policy: FleetPolicy | null = _activePolicy,
+): boolean {
+  return featureRefusal(host, feature, cfg, policy) === null;
 }
 
 /** Refuse the whole call when any selected host disables `feature`, before
- *  anything reaches a host. Throws one error naming every refusing host. */
-export function assertFeature(hosts: readonly Pick<Host, "name" | "disable" | "enable">[], feature: HostFeature, cfg: FleetConfig | null = _activeConfig): void {
-  const refused = hosts.filter((host) => !featureEnabled(host, feature, cfg)).map((host) => host.name);
-  if (!refused.length) return;
-  throw new Error(`${feature} is disabled on ${refused.join(", ")} by the fleet config `
-    + `(hosts.<host>.disable, or the top-level disable without a hosts.<host>.enable)`);
+ *  anything reaches a host. Throws one error naming every refusing host and
+ *  the file that refuses it. */
+export function assertFeature(
+  hosts: readonly (PolicyHostRef & { name: string })[], feature: HostFeature,
+  cfg: FleetConfig | null = _activeConfig, policy: FleetPolicy | null = _activePolicy,
+): void {
+  const why = (source: FeatureSource): string => {
+    if (source === "policy" || source === "policy disable shot") {
+      const file = `the fleet policy file ${policy!.path}`;
+      if (policy!.error !== undefined) return `by ${file}, which is invalid (${policy!.error}) and so refuses every gated feature until root fixes or removes it`;
+      return `by ${file}, ${source === "policy disable shot" ? "which disables shot (ai follows shot) and " : ""}`
+        + "which fleet.config.json cannot override";
+    }
+    if (source === "host disable shot" || source === "top-level disable shot")
+      return "by the fleet config, which refuses shot there (ai follows shot unless hosts.<host>.enable lists ai)";
+    return "by the fleet config (hosts.<host>.disable, or the top-level disable without a hosts.<host>.enable)";
+  };
+  const groups = new Map<string, string[]>();
+  for (const host of hosts) {
+    const source = featureRefusal(host, feature, cfg, policy);
+    if (!source) continue;
+    const reason = why(source);
+    groups.set(reason, [...groups.get(reason) ?? [], host.name]);
+  }
+  if (!groups.size) return;
+  // Policy reasons sort first: they are the ones a config edit cannot lift.
+  const parts = [...groups].sort(([a], [b]) => Number(b.includes("policy file")) - Number(a.includes("policy file")))
+    .map(([reason, names]) => `${names.join(", ")} ${reason}`);
+  throw new Error(`${feature} is disabled on ${parts.join("; on ")}`);
+}
+
+// ── policy file ──────────────────────────────────────────────────────────────
+// fleet.config.json is editable by anything with the user's shell, an agent
+// included. The policy file sits at a fixed root-owned path and only adds
+// refusals. No environment variable or flag moves or disables it: an agent
+// controls its own environment.
+
+/** The policy file's fixed location for a platform. On Windows this is the
+ *  default %ProgramData%; the variable itself is not read. */
+export function policyPath(platform: NodeJS.Platform = process.platform): string {
+  return platform === "win32" ? "C:\\ProgramData\\fleet\\policy.json" : "/etc/fleet/policy.json";
+}
+export const POLICY_PATH = policyPath();
+
+/** Whether only root can change the policy file. */
+export type PolicyProtection = { protected: true } | { protected: false; reason: string };
+
+export interface FleetPolicy {
+  path: string;
+  disable: HostFeature[];
+  hosts: Record<string, { disable: HostFeature[] }>;
+  /** Set when the file exists but cannot be read or parsed. Every gated
+   *  feature is then refused on every host (fail closed). */
+  error?: string;
+  /** Absent on Windows, where fleet reports the path only. */
+  protection?: PolicyProtection;
+}
+
+let _activePolicy: FleetPolicy | null = null;
+export function setActivePolicy(policy: FleetPolicy | null): void { _activePolicy = policy; }
+export function activePolicy(): FleetPolicy | null { return _activePolicy; }
+
+/** Validate a policy file's text. Unknown keys and features are errors. Host
+ *  names are not checked here: the policy may outlive a config edit. */
+export function parsePolicy(text: string, path: string): FleetPolicy {
+  const raw: unknown = JSON.parse(text);
+  if (!isRecord(raw)) throw new Error("the policy must be a JSON object");
+  const features = (value: unknown, at: string): HostFeature[] => {
+    if (value === undefined) return [];
+    if (!Array.isArray(value)) throw new Error(`${at} must be an array of feature names (${HOST_FEATURES.join(", ")})`);
+    for (const f of value as unknown[])
+      if (typeof f !== "string" || !(HOST_FEATURES as readonly string[]).includes(f))
+        throw new Error(`${at}: unknown feature '${String(f)}' (have: ${HOST_FEATURES.join(", ")})${typeof f === "string" ? didYouMean(f, [...HOST_FEATURES]) : ""}`);
+    return value as HostFeature[];
+  };
+  for (const key of Object.keys(raw)) if (key !== "disable" && key !== "hosts") throw new Error(`unknown key '${key}' (have: disable, hosts)`);
+  if (raw.hosts !== undefined && !isRecord(raw.hosts)) throw new Error("hosts must be an object of host name to { disable }");
+  const hosts: FleetPolicy["hosts"] = {};
+  for (const [name, entry] of Object.entries(raw.hosts ?? {})) {
+    if (!isRecord(entry)) throw new Error(`hosts.${name} must be an object`);
+    for (const key of Object.keys(entry)) if (key !== "disable") throw new Error(`hosts.${name}: unknown key '${key}' (have: disable)`);
+    hosts[name] = { disable: features(entry.disable, `hosts.${name}.disable`) };
+  }
+  return { path, disable: features(raw.disable, "disable"), hosts };
+}
+
+type PolicyStat = (path: string) => { uid: number; mode: number; isSymbolicLink(): boolean };
+
+/** Protected means the file and its directory are root-owned, not symlinks,
+ *  and not group- or other-writable. The file is honoured either way, because
+ *  it can only add refusals. */
+export function policyProtection(path: string, stat: PolicyStat = lstatSync): PolicyProtection {
+  for (const p of [path, dirname(path)]) {
+    let s;
+    try { s = stat(p); } catch (error) { return { protected: false, reason: `cannot stat ${p}: ${error instanceof Error ? error.message : String(error)}` }; }
+    if (s.isSymbolicLink()) return { protected: false, reason: `${p} is a symlink` };
+    if (s.uid !== 0) return { protected: false, reason: `${p} is owned by uid ${s.uid}, not root` };
+    if (s.mode & 0o020) return { protected: false, reason: `${p} is group-writable` };
+    if (s.mode & 0o002) return { protected: false, reason: `${p} is writable by everyone` };
+  }
+  return { protected: true };
+}
+
+/** Read the policy file. A missing file is no policy (null); one that exists
+ *  but cannot be read or parsed fails closed with `error` set. Never throws. */
+export async function loadPolicy(
+  path: string = POLICY_PATH,
+  deps: { stat?: PolicyStat; platform?: NodeJS.Platform } = {},
+): Promise<FleetPolicy | null> {
+  const message = (error: unknown) => error instanceof Error ? error.message : String(error);
+  const protection = () => (deps.platform ?? process.platform) === "win32" ? {} : { protection: policyProtection(path, deps.stat) };
+  let text: string;
+  try { text = await readFile(path, "utf8"); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    return { path, disable: [], hosts: {}, error: `cannot read it: ${message(error)}`, ...protection() };
+  }
+  try { return { ...parsePolicy(text, path), ...protection() }; }
+  catch (error) { return { path, disable: [], hosts: {}, error: message(error), ...protection() }; }
 }
 
 type ScalarSetting = Exclude<keyof HostSettings, "shot" | "webcam">;
@@ -326,6 +494,13 @@ export function validateConfig(cfg: FleetConfig, path: string): void {
   const stringIfPresent = (value: unknown, at: string): void => {
     if (value !== undefined && (typeof value !== "string" || !value))
       fail(`${at} must be a non-empty string`);
+  };
+  /** Relative paths or globs: never absolute, never climbing out with `..`. */
+  const allowFilesIfPresent = (value: unknown, at: string): void => {
+    if (value === undefined) return;
+    if (!Array.isArray(value) || value.some((e) => typeof e !== "string" || !e || e.startsWith("/") || /^[A-Za-z]:/.test(e)
+      || e.includes("\\") || e.split("/").includes("..")))
+      fail(`${at} must be an array of relative paths or globs ('/'-separated, no '..')`);
   };
   const boolIfPresent = (value: unknown, at: string): void => {
     if (value !== undefined && typeof value !== "boolean") fail(`${at} must be a boolean`);
@@ -564,11 +739,12 @@ export function validateConfig(cfg: FleetConfig, path: string): void {
       fail(`routes.${rn}: unknown host '${name}' (have: ${Object.keys(cfg.hosts).join(", ")})`);
     const oses = new Set(route.prefer.map((name) => cfg.hosts[name]!.os));
     if (oses.size !== 1) fail(`routes.${rn}: all transports must target the same OS`);
-    // A route picks its transport at run time, so a feature allowed on one
-    // transport and refused on another would depend on which link is up.
-    const allowed = (name: string) => HOST_FEATURES.filter((f) => featureEnabled(cfg.hosts[name]!, f, cfg)).join(",");
+    // A route picks its transports at run time, so a feature allowed on one
+    // transport and refused on another would depend on which link is up. This
+    // judges the config alone: the policy file is not part of the config.
+    const allowed = (name: string) => HOST_FEATURES.filter((f) => featureEnabled(cfg.hosts[name]!, f, cfg, null)).join(",");
     if (new Set(route.prefer.map(allowed)).size !== 1)
-      fail(`routes.${rn}: every transport must allow the same features (check disable/enable on ${route.prefer.join(", ")})`);
+      fail(`routes.${rn}: every transport must allow the same features (check disable/enable on ${route.prefer.join(", ")}; ai follows shot)`);
   }
   for (const [rn, steps] of Object.entries(optionalRecord(cfg.recipes, "recipes")))
     if (!Array.isArray(steps) || steps.some((s) => typeof s !== "string"))
@@ -576,7 +752,7 @@ export function validateConfig(cfg: FleetConfig, path: string): void {
   for (const [tn, rawTool] of Object.entries(optionalRecord(cfg.tools, "tools"))) {
     const tool = record(rawTool, `tools.${tn}`) as unknown as ToolSpec;
     knownKeys(tool as unknown as Record<string, unknown>,
-      ["root", "skill", "bin", "entry", "compile", "dir", "hosts", "exclude"], `tools.${tn}`);
+      ["root", "skill", "bin", "entry", "compile", "dir", "hosts", "exclude", "allowFiles"], `tools.${tn}`);
     if (!tool.root || typeof tool.root !== "string") fail(`tools.${tn}: missing/invalid \`root\``);
     for (const key of ["skill", "bin", "entry", "dir", "hosts"] as const)
       stringIfPresent(tool[key], `tools.${tn}.${key}`);
@@ -585,10 +761,11 @@ export function validateConfig(cfg: FleetConfig, path: string): void {
     if (tool.exclude !== undefined
       && (!Array.isArray(tool.exclude) || tool.exclude.some((e) => typeof e !== "string" || !e)))
       fail(`tools.${tn}.exclude must be an array of non-empty strings`);
+    allowFilesIfPresent(tool.allowFiles, `tools.${tn}.allowFiles`);
   }
   for (const [sn, rawSet] of Object.entries(optionalRecord(cfg.skills, "skills"))) {
     const set = record(rawSet, `skills.${sn}`) as unknown as SkillSetSpec;
-    knownKeys(set as unknown as Record<string, unknown>, ["hosts", "include", "exclude", "root"], `skills.${sn}`);
+    knownKeys(set as unknown as Record<string, unknown>, ["hosts", "include", "exclude", "root", "allowFiles"], `skills.${sn}`);
     if (!set.hosts || typeof set.hosts !== "string") fail(`skills.${sn}: missing/invalid \`hosts\` selector`);
     stringIfPresent(set.root, `skills.${sn}.root`);
     for (const key of ["include", "exclude"] as const) {
@@ -597,6 +774,7 @@ export function validateConfig(cfg: FleetConfig, path: string): void {
       if (!Array.isArray(list) || !list.length || list.some((e) => typeof e !== "string" || !e || e.includes("/")))
         fail(`skills.${sn}.${key} must be a non-empty array of skill names or globs without '/'`);
     }
+    allowFilesIfPresent(set.allowFiles, `skills.${sn}.allowFiles`);
   }
 }
 
@@ -678,10 +856,12 @@ export async function staleBinaryHint(message: string, configPath: string, root 
     + `rebuild it there with: bun run build:local`;
 }
 
-export async function loadConfig(): Promise<FleetConfig> {
+/** Load and validate the config, then the policy file at its fixed path.
+ *  `policyFile` is a test seam only: the CLI never passes it. */
+export async function loadConfig(policyFile: string = POLICY_PATH): Promise<FleetConfig> {
   const path = await resolveConfigPath();
   if (!await Bun.file(path).exists()) throw new Error(configNotFoundMessage());
-  const raw = await Bun.file(path).json() as FleetConfig;
+  const raw = JSON.parse(readTrustedConfig(path)) as FleetConfig;
   try { validateConfig(raw, path); }
   catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -689,6 +869,7 @@ export async function loadConfig(): Promise<FleetConfig> {
     throw new Error(hint ? `${message}\n${hint}` : message);
   }
   for (const [name, h] of Object.entries(raw.hosts)) h.name = name;
+  setActivePolicy(await loadPolicy(policyFile));
   setActiveConfig(raw);
   return raw;
 }

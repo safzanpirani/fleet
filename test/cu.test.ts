@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   briefDescribe, compactCuOutput, cuAct, cuBlockerNote, cuCaptureSize, cuDescribe, cuGridCaption,
-  cuInstall, cuLooksModal, cuRecordStart, cuRecordStop, cuResolvePoint, cuResolveTargetFrom,
+  CUA_INSTALLER, CUA_INSTALLER_FILES, cuInstall, cuLooksModal, cuRecordStart, cuRecordStop, cuResolvePoint, cuResolveTargetFrom,
   cuRun, cuTools, parseCuWindows,
 } from "../src/core.ts";
 import type { CuSnapshot, CuWindowInfo } from "../src/core.ts";
@@ -71,29 +71,109 @@ describe("cuInstall", () => {
     expect(cmds.get("win")).toContain("autostart kick");
   });
 
+  /** Run a generated POSIX install script with stubbed curl and systemctl.
+   *  The stub serves `installSh` as install.sh and empty helpers; HOME is a
+   *  throwaway directory so the systemd unit and drop-in land there. */
+  interface PosixInstallRun { code: number; stdout: string; stderr: string; ranInstaller: boolean }
+  async function runPosixInstall(command: string, opts: { download?: number; installSh: string; restart?: number }): Promise<PosixInstallRun> {
+    const home = await mkdtemp(join(tmpdir(), "fleet-cu-install-"));
+    try {
+      const script = `curl() { [ ${opts.download ?? 0} = 0 ] || return ${opts.download ?? 0}; `
+        + `while [ $# -gt 0 ]; do case "$1" in -o) out="$2"; shift 2;; *) url="$1"; shift;; esac; done; `
+        + `case "$url" in */install.sh) printf '%s\\n' '${opts.installSh.replace(/'/g, "'\\''")}' > "$out";; *) : > "$out";; esac; }\n`
+        + `systemctl() { printf 'RESTART:%s\\n' "$*"; return ${opts.restart ?? 0}; }\n`
+        + command;
+      const proc = Bun.spawn(["/bin/bash", "-s"], {
+        stdin: new TextEncoder().encode(script), stdout: "pipe", stderr: "pipe",
+        env: { ...process.env, HOME: home, FLEET_TEST_HOME: home },
+      });
+      const [code, stdout, stderr] = await Promise.all([
+        proc.exited, new Response(proc.stdout).text(), new Response(proc.stderr).text(),
+      ]);
+      return { code, stdout, stderr, ranInstaller: await Bun.file(join(home, "installer-ran")).exists() };
+    } finally { await rm(home, { recursive: true, force: true }); }
+  }
+  /** The digest the stub's five files produce: install.sh's text, then empties. */
+  const stubDigest = (installSh: string) => new Bun.CryptoHasher("sha256").update(`${installSh}\n`).digest("hex");
+
   test.each([
     { download: 22, install: 0, restart: 0, expected: 22 },
     { download: 0, install: 7, restart: 0, expected: 7 },
     { download: 0, install: 0, restart: 9, expected: 9 },
     { download: 0, install: 0, restart: 0, expected: 0 },
   ])("Linux install preserves download/install/restart failures: %j", async (scenario) => {
+    const installSh = `exit ${scenario.install}`;
     const [action] = await cuInstall(cfg, "lin", {
+      ref: "fixture-ref", sha256: stubDigest(installSh),
       exec: async (target, command) => {
-        const script = `curl() { printf 'exit ${scenario.install}\\n'; return ${scenario.download}; }\n`
-          + `systemctl() { printf 'RESTART:%s\\n' "$*"; return ${scenario.restart}; }\n`
-          + command;
-        const proc = Bun.spawn(["/bin/bash", "-s"], {
-          stdin: new TextEncoder().encode(script), stdout: "pipe", stderr: "pipe",
-        });
-        const [code, stdout, stderr] = await Promise.all([
-          proc.exited, new Response(proc.stdout).text(), new Response(proc.stderr).text(),
-        ]);
-        return { host: target.name, code, ok: code === 0, stdout, stderr };
+        const run = await runPosixInstall(command, { download: scenario.download, installSh, restart: scenario.restart });
+        return { host: target.name, code: run.code, ok: run.code === 0, stdout: run.stdout, stderr: run.stderr };
       },
     });
     expect(action!.result.code).toBe(scenario.expected);
     if (scenario.download || scenario.install) expect(action!.result.stdout).not.toContain("RESTART");
     else expect(action!.result.stdout).toContain("RESTART:--user restart cua-driver.service");
+  });
+
+  test("a wrong installer sha256 refuses before anything runs", async () => {
+    // Runs only as a file beside its verified helpers, as upstream's install.sh
+    // must to take _install-rust.sh from disk instead of from cua.ai.
+    const installSh = '[ -f "$(dirname "${BASH_SOURCE[0]}")/_install-rust.sh" ] && touch "$FLEET_TEST_HOME/installer-ran"';
+    for (const [sha256, runs] of [["0".repeat(64), false], [stubDigest(installSh), true]] as const) {
+      let outcome: PosixInstallRun | undefined;
+      const [action] = await cuInstall(cfg, "lin", {
+        ref: "fixture-ref", sha256,
+        exec: async (target, command) => {
+          outcome = await runPosixInstall(command, { installSh });
+          return { host: target.name, code: outcome.code, ok: outcome.code === 0, stdout: outcome.stdout, stderr: outcome.stderr };
+        },
+      });
+      expect(outcome?.ranInstaller).toBe(runs);
+      if (runs) {
+        expect(action!.result.code, action!.result.stderr).toBe(0);
+        expect(action!.result.stdout).toContain("cua-driver installer trycua/cua@fixture-ref verified");
+        continue;
+      }
+      expect(action!.result.code).toBe(1);
+      expect(action!.result.stderr).toContain(`has sha256 ${stubDigest(installSh)}, expected ${"0".repeat(64)}; refusing to run it`);
+      expect(action!.result.stdout).not.toContain("RESTART");
+    }
+  });
+
+  test("the default pin fetches every script from one commit and pins the driver release", async () => {
+    const cmds = new Map<string, string>();
+    const actions = await cuInstall(cfg, "all", {
+      exec: async (target, cmd) => {
+        cmds.set(target.name, cmd);
+        return { host: target.name, ok: true, code: 0, stdout: "", stderr: "" };
+      },
+    });
+    expect(actions.every((a) => a.installer.ref === CUA_INSTALLER.ref)).toBe(true);
+    expect(CUA_INSTALLER.ref).toMatch(/^[0-9a-f]{40}$/);
+    const base = `https://raw.githubusercontent.com/trycua/cua/${CUA_INSTALLER.ref}/libs/cua-driver/scripts`;
+    for (const cmd of cmds.values()) {
+      expect(cmd).toContain(base);
+      expect(cmd).not.toContain("/main/");
+      expect(cmd).toContain(CUA_INSTALLER.sha256);
+      expect(cmd).toContain(CUA_INSTALLER.driverVersion);
+    }
+    expect(cmds.get("lin")).toContain(`CUA_DRIVER_RS_VERSION=${CUA_INSTALLER.driverVersion} /bin/bash "$fleet_cua_dir/install.sh"`);
+    const win = cmds.get("win")!;
+    for (const file of CUA_INSTALLER_FILES) expect(win).toContain(`'${file}'`);
+    // The digest is compared before the installer starts, and a mismatch throws.
+    const check = win.indexOf(`if ($fleetCuaGot -ne '${CUA_INSTALLER.sha256}') { throw`);
+    expect(check).toBeGreaterThan(win.indexOf("Get-FileHash -InputStream"));
+    expect(check).toBeLessThan(win.indexOf("-File (Join-Path $fleetCuaDir 'install.ps1')"));
+    expect(win.indexOf(`$env:CUA_DRIVER_RS_VERSION='${CUA_INSTALLER.driverVersion}'`)).toBeLessThan(win.indexOf("-File (Join-Path"));
+    expect(win).not.toContain("iex");
+  });
+
+  test("--ref and --sha256 come as a pair of valid values", async () => {
+    const exec = async () => { throw new Error("must not run"); };
+    await expect(cuInstall(cfg, "lin", { exec, ref: "cua-driver-rs-v0.38.0" })).rejects.toThrow(/--ref and --sha256 go together/);
+    await expect(cuInstall(cfg, "lin", { exec, sha256: "a".repeat(64) })).rejects.toThrow(/--ref and --sha256 go together/);
+    await expect(cuInstall(cfg, "lin", { exec, ref: "x; rm -rf ~", sha256: "a".repeat(64) })).rejects.toThrow(/--ref must be/);
+    await expect(cuInstall(cfg, "lin", { exec, ref: "main", sha256: "abc" })).rejects.toThrow(/--sha256 must be 64 hex/);
   });
 
   test("one host failing does not hide the others' results", async () => {
@@ -227,19 +307,6 @@ describe("cuInstall on a host that has never had cua", () => {
     // desktop rather than the SSH login's environment.
     expect(cmd).toContain(".cache/cua-driver/cua-driver.sock");
     expect(cmd).toContain("Environment=DISPLAY=:0");
-  });
-
-  test("the installer is invoked with a $0 placeholder", async () => {
-    const cmds = new Map<string, string>();
-    await cuInstall(cfg, "lin", {
-      exec: async (target, cmd) => {
-        cmds.set(target.name, cmd);
-        return { host: target.name, ok: true, code: 0, stdout: "", stderr: "" };
-      },
-    });
-    // `bash -c "$script" --flag` passes --flag as $0, where the script cannot
-    // see it. A placeholder keeps that trap from biting whoever adds a flag.
-    expect(cmds.get("lin")!).toContain('/bin/bash -c "$installer" cua-driver-install');
   });
 });
 

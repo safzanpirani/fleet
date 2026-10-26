@@ -27,6 +27,7 @@ import { assertFeature, resolveHosts } from "./config.ts";
 import { exec, scp } from "./ssh.ts";
 import type { ExecResult } from "./ssh.ts";
 import { installLockScript as toolSyncLockScript } from "./install-lock.ts";
+import { scanSecretFiles, secretRefusal } from "./secrets.ts";
 export { installLockScript as toolSyncLockScript } from "./install-lock.ts";
 
 /** Where every host records what it has: one small JSON file per tool, all in
@@ -77,6 +78,8 @@ export interface ToolFingerprint {
   sourceHash?: string;
   skillHash?: string;
   compiled?: boolean;
+  lockfile?: string;       // bun.lock or bun.lockb at the root of the shipped set
+  unlocked?: boolean;      // package.json ships without a lockfile: plain `bun install`
 }
 export interface ToolManifest {
   tool: string;
@@ -253,6 +256,11 @@ export async function fingerprint(cfg: FleetConfig, name: string): Promise<ToolF
   return fingerprintSource(spec, files, await findSkill(spec));
 }
 
+/** The Bun lockfile at the root of a shipped file set, if one ships. */
+export function shippedLockfile(files: readonly string[]): string | undefined {
+  return ["bun.lock", "bun.lockb"].find((name) => files.includes(name));
+}
+
 async function fingerprintSource(spec: ReturnType<typeof resolveTool>, files: string[], skillPath?: string): Promise<ToolFingerprint> {
   let version = "0.0.0";
   const pkg = join(spec.root, "package.json");
@@ -266,9 +274,11 @@ async function fingerprintSource(spec: ReturnType<typeof resolveTool>, files: st
   const hash = spec.compile
     ? new Bun.CryptoHasher("sha256").update(`fleet-tools-compiled-v1\0${contentHash}`).digest("hex").slice(0, 12)
     : contentHash;
+  const lockfile = shippedLockfile(files);
   return {
     name: spec.name, version, files: files.length, root: spec.root, skillPath,
     hash, sourceHash, skillHash, ...(spec.compile ? { compiled: true } : {}),
+    ...(lockfile ? { lockfile } : files.includes("package.json") ? { unlocked: true } : {}),
   };
 }
 
@@ -379,12 +389,31 @@ export interface ToolSyncResult {
   tool: string; host: string; ok: boolean; dir: string;
   version: string; hash: string;
   skill?: boolean;          // whether a SKILL.md was pushed
+  unlocked?: boolean;       // dependencies installed without a lockfile
   result: ExecResult;
   error?: string;
 }
 
+/** `bun install` for a tool or deploy install script. With a lockfile it runs
+ *  frozen, so a host never resolves versions the controller did not lock; Bun
+ *  refusing then fails the install before the launcher or manifest changes.
+ *  Its output is shown only on failure. */
+export function bunInstallStep(shell: "bash" | "powershell", frozen: boolean, cd?: string): string {
+  const args = frozen ? " install --frozen-lockfile" : " install";
+  const what = `bun${args}`;
+  if (shell === "powershell") {
+    const run = `$installOut = & $bun${args} 2>&1 | Out-String; $installCode=$LASTEXITCODE`;
+    return [
+      `$installOut=''; $installCode=0`,
+      cd ? `Push-Location ${cd}\ntry { ${run} } finally { Pop-Location }` : run,
+      `if ($installCode -ne 0) { throw ("${what} failed with exit $installCode" + [Environment]::NewLine + $installOut.Trim()) }`,
+    ].join("\n");
+  }
+  return `if ! install_out=$(${cd ? `cd ${cd} && ` : ""}"$bun"${args} 2>&1); then echo "${what} failed:" >&2; printf '%s\\n' "$install_out" >&2; exit 1; fi`;
+}
+
 export function installScript(
-  h: Host, spec: { name: string; entry?: string; compile?: boolean }, dir: string, manifest: ToolManifest, bin: string,
+  h: Host, spec: { name: string; entry?: string; compile?: boolean; lockfile?: string }, dir: string, manifest: ToolManifest, bin: string,
   archive = `${spec.name}-sync.tgz`,
 ): { cmd: string; shell: "bash" | "powershell" } {
   const entry = spec.entry ?? "src/cli.ts";
@@ -402,10 +431,7 @@ export function installScript(
       `New-Item -ItemType Directory -Force -Path $dir | Out-Null`,
       `tar -xzf "$env:USERPROFILE\\${archive}" -C $dir`,
       `if ($LASTEXITCODE -ne 0) { throw "tar extraction failed with exit $LASTEXITCODE" }`,
-      `$installCode=0`,
-      `Push-Location $dir`,
-      `try { & $bun install 2>&1 | Out-Null; $installCode=$LASTEXITCODE } finally { Pop-Location }`,
-      `if ($installCode -ne 0) { throw "bun install failed with exit $installCode" }`,
+      bunInstallStep("powershell", !!spec.lockfile, "$dir"),
       `Remove-Item "$env:USERPROFILE\\${archive}" -Force -EA SilentlyContinue`,
       // A .cmd shim on PATH is the Windows equivalent of the posix launcher.
       `$shim="$env:USERPROFILE\\.local\\bin"`,
@@ -426,7 +452,7 @@ export function installScript(
     `dir="${dir}"`,
     `mkdir -p "$dir" "$HOME/.local/bin" "${MANIFEST_DIR_POSIX}"`,
     `tar -xzf "$HOME/${archive}" -C "$dir"`,
-    `(cd "$dir" && "$bun" install >/dev/null 2>&1)`,
+    bunInstallStep("bash", !!spec.lockfile, `"$dir"`),
     `rm -f "$HOME/${archive}"`,
     `launcher="$HOME/.local/bin/${bin}"`,
     `[ ! -d "$launcher" ] || { echo "launcher path is a directory" >&2; exit 1; }`,
@@ -487,7 +513,7 @@ async function syncOne(
   h: Host, tarLocal: string, opts: { skill?: boolean } = {},
 ): Promise<ToolSyncResult> {
   const dir = toolDir(spec, h);
-  const base = { tool: spec.name, host: h.name, dir, version: fp.version, hash: fp.hash };
+  const base = { tool: spec.name, host: h.name, dir, version: fp.version, hash: fp.hash, ...(fp.unlocked ? { unlocked: true } : {}) };
   const token = crypto.randomUUID();
   const archive = `fleet-tool-${token}.tgz`;
   const lock = toolSyncLockScript(h, dir, token);
@@ -532,7 +558,7 @@ async function installToolPayload(
   tarLocal: string, archive: string, opts: { skill?: boolean },
 ): Promise<ToolSyncResult> {
   const dir = toolDir(spec, h);
-  const base = { tool: spec.name, host: h.name, dir, version: fp.version, hash: fp.hash };
+  const base = { tool: spec.name, host: h.name, dir, version: fp.version, hash: fp.hash, ...(fp.unlocked ? { unlocked: true } : {}) };
   const pushed = await scp(h, tarLocal, archive);
   if (!pushed.ok) return { ...base, ok: false, result: pushed, error: pushed.stderr || "scp failed" };
 
@@ -563,7 +589,7 @@ async function installToolPayload(
     syncedAt: new Date().toISOString().slice(0, 19) + "Z",
     ...(skillPushed ? { skill: fp.skillHash } : fp.skillPath ? { skillSkipped: true } : {}),
   };
-  const { cmd, shell } = installScript(h, spec, dir, manifest, spec.bin ?? spec.name, archive);
+  const { cmd, shell } = installScript(h, { ...spec, lockfile: fp.lockfile }, dir, manifest, spec.bin ?? spec.name, archive);
   let result: ExecResult;
   try { result = await exec(h, cmd, shell); }
   catch (error) {
@@ -586,12 +612,13 @@ export async function syncTool(
   assertFeature(hosts, "deploy", cfg);
   if (spec.compile && hosts.some((host) => host.os === "windows"))
     throw new Error(`tools.${name}.compile supports Linux and macOS only; no hosts were synced`);
+  const files = await shippedFiles(spec.root, spec.exclude ?? []);
+  if (!files.length) throw new Error(`tools.${name}: nothing to ship from ${spec.root}`);
+  const originalSkill = await findSkill(spec);
   const stage = await mkdtemp(join(tmpdir(), "fleet-tool-sync-"));
   try {
     const source = join(stage, "source");
     await mkdir(source);
-    const files = await shippedFiles(spec.root, spec.exclude ?? []);
-    if (!files.length) throw new Error(`tools.${name}: nothing to ship from ${spec.root}`);
     // Hash and archive one immutable local snapshot. A controller edit during a
     // transfer cannot change the manifest or the files delivered to later hosts.
     await mapPool(files, FILE_IO_PARALLELISM, async (rel) => {
@@ -604,8 +631,7 @@ export async function syncTool(
         await chmod(to, metadata.mode);
       }
     });
-    const originalSkill = await findSkill(spec);
-    let skillPath: string | undefined;
+    let skillPath: string | undefined, stagedSkill: { rel: string; path: string }[] = [];
     if (originalSkill) {
       const rel = relative(spec.root, originalSkill);
       skillPath = join(stage, "SKILL.md");
@@ -613,7 +639,15 @@ export async function syncTool(
       // copied from the controller because their targets may be external.
       const captured = files.includes(rel) && !(await lstat(join(source, rel))).isSymbolicLink();
       await copyFile(captured ? join(source, rel) : originalSkill, skillPath);
+      // A captured skill is already scanned among the files; any other copy is
+      // its own shipment.
+      if (!captured && opts.skill !== false) stagedSkill = [{ rel, path: skillPath }];
     }
+    // Refuse on the staged bytes, the ones archived and sent, before any host
+    // is contacted. Source links ship as links and are judged by name.
+    const hits = await scanSecretFiles(
+      [...files.map((rel) => ({ rel, path: join(source, rel) })), ...stagedSkill], spec.allowFiles);
+    if (hits.length) throw secretRefusal(`tool ${name}`, hits, `tools.${name}.allowFiles`);
     const fp = await fingerprintSource({ ...spec, root: source }, files, skillPath);
     fp.root = spec.root;
     const fileList = join(stage, "files");

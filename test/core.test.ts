@@ -376,7 +376,9 @@ describe("hard deadlines and deploy source", () => {
     expect(cmd).toContain('Get-Command fleet');
     expect(cmd).toContain('deployed Fleet is shadowed');
     expect(cmd).toContain('if($LASTEXITCODE -ne 0){throw "tar extraction failed');
-    expect(cmd).toContain('if($LASTEXITCODE -ne 0){throw "bun install failed');
+    expect(cmd).toContain('if ($installCode -ne 0) { throw ("bun install failed');
+    expect(deployScript({ name: "main", ssh: "main", os: "windows" }, "fleet-deploy.tgz", true).cmd)
+      .toContain('if ($installCode -ne 0) { throw ("bun install --frozen-lockfile failed');
     expect(cmd).toContain("} finally {");
   });
 

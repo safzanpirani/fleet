@@ -283,6 +283,24 @@ describe("machine-readable CLI output", () => {
     for (const name of names) expect(text).toContain(`  fleet ${name}`);
   });
 
+  test("cu install rejects --ref without --sha256 (and the reverse) before host routing", async () => {
+    const { root, bin, config } = fixture();
+    try {
+      const marker = join(root, "ssh-called");
+      executable(join(bin, "ssh"), `#!/bin/sh\ntouch '${marker}'\nexit 99\n`);
+      for (const [args, message] of [
+        [["cu", "local", "install", "--ref", "cua-driver-rs-v0.38.0"], "--ref and --sha256 go together"],
+        [["cu", "local", "install", "--sha256", "a".repeat(64)], "--ref and --sha256 go together"],
+        [["cu", "local", "install", "--ref", "main", "--sha256", "nothex"], "--sha256 must be 64 hex digits"],
+      ] as const) {
+        const r = await runCli([...args], config, bin);
+        expect(r.code).toBe(1);
+        expect(r.stderr).toContain(message);
+      }
+      expect(await Bun.file(marker).exists()).toBe(false);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   test("exec payload help remains a remote argument", async () => {
     const { root, bin, config } = fixture();
     try {
@@ -1236,6 +1254,19 @@ describe("feature gates in the CLI", () => {
       const json = await runCli(["exec", "--json", "box", "true"], config, bin);
       expect(json.code).toBe(1);
       expect(JSON.parse(json.stdout)).toMatchObject({ ok: false, command: "exec", error: { code: "FEATURE_DISABLED" } });
+      expect(() => readFileSync(marker)).toThrow();
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test("cu task refuses a host whose ai follows a disabled shot, before any ssh", async () => {
+    const { root, bin, config } = fixture();
+    try {
+      writeFileSync(config, JSON.stringify({ hosts: { box: { ssh: "fake-box", os: "linux", disable: ["shot"] } } }));
+      const marker = join(root, "ssh-called");
+      executable(join(bin, "ssh"), `#!/bin/sh\ntouch '${marker}'\nexit 99\n`);
+      const r = await runCli(["cu", "box", "task", "Notes", "write hi", "--verify", "hi is shown"], config, bin);
+      expect(r.code).toBe(1);
+      expect(r.stderr).toContain("ai is disabled on box by the fleet config, which refuses shot there");
       expect(() => readFileSync(marker)).toThrow();
     } finally { rmSync(root, { recursive: true, force: true }); }
   });

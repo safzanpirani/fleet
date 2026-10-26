@@ -714,13 +714,31 @@ host entries.
 
 **Feature gates.** `hosts.<h>.disable` refuses whole command families on one host, a
 top-level `disable` refuses them everywhere, and `hosts.<h>.enable` re-allows one the top
-level refuses. Features: `webcam`, `cu`, `shot` (also the MCP screenshot tool), `browse`,
-`exec` (exec, spawn, watch, ssh, MCP exec), `files` (cp, edit, diff), `power` (reboot,
-bios, switch), `kill`, `restart`, `deploy` (deploy, tools sync, skills sync). A refused
-command exits 1 before touching any host and names every refusing host; `--json` gives
-code `FEATURE_DISABLED`. A route's transports must allow the same features. This is a
-policy on fleet's own commands, not a sandbox: disable `exec` and `files` too when an
-agent must not reach the host another way through fleet.
+level refuses. Features: `webcam`, `cu`, `shot` (also the MCP screenshot tool), `ai`
+(`cu task` and `elements --task`, which send window content to an AI service; a host
+that refuses `shot` refuses `ai` too unless it `enable`s `ai`), `browse`, `exec` (exec,
+spawn, watch, ssh, MCP exec, and the Windows session broker), `files` (cp, edit, diff),
+`power` (reboot, bios, switch), `kill`, `restart`, `deploy` (deploy, tools sync, skills
+sync). A refused command exits 1 before touching any host and names every refusing
+host; `--json` gives code `FEATURE_DISABLED`. A route's transports must allow the same
+features. This is a policy on fleet's own commands, not a sandbox: disable `exec` and
+`files` too when an agent must not reach the host another way through fleet.
+
+**Policy file.** `/etc/fleet/policy.json` (`C:\ProgramData\fleet\policy.json` on
+Windows) adds refusals no config edit lifts: `{"disable": [...], "hosts": {"<key>":
+{"disable": [...]}}}`, where a host key matches a config host's name, ssh destination
+or `hostKeyAlias`. No env var or flag moves it. An invalid policy refuses every gated
+feature until root fixes it. `fleet config` says whether the file is root-owned and
+protected. A refusal that names the policy file cannot be fixed from the config; ask the user.
+
+**Sync and file safety.** `tools sync` and `skills sync` refuse a tool or set whose
+shipped bytes look secret (`.env`, keys, certificates, API tokens), naming file and rule;
+`allowFiles` lists checked exceptions. Remote installs use `bun install
+--frozen-lockfile` when a lockfile ships, and tools without one show `unlocked`.
+`fleet cu <sel> install` runs upstream's installer scripts from a pinned commit after a
+sha256 check. Fleet refuses a config that another user could write, and a sudo or proxy
+`passwordFile` that anyone but you can read (`chmod 600`); `~/.fleet` and captured images
+are private.
 
 **Defaults and per-host settings.** A top-level `defaults` object sets knobs for every
 host and `hosts.<h>.settings` overrides them for one host; an environment variable beats

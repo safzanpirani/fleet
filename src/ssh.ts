@@ -16,9 +16,10 @@ import { hostKeyOpts, resolveProxy } from "./config.ts";
 import { doneGraceMs, execTimeoutMs, probeTimeout, sshMux, sshPersist } from "./settings.ts";
 import { dtExec, dtProbe, dtPush, dtPull } from "./daytona.ts";
 import { trySessionExec, winSessionEnabled } from "./winsession.ts";
-import { homedir, tmpdir } from "node:os";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { fleetStateDir } from "./perms.ts";
 
 // ── SSH connection multiplexing + proxying ───────────────────────────────────
 // Reuse one master connection per host instead of re-handshaking on every exec/
@@ -51,10 +52,9 @@ export function muxOpts(host: Host): string[] {
   if (mode === "off") return [];
   if (process.platform === "win32") return [];
   if (mode === "config") return [];   // honour ControlMaster/ControlPath from ~/.ssh/config
-  if (_muxDir === null) {
-    _muxDir = join(homedir(), ".fleet", "ssh");
-    try { mkdirSync(_muxDir, { recursive: true }); } catch { /* best-effort; ssh falls back to no-mux if the socket can't be made */ }
-  }
+  // Private (0700), tightened once if wider; never fatal: ssh falls back to
+  // no-mux when it cannot make the socket.
+  if (_muxDir === null) _muxDir = fleetStateDir("ssh");
   // `%C` covers the address, not the host key alias. Two boots of one machine
   // answer on the same address, so the alias keeps their masters apart.
   const alias = host.hostKeyAlias ? `-${host.hostKeyAlias}` : "";
@@ -629,9 +629,22 @@ async function runCopier(host: Host, argv: string[], progress?: boolean): Promis
   return { host: host.name, ok: code === 0, code, stdout: stdout.trimEnd(), stderr: stderr.trimEnd() };
 }
 
-function runScp(host: Host, argv: string[], progress?: boolean): Promise<ExecResult> {
+/** `operands` come after `--`, so a source named `-S./payload` is a file, never
+ *  an scp or rsync option. */
+function runScp(host: Host, flags: string[], operands: string[], progress?: boolean): Promise<ExecResult> {
   return runCopier(host,
-    ["scp", ...connOpts(host), "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", ...argv], progress);
+    ["scp", ...connOpts(host), "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", ...flags, "--", ...operands], progress);
+}
+
+/** A local copier operand that cannot read as an option or a `host:path`.
+ *  scp and rsync take a word with a colon before any slash as remote, so a
+ *  relative local path that starts with `-` or holds a colon gets `./`.
+ *  Absolute paths, and Windows drive paths on a Windows controller, stay as
+ *  they are: the copiers already read those as local. */
+export function localOperand(path: string, platform: NodeJS.Platform = process.platform): string {
+  if (path.startsWith("/")) return path;
+  if (platform === "win32" && (/^[A-Za-z]:/.test(path) || /^[\\/]/.test(path))) return path;
+  return path.startsWith("-") || path.includes(":") ? `./${path}` : path;
 }
 
 let rsyncFlavor: "gnu" | "openrsync" | undefined;
@@ -656,7 +669,7 @@ export function rsyncRemotePath(path: string, flavor: "gnu" | "openrsync"): stri
  *  next run uses it as the delta basis; `-t` lets a rerun skip finished files.
  *  The ssh options go through a throwaway wrapper script, because rsync's `-e`
  *  splitting cannot carry a quoted ProxyCommand. */
-async function runRsync(host: Host, argv: string[], recursive: boolean, progress?: boolean): Promise<ExecResult> {
+async function runRsync(host: Host, operands: string[], recursive: boolean, progress?: boolean): Promise<ExecResult> {
   if (host.transport === "daytona" || host.os === "windows")
     return { host: host.name, ok: false, code: 2, stdout: "",
       stderr: `--resume needs rsync on both ends; ${host.name} is ${host.transport === "daytona" ? "a sandbox" : "Windows"}. Copy without --resume.` };
@@ -667,7 +680,7 @@ async function runRsync(host: Host, argv: string[], recursive: boolean, progress
   try {
     return await runCopier(host, ["rsync", "-t", "--partial", ...(recursive ? ["-r"] : []),
       ...(localRsyncFlavor() === "gnu" ? ["-s"] : []),
-      ...(progress ? ["--progress"] : []), "-e", wrapper, ...argv], progress);
+      ...(progress ? ["--progress"] : []), "-e", wrapper, "--", ...operands], progress);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -712,8 +725,9 @@ export async function scp(
     return mergeScpResults(host, await Promise.all(
       locals.map((l) => dtPush(host, l, joinRemote(remote, l)))));
   }
-  if (opts.resume) return runRsync(host, [...locals, `${host.ssh}:${rsyncRemotePath(remote, localRsyncFlavor())}`], recursive, opts.progress);
-  return runScp(host, [...(recursive ? ["-r"] : []), ...locals, `${host.ssh}:${scpRemotePath(host, remote)}`], opts.progress);
+  const sources = locals.map((l) => localOperand(l));
+  if (opts.resume) return runRsync(host, [...sources, `${host.ssh}:${rsyncRemotePath(remote, localRsyncFlavor())}`], recursive, opts.progress);
+  return runScp(host, recursive ? ["-r"] : [], [...sources, `${host.ssh}:${scpRemotePath(host, remote)}`], opts.progress);
 }
 
 /** scp host:remote → local (pull). Mirror of `scp`, for retrieving file(s)/dir(s)
@@ -731,8 +745,9 @@ export async function scpPull(
     return mergeScpResults(host, await Promise.all(
       remotes.map((r) => dtPull(host, r, joinRemote(local, r)))));
   }
-  if (opts.resume) return runRsync(host, [...remotes.map((r) => `${host.ssh}:${rsyncRemotePath(r, localRsyncFlavor())}`), local], recursive, opts.progress);
-  return runScp(host, [...(recursive ? ["-r"] : []), ...remotes.map((r) => `${host.ssh}:${scpRemotePath(host, r)}`), local], opts.progress);
+  const dest = localOperand(local);
+  if (opts.resume) return runRsync(host, [...remotes.map((r) => `${host.ssh}:${rsyncRemotePath(r, localRsyncFlavor())}`), dest], recursive, opts.progress);
+  return runScp(host, recursive ? ["-r"] : [], [...remotes.map((r) => `${host.ssh}:${scpRemotePath(host, r)}`), dest], opts.progress);
 }
 
 /** `dir` + the basename of `src` — how scp names each file when the destination

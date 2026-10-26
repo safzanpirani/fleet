@@ -5,8 +5,8 @@
  * stdio MCP process. Presentation (ANSI tables, plain text) lives in the
  * frontends; the quoting-proof shell construction lives once, here + `ssh.ts`.
  */
-import { assertFeature, featureEnabled, HOST_FEATURES, captureSetting, hostKeyOpts, resolveHosts, REPO_ROOT, lookupProxy, normalizeProxy, resolveProxy, webcamDevice } from "./config.ts";
-import type { FleetConfig, Host, HostFeature, Service, ServiceType, Machine } from "./config.ts";
+import { assertFeature, featureRefusal, HOST_FEATURES, captureSetting, hostKeyOpts, resolveHosts, REPO_ROOT, lookupProxy, normalizeProxy, resolveProxy, webcamDevice, activePolicy, policyHostKeys, POLICY_PATH } from "./config.ts";
+import type { FeatureSource, FleetConfig, FleetPolicy, Host, HostFeature, Service, ServiceType, Machine } from "./config.ts";
 import { buildArgs, buildArgvCommand, connOpts, exec, probe, probeDetail, resolveWinBin, scp, scpPull, sshDiagnose, sshEnv, bashEsc, bashPathAssignment, psEsc, psHiddenLaunch } from "./ssh.ts";
 import { checkProxy, proxyCommandFor } from "./proxy.ts";
 import { didYouMean } from "./suggest.ts";
@@ -16,12 +16,13 @@ import { homedir, networkInterfaces, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { createConnection } from "node:net";
 import { createSocket } from "node:dgram";
-import { mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { fstatSync, readFileSync, statSync, type Stats } from "node:fs";
 import { installLockScript } from "./install-lock.ts";
+import { assertPrivateSecret, fleetStateDir } from "./perms.ts";
 import { execParallelism, knob, probeTimeout, sshMux, winSessionIdleMs, type Knob, type SettingSource } from "./settings.ts";
-import { DEFAULT_TOOL_SYNC_PARALLELISM, mapPool, TOOL_STATUS_HOST_PARALLELISM } from "./tools.ts";
+import { bunInstallStep, DEFAULT_TOOL_SYNC_PARALLELISM, mapPool, TOOL_STATUS_HOST_PARALLELISM } from "./tools.ts";
 import { DIFF_MAX_BYTES, decodeDiffText, unifiedDiff } from "./diff.ts";
 import {
   detectWebcamVo, parseCameras, renderSize, validateWebcamDevice, validateWebcamStreamOptions, webcamPowerShellSubmission, webcamScript, webcamStreamScript,
@@ -190,7 +191,8 @@ export interface HostReport {
   httpUp?: boolean;   // when ssh is down but a configured health URL answers: alive, just unreachable
   proxy: string | null;   // resolved proxy name (redacted for inline URLs), or null
   proxyDown?: boolean;    // the PROXY is unreachable — the host was never contacted
-  disabled?: HostFeature[];   // fleet commands the config refuses on this host; absent when none
+  disabled?: HostFeature[];   // fleet commands the config or policy file refuses on this host; absent when none
+  refused?: FeatureRefusal[]; // the same features, each with the list that refuses it; absent when none
 }
 /** Probe an HTTP endpoint as a coarse liveness check. Any response (even 401/404)
  *  means something is listening → the box is alive; only a transport failure or a
@@ -212,7 +214,7 @@ export async function lsHosts(
   // is only ever spent on dead ones. A host that was down on the last `ls`
   // gets a short cap; a host that answered keeps the full one, so a slow link
   // to a live box is never cut short.
-  const statePath = opts.statePath ?? join(homedir(), ".fleet", "ls-state.json");
+  const statePath = opts.statePath ?? join(fleetStateDir(), "ls-state.json");
   const known = await readLsState(statePath);
   const reports = await Promise.all(Object.values(cfg.hosts).map(async (h) => {
     // A probe cap the environment or the config pins is never cut short.
@@ -223,13 +225,13 @@ export async function lsHosts(
     const result = await (opts.probe ?? probeDetail)(h, cap);
     const up = result.up;
     const httpUp = !up && http ? await http : undefined;
-    const disabled = HOST_FEATURES.filter((f) => !featureEnabled(h, f, cfg));
+    const refused = featureRefusals(h, cfg);
     const rep: HostReport = {
       name: h.name, os: h.os, ssh: h.ssh, gpu: !!h.gpu, up, httpUp,
       proxy: result.via ?? null,
       proxyDown: result.down === "proxy" ? true : undefined,
       services: Object.keys(h.services ?? {}),
-      ...(disabled.length ? { disabled } : {}),
+      ...(refused.length ? { disabled: refused.map((r) => r.feature), refused } : {}),
     };
     onResult?.(rep);
     return rep;
@@ -251,9 +253,9 @@ async function readLsState(path: string): Promise<Record<string, boolean>> {
 
 async function writeLsState(path: string, state: Record<string, boolean>): Promise<void> {
   try {
-    await mkdir(dirname(path), { recursive: true });
+    await mkdir(dirname(path), { recursive: true, mode: 0o700 });
     const tmp = `${path}.${process.pid}.tmp`;
-    await writeFile(tmp, JSON.stringify(state));
+    await writeFile(tmp, JSON.stringify(state), { mode: 0o600 });
     await rename(tmp, path);
   } catch { /* a hint cache; ls is still correct without it */ }
 }
@@ -656,7 +658,8 @@ export function asRoot(script: string, opts: { password?: string; host?: string 
 }
 
 /** The sudo password configured for a host, or undefined when none is. A file
- *  readable by other users is refused: it holds a root credential. */
+ *  another user can read, or that another user owns, is refused before it is
+ *  read: it holds a root credential. */
 export async function sudoPassword(host: Host): Promise<string | undefined> {
   const spec = host.sudo;
   if (!spec) return undefined;
@@ -668,10 +671,9 @@ export async function sudoPassword(host: Host): Promise<string | undefined> {
   const raw = spec.passwordFile!;
   const path = raw === "~" ? homedir() : raw.startsWith("~/") ? join(homedir(), raw.slice(2)) : raw;
   if (!path.startsWith("/")) throw new Error(`${host.name}: sudo.passwordFile must be an absolute or ~ path (got '${raw}')`);
-  let mode: number;
-  try { mode = statSync(path).mode; }
+  try { statSync(path); }
   catch { throw new Error(`${host.name}: sudo password file not found: ${path}`); }
-  if ((mode & 0o077) !== 0) throw new Error(`${host.name}: ${path} is readable by other users; chmod 600 it`);
+  assertPrivateSecret(path, `${host.name}: sudo.passwordFile`);
   const text = readFileSync(path, "utf8").split("\n")[0]!.replace(/\r$/, "");
   if (!text) throw new Error(`${host.name}: sudo password file is empty: ${path}`);
   return text;
@@ -1102,6 +1104,7 @@ export function parseRemoteSpec(cfg: FleetConfig, token: string): { sel: string;
 // ── deploy (ship the fleet source to a host + reinstall deps + restart) ───────
 export interface DeployResult {
   host: string; ok: boolean; dir: string; result: ExecResult; restarted?: ServiceAction[];
+  unlocked?: boolean;   // the source shipped no bun.lock: dependencies installed unlocked
 }
 export interface DeploySourceOptions {
   explicit?: string;
@@ -1132,7 +1135,9 @@ export async function resolveDeploySourceRoot(opts: DeploySourceOptions = {}): P
 function deployDir(h: Host): string {
   return h.deploy?.dir ?? (h.os === "windows" ? "$env:USERPROFILE\\fleet" : "$HOME/fleet");
 }
-export function deployScript(h: Host, archive = "fleet-deploy.tgz"): { cmd: string; shell: Shell } {
+/** `frozen` when the shipped source has a Bun lockfile: `bun install
+ *  --frozen-lockfile`, and a refusal stops before the launcher changes. */
+export function deployScript(h: Host, archive = "fleet-deploy.tgz", frozen = false): { cmd: string; shell: Shell } {
   if (!/^[a-z0-9.-]+$/.test(archive)) throw new Error("invalid deployment archive");
   const dir = deployDir(h);
   if (h.os === "windows") return { shell: "powershell", cmd: [
@@ -1145,8 +1150,7 @@ export function deployScript(h: Host, archive = "fleet-deploy.tgz"): { cmd: stri
     `tar -xzf "$env:USERPROFILE\\${archive}" -C $dir`,
     `if($LASTEXITCODE -ne 0){throw "tar extraction failed with exit $LASTEXITCODE"}`,
     `Set-Location $dir`,
-    `& $bun install 2>&1 | Out-Null`,
-    `if($LASTEXITCODE -ne 0){throw "bun install failed with exit $LASTEXITCODE"}`,
+    bunInstallStep("powershell", frozen),
     `$shim="$env:USERPROFILE\\.local\\bin"`,
     `New-Item -ItemType Directory -Force -Path $shim | Out-Null`,
     `$shimText = '@echo off' + [Environment]::NewLine + '"' + $bun + '" "' + $dir + '\\src\\cli.ts" %*'`,
@@ -1166,7 +1170,7 @@ export function deployScript(h: Host, archive = "fleet-deploy.tgz"): { cmd: stri
     `mkdir -p "$dir"`,
     `tar -xzf "$HOME/${archive}" -C "$dir"`,
     `cd "$dir"`,
-    `"$bun" install >/dev/null 2>&1`,
+    bunInstallStep("bash", frozen),
     `mkdir -p "$HOME/.local/bin"`,
     `cat > "$HOME/.local/bin/fleet" <<LAUNCHER\n#!/bin/sh\nexec "$bun" "$dir/src/cli.ts" "\\$@"\nLAUNCHER`,
     `chmod 755 "$HOME/.local/bin/fleet"`,
@@ -1185,6 +1189,14 @@ function deployRestartName(h: Host, restart: boolean | string): string | undefin
 export async function deployOne(
   cfg: FleetConfig, h: Host, tarLocal: string, restart: boolean | string,
   deps: { exec?: typeof exec; scp?: typeof scp; restart?: typeof restartService } = {},
+  source: { locked?: boolean } = {},
+): Promise<DeployResult> {
+  const outcome = await deployOneUnlabelled(cfg, h, tarLocal, restart, deps, source.locked === true);
+  return source.locked ? outcome : { ...outcome, unlocked: true };
+}
+async function deployOneUnlabelled(
+  cfg: FleetConfig, h: Host, tarLocal: string, restart: boolean | string,
+  deps: { exec?: typeof exec; scp?: typeof scp; restart?: typeof restartService }, locked: boolean,
 ): Promise<DeployResult> {
   const token = crypto.randomUUID();
   const archive = `fleet-deploy-${token}.tgz`;
@@ -1202,7 +1214,7 @@ export async function deployOne(
       unconfirmed = pushed.code === 124 || pushed.code === 255;
       outcome = { host: h.name, ok: false, dir, result: pushed };
     } else {
-      const { cmd, shell } = deployScript(h, archive);
+      const { cmd, shell } = deployScript(h, archive, locked);
       installing = true;
       const result = await run(h, cmd, shell);
       unconfirmed = result.code === 124 || result.code === 255;
@@ -1250,6 +1262,7 @@ export async function deployHosts(
       throw new Error(`cannot deploy ${host.name}: restart service '${service}' is not configured (available: ${Object.keys(host.services ?? {}).join(", ") || "none"})${didYouMean(service, Object.keys(host.services ?? {}))}`);
   }
   const sourceRoot = await resolveDeploySourceRoot();
+  const locked = await Bun.file(join(sourceRoot, "bun.lock")).exists() || await Bun.file(join(sourceRoot, "bun.lockb")).exists();
   const staging = await mkdtemp(join(tmpdir(), "fleet-deploy-"));
   const tar = join(staging, "source.tgz");
   try {
@@ -1262,7 +1275,7 @@ export async function deployHosts(
       new Response(build.stderr).text(),
     ]);
     if (buildCode !== 0) throw new Error("tarball build failed: " + buildError.trim());
-    return await Promise.all(hosts.map((h) => deployOne(cfg, h, tar, opts.restart ?? true)));
+    return await Promise.all(hosts.map((h) => deployOne(cfg, h, tar, opts.restart ?? true, {}, { locked })));
   } finally {
     await rm(staging, { recursive: true, force: true });
   }
@@ -1744,13 +1757,36 @@ export interface HostConfigView {
   host: string;
   settings: SettingRow[];
   /** Features fleet refuses on this host, and which list refuses each. */
-  refused: { feature: HostFeature; source: "host" | "top-level" }[];
+  refused: FeatureRefusal[];
 }
-export interface ConfigView { global: SettingRow[]; hosts: HostConfigView[] }
+export interface FeatureRefusal { feature: HostFeature; source: FeatureSource }
+/** The policy file as `fleet config` reports it. */
+export interface PolicyView {
+  path: string;
+  present: boolean;
+  /** Why the file fails closed: every gated feature is refused on every host. */
+  error?: string;
+  /** Absent on Windows, where only the path is reported. */
+  protected?: boolean;
+  reason?: string;
+  /** Policy host keys that name no config host by label, ssh destination or host-key alias. */
+  unknownHosts: string[];
+}
+export interface ConfigView { policy: PolicyView; global: SettingRow[]; hosts: HostConfigView[] }
+
+function featureRefusals(host: Host, cfg: FleetConfig, policy: FleetPolicy | null = activePolicy()): FeatureRefusal[] {
+  return HOST_FEATURES.flatMap((feature) => {
+    const source = featureRefusal(host, feature, cfg, policy);
+    return source ? [{ feature, source }] : [];
+  });
+}
 
 /** Every effective knob and refused feature, for one selector or every host.
  *  A route name lists its transports. Reads the config only: no network. */
-export function configView(cfg: FleetConfig, sel?: string, env: Record<string, string | undefined> = process.env): ConfigView {
+export function configView(
+  cfg: FleetConfig, sel?: string, env: Record<string, string | undefined> = process.env,
+  policy: FleetPolicy | null = activePolicy(),
+): ConfigView {
   const hosts = sel === undefined ? Object.values(cfg.hosts)
     : cfg.routes?.[sel] ? cfg.routes[sel]!.prefer.map((name) => cfg.hosts[name]!)
     : resolveHosts(cfg, sel);
@@ -1768,6 +1804,17 @@ export function configView(cfg: FleetConfig, sel?: string, env: Record<string, s
   ];
   const scalar = (host: Host, key: Knob): SettingRow => ({ key, ...knob(host, key, env, cfg) });
   return {
+    policy: policy
+      ? {
+        path: policy.path, present: true,
+        ...(policy.error !== undefined ? { error: policy.error } : {}),
+        ...(policy.protection ? { protected: policy.protection.protected, ...(policy.protection.protected ? {} : { reason: policy.protection.reason }) } : {}),
+        unknownHosts: (() => {
+          const known = new Set(Object.values(cfg.hosts).flatMap(policyHostKeys));
+          return Object.keys(policy.hosts).filter((key) => !known.has(key));
+        })(),
+      }
+      : { path: POLICY_PATH, present: false, unknownHosts: [] },
     global,
     hosts: hosts.map((host) => {
       const s = host.settings;
@@ -1783,8 +1830,7 @@ export function configView(cfg: FleetConfig, sel?: string, env: Record<string, s
           layered("shot.gridStep", s?.shot?.gridStep, d?.shot?.gridStep, 100),
           layered("webcam.device", s?.webcam?.device, d?.webcam?.device, null),
         ],
-        refused: HOST_FEATURES.filter((feature) => !featureEnabled(host, feature, cfg))
-          .map((feature) => ({ feature, source: host.disable?.includes(feature) ? "host" as const : "top-level" as const })),
+        refused: featureRefusals(host, cfg, policy),
       };
     }),
   };
@@ -1855,9 +1901,11 @@ async function planSwitch(
   let warning: string | undefined;
   const esps = await run(liveHost, espListCommand(os), "auto", { timeoutMs: 30_000 });
   if (esps.ok) warning = checkEntries({ ...table, entries: [entry] }, parseEspList(os, esps.stdout))[0]?.warning;
-  const next = bootNextCommand(os, entry, target);
-  const cmd = os === "linux" ? asRoot(next, { password: await sudoPassword(liveHost), host: liveHost.name }) : next;
-  return { kind: "firmware", label, entry, note, warning, command: cmd };
+  // The plan is returned and printed (`--dry-run --json`), so it holds only the
+  // credential-free command; the Linux sudo wrapper is built at trigger time.
+  // Reading the password here still lets a dry run catch a broken sudo config.
+  if (os === "linux") await sudoPassword(liveHost);
+  return { kind: "firmware", label, entry, note, warning, command: bootNextCommand(os, entry, target) };
 }
 
 /** Boot a machine into target OS: detect the live boot, trigger the switch on
@@ -1916,7 +1964,12 @@ export async function switchMachine(
   // A new login, not the shared master or the kept-open Windows session: the
   // trigger runs once and cannot be replayed, so its reply must not depend on
   // a long-lived connection's state.
-  const triggered = await run(liveHost, plan.command, "auto", { timeoutMs: SWITCH_TRIGGER_MS, fresh: true });
+  // A firmware plan on Linux needs root. The wrapper embeds the sudo password,
+  // so it exists only here, on its way to ssh stdin, never in the result.
+  const trigger = plan.kind === "firmware" && liveHost.os === "linux"
+    ? asRoot(plan.command, { password: await sudoPassword(liveHost), host: liveHost.name })
+    : plan.command;
+  const triggered = await run(liveHost, trigger, "auto", { timeoutMs: SWITCH_TRIGGER_MS, fresh: true });
   // A reboot may cut the link before the reply: 255 is ssh's own failure code.
   const dropped = triggered.code === 255 || triggered.code === 124;
   const said = (triggered.stdout + "\n" + triggered.stderr).trim().split("\n").filter(Boolean).slice(-3).join(" | ");
@@ -2309,6 +2362,9 @@ export async function deliverImage(
       if (code !== 0) return { result: { ...pull, ok: false, code, stderr: `cwebp failed: ${stderr}` }, path };
       await validateImageArtifact(candidate);
     }
+    // A capture shows whatever was on screen: only you may read it, whether it
+    // is the scp'd PNG, the WebP transcode or the PNG fallback.
+    await chmod(candidate, 0o600);
     await rename(candidate, resolve(path));
     return { result: pull, path };
   } catch (error) {
@@ -2653,8 +2709,12 @@ export function captureCmd(os: Host["os"], target: CaptureTarget = {}): { cmd: s
     const r = target.rect;
     const which = target.macDisplay && target.wholeOutput ? `-D ${target.macDisplay} `
       : r ? `-R ${r.x},${r.y},${r.width},${r.height} ` : "";
-    return { shell: "bash", cmd:
-      `set -e; t="$(mktemp -t fleet_shot)"; p="$t.png"; rm -f "$t"; screencapture -x ${which}"$p"; [ -s "$p" ]; echo "$p"` };
+    return { shell: "bash", cmd: [
+      `set -e`,
+      SHOT_DIR_SH,
+      `trap '[ "$?" = 0 ] || rm -rf -- "$fleet_shot_dir"' EXIT`,
+      `screencapture -x ${which}"$p"; [ -s "$p" ]; echo "$p"`,
+    ].join("\n") };
   }
   const r = target.rect;
   const out = target.output && /^[A-Za-z0-9._-]+$/.test(target.output) ? target.output : undefined;
@@ -2673,11 +2733,15 @@ export function captureCmd(os: Host["os"], target: CaptureTarget = {}): { cmd: s
     ? `swaymsg output '${n}' power ${state} >/dev/null`
     // Hyprland 0.56 reads dispatch arguments as Lua; older releases take the classic form.
     : `{ hyprctl dispatch dpms ${state} '${n}' >/dev/null 2>&1 || hyprctl dispatch 'hl.dsp.dpms({ action = "${state}", monitor = "${n}" })' >/dev/null; }`).join("; ");
+  // A failed capture removes its private directory; a good one leaves it for
+  // the pull, after which rmCmd removes the file and the directory.
+  const onExit = [`rc=$?; [ "$rc" = 0 ] || rm -rf -- "$fleet_shot_dir"`, ...(names.length ? [power("off")] : [])].join("; ");
   return { shell: "bash", cmd: [
     GRAPHICAL_ENV_SH,
     `set -e`,
-    `p="/tmp/fleet_shot_$$.png"`,
-    ...(names.length ? [`trap '${power("off").replace(/'/g, `'\\''`)}' EXIT`, `${power("on")}`, `sleep 1`] : []),
+    SHOT_DIR_SH,
+    `trap '${onExit.replace(/'/g, `'\\''`)}' EXIT`,
+    ...(names.length ? [`${power("on")}`, `sleep 1`] : []),
     // KDE Plasma's KWin has no wlr-screencopy, so grim cannot capture there and
     // spectacle can. X tools under Wayland see only XWayland: never fall back to them.
     // The user manager may not carry XDG_CURRENT_DESKTOP; KWin's process says the same.
@@ -2697,10 +2761,18 @@ export function captureCmd(os: Host["os"], target: CaptureTarget = {}): { cmd: s
     `echo "$p"`,
   ].join("\n") };
 }
+/** The capture writes into a fresh 0700 directory from `mktemp -d`, never a
+ *  guessable name in a shared /tmp another local user could pre-create or read. */
+const SHOT_DIR_SH = `fleet_shot_dir="$(mktemp -d "\${TMPDIR:-/tmp}/fleet_shot.XXXXXX")"; chmod 700 "$fleet_shot_dir"; p="$fleet_shot_dir/shot.png"`;
+
+/** Remove a pulled capture. On POSIX also remove its private directory; rmdir
+ *  only removes an empty one, so an unexpected path cannot widen the delete. */
 function rmCmd(os: Host["os"], remote: string): { cmd: string; shell: Shell } {
-  return os === "windows"
-    ? { shell: "powershell", cmd: `Remove-Item -LiteralPath '${psEsc(remote)}' -ErrorAction SilentlyContinue` }
-    : { shell: "bash", cmd: `rm -f -- '${bashEsc(remote)}'` };
+  if (os === "windows")
+    return { shell: "powershell", cmd: `Remove-Item -LiteralPath '${psEsc(remote)}' -ErrorAction SilentlyContinue` };
+  const dir = remote.slice(0, remote.lastIndexOf("/"));
+  return { shell: "bash", cmd: `rm -f -- '${bashEsc(remote)}'`
+    + (/\/fleet_shot\.[^/]+$/.test(dir) ? `; rmdir -- '${bashEsc(dir)}' 2>/dev/null; true` : "") };
 }
 
 export interface MonitorList { host: string; source: MonitorSource; monitors: Monitor[]; main?: string }
@@ -3255,28 +3327,108 @@ const CUA_SESSION_DROPIN_SH = [
   `  "[Service]" "Environment=" "ExecStart=" "ExecStart=%h/.config/cua-driver/fleet-start.sh" "RestartSec=5" > "$dropin"`,
 ].join("\n");
 
-/** Install the current release, then restart the host's desktop daemon. */
-function cuInstallCmd(os: Host["os"]): { cmd: string; shell: Shell } {
+/** The cua-driver installer fleet runs. Upstream's install.sh hands off to
+ *  `_install-rust.sh`, which sources `_install-common.sh`, and install.ps1
+ *  imports `_install-common.psm1`; each script takes its helper from beside
+ *  itself and otherwise downloads it from cua.ai, unpinned. So every host
+ *  fetches all five scripts at one immutable commit into one directory, checks
+ *  one sha256 over their bytes in `CUA_INSTALLER_FILES` order, and only then
+ *  runs its OS's entry script from that directory. `driverVersion` reaches the
+ *  installer as CUA_DRIVER_RS_VERSION, so it installs that release rather than
+ *  whatever is newest; the installer checks the release archive against the
+ *  release's SHA256SUMS itself. `fleet cu <sel> install --ref REF --sha256 HEX`
+ *  replaces `ref` and `sha256` for one call. */
+export const CUA_INSTALLER = {
+  repo: "trycua/cua",
+  /** Commit of tag cua-driver-rs-v0.38.0 (scripts identical to main on 2026-10-26). */
+  ref: "85e2b1318bd77ccf3cfa88ccdf875a4bb7eaed19",
+  sha256: "8a17808786a8404e52ab31339d154b51550aa8812593e75be35191ea4ed36685",
+  /** Upstream's published release (`.github/release-state/cua-driver-rs-published-version`). */
+  driverVersion: "0.37.0",
+} as const;
+/** The scripts the installer digest covers, in digest order. */
+export const CUA_INSTALLER_FILES = ["install.sh", "_install-rust.sh", "_install-common.sh", "install.ps1", "_install-common.psm1"] as const;
+export interface CuInstallerPin { ref: string; sha256: string; driverVersion: string }
+
+/** The pin one install call uses: the constants, or a `--ref`/`--sha256` pair.
+ *  Either option alone is refused, so a moved ref never runs unverified. */
+export function cuInstallerPin(override: { ref?: string; sha256?: string } = {}): CuInstallerPin {
+  const { ref, sha256 } = override;
+  if (ref === undefined && sha256 === undefined) return { ...CUA_INSTALLER };
+  if (ref === undefined || sha256 === undefined)
+    throw new Error("--ref and --sha256 go together: name the installer ref and the sha256 of its scripts");
+  if (!/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(ref) || ref.includes(".."))
+    throw new Error(`--ref must be a git tag, branch or commit of ${CUA_INSTALLER.repo} (got '${ref}')`);
+  if (!/^[0-9a-fA-F]{64}$/.test(sha256)) throw new Error(`--sha256 must be 64 hex digits (got '${sha256}')`);
+  return { ref, sha256: sha256.toLowerCase(), driverVersion: CUA_INSTALLER.driverVersion };
+}
+
+function cuInstallerUrl(ref: string): string {
+  return `https://raw.githubusercontent.com/${CUA_INSTALLER.repo}/${ref}/libs/cua-driver/scripts`;
+}
+
+/** Install the pinned release, then restart the host's desktop daemon. */
+export function cuInstallCmd(os: Host["os"], pin: CuInstallerPin = CUA_INSTALLER): { cmd: string; shell: Shell } {
+  const where = `${CUA_INSTALLER.repo}@${pin.ref}`;
+  const files = CUA_INSTALLER_FILES.join(" ");
   if (os === "windows") return {
     shell: "powershell",
-    cmd: `$ErrorActionPreference='Stop'; irm https://raw.githubusercontent.com/trycua/cua/main/libs/cua-driver/scripts/install.ps1 | iex; `
-      + `& "$env:LOCALAPPDATA\\Programs\\Cua\\cua-driver\\bin\\cua-driver.exe" autostart kick`,
+    cmd: [
+      `$ErrorActionPreference='Stop'`,
+      `$fleetCuaProgress=$ProgressPreference; $ProgressPreference='SilentlyContinue'`,
+      `$fleetCuaDir=Join-Path ([IO.Path]::GetTempPath()) ('fleet-cua-' + [Guid]::NewGuid().ToString('N'))`,
+      `New-Item -ItemType Directory -Path $fleetCuaDir | Out-Null`,
+      `try {`,
+      `  $fleetCuaBytes=New-Object System.IO.MemoryStream`,
+      `  foreach ($fleetCuaFile in @(${CUA_INSTALLER_FILES.map((f) => `'${f}'`).join(",")})) {`,
+      `    $fleetCuaPath=Join-Path $fleetCuaDir $fleetCuaFile`,
+      `    Invoke-WebRequest -UseBasicParsing -Uri ('${cuInstallerUrl(pin.ref)}/' + $fleetCuaFile) -OutFile $fleetCuaPath`,
+      `    $fleetCuaData=[IO.File]::ReadAllBytes($fleetCuaPath)`,
+      `    $fleetCuaBytes.Write($fleetCuaData, 0, $fleetCuaData.Length)`,
+      `  }`,
+      `  $fleetCuaBytes.Position=0`,
+      `  $fleetCuaGot=(Get-FileHash -InputStream $fleetCuaBytes -Algorithm SHA256).Hash.ToLowerInvariant()`,
+      `  if ($fleetCuaGot -ne '${pin.sha256}') { throw "cua-driver installer at ${where} has sha256 $fleetCuaGot, expected ${pin.sha256}; refusing to run it" }`,
+      `  "fleet: cua-driver installer ${where} verified; installing cua-driver ${pin.driverVersion}"`,
+      `  $env:CUA_DRIVER_RS_VERSION='${pin.driverVersion}'`,
+      // A child process, so the installer's own `exit 1` reaches $LASTEXITCODE
+      // and $PSScriptRoot points at the verified helpers beside it.
+      `  & (Get-Process -Id $PID).Path -NoProfile -ExecutionPolicy Bypass -File (Join-Path $fleetCuaDir 'install.ps1')`,
+      `  if ($LASTEXITCODE -ne 0) { throw "cua-driver installer exited with $LASTEXITCODE" }`,
+      `} finally {`,
+      `  Remove-Item Env:CUA_DRIVER_RS_VERSION -EA SilentlyContinue`,
+      `  $ProgressPreference=$fleetCuaProgress`,
+      `  Remove-Item -LiteralPath $fleetCuaDir -Recurse -Force -EA SilentlyContinue`,
+      `}`,
+      `& "$env:LOCALAPPDATA\\Programs\\Cua\\cua-driver\\bin\\cua-driver.exe" autostart kick`,
+    ].join("\n"),
   };
-  // `bash -c "$installer" <flag>` would pass the flag as $0, not $1, so any
-  // argument has to come after an explicit $0 placeholder. Nothing needs one
-  // today; the placeholder is here so adding one later does not silently do
-  // nothing.
-  const runInstaller = `/bin/bash -c "$installer" cua-driver-install || exit $?`;
+  // Run install.sh as a file from the verified directory: it then execs the
+  // `_install-rust.sh` beside it, which sources the `_install-common.sh` beside
+  // it, instead of fetching either from cua.ai.
+  const install = [
+    `fleet_cua_dir=$(mktemp -d "\${TMPDIR:-/tmp}/fleet-cua.XXXXXX") || exit 1`,
+    `trap 'rm -rf "$fleet_cua_dir"' EXIT`,
+    `for f in ${files}; do`,
+    `  curl -fsSL -o "$fleet_cua_dir/$f" "${cuInstallerUrl(pin.ref)}/$f" || exit $?`,
+    `done`,
+    `if command -v sha256sum >/dev/null 2>&1; then fleet_cua_sum=sha256sum; else fleet_cua_sum="shasum -a 256"; fi`,
+    `fleet_cua_got=$(cd "$fleet_cua_dir" && cat ${files} | $fleet_cua_sum | cut -d' ' -f1)`,
+    `if [ "$fleet_cua_got" != ${pin.sha256} ]; then`,
+    `  echo "fleet: cua-driver installer at ${where} has sha256 \${fleet_cua_got:-unknown}, expected ${pin.sha256}; refusing to run it" >&2`,
+    `  exit 1`,
+    `fi`,
+    `echo "fleet: cua-driver installer ${where} verified; installing cua-driver ${pin.driverVersion}"`,
+    `CUA_DRIVER_RS_VERSION=${pin.driverVersion} /bin/bash "$fleet_cua_dir/install.sh" || exit $?`,
+  ].join("\n");
   if (os !== "linux") return {
     shell: "bash",
-    cmd: `installer=$(curl -fsSL https://raw.githubusercontent.com/trycua/cua/main/libs/cua-driver/scripts/install.sh) || exit $?\n`
-      + `${runInstaller}\n`
+    cmd: `${install}\n`
       + `"$(command -v cua-driver || echo "$HOME/.local/bin/cua-driver")" autostart kick`,
   };
   return {
     shell: "bash",
-    cmd: `installer=$(curl -fsSL https://raw.githubusercontent.com/trycua/cua/main/libs/cua-driver/scripts/install.sh) || exit $?\n`
-      + `${runInstaller}\n`
+    cmd: `${install}\n`
       + `unit="$HOME/.config/systemd/user/cua-driver.service"\n`
       + `if [ ! -f "$unit" ]; then\n`
       + `  mkdir -p "$(dirname "$unit")"\n`
@@ -3296,18 +3448,19 @@ function cuInstallCmd(os: Host["os"]): { cmd: string; shell: Shell } {
 export async function cuInstall(
   cfg: FleetConfig,
   sel: string,
-  deps: { exec?: typeof exec } = {},
+  deps: { exec?: typeof exec; ref?: string; sha256?: string } = {},
 ): Promise<CuInstallAction[]> {
+  const pin = cuInstallerPin({ ref: deps.ref, sha256: deps.sha256 });
   const run = deps.exec ?? exec;
   const hosts = resolveHosts(cfg, sel);
   assertFeature(hosts, "cu", cfg);
   return Promise.all(hosts.map(async (h) => {
-    const { cmd, shell } = cuInstallCmd(h.os);
-    return { host: h.name, os: h.os, result: await run(h, cmd, shell) };
+    const { cmd, shell } = cuInstallCmd(h.os, pin);
+    return { host: h.name, os: h.os, installer: pin, result: await run(h, cmd, shell) };
   }));
 }
 
-export interface CuInstallAction { host: string; os: Host["os"]; result: ExecResult; }
+export interface CuInstallAction { host: string; os: Host["os"]; installer: CuInstallerPin; result: ExecResult; }
 export interface CuResult { host: string; result: ExecResult; localImage?: string; }
 
 /** Build the piped/quoted `<bin> <args>` invocation for one cua-driver call.
@@ -3683,7 +3836,8 @@ export async function cuRecordStop(
   if (!response.result.ok || !localOut) return { ...response, state, stateBefore, localPaths: [] };
   if (!stateBefore?.output_dir) throw new Error("cua-driver has no recording output directory to pull");
 
-  await (deps.makeDir ?? (async (path) => { await mkdir(path, { recursive: true }); }))(localOut);
+  // A recording holds screen captures: a 0700 directory keeps them private.
+  await (deps.makeDir ?? (async (path) => { await mkdir(path, { recursive: true, mode: 0o700 }); }))(localOut);
   const pull = await (deps.pull ?? pullUngated)(cfg, sel, `${stateBefore.output_dir}/.`, localOut, true);
   if (!pull.ok) throw new Error(`could not pull recording from ${response.host}: ${pull.stderr || `scp exit ${pull.code}`}`);
   const localPaths = await (deps.listLocalFiles ?? localFiles)(localOut);
@@ -5208,10 +5362,12 @@ export async function cuRegions(
   ].join("\n") : [
     prelude,
     `command -v python3 >/dev/null 2>&1 || { echo '${PV_SENTINEL}error|{"code":"session_unavailable","message":"python3 is required for perception"}'; exit 3; }`,
-    opts.imageOut ? `shot="\${TMPDIR:-/tmp}/fleet_pv_$$.png"; rm -f "$shot"` : `shot=""`,
-    `python3 -c ${shellQuote(REGION_PY, host.os)} "$fcd" '${config}' $shot`,
+    // A private mktemp directory, not a guessable name in a shared /tmp.
+    opts.imageOut ? `fleet_pv_dir="$(mktemp -d "\${TMPDIR:-/tmp}/fleet_pv.XXXXXX")" || exit 1; shot="$fleet_pv_dir/shot.png"` : `shot=""`,
+    `python3 -c ${shellQuote(REGION_PY, host.os)} "$fcd" '${config}' \${shot:+"$shot"}`,
     `rc=$?`,
     emitImage(host.os, "shot", "regions"),
+    `[ -z "\${fleet_pv_dir:-}" ] || rm -rf -- "$fleet_pv_dir"`,
     `exit $rc`,
   ].join("\n");
   const executed = await run(host, script, win ? "powershell" : "bash");

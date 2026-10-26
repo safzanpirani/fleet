@@ -7,6 +7,7 @@
  */
 import { readFileSync } from "node:fs";
 import type { CuElement } from "./core.ts";
+import { featureRefusal, type FleetConfig, type Host } from "./config.ts";
 
 const ENDPOINT = "https://api.typesafe.ai/v1/systemone";
 const SHARD = 50;
@@ -66,11 +67,14 @@ export function decideFocus(count: number, answers: Record<string, { noul?: numb
 
 export interface Focused { elements: CuElement[]; hidden: CuElement[]; note?: string }
 
-/** Hide the rows the task does not need. Never throws. */
+/** Hide the rows the task does not need. Never throws. A `host` that refuses
+ *  `ai` gets every row and nothing is sent. */
 export async function focusElements(
   elements: CuElement[], task: string, window: string,
-  deps: { key?: JevKey | null; fetch?: typeof fetch } = {},
+  deps: { key?: JevKey | null; fetch?: typeof fetch; host?: Host; cfg?: FleetConfig } = {},
 ): Promise<Focused> {
+  const refusal = deps.host && featureRefusal(deps.host, "ai", deps.cfg);
+  if (refusal) return { elements, hidden: [], note: `focus skipped: ai is disabled on ${deps.host!.name} (${refusal}); showing every row` };
   const key = deps.key === undefined ? loadJevKey() : deps.key ?? undefined;
   if (!key) return { elements, hidden: [], note: "no TypeSafe key (TYPESAFE_API_KEY), so nothing was hidden" };
   if (elements.length <= FOCUS_MIN_ROWS) return { elements, hidden: [] };

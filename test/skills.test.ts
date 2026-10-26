@@ -311,4 +311,39 @@ describe("skills sync", () => {
       cleanup();
     }
   });
+
+  test("a secret-looking file refuses the whole set before any exec or scp, dry run included", async () => {
+    const { root, home, cfg, cleanup } = scenario();
+    try {
+      write(join(root, "beta", ".env.local"), "TOKEN=1\n");
+      write(join(root, "gamma", "notes.md"), `token ${"ghp" + "_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8"}\n`);
+      write(join(root, "gamma", ".env.example"), "TOKEN=\n");
+      const before = readFileSync(join(home, ".fleet-tools", "skills", "manifest.json"), "utf8");
+      const calls: string[] = [];
+      const deps = {
+        exec: async (h: Host, cmd: string): Promise<ExecResult> => { calls.push(cmd); return { host: h.name, ok: true, code: 0, stdout: "", stderr: "" }; },
+        scp: async (h: Host): Promise<ExecResult> => { calls.push("scp"); return { host: h.name, ok: true, code: 0, stdout: "", stderr: "" }; },
+        toolOwned: new Map<string, string>(),
+      };
+      for (const dryRun of [false, true]) {
+        const refusal = syncSkills(cfg, "core", undefined, { force: true, dryRun }, deps);
+        await expect(refusal).rejects.toThrow(/refusing to sync skill set core: 2 files look secret; nothing was sent/);
+        const message = await refusal.catch((error: Error) => error.message);
+        expect(message).toContain("  beta/.env.local: env file");
+        expect(message).toContain("  gamma/notes.md: GitHub token");
+        expect(message).toContain("skills.core.allowFiles");
+        expect(message).not.toContain("a1B2c3");
+      }
+      expect(calls).toEqual([]);
+      expect(readFileSync(join(home, ".fleet-tools", "skills", "manifest.json"), "utf8")).toBe(before);
+
+      const allowed: FleetConfig = { ...cfg, skills: { core: { ...cfg.skills!.core!, allowFiles: ["beta/.env.local", "gamma/*.md"] } } };
+      const remote = localBash(home);
+      const [synced] = await syncSkills(allowed, "core", undefined, { force: true }, { exec: remote.exec, scp: remote.scp, toolOwned: new Map() });
+      expect(synced!.ok, synced!.error).toBe(true);
+      expect(remote.pushes.length).toBe(1);
+    } finally {
+      cleanup();
+    }
+  });
 });

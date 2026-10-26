@@ -87,4 +87,45 @@ describe("deployment isolation", () => {
       expect((await readdir(home)).some((name) => name.includes("install-lock") || name.endsWith(".tgz"))).toBe(false);
     } finally { await rm(root, { recursive: true, force: true }); }
   });
+
+  test("a locked source deploys frozen and keeps the old launcher when Bun refuses; an unlocked one says so", async () => {
+    const root = await mkdtemp(join(tmpdir(), "fleet-deploy-frozen-"));
+    try {
+      const home = join(root, "home");
+      const bin = join(home, ".local", "bin");
+      await mkdir(bin, { recursive: true });
+      const fakeBun = join(root, "bun");
+      // Out-of-date lockfile: a frozen install refuses, a plain one succeeds.
+      await writeFile(fakeBun, '#!/bin/sh\nfor a in "$@"; do [ "$a" = --frozen-lockfile ] && { echo "error: lockfile had changes, but lockfile is frozen" >&2; exit 1; }; done\nexit 0\n');
+      await chmod(fakeBun, 0o755);
+      await writeFile(join(bin, "fleet"), "#!/bin/sh\necho old-fleet-source\n");
+      await chmod(join(bin, "fleet"), 0o755);
+      const archive = join(root, "source.tgz");
+      await mkdir(join(root, "source"));
+      await writeFile(join(root, "source", "package.json"), "{}");
+      expect(await Bun.spawn(["tar", "czf", archive, "-C", join(root, "source"), "."]).exited).toBe(0);
+      const host: Host = { name: "local", ssh: "unused", os: "linux", deploy: { bun: fakeBun } };
+      const cfg: FleetConfig = { hosts: { local: host } };
+      const env = { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH}` };
+      const deps = {
+        exec: async (h: Host, command: string): Promise<ExecResult> => {
+          const proc = Bun.spawn(["bash", "-s"], { env, stdin: new TextEncoder().encode(command), stdout: "pipe", stderr: "pipe" });
+          const [code, stdout, stderr] = await Promise.all([proc.exited, new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+          return { host: h.name, ok: code === 0, code, stdout, stderr };
+        },
+        scp: async (h: Host, local: string | string[], remote: string) => { await copyFile(local as string, join(home, remote)); return ok(h.name); },
+      };
+
+      const refused = await deployOne(cfg, host, archive, false, deps, { locked: true });
+      expect(refused.ok).toBe(false);
+      expect(refused.unlocked).toBeUndefined();
+      expect(refused.result.stderr).toContain("bun install --frozen-lockfile failed");
+      expect(await readFile(join(bin, "fleet"), "utf8")).toContain("old-fleet-source");
+
+      const unlocked = await deployOne(cfg, host, archive, false, deps, { locked: false });
+      expect(unlocked.ok, unlocked.result.stderr).toBe(true);
+      expect(unlocked.unlocked).toBe(true);
+      expect(await readFile(join(bin, "fleet"), "utf8")).toContain("src/cli.ts");
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
 });

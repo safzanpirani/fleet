@@ -308,15 +308,21 @@ describe("proxyPassword", () => {
     expect(await proxyPassword({ ...socks, passwordFile: file })).toBe("s3cret");
   });
 
-  test("a world-readable passwordFile warns but still connects", async () => {
+  test.if(process.platform !== "win32")("a passwordFile other users can read is refused, naming the fix and never the secret", async () => {
     const file = join(dir, "loose.pw");
     writeFileSync(file, "s3cret\n"); chmodSync(file, 0o644);
-    const warnings: string[] = [];
-    const real = console.error;
-    console.error = (...a: unknown[]) => { warnings.push(a.join(" ")); };
-    try { expect(await proxyPassword({ ...socks, passwordFile: file })).toBe("s3cret"); }
-    finally { console.error = real; }
-    expect(warnings.join("\n")).toMatch(/readable by other users/);
+    const err = await proxyPassword({ ...socks, passwordFile: file }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ProxyError);
+    expect((err as ProxyError).code).toBe(PROXY_EXIT.usage);
+    expect((err as ProxyError).message).toContain(`chmod 600 ${file}`);
+    expect((err as ProxyError).message).not.toContain("s3cret");
+  });
+
+  test.if(process.platform !== "win32")("a group-readable passwordFile is refused before it is read", async () => {
+    // Owner may not read it, so a read attempt would fail with EACCES instead of the refusal.
+    const file = join(dir, "group.pw");
+    writeFileSync(file, "s3cret\n"); chmodSync(file, 0o240);
+    await expect(proxyPassword({ ...socks, passwordFile: file })).rejects.toThrow(/accessible to other users \(mode 240\)/);
   });
 
   test("a missing passwordFile fails by path", async () =>

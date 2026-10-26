@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { captureScreenshot, cuRun, cuShotWindow, deliverImage, validateImageArtifact } from "../src/core.ts";
@@ -88,6 +88,25 @@ describe("capture artifacts", () => {
       await validateImageArtifact(output);
       expect(await readFile(output)).toEqual(png);
       expect(await readdir(root)).toEqual(["result.png"]);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  test.if(process.platform !== "win32")("a captured screenshot is readable only by you, whatever mode the transfer left", async () => {
+    const root = await mkdtemp(join(tmpdir(), "fleet-image-test-"));
+    const pull = async (_host: Host, _remote: string | string[], path: string) => {
+      await writeFile(path, decodablePng, { mode: 0o644 });
+      return success();
+    };
+    try {
+      const shot = await captureScreenshot(cfg, "win", join(root, "shot.png"), {
+        exec: async () => success("C:\\Temp\\capture.png"), pull,
+      });
+      expect((await stat(shot.localPath)).mode & 0o777).toBe(0o600);
+      if (Bun.which("cwebp")) {
+        const webp = await deliverImage(host, "C:\\Temp\\capture.png", join(root, "shot.webp"), { pull });
+        expect(webp.result.ok).toBe(true);
+        expect((await stat(webp.path)).mode & 0o777).toBe(0o600);
+      }
     } finally { await rm(root, { recursive: true, force: true }); }
   });
 

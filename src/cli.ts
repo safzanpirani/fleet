@@ -57,13 +57,14 @@ import {
   pullFlag, pullVal, parseFlags, parseLeadingFlags, lsHosts, runExec, runScript, rebootRefusal, droppedStdinCheck, nestedShellNote, psInterpConflict, readScriptSource, editRemoteFile, parseEditList, diffFiles,
   pushFile, pullFile, parseRemoteSpec, restartService, serviceLogs, serviceLogsFollow, svcStatus, serviceTarget,
   gpuRows, diskRows, duRows, duLimit, whichRows, assertProgramName, sudoWrap, fetchDashboard, hostStatus, runRecipe, captureScreenshot, captureWebcam, prepareWebcamStream, rebootHosts,
-  cuInstall, cuRun, cuTools, cuDescribe, cuRecordStart, cuRecordStop, cuRecordStatus, cuRegions, cuPerception, bootMismatchNote,
+  cuInstall, cuInstallerPin, CUA_INSTALLER, cuRun, cuTools, cuDescribe, cuRecordStart, cuRecordStop, cuRecordStatus, cuRegions, cuPerception, bootMismatchNote,
   cuApps, cuShotWindow, browseHost, preferredImageExt, overlayGrid,
   cuSnapshot, cuResolveTargetFrom, cuResolvePoint, cuAct, cuBatch, cuBlockerNote, cuElements, cuOpen, sameRole, cuVerify,
   cuGridCaption, cuElementSupport, compactCuOutput, briefDescribe,
   bootState, switchMachine, firmwareEntries, hostKey, findHost, listMonitors, waitFor, routeSelector, deployHosts, diagnose, firmwareRebootHosts,
   proxyRows, proxyChecks, dropMasters, configView,
 } from "./core.ts";
+import type { CuInstallerPin } from "./core.ts";
 import { currentViewport, detectWebcamVo, runWebcamStream, validateWebcamStreamOptions } from "./webcam.ts";
 import {
   fingerprint,
@@ -135,8 +136,8 @@ function die(m: string): never {
     // Only fixed diagnostics enter the machine-readable failure envelope.
     const error = failurePhase === "config"
       ? { code: "CONFIG_ERROR", message: "Unable to load Fleet configuration. Check FLEET_CONFIG and the configuration file." }
-      : / is disabled on .+ by the fleet config/.test(m)
-        ? { code: "FEATURE_DISABLED", message: "The Fleet configuration disables this command on a selected host." }
+      : / is disabled on .+ by the fleet (config|policy file)/.test(m)
+        ? { code: "FEATURE_DISABLED", message: "The Fleet configuration or policy file disables this command on a selected host." }
       : /unknown host|unknown selector|no hosts|unknown group/i.test(m)
         ? { code: "UNKNOWN_SELECTOR", message: "The selector does not resolve to configured hosts." }
         : /usage:|option|requires|needs an integer|choose either|cannot be combined|must come|--interp|--argv/i.test(m)
@@ -358,7 +359,9 @@ export async function cuTaskCommand(
     return n;
   };
   if (timeout !== undefined && (!/^\d+$/.test(timeout) || Number(timeout) < 1)) die(`--timeout must be a positive integer in seconds (got '${timeout}')`);
-  assertFeature(resolveHosts(cfg, target), "cu", cfg);
+  const taskHosts = resolveHosts(cfg, target);
+  assertFeature(taskHosts, "cu", cfg);
+  assertFeature(taskHosts, "ai", cfg);
   const key = loadTaskKey();
   if (!key) die("a task needs a TypeSafe key: set TYPESAFE_API_KEY, or name a JSON file with apiKey in FLEET_JEV_CONFIG");
   const backend = o.android
@@ -962,13 +965,19 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
           : r.key === "parallel.exec" ? "all" : r.key === "shot.format" ? "auto" : r.key === "webcam.device" ? "first" : "-";
         console.log(`  ${r.key.padEnd(24)} ${value.padEnd(12)} ${A.d(r.source + (r.env ? ` ${r.env}` : ""))}`);
       });
+      const p = view.policy;
+      const verdict = !p.present ? A.d("(not present)")
+        : p.protected === undefined ? "" : p.protected ? A.g("(protected)") : A.y(`(NOT protected: ${p.reason})`);
+      console.log(`${A.b("policy:")} ${p.path} ${verdict}`.trimEnd());
+      if (p.error !== undefined) console.log(A.r(`  invalid: ${p.error}; every gated feature is refused on every host`));
+      if (p.unknownHosts.length) console.log(A.y(`  ▲ names hosts the config does not define: ${p.unknownHosts.join(", ")}`));
       console.log(A.b("fleet-wide"));
       rows(view.global);
       for (const h of view.hosts) {
         console.log(A.b(h.host));
         rows(h.settings);
         if (h.refused.length) console.log(`  ${"refused".padEnd(24)} ${h.refused.map((r) =>
-          `${r.feature} ${A.d(r.source === "host" ? "(host disable)" : "(top-level disable)")}`).join(", ")}`);
+          `${r.feature} ${A.d(r.source === "host" ? "(host disable)" : r.source === "top-level" ? "(top-level disable)" : `(${r.source})`)}`).join(", ")}`);
       }
       return 0;
     }
@@ -1818,6 +1827,16 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       const regionKind = pullVal(rest, "--kind");
       const sel = rest.shift();
       if (!sel) die("usage: fleet cu <host> <cua-driver args…> [--out f.png] [--grid]  |  fleet cu <sel> install");
+      // Installer pin options belong to `install` alone; anywhere else they are
+      // cua-driver arguments. Checked before the selector is routed.
+      let installPin: CuInstallerPin | undefined;
+      if (rest[0] === "install") {
+        const ref = pullVal(rest, "--ref");
+        const sha256 = pullVal(rest, "--sha256");
+        if (rest.length !== 1) die(`usage: fleet cu ${sel} install [--ref REF --sha256 HEX]`);
+        try { installPin = cuInstallerPin({ ref, sha256 }); }
+        catch (error) { die(error instanceof Error ? error.message : String(error)); }
+      }
       // watch, record and revive run on this machine through its own adb, and
       // revive runs precisely when SSH to the phone is down, so none of them
       // probes the route first.
@@ -1928,8 +1947,9 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       const verb = rest[0];
 
       if (verb === "install") {
-        console.log(A.d(`◎ installing cua-driver on ${target} …`));
-        const actions = await cuInstall(cfg, target);
+        const pin = installPin!;
+        console.log(A.d(`◎ installing cua-driver ${pin.driverVersion} on ${target} from ${CUA_INSTALLER.repo}@${pin.ref} (installer sha256 ${pin.sha256.slice(0, 12)}) …`));
+        const actions = await cuInstall(cfg, target, { ref: pin.ref, sha256: pin.sha256 });
         actions.forEach((a) => printResult(a.result));
         const failed = actions.filter((a) => !a.result.ok);
         if (actions.length > 1)
@@ -2107,7 +2127,8 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
         let focusNote: string | undefined;
         let hiddenCount = 0;
         if (task && r.available) {
-          const f = await focusElements(shown, task, `${r.target.name} · ${r.target.window.title || "(untitled)"}`);
+          const f = await focusElements(shown, task, `${r.target.name} · ${r.target.window.title || "(untitled)"}`,
+            { host: resolveHosts(cfg, target)[0], cfg });
           shown = f.elements; focusNote = f.note; hiddenCount = f.hidden.length;
         }
         if (json) { console.log(JSON.stringify({ ...r, elements: shown, ...(task ? { hidden: hiddenCount, focus: focusNote } : {}) })); return r.available ? 0 : 1; }
@@ -2528,7 +2549,7 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       const results = await deployHosts(cfg, await routeSelector(cfg, sel!), { restart });
       if (json) { console.log(JSON.stringify(results, null, 2)); return results.some((r) => !r.ok) ? 1 : 0; }
       for (const r of results) {
-        if (r.ok) console.log(`${A.g("●")} ${A.b(r.host)} ${A.d("→ " + r.result.stdout.trimEnd().split("\n").pop())}`);
+        if (r.ok) console.log(`${A.g("●")} ${A.b(r.host)} ${A.d("→ " + r.result.stdout.trimEnd().split("\n").pop())}${r.unlocked ? " " + A.y("unlocked (no bun.lock shipped)") : ""}`);
         else { console.log(`${A.r("✗")} ${A.b(r.host)} ${A.d("deploy failed")}`); printResult(r.result); }
         for (const a of r.restarted ?? [])
           console.log(`  ${a.result.ok ? A.g("↻") : A.r("✗")} ${A.d("restarted " + a.service + " (" + a.type + ")")}`);
@@ -2560,7 +2581,7 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
           const name = known[index]!;
           const fp = fingerprints[index]!;
           if (fp instanceof Error) { failed++; console.log(`${A.r("✗")} ${A.b(name.padEnd(12))} ${A.d(fp.message)}`); continue; }
-          console.log(`${A.g("●")} ${A.b(name.padEnd(12))} ${A.c(fp.version.padEnd(9))} ${A.d(fp.hash)} ${A.d(`${fp.files} files · ${fp.root}${fp.skillPath ? " · skill" : ""}`)}`);
+          console.log(`${A.g("●")} ${A.b(name.padEnd(12))} ${A.c(fp.version.padEnd(9))} ${A.d(fp.hash)} ${A.d(`${fp.files} files · ${fp.root}${fp.skillPath ? " · skill" : ""}`)}${fp.unlocked ? " " + A.y("· unlocked (no bun.lock)") : ""}`);
         }
         return failed ? 1 : 0;
       }
@@ -2630,11 +2651,12 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
         for (const block of blocks) {
           console.log(A.d(`◎ ${block.tool} → ${sel} …`));
           if (block.error) {
-            console.log(`${A.r("✗")} ${A.b(block.tool.padEnd(14))} ${A.d(block.error.split("\n")[0] ?? "failed")}`);
+            // Every line: a secret refusal lists each file and rule.
+            console.log(`${A.r("✗")} ${A.b(block.tool.padEnd(14))} ${A.d(block.error.replace(/\n/g, "\n  "))}`);
             continue;
           }
           for (const result of block.results) {
-            if (result.ok) console.log(`${A.g("●")} ${A.b(result.host.padEnd(14))} ${A.d(`${result.version}/${result.hash} → ${result.dir}${result.skill ? " + skill" : ""}`)}`);
+            if (result.ok) console.log(`${A.g("●")} ${A.b(result.host.padEnd(14))} ${A.d(`${result.version}/${result.hash} → ${result.dir}${result.skill ? " + skill" : ""}`)}${result.unlocked ? " " + A.y("unlocked (no bun.lock shipped)") : ""}`);
             else console.log(`${A.r("✗")} ${A.b(result.host.padEnd(14))} ${A.d((result.error ?? "failed").split("\n")[0] ?? "failed")}`);
           }
         }
@@ -2783,7 +2805,7 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       const verb = { apply: dryRun ? "would apply" : "applied", keep: "current", adopt: dryRun ? "would record" : "recorded", held: "held" };
       for (const block of blocks) {
         console.log(A.d(`◎ ${block.set}${dryRun ? " (dry run)" : ""} → ${args[0] ?? cfg.skills![block.set]!.hosts} …`));
-        if (block.error) { console.log(`${A.r("✗")} ${A.d(block.error.split("\n")[0] ?? "failed")}`); continue; }
+        if (block.error) { console.log(`${A.r("✗")} ${A.d(block.error.replace(/\n/g, "\n  "))}`); continue; }
         for (const r of block.results) {
           const count = (action: string) => r.items.filter((i) => i.action === action).length;
           const summary = [`${count("apply")} ${verb.apply}`, `${count("keep")} current`, `${count("adopt")} ${verb.adopt}`, `${count("held")} held`].join(" · ");

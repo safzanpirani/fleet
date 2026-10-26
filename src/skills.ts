@@ -31,6 +31,7 @@ import type { ExecResult } from "./ssh.ts";
 import { didYouMean } from "./suggest.ts";
 import { installLockScript } from "./install-lock.ts";
 import { findSkill, mapPool, resolveTool } from "./tools.ts";
+import { scanSecretFiles, secretRefusal, type SecretFile } from "./secrets.ts";
 
 export const DEFAULT_SKILL_ROOT = "~/.agents/skills";
 /** Remote agent roots, in the order a sync writes them. The first holds the real copy. */
@@ -601,11 +602,13 @@ function parseApply(stdout: string): { ok: Set<string>; failed: Map<string, stri
 }
 
 /** Copy the selected skills into a private snapshot (symlinks followed, the
- *  fixed names skipped), hash the snapshot, and tar it once. Every host then
- *  receives the same bytes the manifest describes. */
-async function snapshot(selection: SkillSelection, stage: string): Promise<{ skills: SkillSource[]; tar: string }> {
+ *  fixed names skipped), refuse the set when a staged file looks secret, hash
+ *  the snapshot, and tar it once. Every host then receives the same bytes the
+ *  scan read and the manifest describes. */
+async function snapshot(selection: SkillSelection, stage: string, allowFiles: readonly string[] | undefined): Promise<{ skills: SkillSource[]; tar: string }> {
   const source = join(stage, "source");
   await mkdir(source);
+  const staged: SecretFile[] = [];
   const skills = await mapPool(selection.skills, SKILL_HASH_PARALLELISM, async (skill) => {
     const into = join(source, skill.name);
     await mkdir(into, { recursive: true });
@@ -615,9 +618,13 @@ async function snapshot(selection: SkillSelection, stage: string): Promise<{ ski
       await mkdir(join(to, ".."), { recursive: true });
       await copyFile(path, to);
       await chmod(to, (await stat(path)).mode & 0o777);
+      staged.push({ rel: `${skill.name}/${rel}`, path: to });
     });
     return { ...skill, ...(await treeHash(into)) };
   });
+  staged.sort((a, b) => a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0);
+  const hits = await scanSecretFiles(staged, allowFiles);
+  if (hits.length) throw secretRefusal(`skill set ${selection.set}`, hits, `skills.${selection.set}.allowFiles`);
   const tar = join(stage, "skills.tgz");
   const build = Bun.spawn(["tar", "czf", tar, ...(process.platform === "darwin" ? ["--no-xattrs"] : []),
     "-C", source, ...skills.map((s) => s.name)],
@@ -718,8 +725,9 @@ async function syncHost(
 }
 
 /** Push one set to its hosts (or `sel`). Refuses before any skill is read or
- *  written when `deploy` is disabled on a target. Drifted or unmanaged skills
- *  are held back alone unless `force`; the rest still apply. */
+ *  written when `deploy` is disabled on a target, and before any host is
+ *  contacted when a shipped file looks secret (`src/secrets.ts`). Drifted or
+ *  unmanaged skills are held back alone unless `force`; the rest still apply. */
 export async function syncSkills(
   cfg: FleetConfig, set: string, sel: string | undefined,
   opts: { force?: boolean; dryRun?: boolean } = {}, deps: SkillsDeps = {},
@@ -732,6 +740,15 @@ export async function syncSkills(
   assertFeature(hosts, "deploy", cfg);
   const toolOwned = deps.toolOwned ?? await toolOwnedSkills(cfg);
   const selection = await selectSkills(cfg, set, { toolOwned });
+  // A dry run stages nothing, so it refuses on the source files (links read
+  // through, as a sync copies them) before it reads any host. A sync refuses
+  // on its staged snapshot instead, before archiving or contacting a host.
+  if (opts.dryRun === true) {
+    const shipped = (await mapPool(selection.skills, SKILL_HASH_PARALLELISM, async (skill) =>
+      (await skillFiles(skill.dir)).map(({ rel, path }) => ({ rel: `${skill.name}/${rel}`, path })))).flat();
+    const hits = await scanSecretFiles(shipped, spec.allowFiles, { followLinks: true });
+    if (hits.length) throw secretRefusal(`skill set ${set}`, hits, `skills.${set}.allowFiles`);
+  }
   // Orphans are judged against every configured set's current selection.
   const selections = new Map<string, SkillSelection>([[set, selection]]);
   // A set whose root cannot be read is left out: its entries are then not judged.
@@ -748,7 +765,7 @@ export async function syncSkills(
   }
   const stage = await mkdtemp(join(tmpdir(), "fleet-skills-sync-"));
   try {
-    const { skills, tar } = await snapshot(selection, stage);
+    const { skills, tar } = await snapshot(selection, stage, spec.allowFiles);
     selections.set(set, { ...selection, skills });
     return await mapPool(hosts, hostParallelism(cfg), (h) => syncHost(cfg, set, h, skills, tar, selections, flags, run, push));
   } finally {

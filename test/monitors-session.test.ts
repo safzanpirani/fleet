@@ -1,7 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import { mainMonitor, parseMonitors, parseRegion, pickMonitor, regionRect } from "../src/monitors.ts";
 import { parseLinuxSession, parseMacSession, parseQueryIdle, parseWindowsSession } from "../src/session.ts";
-import { captureCmd, droppedStdinCheck, readsStdin } from "../src/core.ts";
+import { captureCmd, captureScreenshot, droppedStdinCheck, readsStdin } from "../src/core.ts";
+import type { FleetConfig, Host } from "../src/config.ts";
+import type { ExecResult } from "../src/ssh.ts";
+import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { buildArgs, psHiddenLaunch } from "../src/ssh.ts";
 
 // A two-monitor Hyprland layout: a rotated 1080p monitor left of a 1440p one at 1.25.
@@ -53,6 +58,47 @@ describe("monitor layouts", () => {
     expect(cmd.indexOf("dpms on")).toBeLessThan(cmd.indexOf("grim -s"));
     expect(captureCmd("linux", { rect: { x: 0, y: 0, width: 2048, height: 1152 }, output: "DP-3", wholeOutput: true }).cmd)
       .toContain("grim -o 'DP-3'");
+  });
+
+  test("a Linux capture writes into a private mktemp -d directory that cleanup removes", async () => {
+    expect(captureCmd("linux").cmd).toContain('mktemp -d "${TMPDIR:-/tmp}/fleet_shot.XXXXXX"');
+    // Run the real capture and cleanup scripts locally, with a fake scrot and
+    // an empty user session, so the directory's mode and lifetime are observed.
+    const root = mkdtempSync(join(tmpdir(), "fleet-shot-test-"));
+    const bin = join(root, "bin"), tmp = join(root, "tmp"), run = join(root, "run");
+    for (const d of [bin, tmp, run]) mkdirSync(d);
+    const png = join(root, "one.png");
+    writeFileSync(png, Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=", "base64"));
+    writeFileSync(join(bin, "systemctl"), "#!/bin/sh\nexit 0\n");
+    writeFileSync(join(bin, "scrot"), `#!/bin/sh\n[ -z "$FLEET_TEST_SCROT_FAIL" ] || exit 1\ncp '${png}' "$1"\n`);
+    chmodSync(join(bin, "systemctl"), 0o755); chmodSync(join(bin, "scrot"), 0o755);
+    const host: Host = { name: "lin", ssh: "lin", os: "linux" };
+    const cfg: FleetConfig = { hosts: { lin: host } };
+    const local = (fail: boolean) => async (_h: Host, cmd: string): Promise<ExecResult> => {
+      // The monitor listing has no source here; a plain capture goes ahead without it.
+      if (!cmd.includes("scrot") && !cmd.startsWith("rm -f")) return { host: "lin", ok: false, code: 1, stdout: "", stderr: "no layout" };
+      const { WAYLAND_DISPLAY: _w, DISPLAY: _d, ...env } = process.env;
+      const p = Bun.spawnSync(["bash"], { stdin: new TextEncoder().encode(cmd), stdout: "pipe", stderr: "pipe",
+        env: { ...env, PATH: `${bin}:${process.env.PATH}`, TMPDIR: tmp, XDG_RUNTIME_DIR: run, ...(fail ? { FLEET_TEST_SCROT_FAIL: "1" } : {}) } });
+      return { host: "lin", ok: p.exitCode === 0, code: p.exitCode ?? 1, stdout: p.stdout.toString(), stderr: p.stderr.toString() };
+    };
+    let dirMode = 0;
+    try {
+      const r = await captureScreenshot(cfg, "lin", join(root, "out.png"), {
+        exec: local(false),
+        pull: async (_h: Host, remote: string | string[], out: string): Promise<ExecResult> => {
+          dirMode = statSync(dirname(String(remote))).mode & 0o777;
+          copyFileSync(String(remote), out);
+          return { host: "lin", ok: true, code: 0, stdout: "", stderr: "" };
+        },
+      });
+      expect(dirname(r.remotePath)).toMatch(new RegExp(`^${tmp}/fleet_shot\\.[A-Za-z0-9]+$`));
+      expect(dirMode).toBe(0o700);
+      expect(readdirSync(tmp)).toEqual([]);
+      // A failed capture removes its directory too.
+      await expect(captureScreenshot(cfg, "lin", join(root, "out2.png"), { exec: local(true) })).rejects.toThrow(/capture failed/);
+      expect(readdirSync(tmp)).toEqual([]);
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
   test("a Windows capture task runs under a headless conhost, so Windows Terminal opens no window", () => {

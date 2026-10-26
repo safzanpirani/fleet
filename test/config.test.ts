@@ -225,6 +225,28 @@ describe("validateConfig", () => {
     expect(() => validateConfig(badExclude, "t")).toThrow(/tools\.tg\.exclude must be an array/);
   });
 
+  test("allowFiles takes relative paths or globs on tools and skill sets", () => {
+    const ok = base();
+    ok.tools = { tg: { root: "~/x", allowFiles: ["test/fixtures/**", ".env.test"] } };
+    ok.skills = { core: { hosts: "web", include: ["*"], allowFiles: ["demo/certs/*.pem"] } };
+    expect(() => validateConfig(ok, "t")).not.toThrow();
+    for (const [allowFiles, at] of [
+      ["fixtures", "tools.tg.allowFiles"],
+      [["/etc/key.pem"], "tools.tg.allowFiles"],
+      [["../outside/.env"], "tools.tg.allowFiles"],
+      [[""], "tools.tg.allowFiles"],
+      [["C:/keys/id_rsa"], "tools.tg.allowFiles"],
+    ] as const) {
+      const bad = base();
+      // Deliberately ill-typed input: validation must reject what the type forbids.
+      bad.tools = { tg: { root: "~/x", allowFiles: allowFiles as unknown as string[] } };
+      expect(() => validateConfig(bad, "t")).toThrow(new RegExp(`${at.replace(/\./g, "\\.")} must be an array of relative paths`));
+    }
+    const badSet = base();
+    badSet.skills = { core: { hosts: "web", include: ["*"], allowFiles: ["a/../../b"] } };
+    expect(() => validateConfig(badSet, "t")).toThrow(/skills\.core\.allowFiles must be an array of relative paths/);
+  });
+
   test("null optional containers fail with their exact path", () => {
     const bad = base();
     bad.groups = null as any;

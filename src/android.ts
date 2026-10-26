@@ -13,8 +13,7 @@
  * showing the target package BEFORE it sends input, so a refusal never
  * delivers anything.
  */
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
+import { mkdir, readFile, rm } from "node:fs/promises";
 import { gunzipSync } from "node:zlib";
 import { createConnection } from "node:net";
 import { dirname, join } from "node:path";
@@ -22,6 +21,7 @@ import type { FleetConfig, Host } from "./config.ts";
 import { assertFeature, resolveHosts } from "./config.ts";
 import { exec, probe, sshEnv, type ExecResult } from "./ssh.ts";
 import { emitImage, takeInlineImages, validateImageArtifact } from "./core.ts";
+import { fleetStateDir, writePrivateFile } from "./perms.ts";
 import { UI_JAR_B64, UI_JAR_MD5 } from "./android-ui-jar.ts";
 
 export const ANDROID_DEFAULT_SERIAL = "127.0.0.1:5555";
@@ -511,7 +511,7 @@ const FRAME_FILE = "/data/local/tmp/fleet-ui-frame.raw";
 
 interface TreeCache { hash: string; xml: string; width?: number; height?: number }
 const cacheFile = (deps: AndroidDeps, host: string) =>
-  join(deps.cacheDir ?? join(homedir(), ".fleet"), `android-${host.replace(/[^A-Za-z0-9._-]/g, "_")}.json`);
+  join(deps.cacheDir ?? fleetStateDir(), `android-${host.replace(/[^A-Za-z0-9._-]/g, "_")}.json`);
 async function readTreeCache(deps: AndroidDeps, host: string): Promise<TreeCache | undefined> {
   try {
     const c = JSON.parse(await readFile(cacheFile(deps, host), "utf8")) as TreeCache;
@@ -520,8 +520,8 @@ async function readTreeCache(deps: AndroidDeps, host: string): Promise<TreeCache
 }
 async function writeTreeCache(deps: AndroidDeps, host: string, c: TreeCache): Promise<void> {
   const path = cacheFile(deps, host);
-  await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, JSON.stringify(c));
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  await writePrivateFile(path, JSON.stringify(c));
 }
 async function dropTreeCache(deps: AndroidDeps, host: string): Promise<void> {
   await rm(cacheFile(deps, host), { force: true });
@@ -641,7 +641,7 @@ export async function androidShot(
   if (!r.image) return { host: host.name, result: failed(r, "the capture produced no image"), state: r.state };
   const { bytes, ...image } = r.image;
   const local = out.replace(/\.(png|webp)$/i, "") + `.${image.format}`;
-  await writeFile(local, bytes);
+  await writePrivateFile(local, bytes);
   await validateImageArtifact(local);
   return { host: host.name, result: r.result, state: r.state, localImage: local, image };
 }
@@ -1090,7 +1090,7 @@ async function sendInput(
   let localImage: string | undefined;
   if (opts.imageOut && r.image) {
     localImage = opts.imageOut.replace(/\.(png|webp)$/i, "") + `.${r.image.format}`;
-    await writeFile(localImage, r.image.bytes);
+    await writePrivateFile(localImage, r.image.bytes);
     await validateImageArtifact(localImage);
   } else if (opts.imageOut && result.ok) {
     result = failed(r, "the after-capture produced no image");
@@ -1393,7 +1393,7 @@ export async function androidBatch(
   let localImage: string | undefined;
   if (opts.imageOut && r.image) {
     localImage = opts.imageOut.replace(/\.(png|webp)$/i, "") + `.${r.image.format}`;
-    await writeFile(localImage, r.image.bytes);
+    await writePrivateFile(localImage, r.image.bytes);
     await validateImageArtifact(localImage);
   } else if (opts.imageOut && result.ok) result = failed(r, "the after-capture produced no image");
   return { ...base, result, effect, ...(reason ? { reason } : {}), ...(localImage ? { localImage } : {}) };
@@ -1872,7 +1872,7 @@ export interface AndroidRecordResult {
 
 interface RecordState { pid: number; file: string; started: number; limitS: number; host: string }
 const recordStateFile = (cacheDir: string | undefined, host: string) =>
-  join(cacheDir ?? join(homedir(), ".fleet"), `android-rec-${host.replace(/[^A-Za-z0-9._-]/g, "_")}.json`);
+  join(cacheDir ?? fleetStateDir(), `android-rec-${host.replace(/[^A-Za-z0-9._-]/g, "_")}.json`);
 const pidAlive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
 
 /** Record the phone's screen to an MP4 on this machine with scrcpy (no window).
@@ -1903,8 +1903,8 @@ export async function androidRecordStart(
     "--record", file, "--time-limit", String(limit), ...quality], { stdout: "ignore", stderr: "ignore", stdin: "ignore" });
   proc.unref();
   const state: RecordState = { pid: proc.pid, file, started: Date.now(), limitS: limit, host: found.host.name };
-  await mkdir(dirname(stateFile), { recursive: true });
-  await writeFile(stateFile, JSON.stringify(state));
+  await mkdir(dirname(stateFile), { recursive: true, mode: 0o700 });
+  await writePrivateFile(stateFile, JSON.stringify(state));
   return { ok: true, host: found.host.name, recording: true, limitS: limit, localVideo: file,
     detail: `recording to ${file}; stops by itself after ${limit} s` };
 }

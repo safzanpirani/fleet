@@ -35,6 +35,18 @@ test("focus keeps the rows Jev needs and names what it hid", async () => {
   expect(r.note).toContain(`hid ${many.length - 1} controls`);
 });
 
+test("a host that refuses ai sends nothing and shows every row", async () => {
+  const many = Array.from({ length: FOCUS_MIN_ROWS + 5 }, (_v, i) => el(i, `item ${i}`));
+  const cfg: FleetConfig = { hosts: { box: { name: "box", ssh: "box", os: "linux", disable: ["shot"] } } };
+  let calls = 0;
+  const judge = (async () => { calls++; return new Response(JSON.stringify({ answers: {} })); }) as unknown as typeof fetch;
+  const r = await focusElements(many, "t", "w", { key, fetch: judge, host: cfg.hosts.box, cfg });
+  expect(calls).toBe(0);
+  expect(r.elements).toHaveLength(many.length);
+  expect(r.hidden).toHaveLength(0);
+  expect(r.note).toBe("focus skipped: ai is disabled on box (host disable shot); showing every row");
+});
+
 test("open sends a URL to the default browser, or as an argument to a named app, and names the new window", async () => {
   const cfg: FleetConfig = { hosts: { box: { name: "box", ssh: "box", os: "windows" } } };
   const calls: string[] = [];

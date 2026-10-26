@@ -291,6 +291,53 @@ describe("switchMachine", () => {
     await expect(switchMachine(c, "box", "linux", { deps: { exec: b.exec, probe: b.probe } })).rejects.toThrow(/no firmware entry labelled 'Nope'/);
     expect(b.execs.every((x) => !x.includes("shutdown"))).toBe(true);
   });
+
+  test("a Linux firmware switch never puts the sudo password in its result", async () => {
+    // Built at run time so the repository never holds a password-looking literal.
+    const pw = ["pw", "Zq7", "leak", "check"].join("-");
+    const pwB64 = Buffer.from(pw, "utf8").toString("base64");
+    const env = `FLEET_TEST_SWITCH_PW_${process.pid}`;
+    process.env[env] = pw;
+    try {
+      const c: FleetConfig = {
+        hosts: {
+          win: { name: "win", ssh: "win", os: "windows" },
+          lin: { name: "lin", ssh: "lin", os: "linux", sudo: { passwordEnv: env } },
+        },
+        machines: { box: { boots: { windows: { host: "win", firmware: "Windows Boot Manager" }, linux: { host: "lin" } } } },
+      };
+      let live = "lin", sourceProbes = 0, triggered = false;
+      const triggers: string[] = [];
+      const exec = async (_h: Host, cmd: string): Promise<ExecResult> => {
+        if (cmd === "efibootmgr -v") return ok(EFI_TAB);
+        if (cmd.startsWith("lsblk")) return ok("ESP\t0e5f0000-0000-4000-8000-000000000001\t/dev/nvme0n1p1\n");
+        triggered = true;
+        triggers.push(cmd);
+        return ok("fleet: one-time boot set");
+      };
+      const probe = async (h: Host) => {
+        if (h.name === "lin" && triggered && ++sourceProbes >= 2) live = "win";
+        return h.name === live;
+      };
+      const dry = await switchMachine(c, "box", "windows", { dryRun: true, deps: { exec, probe } });
+      expect(dry.plan).toMatchObject({ kind: "firmware", command: expect.stringContaining("efibootmgr --bootnext 0000") });
+      const dryJson = JSON.stringify(dry, null, 2);
+      expect(dryJson).not.toContain(pw);
+      expect(dryJson).not.toContain(pwB64);
+      expect(triggers).toEqual([]);
+
+      const done = await switchMachine(c, "box", "windows", { intervalMs: 1, timeoutMs: 60_000, deps: { exec, probe } });
+      expect(done.arrived).toBe(true);
+      // The trigger itself still runs as root with the password on stdin.
+      expect(triggers).toHaveLength(1);
+      expect(triggers[0]).toContain(pwB64);
+      const doneJson = JSON.stringify(done);
+      expect(doneJson).not.toContain(pw);
+      expect(doneJson).not.toContain(pwB64);
+    } finally {
+      delete process.env[env];
+    }
+  });
 });
 
 describe("reboot guard", () => {
