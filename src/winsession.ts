@@ -27,6 +27,7 @@ import { join } from "node:path";
 import { hostKeyOpts, type Host } from "./config.ts";
 import { sshEnv } from "./ssh.ts";
 import { fleetReinvocation, proxyControlKey, proxyOpts } from "./proxy.ts";
+import { winSessionIdleMs } from "./settings.ts";
 
 const READY = "__FLEET_SESSION_READY__";
 const PIPE_PROBE = "__FLEET_PIPE__";
@@ -43,7 +44,6 @@ export function takePipeProbe(stdout: string, end: string): { stdout: string; pr
   if (at < 0 || (at > 0 && stdout[at - 1] !== "\n")) return { stdout, probed: false };
   return { stdout: stdout.slice(0, at), probed: true };
 }
-const IDLE_MS = Math.max(10_000, Number(process.env.FLEET_WIN_SESSION_IDLE_S ?? 600) * 1000 || 600_000);
 
 /** The pwsh program the session runs. Each request is the end marker on its
  *  own line, the base64 program in lines of at most 2000 characters, and a
@@ -345,8 +345,10 @@ export function claimBroker(path: string): (() => void) | undefined {
 }
 
 /** The broker: owns one pwsh session for `host` and serves one request at a
- *  time. Exits after IDLE_MS without a request. Returns false when another
- *  broker already serves the host. */
+ *  time. Exits after the host's idle timeout (FLEET_WIN_SESSION_IDLE_S, then
+ *  settings.winSessionIdleS, default 600 s) without a request. The broker runs
+ *  `fleet __win-session <host>`, which loads the same config and inherits the
+ *  environment. Returns false when another broker already serves the host. */
 export async function runWinSessionBroker(host: Host): Promise<boolean> {
   const path = winSessionSocket(host);
   mkdirSync(join(homedir(), ".fleet"), { recursive: true, mode: 0o700 });
@@ -360,9 +362,10 @@ export async function runWinSessionBroker(host: Host): Promise<boolean> {
   let busy = false;
   let activeReplies = 0;
   let idle: ReturnType<typeof setTimeout>;
+  const idleMs = winSessionIdleMs(host);
   const armIdle = () => {
     clearTimeout(idle);
-    if (!busy && activeReplies === 0) idle = setTimeout(shutdown, IDLE_MS);
+    if (!busy && activeReplies === 0) idle = setTimeout(shutdown, idleMs);
   };
   const shutdown = () => { session?.kill(); server.stop(true); rmSync(path, { force: true }); release(); process.exit(0); };
   const ensure = async () => {

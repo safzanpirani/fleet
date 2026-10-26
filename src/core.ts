@@ -5,8 +5,8 @@
  * stdio MCP process. Presentation (ANSI tables, plain text) lives in the
  * frontends; the quoting-proof shell construction lives once, here + `ssh.ts`.
  */
-import { hostKeyOpts, resolveHosts, REPO_ROOT, lookupProxy, normalizeProxy, resolveProxy } from "./config.ts";
-import type { FleetConfig, Host, Service, ServiceType, Machine } from "./config.ts";
+import { assertFeature, featureEnabled, HOST_FEATURES, captureSetting, hostKeyOpts, resolveHosts, REPO_ROOT, lookupProxy, normalizeProxy, resolveProxy, webcamDevice } from "./config.ts";
+import type { FleetConfig, Host, HostFeature, Service, ServiceType, Machine } from "./config.ts";
 import { buildArgs, buildArgvCommand, connOpts, exec, probe, probeDetail, resolveWinBin, scp, scpPull, sshDiagnose, sshEnv, bashEsc, bashPathAssignment, psEsc, psHiddenLaunch } from "./ssh.ts";
 import { checkProxy, proxyCommandFor } from "./proxy.ts";
 import { didYouMean } from "./suggest.ts";
@@ -20,6 +20,8 @@ import { mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:f
 import { createHash } from "node:crypto";
 import { fstatSync, readFileSync, statSync, type Stats } from "node:fs";
 import { installLockScript } from "./install-lock.ts";
+import { execParallelism, knob, probeTimeout, sshMux, winSessionIdleMs, type Knob, type SettingSource } from "./settings.ts";
+import { DEFAULT_TOOL_SYNC_PARALLELISM, mapPool, TOOL_STATUS_HOST_PARALLELISM } from "./tools.ts";
 import { DIFF_MAX_BYTES, decodeDiffText, unifiedDiff } from "./diff.ts";
 import {
   detectWebcamVo, parseCameras, renderSize, validateWebcamDevice, validateWebcamStreamOptions, webcamPowerShellSubmission, webcamScript, webcamStreamScript,
@@ -188,6 +190,7 @@ export interface HostReport {
   httpUp?: boolean;   // when ssh is down but a configured health URL answers: alive, just unreachable
   proxy: string | null;   // resolved proxy name (redacted for inline URLs), or null
   proxyDown?: boolean;    // the PROXY is unreachable — the host was never contacted
+  disabled?: HostFeature[];   // fleet commands the config refuses on this host; absent when none
 }
 /** Probe an HTTP endpoint as a coarse liveness check. Any response (even 401/404)
  *  means something is listening → the box is alive; only a transport failure or a
@@ -211,19 +214,22 @@ export async function lsHosts(
   // to a live box is never cut short.
   const statePath = opts.statePath ?? join(homedir(), ".fleet", "ls-state.json");
   const known = await readLsState(statePath);
-  const shortCap = process.env.FLEET_PROBE_TIMEOUT_MS === undefined ? LS_KNOWN_DOWN_CAP_MS : undefined;
   const reports = await Promise.all(Object.values(cfg.hosts).map(async (h) => {
-    const cap = known[h.name] === false && !resolveProxy(h) ? shortCap : undefined;
+    // A probe cap the environment or the config pins is never cut short.
+    const cap = known[h.name] === false && !resolveProxy(h) && !probeTimeout(h, process.env, cfg).pinned
+      ? LS_KNOWN_DOWN_CAP_MS : undefined;
     // The health URL is checked alongside ssh, not after it times out.
     const http = h.health ? (opts.http ?? probeHttp)(h.health) : undefined;
     const result = await (opts.probe ?? probeDetail)(h, cap);
     const up = result.up;
     const httpUp = !up && http ? await http : undefined;
+    const disabled = HOST_FEATURES.filter((f) => !featureEnabled(h, f, cfg));
     const rep: HostReport = {
       name: h.name, os: h.os, ssh: h.ssh, gpu: !!h.gpu, up, httpUp,
       proxy: result.via ?? null,
       proxyDown: result.down === "proxy" ? true : undefined,
       services: Object.keys(h.services ?? {}),
+      ...(disabled.length ? { disabled } : {}),
     };
     onResult?.(rep);
     return rep;
@@ -257,15 +263,18 @@ async function writeLsState(path: string, state: Record<string, boolean>): Promi
 export async function runExec(
   cfg: FleetConfig, sel: string, cmd: string | string[],
   opts: { wsl?: boolean; cwd?: string; timeoutMs?: number; sudo?: boolean; fresh?: boolean } = {},
+  deps: { exec?: typeof exec } = {},
 ): Promise<ExecResult[]> {
   const hosts = resolveHosts(cfg, sel);
+  assertFeature(hosts, "exec", cfg);
   const shell: Shell = opts.wsl ? "wsl" : "auto";
-  return withWslHints(await Promise.all(hosts.map(async (h) => {
+  const run = deps.exec ?? exec;
+  return withWslHints(await mapPool(hosts, execParallelism(cfg, hosts.length), async (h) => {
     const command = Array.isArray(cmd) ? buildArgvCommand(cmd, h.os === "windows" && !opts.wsl) : cmd;
     const sudo = opts.sudo ? await sudoWrap(h, command, !!opts.wsl) : { cmd: command };
     if ("error" in sudo) return sudo.error;
-    return exec(h, sudo.cmd, shell, { cwd: opts.cwd, timeoutMs: opts.timeoutMs, fresh: opts.fresh, wslRoot: sudo.wslRoot });
-  })));
+    return run(h, sudo.cmd, shell, { cwd: opts.cwd, timeoutMs: opts.timeoutMs, fresh: opts.fresh, wslRoot: sudo.wslRoot });
+  }));
 }
 
 /** wsl.exe fails every launch with Wsl/Service/0x80072747 (WSAENOBUFS) once
@@ -529,8 +538,9 @@ export async function runScript(
   if (script.label === "<stdin>" && !script.ext && !opts.interp)
     throw new Error("fleet: --script - needs --interp <command> unless stdin starts with a supported shebang");
   const hosts = resolveHosts(cfg, sel);
+  assertFeature(hosts, "exec", cfg);
   const shell: Shell = opts.wsl ? "wsl" : "auto";
-  return withWslHints(await Promise.all(hosts.map((h) => {
+  return withWslHints(await mapPool(hosts, execParallelism(cfg, hosts.length), (h) => {
     // a WSL target is a linux box wearing a Windows host entry — pick its interpreter as such
     const os = opts.wsl ? "linux" : h.os;
     const interp = opts.interp ?? interpreterFor(script.ext, os);
@@ -538,7 +548,7 @@ export async function runScript(
     const eo = { cwd: opts.cwd, timeoutMs: opts.timeoutMs, fresh: opts.fresh };
     if (!opts.sudo) return exec(h, cmd, shell, eo);
     return sudoWrap(h, cmd, !!opts.wsl).then((sudo) => "error" in sudo ? sudo.error : exec(h, sudo.cmd, shell, { ...eo, wslRoot: sudo.wslRoot }));
-  })));
+  }));
 }
 
 // ── cp ────────────────────────────────────────────────────────────────────────
@@ -547,6 +557,7 @@ export async function pushFile(
   deps: { exec?: typeof exec; scp?: typeof scp } & TransferOptions = {},
 ): Promise<ExecResult[]> {
   const hosts = resolveHosts(cfg, sel);
+  assertFeature(hosts, "files", cfg);
   if (!recursive) {
     const dir = (Array.isArray(local) ? local : [local]).find((p) => { try { return statSync(p).isDirectory(); } catch { return false; } });
     if (dir) throw new Error(`${dir} is a directory; pass -r to copy it`);
@@ -580,6 +591,16 @@ mkdir -p -- "$d"`;
 
 /** Pull host:remote → local. Single-host only (one local destination). */
 export async function pullFile(
+  cfg: FleetConfig, sel: string, remote: string | string[], local: string, recursive = false,
+  opts: TransferOptions = {},
+): Promise<ExecResult> {
+  assertFeature(resolveHosts(cfg, sel), "files", cfg);
+  return pullUngated(cfg, sel, remote, local, recursive, opts);
+}
+
+/** pullFile without the `files` gate, for commands that pull their own output
+ *  (a cu recording) under their own feature. */
+async function pullUngated(
   cfg: FleetConfig, sel: string, remote: string | string[], local: string, recursive = false,
   opts: TransferOptions = {},
 ): Promise<ExecResult> {
@@ -725,6 +746,7 @@ export async function diffFiles(
   cfg: FleetConfig, a: DiffSide, b: DiffSide, context = 3,
   deps: { exec?: typeof exec } = {},
 ): Promise<DiffResult> {
+  for (const side of [a, b]) if (side.sel !== undefined) assertFeature(resolveHosts(cfg, side.sel), "files", cfg);
   const load = async (side: DiffSide): Promise<string> => {
     let bytes: Uint8Array;
     if (side.sel === undefined) {
@@ -1035,6 +1057,7 @@ export async function editRemoteFile(
     if (!e.old) throw new Error(edits.length > 1 ? `fleet edit: edit ${k + 1} has an empty "old"` : "fleet edit: --old cannot be empty");
   });
   const hosts = resolveHosts(cfg, sel);
+  assertFeature(hosts, "files", cfg);
   const shell: Shell = opts.wsl ? "wsl" : "auto";
   return Promise.all(hosts.map(async (h): Promise<EditResult> => {
     const base = { host: h.name, path, replacements: 0, diff: "" };
@@ -1220,6 +1243,7 @@ export async function deployHosts(
   cfg: FleetConfig, sel: string, opts: { restart?: boolean | string } = {},
 ): Promise<DeployResult[]> {
   const hosts = resolveHosts(cfg, sel);
+  assertFeature(hosts, "deploy", cfg);
   for (const host of hosts) {
     const service = deployRestartName(host, opts.restart ?? true);
     if (service && !host.services?.[service])
@@ -1633,7 +1657,8 @@ async function resolveLiveHostOrSelf(
 
 /** How long a preferred transport may stay unanswered before the next one is
  *  probed too. A reachable LAN host answers well inside it; an unreachable one
- *  would otherwise cost its whole probe timeout before the fallback was tried. */
+ *  would otherwise cost its whole probe timeout before the fallback was tried.
+ *  `defaults.routeGraceMs` overrides it. */
 export const ROUTE_GRACE_MS = 1500;
 
 /** The index of the first transport, in preference order, whose probe succeeds.
@@ -1696,7 +1721,7 @@ export async function routeSelector(
         const chosen = await pickPreferred(route.prefer.map((name) => () => {
           const host = cfg.hosts[name];
           return host ? probeHost(host) : Promise.resolve(false);
-        }), deps.graceMs ?? ROUTE_GRACE_MS);
+        }), deps.graceMs ?? cfg.defaults?.routeGraceMs ?? ROUTE_GRACE_MS);
         if (chosen >= 0) return route.prefer[chosen]!;
         throw new Error(`route ${token} is not reachable (tried: ${route.prefer.join(", ")})`);
       }
@@ -1708,6 +1733,61 @@ export async function routeSelector(
   };
   const tokens = sel.split(",").map((token) => token.trim()).filter(Boolean);
   return (await Promise.all(tokens.map(resolveToken))).join(",");
+}
+
+// ── effective configuration (`fleet config`) ─────────────────────────────────
+
+/** One knob as fleet resolves it. A null value means fleet decides at run time
+ *  (every host at once, the automatic image format, the first camera, …). */
+export interface SettingRow { key: string; value: string | number | null; source: SettingSource; env?: string }
+export interface HostConfigView {
+  host: string;
+  settings: SettingRow[];
+  /** Features fleet refuses on this host, and which list refuses each. */
+  refused: { feature: HostFeature; source: "host" | "top-level" }[];
+}
+export interface ConfigView { global: SettingRow[]; hosts: HostConfigView[] }
+
+/** Every effective knob and refused feature, for one selector or every host.
+ *  A route name lists its transports. Reads the config only: no network. */
+export function configView(cfg: FleetConfig, sel?: string, env: Record<string, string | undefined> = process.env): ConfigView {
+  const hosts = sel === undefined ? Object.values(cfg.hosts)
+    : cfg.routes?.[sel] ? cfg.routes[sel]!.prefer.map((name) => cfg.hosts[name]!)
+    : resolveHosts(cfg, sel);
+  type Value = string | number | null;
+  const layered = (key: string, own: Value | undefined, shared: Value | undefined, builtin: Value): SettingRow =>
+    own !== undefined ? { key, value: own, source: "host" }
+      : shared !== undefined ? { key, value: shared, source: "defaults" }
+      : { key, value: builtin, source: "built-in" };
+  const d = cfg.defaults;
+  const global = [
+    layered("routeGraceMs", undefined, d?.routeGraceMs, ROUTE_GRACE_MS),
+    layered("parallel.exec", undefined, d?.parallel?.exec, null),
+    layered("parallel.toolSync", undefined, d?.parallel?.toolSync, DEFAULT_TOOL_SYNC_PARALLELISM),
+    layered("parallel.toolStatusHosts", undefined, d?.parallel?.toolStatusHosts, TOOL_STATUS_HOST_PARALLELISM),
+  ];
+  const scalar = (host: Host, key: Knob): SettingRow => ({ key, ...knob(host, key, env, cfg) });
+  return {
+    global,
+    hosts: hosts.map((host) => {
+      const s = host.settings;
+      return {
+        host: host.name,
+        settings: [
+          scalar(host, "execTimeoutS"), scalar(host, "probeTimeoutMs"), scalar(host, "doneGraceMs"),
+          ...(host.os === "windows" ? [{ ...scalar(host, "winSessionIdleS"), value: winSessionIdleMs(host, env, cfg) / 1000 }] : []),
+          { key: "sshMux", ...sshMux(host, env, cfg) }, scalar(host, "sshPersist"),
+          layered("shot.output", s?.shot?.output, d?.shot?.output, null),
+          layered("shot.region", s?.shot?.region, d?.shot?.region, null),
+          layered("shot.format", s?.shot?.format, d?.shot?.format, null),
+          layered("shot.gridStep", s?.shot?.gridStep, d?.shot?.gridStep, 100),
+          layered("webcam.device", s?.webcam?.device, d?.webcam?.device, null),
+        ],
+        refused: HOST_FEATURES.filter((feature) => !featureEnabled(host, feature, cfg))
+          .map((feature) => ({ feature, source: host.disable?.includes(feature) ? "host" as const : "top-level" as const })),
+      };
+    }),
+  };
 }
 
 async function probePort(hostname: string, port: number, timeoutMs: number): Promise<boolean> {
@@ -1793,6 +1873,9 @@ export async function switchMachine(
 ): Promise<SwitchResult> {
   const m = getMachine(cfg, machine);
   if (!m.boots[target]) throw new Error(`machine ${machine} has no boot '${target}' (have: ${Object.keys(m.boots).join(", ")})`);
+  // Every boot can be the one that receives the trigger, so each must allow it.
+  assertFeature(Object.values(m.boots).flatMap((b) => [b.host, b.lan])
+    .flatMap((name) => (name && cfg.hosts[name] ? [cfg.hosts[name]!] : [])), "power", cfg);
   const run = opts.deps?.exec ?? exec;
   const probeHost = opts.deps?.probe ?? probe;
   const timeoutMs = opts.timeoutMs ?? 300_000, intervalMs = opts.intervalMs ?? 5_000;
@@ -2176,9 +2259,10 @@ async function findCwebp(): Promise<string | null> {
   await proc.exited;
   return (_cwebp = out || null);
 }
-/** What extension new screenshots default to: webp when cwebp is available. */
-export async function preferredImageExt(): Promise<"webp" | "png"> {
-  return (await findCwebp()) ? "webp" : "png";
+/** What extension new screenshots default to: the host's shot.format setting,
+ *  else webp when cwebp is available. A png never goes through cwebp. */
+export async function preferredImageExt(host?: Pick<Host, "settings">, cfg?: FleetConfig | null): Promise<"webp" | "png"> {
+  return captureSetting(host, "format", cfg) ?? ((await findCwebp()) ? "webp" : "png");
 }
 /** Pull a remote image to `finalOut`. If finalOut is .webp and cwebp exists,
  *  transcode locally (lossless — crisp UI text, smaller than PNG); otherwise
@@ -2696,6 +2780,7 @@ export async function captureWebcam(
 ): Promise<{ host: string; cameras: Camera[]; device?: string; localPath?: string }> {
   const local = sel === "local";
   const hosts = local ? [] : resolveHosts(cfg, sel);
+  assertFeature(hosts, "webcam", cfg);
   if (!local && hosts.length !== 1) throw new Error("webcam requires exactly one host");
   const host = hosts[0];
   const os = host?.os ?? (process.platform === "darwin" ? "mac" : process.platform === "win32" ? "windows" : "linux");
@@ -2712,14 +2797,16 @@ export async function captureWebcam(
     const [stdout, stderr, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
     return { host: "local", stdout, stderr, code, ok: code === 0 };
   };
+  // An absent --device takes the host's webcam.device setting (defaults.webcam.device for local).
+  const wanted = opts.device ?? webcamDevice(host, cfg);
   let cameras: Camera[] = [];
-  if (opts.list || opts.device === undefined) {
+  if (opts.list || wanted === undefined) {
     const result = await run();
     if (!result.ok) throw new Error(result.stderr || "Camera discovery failed");
     cameras = parseCameras(os, result.stdout);
     if (opts.list) return { host: host?.name ?? "local", cameras };
   }
-  const device = opts.device ?? cameras[0]?.device;
+  const device = wanted ?? cameras[0]?.device;
   validateWebcamDevice(os, device);
   const result = await run(device);
   if (!result.ok) throw new Error(result.stderr || "Camera unavailable, busy, or permission denied");
@@ -2751,13 +2838,15 @@ export async function prepareWebcamStream(
   validateWebcamStreamOptions(opts);
   const local = sel === "local";
   const hosts = local ? [] : resolveHosts(cfg, sel);
+  assertFeature(hosts, "webcam", cfg);
   if (!local && hosts.length !== 1) throw new Error("webcam requires exactly one host");
   const host = hosts[0];
   const os = host?.os ?? (process.platform === "darwin" ? "mac" : process.platform === "win32" ? "windows" : "linux");
   if (host?.android) throw new Error("webcam supports desktop hosts; Android cameras are not supported");
   const vo = detectWebcamVo({ vo: opts.vo, window: opts.window }, deps.env);
+  const wanted = opts.device ?? webcamDevice(host, cfg);
   let cameras: Camera[] = [];
-  if (opts.device === undefined) {
+  if (wanted === undefined) {
     const listScript = webcamScript(os);
     const res = host
       ? await (deps.exec ?? exec)(host, listScript.cmd, listScript.shell, { timeoutMs: 30000 })
@@ -2775,7 +2864,7 @@ export async function prepareWebcamStream(
     if (!res.ok) throw new Error(res.stderr || "Camera discovery failed");
     cameras = parseCameras(os, res.stdout);
   }
-  const device = opts.device ?? cameras[0]?.device;
+  const device = wanted ?? cameras[0]?.device;
   validateWebcamDevice(os, device);
   const view = opts.viewport;
   const maxW = opts.width ?? (vo === "window" || local ? 1280 : 640);
@@ -2818,15 +2907,27 @@ export async function prepareWebcamStream(
     cameras, startProducer,
   };
 }
-/** Capture a screenshot on the first selected host and pull it to `localPath`. */
+/** Capture a screenshot on the first selected host and pull it to `localPath`.
+ *  An absent output or region takes the host's shot settings. */
 export async function captureScreenshot(
+  cfg: FleetConfig, sel: string, localPath: string,
+  deps: { exec?: typeof exec; deliver?: typeof deliverImage; pull?: typeof scpPull } = {},
+  opts: { output?: string; region?: string; wake?: boolean } = {},
+): Promise<ScreenshotResult> {
+  assertFeature(resolveHosts(cfg, sel).slice(0, 1), "shot", cfg);
+  return screenshotUngated(cfg, sel, localPath, deps, opts);
+}
+
+/** captureScreenshot without the `shot` gate, for cu's own desktop fallback. */
+async function screenshotUngated(
   cfg: FleetConfig, sel: string, localPath: string,
   deps: { exec?: typeof exec; deliver?: typeof deliverImage; pull?: typeof scpPull } = {},
   opts: { output?: string; region?: string; wake?: boolean } = {},
 ): Promise<ScreenshotResult> {
   const host = resolveHosts(cfg, sel)[0]!;
   const run = deps.exec ?? exec;
-  const { cmd, shell } = captureCmd(host.os, await captureTarget(cfg, host, opts, { exec: run }));
+  const target = { ...opts, output: opts.output ?? captureSetting(host, "output", cfg), region: opts.region ?? captureSetting(host, "region", cfg) };
+  const { cmd, shell } = captureCmd(host.os, await captureTarget(cfg, host, target, { exec: run }));
   const capture = await run(host, cmd, shell);
   if (!capture.ok) throw new Error(
     `screenshot capture failed on ${host.name}: ${capture.stderr || capture.stdout || "exit " + capture.code}`);
@@ -3198,7 +3299,9 @@ export async function cuInstall(
   deps: { exec?: typeof exec } = {},
 ): Promise<CuInstallAction[]> {
   const run = deps.exec ?? exec;
-  return Promise.all(resolveHosts(cfg, sel).map(async (h) => {
+  const hosts = resolveHosts(cfg, sel);
+  assertFeature(hosts, "cu", cfg);
+  return Promise.all(hosts.map(async (h) => {
     const { cmd, shell } = cuInstallCmd(h.os);
     return { host: h.name, os: h.os, result: await run(h, cmd, shell) };
   }));
@@ -3244,6 +3347,7 @@ export async function cuRun(
   deps: { exec?: typeof exec } = {},
 ): Promise<CuResult> {
   const host = resolveHosts(cfg, sel)[0]!;
+  assertFeature([host], "cu", cfg);
   // Desktop-wide calls on Linux: cua-driver refuses them on a multi-monitor
   // Wayland layout, and its own grim waits forever on a powered-off monitor.
   // Check the layout first and answer those cases here.
@@ -3292,7 +3396,7 @@ async function cuDesktopFallback(
     stdout: JSON.stringify({ ...size, monitors: layout.monitors, source: `fleet (${layout.source})` }, null, 2), stderr: note } };
   if (!imageOut) return fail(`${note}. Pass --out FILE for the main monitor's image, or use fleet shot ${host.name} --output ${m.name}.`);
   try {
-    const shot = await captureScreenshot(cfg, host.name, imageOut, { exec: deps.exec }, { output: m.name });
+    const shot = await screenshotUngated(cfg, host.name, imageOut, { exec: deps.exec }, { output: m.name });
     return { host: host.name, localImage: shot.localPath,
       result: { host: host.name, ok: true, code: 0, stdout: JSON.stringify(size, null, 2), stderr: note } };
   } catch (e) { return fail(`${note}; ${(e as Error).message}`); }
@@ -3465,6 +3569,7 @@ export async function browseHost(
   deps: { fetch?: (input: string, init?: RequestInit) => Promise<Response>; timeoutMs?: number } = {},
 ): Promise<BrowseResult> {
   const host = resolveHosts(cfg, sel)[0]!;
+  assertFeature([host], "browse", cfg);
   if (!host.cdp) throw new Error(
     `host ${host.name} has no CDP endpoint; add \"cdp\": \"http://host:port\" to hosts.${host.name} in fleet.config.json`,
   );
@@ -3579,7 +3684,7 @@ export async function cuRecordStop(
   if (!stateBefore?.output_dir) throw new Error("cua-driver has no recording output directory to pull");
 
   await (deps.makeDir ?? (async (path) => { await mkdir(path, { recursive: true }); }))(localOut);
-  const pull = await (deps.pull ?? pullFile)(cfg, sel, `${stateBefore.output_dir}/.`, localOut, true);
+  const pull = await (deps.pull ?? pullUngated)(cfg, sel, `${stateBefore.output_dir}/.`, localOut, true);
   if (!pull.ok) throw new Error(`could not pull recording from ${response.host}: ${pull.stderr || `scp exit ${pull.code}`}`);
   const localPaths = await (deps.listLocalFiles ?? localFiles)(localOut);
   return { ...response, state, stateBefore, pull, localPaths: localPaths.length ? localPaths : [localOut] };
@@ -3605,6 +3710,7 @@ export async function cuApps(
   cfg: FleetConfig, sel: string, filter?: string, opts: { all?: boolean } = {},
 ): Promise<{ apps: CuApp[]; result: ExecResult; hidden: number }> {
   const host = resolveHosts(cfg, sel)[0]!;
+  assertFeature([host], "cu", cfg);
   let apps: CuApp[];
   let result: ExecResult;
   let hidden = 0;
@@ -3744,6 +3850,7 @@ export async function cuSnapshot(
   cfg: FleetConfig, sel: string, deps: { exec?: typeof exec } = {},
 ): Promise<CuSnapshot> {
   const host = resolveHosts(cfg, sel)[0]!;
+  assertFeature([host], "cu", cfg);
   const win = host.os === "windows";
   const { prelude, invoke } = cuaBin(host.os);
   const mark = win ? `Write-Output '${SEP_SENTINEL}'` : `echo '${SEP_SENTINEL}'`;
@@ -4063,6 +4170,7 @@ export async function cuShotWindow(
   opts: { composite?: boolean } = {},
 ): Promise<CuShotWindowResult> {
   const host = resolveHosts(cfg, sel)[0]!;
+  assertFeature([host], "cu", cfg);
   const run = deps.exec ?? exec;
   const { target } = await cuResolveTarget(cfg, sel, query, { snapshot: deps.snapshot, exec: deps.exec });
   const { prelude, invoke } = cuaBin(host.os);
@@ -4284,6 +4392,7 @@ export async function cuAct(
   deps: { exec?: typeof exec; deliver?: typeof deliverImage; snapshot?: typeof cuSnapshot; elements?: typeof cuElements } = {},
 ): Promise<CuActResult> {
   const host = resolveHosts(cfg, sel)[0]!;
+  assertFeature([host], "cu", cfg);
   if (opts.region) validateRegionLocator(opts.region);
   const { target } = await cuResolveTarget(cfg, sel, query, { snapshot: deps.snapshot, exec: deps.exec });
   if (opts.region) return cuConfirmClosed(cfg, sel, await cuActOnRegion(host, target, tool, payload, opts, deps), deps);
@@ -4609,6 +4718,7 @@ export async function cuBatch(
   if (new TextEncoder().encode(JSON.stringify(actions)).length > 256 * 1024)
     throw new Error("batch input exceeds 256 KiB");
   const host = resolveHosts(cfg, sel)[0]!;
+  assertFeature([host], "cu", cfg);
   const { target } = await cuResolveTarget(cfg, sel, query, { snapshot: deps.snapshot, exec: deps.exec });
   const prepared = actions.map((step, index) => {
     try {
@@ -5078,6 +5188,7 @@ export async function cuRegions(
 ): Promise<CuRegions> {
   const options = validateRegionOptions(opts);
   const host = resolveHosts(cfg, sel)[0]!;
+  assertFeature([host], "cu", cfg);
   const run = deps.exec ?? exec;
   const { target } = await cuResolveTarget(cfg, sel, query, { snapshot: deps.snapshot, exec: deps.exec });
   const { prelude } = cuaBin(host.os);
@@ -5146,6 +5257,7 @@ export async function cuPerception(
 ): Promise<CuPerceptionAction[]> {
   const run = deps.exec ?? exec;
   const hosts = resolveHosts(cfg, sel);
+  assertFeature(hosts, "cu", cfg);
   for (const h of hosts) if (h.android) throw new Error(`${h.name} is an Android host; cua-perception runs on desktops`);
   const scripts = hosts.map((h) => perceptionScript(h.os, action, opts.version));
   return Promise.all(hosts.map(async (h, i) => ({
@@ -5330,15 +5442,18 @@ function serviceHosts(cfg: FleetConfig, sel: string, target: ServiceTarget): { h
 }
 async function serviceAction(
   cfg: FleetConfig, sel: string, target: ServiceTarget, command: (svc: Service) => { cmd: string; shell: Shell },
+  feature?: "restart",
 ): Promise<ServiceAction[]> {
-  return Promise.all(serviceHosts(cfg, sel, target).map(async ({ host, svc, error }) => {
+  const matched = serviceHosts(cfg, sel, target);
+  if (feature) assertFeature(matched.map((m) => m.host), feature, cfg);
+  return Promise.all(matched.map(async ({ host, svc, error }) => {
     const { cmd, shell } = error ? { cmd: "", shell: "auto" as Shell } : command(svc);
     const result = error ? { host: host.name, ok: false, code: 1, stdout: "", stderr: error } : await exec(host, cmd, shell);
     return { host: host.name, service: serviceName(target), type: svc.type, cmd, result };
   }));
 }
 export async function restartService(cfg: FleetConfig, sel: string, target: ServiceTarget): Promise<ServiceAction[]> {
-  return serviceAction(cfg, sel, target, restartCmd);
+  return serviceAction(cfg, sel, target, restartCmd, "restart");
 }
 export async function serviceLogs(cfg: FleetConfig, sel: string, target: ServiceTarget, n: number): Promise<ServiceAction[]> {
   return serviceAction(cfg, sel, target, (svc) => logsCmd(svc, n));
@@ -5417,7 +5532,9 @@ export async function rebootHosts(cfg: FleetConfig, sel: string, opts: {
   if (opts.timeoutMs !== undefined && !opts.wait) throw new Error("reboot timeout requires wait");
   const now = opts.deps?.now ?? Date.now;
   const run = opts.deps?.exec ?? exec;
-  return Promise.all(resolveHosts(cfg, sel).map(async (h) => {
+  const hosts = resolveHosts(cfg, sel);
+  assertFeature(hosts, "power", cfg);
+  return Promise.all(hosts.map(async (h) => {
     const { cmd, shell } = rebootCmd(h);
     const start = now(), deadline = start + timeout;
     const triggered = await run(h, cmd, shell, opts.wait ? { timeoutMs: Math.min(timeout, SWITCH_TRIGGER_MS) } : {});
@@ -5443,7 +5560,9 @@ export async function firmwareRebootHosts(
   deps: { exec?: typeof exec } = {},
 ): Promise<RebootAction[]> {
   const run = deps.exec ?? exec;
-  return Promise.all(resolveHosts(cfg, sel).map(async (h) => {
+  const hosts = resolveHosts(cfg, sel);
+  assertFeature(hosts, "power", cfg);
+  return Promise.all(hosts.map(async (h) => {
     if (h.os === "mac") {
       return {
         host: h.name,

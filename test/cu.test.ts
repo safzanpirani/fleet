@@ -742,3 +742,15 @@ describe("cua-driver start script (Linux)", () => {
     expect(sent).not.toMatch(/Environment=(WAYLAND_DISPLAY|HYPRLAND_INSTANCE_SIGNATURE|XDG_RUNTIME_DIR)=/);
   });
 });
+
+describe("feature gates", () => {
+  test("a host that disables cu refuses before anything reaches it", async () => {
+    const gated: FleetConfig = { hosts: { ...cfg.hosts, lin: { ...host("lin", "linux"), disable: ["cu"] } } };
+    let calls = 0;
+    const exec = async (target: Host): Promise<ExecResult> => { calls++; return { host: target.name, ok: true, code: 0, stdout: "{}", stderr: "" }; };
+    await expect(cuRun(gated, "lin", ["get_screen_size"], undefined, { exec })).rejects.toThrow(/cu is disabled on lin/);
+    await expect(cuInstall(gated, "all", { exec })).rejects.toThrow(/cu is disabled on lin/);
+    expect(calls).toBe(0);
+    expect((await cuRun(gated, "win", ["get_screen_size"], undefined, { exec })).result.ok).toBe(true);
+  });
+});

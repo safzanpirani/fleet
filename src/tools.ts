@@ -23,7 +23,7 @@ import { copyFile, chmod, lstat, mkdir, mkdtemp, readFile, readlink, readdir, rm
 import type { Dirent } from "node:fs";
 import { didYouMean } from "./suggest.ts";
 import type { FleetConfig, Host, ToolSpec } from "./config.ts";
-import { resolveHosts } from "./config.ts";
+import { assertFeature, resolveHosts } from "./config.ts";
 import { exec, scp } from "./ssh.ts";
 import type { ExecResult } from "./ssh.ts";
 import { installLockScript as toolSyncLockScript } from "./install-lock.ts";
@@ -39,8 +39,10 @@ const ALWAYS_EXCLUDE = ["node_modules", ".git", "dist", ".DS_Store"];
 const FILE_IO_PARALLELISM = 16;
 const TRAVERSAL_PARALLELISM = 8;
 const TOOL_FINGERPRINT_PARALLELISM = 4;
-const TOOL_STATUS_HOST_PARALLELISM = 8;
-const DEFAULT_TOOL_SYNC_PARALLELISM = 2;
+/** Host manifest reads `tools status` runs at once; defaults.parallel.toolStatusHosts overrides it. */
+export const TOOL_STATUS_HOST_PARALLELISM = 8;
+/** Tools `tools sync --all` syncs at once; defaults.parallel.toolSync overrides it. */
+export const DEFAULT_TOOL_SYNC_PARALLELISM = 2;
 
 /** Run independent work with a fixed ceiling while preserving input order. */
 export async function mapPool<T, R>(
@@ -227,7 +229,7 @@ async function fileHash(path: string): Promise<string> {
  *  house convention `<root>/skills/<name>/SKILL.md`, else the installed copy
  *  under ~/.claude/skills — several tools keep the skill only there, never
  *  having vendored it back into their repo. None is fine; not every tool has one. */
-async function findSkill(spec: { name: string; root: string; skill?: string }): Promise<string | undefined> {
+export async function findSkill(spec: { name: string; root: string; skill?: string }): Promise<string | undefined> {
   const candidates = spec.skill
     ? [join(spec.root, spec.skill)]
     : [
@@ -352,7 +354,7 @@ export async function toolsStatus(
   }
   const hostResults = await mapPool(
     hosts,
-    TOOL_STATUS_HOST_PARALLELISM,
+    cfg.defaults?.parallel?.toolStatusHosts ?? TOOL_STATUS_HOST_PARALLELISM,
     (host) => readHostManifests(host),
   );
   const manifestsByHost = new Map(hosts.map((host, index) => [host.name, hostResults[index]!]));
@@ -581,6 +583,7 @@ export async function syncTool(
 ): Promise<ToolSyncResult[]> {
   const spec = resolveTool(cfg, name);
   const hosts = resolveHosts(cfg, sel);
+  assertFeature(hosts, "deploy", cfg);
   if (spec.compile && hosts.some((host) => host.os === "windows"))
     throw new Error(`tools.${name}.compile supports Linux and macOS only; no hosts were synced`);
   const stage = await mkdtemp(join(tmpdir(), "fleet-tool-sync-"));
@@ -652,7 +655,7 @@ export async function syncTools(
   } = {},
 ): Promise<MultiToolSyncResult[]> {
   const sync = opts.sync ?? syncTool;
-  return mapPool(names, opts.maxParallel ?? DEFAULT_TOOL_SYNC_PARALLELISM, async (tool) => {
+  return mapPool(names, opts.maxParallel ?? cfg.defaults?.parallel?.toolSync ?? DEFAULT_TOOL_SYNC_PARALLELISM, async (tool) => {
     try {
       return { tool, results: await sync(cfg, tool, sel, { skill: opts.skill }) };
     } catch (error) {
@@ -661,11 +664,12 @@ export async function syncTools(
   });
 }
 
-/** Validate the CLI-only multi-tool pool flag. */
-export function toolSyncParallelism(toolCount: number, requested?: string): number {
+/** Validate the CLI-only multi-tool pool flag. Without it, defaults.parallel.toolSync
+ *  (else two tools at a time) applies. */
+export function toolSyncParallelism(toolCount: number, requested?: string, cfg?: Pick<FleetConfig, "defaults">): number {
   if (requested !== undefined && toolCount < 2)
     throw new Error("--max-parallel is only valid with multi-tool sync (`fleet tools sync --all`)");
-  if (requested === undefined) return DEFAULT_TOOL_SYNC_PARALLELISM;
+  if (requested === undefined) return cfg?.defaults?.parallel?.toolSync ?? DEFAULT_TOOL_SYNC_PARALLELISM;
   const parsed = Number(requested);
   if (!Number.isInteger(parsed) || parsed < 1)
     throw new Error(`--max-parallel needs an integer ≥ 1 (got '${requested}')`);

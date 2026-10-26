@@ -11,7 +11,7 @@
  *
  * Like core.ts, nothing here prints; functions return data and throw.
  */
-import { resolveHosts } from "./config.ts";
+import { assertFeature, resolveHosts } from "./config.ts";
 import type { FleetConfig, Host } from "./config.ts";
 import { exec } from "./ssh.ts";
 import type { ExecResult } from "./ssh.ts";
@@ -358,6 +358,7 @@ export async function processKill(
     throw new Error("grace must be 0-120 seconds");
   const run = deps.exec ?? exec;
   const hosts = resolveHosts(cfg, sel);
+  assertFeature(hosts, "kill", cfg);
   return Promise.all(hosts.map(async (h): Promise<KillResult> => {
     const l = await listOne(h, run);
     if (!l.ok) return { host: h.name, ok: false, error: l.error, targets: [] };

@@ -19,7 +19,7 @@ import { gunzipSync } from "node:zlib";
 import { createConnection } from "node:net";
 import { dirname, join } from "node:path";
 import type { FleetConfig, Host } from "./config.ts";
-import { resolveHosts } from "./config.ts";
+import { assertFeature, resolveHosts } from "./config.ts";
 import { exec, probe, sshEnv, type ExecResult } from "./ssh.ts";
 import { emitImage, takeInlineImages, validateImageArtifact } from "./core.ts";
 import { UI_JAR_B64, UI_JAR_MD5 } from "./android-ui-jar.ts";
@@ -371,11 +371,13 @@ interface PhoneRun {
 
 type Run = typeof exec;
 
-/** The host a selector names, and its adb serial. Throws for a host that is not an Android phone. */
+/** The host a selector names, and its adb serial. Throws for a host that is not
+ *  an Android phone, or one whose config disables `cu` (every caller is fleet cu). */
 export function androidHost(cfg: FleetConfig, sel: string): { host: Host; serial: string } {
   const host = resolveHosts(cfg, sel)[0];
   if (!host) throw new Error(`no host matches '${sel}'`);
   if (!host.android) throw new Error(`${host.name} is not an Android host (give it an "android" block in fleet.config.json)`);
+  assertFeature([host], "cu", cfg);
   return { host, serial: host.android.serial ?? ANDROID_DEFAULT_SERIAL };
 }
 export const isAndroidHost = (cfg: FleetConfig, sel: string): boolean => {

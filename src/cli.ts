@@ -17,6 +17,7 @@
  *   fleet top <host>                  live terminal btop for one host
  *   fleet logs <host> <svc> [-n N] [-f] recent logs / status for a service; -f streams
  *   fleet tools status [tool] [sel]   which boxes run a stale CLI tool / skill
+ *   fleet skills status [set] [sel]   which boxes hold stale agent skill directories
  *   fleet run <recipe>                run a saved playbook from config
  *   fleet ssh <host>                  interactive shell
  *
@@ -33,7 +34,7 @@ import { processList, processKill } from "./procs.ts";
 import type { KillResult } from "./procs.ts";
 import { portList } from "./ports.ts";
 import { format } from "node:util";
-import { loadConfig, resolveHosts } from "./config.ts";
+import { assertFeature, captureSetting, loadConfig, resolveHosts } from "./config.ts";
 import { parseWatchInterval, watchLoop, type WatchRun } from "./watch.ts";
 import { runWinSessionBroker, runWinSessionTransport } from "./winsession.ts";
 import { focusElements } from "./focus.ts";
@@ -61,7 +62,7 @@ import {
   cuSnapshot, cuResolveTargetFrom, cuResolvePoint, cuAct, cuBatch, cuBlockerNote, cuElements, cuOpen, sameRole, cuVerify,
   cuGridCaption, cuElementSupport, compactCuOutput, briefDescribe,
   bootState, switchMachine, firmwareEntries, hostKey, findHost, listMonitors, waitFor, routeSelector, deployHosts, diagnose, firmwareRebootHosts,
-  proxyRows, proxyChecks, dropMasters,
+  proxyRows, proxyChecks, dropMasters, configView,
 } from "./core.ts";
 import { currentViewport, detectWebcamVo, runWebcamStream, validateWebcamStreamOptions } from "./webcam.ts";
 import {
@@ -74,7 +75,9 @@ import {
   toolSyncParallelism,
   stampSkill,
 } from "./tools.ts";
-import type { ServiceAction, CuTarget, GridOptions, CuElementLocator, EditSpec, DuResult, WhichRow } from "./core.ts";
+import { selectSkills, skillsStatus, syncSkills, toolOwnedSkills } from "./skills.ts";
+import type { SkillStatusRow, SkillSyncHostResult } from "./skills.ts";
+import type { ServiceAction, CuTarget, GridOptions, CuElementLocator, EditSpec, DuResult, WhichRow, SettingRow } from "./core.ts";
 import type { CuRegionLocator } from "./perception.ts";
 import {
   isAndroidHost, androidState, androidDoctor, androidElementsOf, androidShot, androidAct, androidOpen, androidApps,
@@ -132,6 +135,8 @@ function die(m: string): never {
     // Only fixed diagnostics enter the machine-readable failure envelope.
     const error = failurePhase === "config"
       ? { code: "CONFIG_ERROR", message: "Unable to load Fleet configuration. Check FLEET_CONFIG and the configuration file." }
+      : / is disabled on .+ by the fleet config/.test(m)
+        ? { code: "FEATURE_DISABLED", message: "The Fleet configuration disables this command on a selected host." }
       : /unknown host|unknown selector|no hosts|unknown group/i.test(m)
         ? { code: "UNKNOWN_SELECTOR", message: "The selector does not resolve to configured hosts." }
         : /usage:|option|requires|needs an integer|choose either|cannot be combined|must come|--interp|--argv/i.test(m)
@@ -353,6 +358,7 @@ export async function cuTaskCommand(
     return n;
   };
   if (timeout !== undefined && (!/^\d+$/.test(timeout) || Number(timeout) < 1)) die(`--timeout must be a positive integer in seconds (got '${timeout}')`);
+  assertFeature(resolveHosts(cfg, target), "cu", cfg);
   const key = loadTaskKey();
   if (!key) die("a task needs a TypeSafe key: set TYPESAFE_API_KEY, or name a JSON file with apiKey in FLEET_JEV_CONFIG");
   const backend = o.android
@@ -753,8 +759,9 @@ function printRaw(r: ExecResult): void {
 
 const SUBCOMMANDS = [
   "webcam",
+  "config",
   "ls", "hosts", "dt", "exec", "spawn", "watch", "jobs", "cp", "edit", "diff", "restart", "reboot", "bios", "boot", "switch", "wait",
-  "gpu", "disk", "du", "which", "ps", "ports", "kill", "status", "top", "logs", "svc", "shot", "cu", "browse", "run", "deploy", "tools", "proxy", "doctor", "hostkey", "find", "session", "drop", "completion", "ssh", "help",
+  "gpu", "disk", "du", "which", "ps", "ports", "kill", "status", "top", "logs", "svc", "shot", "cu", "browse", "run", "deploy", "tools", "skills", "proxy", "doctor", "hostkey", "find", "session", "drop", "completion", "ssh", "help",
 ];
 /** Emit a bash/zsh completion script with this config's hosts/groups/recipes/
  *  services baked in. Source it: `eval "$(fleet completion zsh)"`. */
@@ -766,6 +773,7 @@ export function completionScript(cfg: FleetConfig, shell: string): string {
   const machines = Object.keys(cfg.machines ?? {});
   const groups = ["@linux", "@windows", "@mac", "@gpu", ...Object.keys(cfg.groups ?? {}).map((g) => "@" + g)];
   const recipes = Object.keys(cfg.recipes ?? {});
+  const skillSets = ["list", "status", "sync", ...Object.keys(cfg.skills ?? {})];
   const services = [...new Set(Object.values(cfg.hosts).flatMap((h) => Object.keys(h.services ?? {})))];
   const sels = ["all", ...groups, ...hosts, ...routes, ...machines];
   const svcCmds = "restart logs svc";   // commands whose args include service names
@@ -775,11 +783,13 @@ _fleet() {
   local -a sels=${shellArray(sels)}
   local -a svcs=${shellArray(services)}
   local -a recipes=${shellArray(recipes)}
+  local -a skillsets=${shellArray(skillSets)}
   if (( CURRENT == 2 )); then compadd -- "\${cmds[@]}"; return; fi
   case $words[2] in
     run) compadd -- "\${recipes[@]}";;
+    skills) compadd -- "\${skillsets[@]}" "\${sels[@]}";;
     ${svcCmds.split(" ").join("|")}) compadd -- "\${sels[@]}" "\${svcs[@]}";;
-    boot|switch|wait|exec|spawn|watch|cp|edit|diff|reboot|bios|top|shot|webcam|cu|ssh|doctor|status|deploy|proxy|ports) compadd -- "\${sels[@]}";;
+    boot|switch|wait|exec|spawn|watch|cp|edit|diff|reboot|bios|top|shot|webcam|cu|ssh|doctor|status|deploy|proxy|ports|config) compadd -- "\${sels[@]}";;
   esac
 }
 compdef _fleet fleet`;
@@ -798,11 +808,13 @@ _fleet() {
   local -a sels=${shellArray(sels)}
   local -a svcs=${shellArray(services)}
   local -a recipes=${shellArray(recipes)}
+  local -a skillsets=${shellArray(skillSets)}
   if [ "\$COMP_CWORD" -eq 1 ]; then _fleet_matches "$cur" "\${cmds[@]}"; return; fi
   case "\${COMP_WORDS[1]}" in
     run) _fleet_matches "$cur" "\${recipes[@]}";;
+    skills) _fleet_matches "$cur" "\${skillsets[@]}" "\${sels[@]}";;
     ${svcCmds.split(" ").join("|")}) _fleet_matches "$cur" "\${sels[@]}" "\${svcs[@]}";;
-    boot|switch|wait|exec|spawn|watch|cp|edit|diff|reboot|bios|top|shot|webcam|cu|ssh|doctor|status|deploy|proxy|ports) _fleet_matches "$cur" "\${sels[@]}";;
+    boot|switch|wait|exec|spawn|watch|cp|edit|diff|reboot|bios|top|shot|webcam|cu|ssh|doctor|status|deploy|proxy|ports|config) _fleet_matches "$cur" "\${sels[@]}";;
   esac
 }
 complete -F _fleet fleet`;
@@ -836,7 +848,7 @@ const PROXY_LEADING_VALUES: Record<string, readonly string[]> = {
  * parsing remote payloads. Keep this boundary aligned with exec flag hoisting. */
 export function fleetJsonCommand(command: string | undefined, args: string[]): string | undefined {
   const canonical = command === "job" ? "jobs" : command === "service" ? "svc" : command === "push" || command === "pull" ? "cp" : command;
-  if (!canonical || !["exec", "spawn", "jobs", "cp", "edit", "tools", "restart", "logs", "svc", "webcam"].includes(canonical)) return undefined;
+  if (!canonical || !["exec", "spawn", "jobs", "cp", "edit", "tools", "skills", "restart", "logs", "svc", "webcam", "config"].includes(canonical)) return undefined;
   const values = new Set([...(PROXY_LEADING_VALUES[canonical] ?? []), "--proxy"]);
   const payload = canonical === "exec" || canonical === "spawn";
   const bools = new Set(canonical === "exec"
@@ -923,18 +935,41 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       const json = flags["--json"] === true;
       const anyProxy = Object.values(cfg.hosts).some((h) => h.proxy) || !!cfg.defaultProxy
         || !!process.env.FLEET_PROXY || !!process.env.FLEET_PROXY_OVERRIDE;
-      const row = (h: { up: boolean; httpUp?: boolean; name: string; os: string; ssh: string; services: string[]; proxy: string | null; proxyDown?: boolean }) => {
+      const row = (h: { up: boolean; httpUp?: boolean; name: string; os: string; ssh: string; services: string[]; proxy: string | null; proxyDown?: boolean; disabled?: string[] }) => {
         const dot = h.up ? A.g("●") : h.proxyDown ? A.y("◌") : h.httpUp ? A.y("◍") : A.r("○");
         // "proxy down" and "host down" are different facts. Conflating them sends
         // someone to power-cycle a box that was never contacted.
         const note = h.proxyDown ? A.y(`proxy down          `)
           : !h.up && h.httpUp ? A.y("ssh-down · http ok  ") : "";
         const via = anyProxy ? A.d((h.proxy ?? "-").padEnd(16)) + " " : "";
-        return `${dot} ${A.b(h.name.padEnd(10))} ${A.d(h.os.padEnd(8))} ${A.d(h.ssh.padEnd(16))} ${via}${note}${A.d(h.services.join(", "))}`;
+        const off = h.disabled ? A.y(`${h.services.length ? "  " : ""}disabled: ${h.disabled.join(", ")}`) : "";
+        return `${dot} ${A.b(h.name.padEnd(10))} ${A.d(h.os.padEnd(8))} ${A.d(h.ssh.padEnd(16))} ${via}${note}${A.d(h.services.join(", "))}${off}`;
       };
       if (json) { console.log(JSON.stringify(await lsHosts(cfg), null, 2)); return 0; }
       // stream each host as it resolves (fastest first) — don't block on the slowest/dead host
       await lsHosts(cfg, (h) => console.log(row(h)));
+      return 0;
+    }
+
+    case "config": {
+      const { flags, rest: pos } = parseFlags(rest, ["--json"], []);
+      if (pos.length > 1) die("usage: fleet config [<host>] [--json]");
+      const view = configView(cfg, pos[0]);
+      if (flags["--json"] === true) { console.log(JSON.stringify(view, null, 2)); return 0; }
+      // A null value means fleet decides at run time; say what it decides.
+      const rows = (settings: SettingRow[]) => settings.forEach((r) => {
+        const value = r.value !== null ? String(r.value)
+          : r.key === "parallel.exec" ? "all" : r.key === "shot.format" ? "auto" : r.key === "webcam.device" ? "first" : "-";
+        console.log(`  ${r.key.padEnd(24)} ${value.padEnd(12)} ${A.d(r.source + (r.env ? ` ${r.env}` : ""))}`);
+      });
+      console.log(A.b("fleet-wide"));
+      rows(view.global);
+      for (const h of view.hosts) {
+        console.log(A.b(h.host));
+        rows(h.settings);
+        if (h.refused.length) console.log(`  ${"refused".padEnd(24)} ${h.refused.map((r) =>
+          `${r.feature} ${A.d(r.source === "host" ? "(host disable)" : "(top-level disable)")}`).join(", ")}`);
+      }
       return 0;
     }
 
@@ -1057,6 +1092,7 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       const target = await routeSelector(cfg, sel!);
       const hosts = resolveHosts(cfg, target);
       if (hosts.length !== 1) die(`fleet watch takes one host; '${sel}' selects ${hosts.length}`);
+      assertFeature(hosts, "exec", cfg);
       const words = keepsArgvBoundaries(pos);
       const tty = Boolean(process.stdout.isTTY);
       const restore = () => { if (tty) process.stdout.write("\x1b[?25h\x1b[?1049l"); };
@@ -1408,7 +1444,9 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       if (!sel || pos.length !== 1) die("usage: fleet reboot <sel> [--yes] [--wait [--timeout S]]");
       if (!yes && !process.stdin.isTTY) die("reboot requires --yes non-interactively");
       const routed = await routeSelector(cfg, sel);
-      const hosts = resolveHosts(cfg, routed).map((h) => h.name);
+      const targets = resolveHosts(cfg, routed);
+      assertFeature(targets, "power", cfg);   // refuse before asking
+      const hosts = targets.map((h) => h.name);
       if (!await confirm(`reboot ${A.b(hosts.join(", "))} (this drops the connection)`, yes)) return 1;
       const actions = await rebootHosts(cfg, routed, { wait, ...(wait ? { timeoutMs: timeout * 1000 } : {}) });
       for (const a of actions) {
@@ -1424,7 +1462,9 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       const [sel] = pos;
       if (!sel || pos.length !== 1) die("usage: fleet bios <sel> [--yes]");
       const routed = await routeSelector(cfg, sel!);
-      const hosts = resolveHosts(cfg, routed).map((h) => h.name);
+      const targets = resolveHosts(cfg, routed);
+      assertFeature(targets, "power", cfg);   // refuse before asking
+      const hosts = targets.map((h) => h.name);
       if (!await confirm(`reboot ${hosts.join(", ")} into BIOS/UEFI setup (drops the connection)`, yes)) return 1;
       const actions = await firmwareRebootHosts(cfg, routed);
       for (const a of actions)
@@ -1706,7 +1746,7 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       const { flags, rest: pos } = parseFlags(rest, ["--no-open", "--grid", "--list", "--json", "--wake"], ["--grid-step", "--out", "-o", "--output", "--monitor", "--region"]);
       const noOpen = flags["--no-open"] === true;
       const grid = flags["--grid"] === true;
-      const gridStep = numFlag(flags, "--grid-step", 100);
+      const gridStepFlag = numFlag(flags, "--grid-step", 0);   // 0: absent; a given value is ≥ 1
       if (flags["--out"] !== undefined && flags["-o"] !== undefined) die("-o is another name for --out; pass one");
       const out = (flags["--out"] ?? flags["-o"]) as string | undefined;
       if (flags["--output"] !== undefined && flags["--monitor"] !== undefined) die("--monitor is another name for --output; pass one");
@@ -1716,6 +1756,8 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       if (!sel || pos.length !== 1)
         die("usage: fleet shot <host> [--output NAME|main|focused|N] [--region top-right|…|X,Y,W,H] [--wake] [--out|-o file.png] [--grid [--grid-step N]] [--no-open]\n       fleet shot <host> --list [--json]");
       const routed = await routeSelector(cfg, sel);
+      const host = resolveHosts(cfg, routed)[0]!;
+      assertFeature([host], "shot", cfg);
       if (flags["--list"] === true) {
         const l = await listMonitors(cfg, routed);
         if (flags["--json"] === true) { console.log(JSON.stringify(l, null, 2)); return 0; }
@@ -1726,10 +1768,11 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
           + `${m.description ? A.d("  " + m.description) : ""}`));
         return 0;
       }
-      const host = resolveHosts(cfg, routed)[0]!;
+      const gridStep = gridStepFlag || (captureSetting(host, "gridStep") ?? 100);
+      const shown = [output ?? captureSetting(host, "output"), region ?? captureSetting(host, "region")];
       const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-      const local = out ?? `${host.name}-${ts}.${await preferredImageExt()}`;
-      process.stdout.write(A.d(`◎ capturing ${host.name}${output || region ? ` (${[output ?? "main", region].filter(Boolean).join(", ")})` : ""} …\r`));
+      const local = out ?? `${host.name}-${ts}.${await preferredImageExt(host)}`;
+      process.stdout.write(A.d(`◎ capturing ${host.name}${shown[0] || shown[1] ? ` (${[shown[0] ?? "main", shown[1]].filter(Boolean).join(", ")})` : ""} …\r`));
       const r = await captureScreenshot(cfg, routed, local, {}, { output, region, wake: flags["--wake"] === true });
       if (grid && !await overlayGrid(r.localPath, gridStep)) console.error(A.y("grid overlay skipped (need python3 + Pillow)"));
       console.log(`${A.g("●")} ${A.b(r.host)} ${A.d("→")} ${r.localPath}${grid ? A.d(" (grid)") : ""}`);
@@ -1751,7 +1794,7 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
     case "cu": case "computer": {
       const noOpen = pullFlag(rest, "--no-open");
       const grid = pullFlag(rest, "--grid");
-      const gridStep = numVal(rest, "--grid-step", 100);
+      const gridStepFlag = numVal(rest, "--grid-step", 0);   // 0: absent; a given value is ≥ 1
       const gridMinor = numVal(rest, "--grid-minor", 0, 0);
       const noCross = pullFlag(rest, "--no-cross-labels");
       const noComposite = pullFlag(rest, "--no-composite");
@@ -1782,6 +1825,7 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
         const names = cfg.routes?.[sel]?.prefer ?? [sel];
         const hosts = names.map((n) => cfg.hosts[n]).filter((h): h is NonNullable<typeof h> => !!h?.android);
         if (!hosts.length) die(`${sel} is not an Android host or a route of Android hosts`);
+        assertFeature(hosts, "cu", cfg);
         const json = pullFlag(rest, "--json");
         const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
         if (rest[0] === "revive") {
@@ -1829,6 +1873,8 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
         die((error instanceof Error ? error.message : String(error))
           + (phone ? `\nif Termux's SSH server died, try: fleet cu ${sel} revive` : ""));
       }
+      assertFeature(resolveHosts(cfg, target), "cu", cfg);
+      const gridStep = gridStepFlag || (captureSetting(cfg.hosts[target], "gridStep") ?? 100);
       if (rest[0] === "task") {
         const stray = [["--element", elementToken], ["--label", elementLabel], ["--role", elementRole], ["--nth", elementNth],
           ["--region", regionText], ["--region-at", regionAt], ["--kind", regionKind], ["--out", out], ["--shot", wantShot || undefined],
@@ -2566,8 +2612,10 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
         if (!tools) die(`usage: fleet tools sync <tool|--all> <sel> [--no-skill] [--max-parallel N]   (tools: ${known.join(", ")})`);
         const sel = args[0] ?? (!all && tools.length === 1 ? cfg.tools?.[tools[0]!]?.hosts : undefined);
         if (!sel) die("fleet tools sync needs a selector (or a `hosts` default on the tool)");
-        const maxParallel = toolSyncParallelism(tools.length, requestedMaxParallel);
+        const maxParallel = toolSyncParallelism(tools.length, requestedMaxParallel, cfg);
         const routed = await routeSelector(cfg, sel);
+        // Refuse the whole sync up front, not once per tool block.
+        assertFeature(resolveHosts(cfg, routed), "deploy", cfg);
         const blocks = tools.length > 1
           ? await syncTools(cfg, tools, routed, { skill: !noSkill, maxParallel })
           : [{ tool: tools[0]!, results: await syncTool(cfg, tools[0]!, routed, { skill: !noSkill }) }];
@@ -2625,6 +2673,132 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       }
 
       return die("usage: fleet tools [status|sync|list|stamp] …");
+    }
+
+    case "skills": {
+      const options = parseFlags(rest, ["--json", "--all", "--force", "--dry-run"], []);
+      const json = options.flags["--json"] === true;
+      const sub = options.rest.shift() ?? "status";
+      if (!["list", "status", "sync"].includes(sub)) die("usage: fleet skills [list|status|sync] …");
+      for (const flag of Object.keys(options.flags))
+        if (flag !== "--json" && sub !== "sync") die(`${flag} is only valid with skills sync`);
+      const all = options.flags["--all"] === true;
+      const maxArgs = sub === "list" ? 0 : sub === "sync" && all ? 1 : 2;
+      if (options.rest.length > maxArgs) die(`too many arguments for skills ${sub}; try fleet skills --help`);
+      const known = Object.keys(cfg.skills ?? {});
+      if (!known.length) die("no `skills` block in fleet.config.json — nothing to sync");
+      const resolveSelector = (sel: string) => routeSelector(cfg, sel);
+      const short = (hash?: string) => (hash ?? "").slice(0, 12);
+
+      if (sub === "list") {
+        const toolOwned = await toolOwnedSkills(cfg);
+        const selections = await Promise.all(known.map((set) => selectSkills(cfg, set, { toolOwned })
+          .catch((error: unknown) => ({ set, error: error instanceof Error ? error.message : String(error) }))));
+        if (json) {
+          console.log(JSON.stringify(selections, null, 2));
+          return selections.some((s) => "error" in s) ? 1 : 0;
+        }
+        for (const s of selections) {
+          if ("error" in s) { console.log(`${A.r("✗")} ${A.b(s.set)} ${A.d(s.error)}`); continue; }
+          console.log(`${A.b(s.set)} ${A.d(`→ ${s.hosts} · ${s.root} · ${s.skills.length} skill${s.skills.length === 1 ? "" : "s"}`)}`);
+          for (const skill of s.skills)
+            console.log(`  ${A.g("●")} ${A.b(skill.name.padEnd(24))} ${A.d(`${short(skill.hash)} · ${skill.files} files`)}`);
+          for (const owned of s.toolOwned)
+            console.log(`  ${A.d("·")} ${A.b(owned.name.padEnd(24))} ${A.d(`shipped by fleet tools sync ${owned.tool}; excluded here`)}`);
+          for (const name of s.invalid)
+            console.log(`  ${A.y("!")} ${A.b(name.padEnd(24))} ${A.y("name has characters fleet will not ship; excluded")}`);
+          for (const pattern of s.unmatched)
+            console.log(`  ${A.y("!")} ${A.y(`include '${pattern}' matches no skill under ${s.root}`)}`);
+        }
+        return selections.some((s) => "error" in s) ? 1 : 0;
+      }
+
+      if (sub === "status") {
+        // `fleet skills status [set] [sel]`: a lone word is a set if it names one,
+        // else a selector; a word naming both is ambiguous.
+        const args = options.rest;
+        const setList = `(sets: ${known.join(", ")})`;
+        if (args.length > 1 && !known.includes(args[0]!))
+          die(`unknown skill set '${args[0]}' in 'fleet skills status <set> <sel>' ${setList}${didYouMean(args[0]!, known)}`);
+        if (args.length === 1) {
+          const word = args[0]!;
+          const selector = word.split(",").map((t) => t.trim()).filter(Boolean).every((t) => t === "all" || t === "*"
+            || t.startsWith("@") || t.startsWith("dt:") || !!cfg.hosts[t] || !!cfg.routes?.[t] || !!cfg.machines?.[t]);
+          if (known.includes(word) && selector)
+            die(`'${word}' names both a skill set and a host; use 'fleet skills status ${word} <sel>' for the set or 'fleet skills status ${word},' for the host`);
+          if (!known.includes(word) && !selector)
+            die(`'${word}' is neither a skill set ${setList} nor a host, group, route or machine`);
+        }
+        const sets = args[0] && known.includes(args[0]) ? [args.shift()!] : known;
+        const rows = await skillsStatus(cfg, sets, args[0], { resolveSelector });
+        const failed = rows.some((r) => r.state !== "current" && r.state !== "orphan");
+        if (json) { console.log(JSON.stringify(rows, null, 2)); return failed ? 1 : 0; }
+        const describe = (r: SkillStatusRow): string => {
+          const remote = r.copies?.find((c) => c.root === ".agents")?.hash;
+          const synced = r.manifest?.syncedAt ? ` · synced ${r.manifest.syncedAt.slice(0, 10)}` : "";
+          switch (r.state) {
+            case "current": return A.g("✓ ") + A.d(`current · ${short(r.source)}${r.adopt ? " · not yet recorded; sync adopts it" : synced}`);
+            case "stale": return A.y("✗ ") + A.y(`stale — host has ${short(remote) || "a partial install"}${synced}; sync updates it`);
+            case "drifted": return A.r("! ") + A.r(`drifted — edited on the host since the last sync; sync --force overwrites`);
+            case "unmanaged": return A.r("! ") + A.r(`unmanaged — present without a manifest entry and different; sync --force overwrites`);
+            case "missing": return A.d("· not installed");
+            case "orphan": return A.d(`○ orphan — set ${r.set} no longer ships it; left in place`);
+            default: return A.r(`? unreachable — ${(r.error ?? "").split("\n")[0]}`);
+          }
+        };
+        for (const set of sets) {
+          const mine = rows.filter((r) => r.set === set);
+          console.log(A.b(set));
+          for (const host of [...new Set(mine.map((r) => r.host))]) {
+            console.log(`  ${A.b(host)}`);
+            for (const r of mine.filter((row) => row.host === host)) console.log(`    ${A.b(r.skill.padEnd(24))} ${describe(r)}`);
+          }
+        }
+        for (const r of rows.filter((row) => !known.includes(row.set)))
+          console.log(`  ${A.b(r.host)} ${A.b(r.skill.padEnd(24))} ${describe(r)}`);
+        return failed ? 1 : 0;
+      }
+
+      // sync
+      const args = options.rest;
+      const sets = all ? known : args[0] && known.includes(args[0]) ? [args.shift()!] : null;
+      if (!sets) die(`usage: fleet skills sync <set|--all> [<sel>] [--force] [--dry-run] [--json]   (sets: ${known.join(", ")})${args[0] ? didYouMean(args[0], known) : ""}`);
+      const force = options.flags["--force"] === true;
+      const dryRun = options.flags["--dry-run"] === true;
+      const blocks: { set: string; results: SkillSyncHostResult[]; error?: string }[] = [];
+      // Sets run one after another: each holds the same per-host install lock.
+      for (const set of sets) {
+        try {
+          blocks.push({ set, results: await syncSkills(cfg, set, args[0], { force, dryRun }, { resolveSelector }) });
+        } catch (error) {
+          if (!all) throw error;
+          blocks.push({ set, results: [], error: error instanceof Error ? error.message : String(error) });
+        }
+      }
+      const bad = blocks.some((b) => b.error || b.results.some((r) => !r.ok));
+      if (json) {
+        console.log(JSON.stringify(all ? blocks : blocks[0]!.results, null, 2));
+        return bad ? 1 : 0;
+      }
+      const verb = { apply: dryRun ? "would apply" : "applied", keep: "current", adopt: dryRun ? "would record" : "recorded", held: "held" };
+      for (const block of blocks) {
+        console.log(A.d(`◎ ${block.set}${dryRun ? " (dry run)" : ""} → ${args[0] ?? cfg.skills![block.set]!.hosts} …`));
+        if (block.error) { console.log(`${A.r("✗")} ${A.d(block.error.split("\n")[0] ?? "failed")}`); continue; }
+        for (const r of block.results) {
+          const count = (action: string) => r.items.filter((i) => i.action === action).length;
+          const summary = [`${count("apply")} ${verb.apply}`, `${count("keep")} current`, `${count("adopt")} ${verb.adopt}`, `${count("held")} held`].join(" · ");
+          console.log(`${r.ok ? A.g("●") : A.r("✗")} ${A.b(r.host.padEnd(14))} ${A.d(summary)}${r.error ? " " + A.r(r.error.split("\n")[0] ?? "") : ""}`);
+          for (const item of r.items) {
+            if (item.action === "keep") continue;
+            const line = item.ok === false ? A.r(`failed — ${item.error ?? "not applied"}`)
+              : item.action === "held" ? A.y(`held (${item.state}) — ${item.reason ?? ""}`)
+                : A.d(`${verb[item.action]} (${item.state})`);
+            console.log(`    ${A.b(item.skill.padEnd(24))} ${line}`);
+          }
+          for (const orphan of r.orphans) console.log(`    ${A.b(orphan.padEnd(24))} ${A.d("orphan — no longer selected; left in place")}`);
+        }
+      }
+      return bad ? 1 : 0;
     }
 
     case "completion": {
@@ -2778,7 +2952,9 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       const { rest: pos } = parseFlags(rest, [], []);
       const [sel] = pos;
       if (!sel || pos.length !== 1) die("usage: fleet ssh <host>");
-      return await sshInteractive(resolveHosts(cfg, await routeSelector(cfg, sel))[0]!);
+      const host = resolveHosts(cfg, await routeSelector(cfg, sel))[0]!;
+      assertFeature([host], "exec", cfg);
+      return await sshInteractive(host);
     }
 
     case "script": return die("there is no fleet script; run a local file with fleet exec --script <file|-> <sel> [ARG…]");

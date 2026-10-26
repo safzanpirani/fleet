@@ -1217,3 +1217,26 @@ describe("webcam CLI", () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });
+
+describe("feature gates in the CLI", () => {
+  test("disabled commands exit 1 without starting ssh, with one JSON value under --json", async () => {
+    const { root, bin, config } = fixture();
+    try {
+      writeFileSync(config, JSON.stringify({ hosts: { box: { ssh: "fake-box", os: "linux", disable: ["exec", "cu", "shot"] } } }));
+      const marker = join(root, "ssh-called");
+      executable(join(bin, "ssh"), `#!/bin/sh\ntouch '${marker}'\nexit 99\n`);
+      for (const [args, feature] of [
+        [["exec", "box", "true"], "exec"], [["cu", "box", "get_screen_size"], "cu"],
+        [["ssh", "box"], "exec"], [["shot", "box", "--list"], "shot"],
+      ] as const) {
+        const r = await runCli([...args], config, bin);
+        expect(r.code, args.join(" ")).toBe(1);
+        expect(r.stderr).toContain(`${feature} is disabled on box`);
+      }
+      const json = await runCli(["exec", "--json", "box", "true"], config, bin);
+      expect(json.code).toBe(1);
+      expect(JSON.parse(json.stdout)).toMatchObject({ ok: false, command: "exec", error: { code: "FEATURE_DISABLED" } });
+      expect(() => readFileSync(marker)).toThrow();
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+});

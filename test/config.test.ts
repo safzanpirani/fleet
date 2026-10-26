@@ -1,5 +1,5 @@
 import { test, expect, describe } from "bun:test";
-import { configNotFoundMessage, configSearchPaths, loadConfig, resolveConfigPath, resolveHosts, staleBinaryHint, validateConfig } from "../src/config.ts";
+import { assertFeature, configNotFoundMessage, configSearchPaths, featureEnabled, loadConfig, resolveConfigPath, resolveHosts, staleBinaryHint, validateConfig } from "../src/config.ts";
 import { mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -384,5 +384,42 @@ describe("staleBinaryHint", () => {
     const { root, installed } = setup();
     try { expect(await staleBinaryHint("invalid config x: hosts.a: missing/invalid `ssh`", installed, "/$bunfs")).toBeUndefined(); }
     finally { rmSync(root, { recursive: true, force: true }); }
+  });
+});
+
+describe("feature gates", () => {
+  const gated = (): FleetConfig => ({
+    hosts: {
+      alpha: { ...host("alpha", "linux"), disable: ["cu"] },
+      beta: { ...host("beta", "linux"), enable: ["webcam"] },
+      gamma: host("gamma", "linux"),
+    },
+    disable: ["webcam"],
+  });
+
+  test("a host's disable refuses, its enable re-allows, the top level decides the rest", () => {
+    const c = gated();
+    expect(featureEnabled(c.hosts.alpha!, "cu", c)).toBe(false);
+    expect(featureEnabled(c.hosts.gamma!, "cu", c)).toBe(true);
+    expect(featureEnabled(c.hosts.beta!, "webcam", c)).toBe(true);
+    expect(featureEnabled(c.hosts.gamma!, "webcam", c)).toBe(false);
+  });
+
+  test("assertFeature names every refusing host in one error", () => {
+    const c = gated();
+    expect(() => assertFeature(resolveHosts(c, "alpha,beta,gamma"), "webcam", c)).toThrow(/webcam is disabled on alpha, gamma/);
+    expect(() => assertFeature(resolveHosts(c, "beta"), "webcam", c)).not.toThrow();
+  });
+
+  test("validation rejects unknown names, a feature in both lists, and routes that disagree", () => {
+    const c = gated();
+    (c.hosts.gamma as any).disable = ["telepathy"];
+    expect(() => validateConfig(c, "t")).toThrow(/hosts\.gamma\.disable: unknown feature 'telepathy'/);
+    const both = gated();
+    both.hosts.beta!.disable = ["webcam"];
+    expect(() => validateConfig(both, "t")).toThrow(/hosts\.beta: 'webcam' is in both disable and enable/);
+    const route = gated();
+    route.routes = { pair: { prefer: ["alpha", "gamma"] } };
+    expect(() => validateConfig(route, "t")).toThrow(/routes\.pair: every transport must allow the same features/);
   });
 });

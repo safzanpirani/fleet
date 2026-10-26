@@ -70,6 +70,8 @@ fleet exec win-box "nvidia-smi"
 | `fleet run <recipe>` | Run a saved playbook from config (stops on first failure). |
 | `fleet proxy [list]` · `check [name…]` · `drop <sel>` | Configured proxies and what routes through each; probe each endpoint and re-run its `verify` fetch through it; close ssh control masters after a route change. `--proxy NAME\|URL` / `--no-proxy` override the route on any command (before the selector). |
 | `fleet tools status [tool] [sel]` | Report stale CLI and skill installations. Use `tools sync` to ship source, a launcher, and paired skills. |
+| `fleet skills list` · `status [set] [sel]` · `sync <set\|--all> [sel] [--force] [--dry-run]` | Ship whole agent skill directories named by the config's `skills` sets. Status reads tree hashes: current, stale, drifted (edited on the host), unmanaged, missing, orphan. Sync holds drifted and unmanaged skills unless `--force` and never deletes. A skill a `tools` entry ships stays with `tools sync`. |
+| `fleet config [<host>] [--json]` | Each effective knob (exec deadline, probe cap, done grace, ssh mux and persist, shot and webcam defaults, route grace, parallelism) with its source (`env`, `host`, `defaults`, `built-in`), plus the features the config refuses on the host. Reads config only. |
 | `fleet ssh <host>` | Interactive shell. |
 
 ## Prefer the LAN entry over the Tailscale one
@@ -125,6 +127,7 @@ Anywhere `<sel>` appears: a hostname, logical route, group, `all`, Daytona
 - **Use real newlines with `fleet edit`.** The CLI preserves argument bytes and does not translate the characters `\\n` unless you pass `--escapes`, which turns `\n`, `\t` and `\\` in `--old`/`--new` into a newline, a tab and a backslash. A leading `~` in Unix edit paths expands safely. Type `\n` newlines even for a Windows CRLF file; fleet converts them to the file's style.
 - **Several changes to one file? One `fleet edit --edits -` call.** Pipe a JSON array such as `[{"old":"a","new":"b"},{"old":"x","new":"y","all":true}]`. Edits apply in order, and if any edit misses, the file is left unchanged.
 - **Sync paired skills to every agent root.** `fleet tools sync` installs `SKILL.md` under `~/.claude/skills`, `~/.agents/skills`, and `~/.openclaw/skills`.
+- **"<feature> is disabled on <host> by the fleet config" is the owner's policy.** The config refuses that command family on that host (`fleet ls` lists each host's `disabled` features). Do not route around it with `exec`, a raw `ssh`, or another command; ask the user.
 - **Windows shell:** fleet uses a host's configured `winShell` (`pwsh` or `powershell`)
   without an extra discovery round-trip. When omitted, it auto-prefers **PowerShell 7
   (`pwsh`)** and falls back to Windows PowerShell 5.1. Override every host with
@@ -704,9 +707,31 @@ Config lives under a top-level `proxies` map plus `"proxy": "<name>"` on a host 
 
 Hosts, logical routes, groups, and recipes live in `fleet.config.json` (override path
 with `FLEET_CONFIG`; copy `fleet.config.example.json` to start). A host has `ssh`, `os`,
-optional `gpu`, `wsl`, `winShell`, `proxy`, and a `services` map; each service `type`
-(`systemd` / `systemd-user` / `winservice` / `schtask`) decides how restart/logs run.
-A route has an ordered `prefer` list of same-OS host entries.
+optional `gpu`, `wsl`, `winShell`, `proxy`, `disable`, `enable`, `settings`, and a
+`services` map; each service `type` (`systemd` / `systemd-user` / `winservice` /
+`schtask`) decides how restart/logs run. A route has an ordered `prefer` list of same-OS
+host entries.
+
+**Feature gates.** `hosts.<h>.disable` refuses whole command families on one host, a
+top-level `disable` refuses them everywhere, and `hosts.<h>.enable` re-allows one the top
+level refuses. Features: `webcam`, `cu`, `shot` (also the MCP screenshot tool), `browse`,
+`exec` (exec, spawn, watch, ssh, MCP exec), `files` (cp, edit, diff), `power` (reboot,
+bios, switch), `kill`, `restart`, `deploy` (deploy, tools sync, skills sync). A refused
+command exits 1 before touching any host and names every refusing host; `--json` gives
+code `FEATURE_DISABLED`. A route's transports must allow the same features. This is a
+policy on fleet's own commands, not a sandbox: disable `exec` and `files` too when an
+agent must not reach the host another way through fleet.
+
+**Defaults and per-host settings.** A top-level `defaults` object sets knobs for every
+host and `hosts.<h>.settings` overrides them for one host; an environment variable beats
+both (env → host settings → defaults → built-in). Knobs: `execTimeoutS`,
+`probeTimeoutMs`, `doneGraceMs`, `winSessionIdleS`, `sshMux` (`on|off|config`),
+`sshPersist`, `shot.{output,region,format,gridStep}`, `webcam.device`; `defaults` alone
+also takes `routeGraceMs` and `parallel.{exec,toolSync,toolStatusHosts}`. `fleet config`
+shows the effective values.
+
+**Skill sets.** A `skills` block names sets for `fleet skills sync`: each has `hosts`,
+`include` (names or globs), optional `exclude` and `root` (default `~/.agents/skills`).
 
 ## When not to use fleet
 

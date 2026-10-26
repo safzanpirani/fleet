@@ -100,6 +100,8 @@ fleet switch box --to linux --dry-run   # dual-boot: show the UEFI entry a switc
 fleet find box --from web      # find a machine's LAN address by its MAC
 fleet completion zsh                # shell completion:  eval "$(fleet completion zsh)"
 fleet ssh web                  # drop into an interactive shell
+fleet skills status                 # which hosts hold stale agent skill directories
+fleet skills sync agents --dry-run  # plan a skill-set sync without writing anything
 ```
 
 `fleet bios` supports Windows UEFI and systemd Linux hosts. macOS entries in a
@@ -880,11 +882,55 @@ is absent. Compiled binaries search beside the executable, then the user config
 and deployed source directories. Missing-config errors list usable locations.
 An explicit `FLEET_CONFIG` that does not exist fails without falling back.
 
+### Feature gates
+
+A host can refuse whole families of fleet commands. `hosts.<h>.disable` lists
+the features refused on that host, a top-level `disable` refuses them on every
+host, and `hosts.<h>.enable` re-allows a feature the top level refuses:
+
+```json
+{
+  "disable": ["webcam"],
+  "hosts": {
+    "office": { "ssh": "office", "os": "windows", "disable": ["cu", "shot"] },
+    "studio": { "ssh": "studio", "os": "mac", "enable": ["webcam"] }
+  }
+}
+```
+
+| feature | commands |
+|---|---|
+| `webcam` | `webcam` (never `webcam local`) |
+| `cu` | `cu` on desktops and Android, perception, recording |
+| `shot` | `shot`, the MCP `screenshot` tool |
+| `browse` | `browse` |
+| `exec` | `exec`, `exec --script`, `spawn`, `watch`, `ssh`, the MCP `exec` tool |
+| `files` | `cp`/`push`/`pull`, `edit`, `diff` (the remote sides) |
+| `power` | `reboot`, `bios`, `switch` (every boot of the machine) |
+| `kill` | `kill` |
+| `restart` | `restart` |
+| `deploy` | `deploy`, `tools sync`, `skills sync` |
+
+A refused command exits 1 before it contacts any host, and names every host
+that refused. A selector that includes one refusing host refuses the whole call;
+recipes and MCP tools hit the same check. `--json` failures carry the code
+`FEATURE_DISABLED`. `fleet ls` shows each host's refused features. A feature
+name fleet does not know, or one listed in both `disable` and `enable`, fails
+validation, and so does a route whose transports allow different features.
+Read-only commands such as `status`, `ps`, `disk`, `which` and `tools status`
+are never gated.
+
+This is a policy on fleet's own commands, not a sandbox. Anyone holding the
+host's ssh login can still run cua-driver or ffmpeg directly, and so can
+`fleet exec`. To stop an agent from doing something through fleet, disable
+`exec` (and `files`) as well.
+Blocking all computer use means disabling `cu` and `shot`.
+
 ### Proxies
 
 A host with a `proxy` is reachable **only** through that proxy. Every transport
 carries the same route: `exec`, `spawn`/`jobs`, `cp`, `edit`, `restart`,
-`reboot`, `tools sync`, `deploy`, `ls`/`wait` probes, `doctor`, and interactive
+`reboot`, `tools sync`, `skills sync`, `deploy`, `ls`/`wait` probes, `doctor`, and interactive
 `fleet ssh`.
 
 ```jsonc
@@ -952,22 +998,131 @@ Daytona (`dt:`) hosts speak HTTP, not ssh; a proxy configured for one is ignored
 Override the config path with `FLEET_CONFIG=/path/to.json`. Keep a personal,
 git-ignored `fleet.config.local.json` if you don't want hosts in git.
 
+### Defaults and per-host settings
+
+A top-level `defaults` object sets knobs for every host, and `hosts.<h>.settings`
+overrides any of them for one host. An environment variable still beats both:
+env var → `hosts.<h>.settings` → `defaults` → built-in.
+
+```jsonc
+{
+  "defaults": {
+    "execTimeoutS": 600,              // FLEET_EXEC_TIMEOUT; 0 = no deadline (built-in)
+    "shot": { "format": "png", "gridStep": 200 },
+    "routeGraceMs": 800,              // defaults only
+    "parallel": { "exec": 4, "toolSync": 3, "toolStatusHosts": 8 }   // defaults only
+  },
+  "hosts": {
+    "slowbox": { "ssh": "slowbox", "os": "linux",
+      "settings": { "probeTimeoutMs": 9000, "sshMux": "config", "webcam": { "device": "/dev/video2" } } }
+  }
+}
+```
+
+| knob | env var | built-in | effect |
+|---|---|---|---|
+| `execTimeoutS` | `FLEET_EXEC_TIMEOUT` | 0 (none) | wall-clock cap of one exec; `--timeout` / MCP `timeout` still wins |
+| `probeTimeoutMs` | `FLEET_PROBE_TIMEOUT_MS` | 4000 | reachability-probe cap; a set value gets no proxy bonus and no short `ls` cap |
+| `doneGraceMs` | `FLEET_DONE_GRACE_MS` | 1500 | output drain after a script reports it finished |
+| `winSessionIdleS` | `FLEET_WIN_SESSION_IDLE_S` | 600 | idle seconds before a Windows host's kept-open session closes (minimum 10) |
+| `sshMux` | `FLEET_NO_SSH_MUX=1` (off), `FLEET_SSH_MUX=config` | `on` | `on`, `off`, or `config` (defer to `~/.ssh/config`) |
+| `sshPersist` | `FLEET_SSH_PERSIST` | `60s` | `ControlPersist` of fleet's own control masters |
+| `shot.output`, `shot.region` | | none | `fleet shot` / MCP screenshot `--output` and `--region` when not given |
+| `shot.format` | | webp when `cwebp` is installed | `webp` or `png` for `fleet shot`'s automatic file name and the MCP screenshot image; png skips the webp transcode |
+| `shot.gridStep` | | 100 | `--grid` spacing for `fleet shot`, `fleet cu` and MCP screenshot when `--grid-step` is absent |
+| `webcam.device` | | first camera | `fleet webcam` device when `--device` is absent (`defaults.webcam.device` for `local`) |
+| `routeGraceMs` (defaults only) | | 1500 | head start a route's preferred transport gets before the next is probed |
+| `parallel.exec` (defaults only) | | every host | hosts one `exec`, `exec --script` or `spawn` fan-out runs at once |
+| `parallel.toolSync` (defaults only) | | 2 | tools `tools sync --all` runs at once; `--max-parallel` wins |
+| `parallel.toolStatusHosts` (defaults only) | | 8 | hosts `tools status` reads at once |
+
+`fleet config [<host>] [--json]` prints each effective value with its source
+(`env`, `host`, `defaults` or `built-in`) and the features the config refuses on
+the host. It reads the config only and contacts nothing.
+
 ### Environment variables
 | var | effect |
 |---|---|
 | `FLEET_CONFIG` | alternate config path |
 | `FLEET_SOURCE_ROOT` | source checkout for deployment from a compiled binary |
-| `FLEET_EXEC_TIMEOUT` | default wall-clock cap in seconds; per-call timeout wins. Unset/0 disables the SSH cap; Daytona retains its five-minute default |
-| `FLEET_DONE_GRACE_MS` | after a remote script reports it finished, how long to wait for its output to drain before returning (default 1500). Stops a remote child that keeps stdout open from hanging the call |
-| `FLEET_PROBE_TIMEOUT_MS` | reachability-probe cap (default 4000; a proxied host gets +2000 unless this is set) |
+| `FLEET_EXEC_TIMEOUT` | default wall-clock cap in seconds; per-call timeout wins. Beats the `execTimeoutS` setting. Unset/0 disables the SSH cap; Daytona retains its five-minute default |
+| `FLEET_DONE_GRACE_MS` | after a remote script reports it finished, how long to wait for its output to drain before returning (default 1500; beats `doneGraceMs`). Stops a remote child that keeps stdout open from hanging the call |
+| `FLEET_PROBE_TIMEOUT_MS` | reachability-probe cap (default 4000; a proxied host gets +2000 unless this or `probeTimeoutMs` is set) |
 | `FLEET_PROXY` | default proxy (name or URL) for every host with no `proxy` of its own |
 | `FLEET_NO_PROXY` | `1` routes every connection directly, which bypasses a wedged proxy. `--proxy` still wins |
 | `FLEET_WIN_SHELL` | force `pwsh` or `powershell` on every Windows host (overrides per-host `winShell`) |
 | `NO_COLOR` / `FORCE_COLOR` | output is uncoloured unless stdout is a terminal; `NO_COLOR` always disables colour, `FORCE_COLOR=1` forces it |
 | `FLEET_WIN_SESSION` | `0` turns off the kept-open PowerShell session that makes repeat Windows execs take ~50-250 ms instead of ~0.6 s |
-| `FLEET_WIN_SESSION_IDLE_S` | idle seconds before that session closes (default 600) |
+| `FLEET_WIN_SESSION_IDLE_S` | idle seconds before that session closes (default 600; beats `winSessionIdleS`) |
 | `TYPESAFE_API_KEY` | enables `fleet cu … task`, which runs a bounded subtask with Jev choosing each action (one paid call per step), and `fleet cu … elements --task` (paid call; fails open). `FLEET_JEV_CONFIG` may name a JSON file with `apiKey` instead |
-| `FLEET_NO_SSH_MUX` | `1` disables SSH connection multiplexing. By default fleet reuses one master connection per host (`ControlMaster=auto`, `ControlPersist=60s`, sockets under `~/.fleet/ssh/`) so fan-outs and poll loops don't re-handshake; a wedged socket is fixed by this flag or `rm ~/.fleet/ssh/cm-*` |
+| `FLEET_NO_SSH_MUX` | `1` disables SSH connection multiplexing, beating the `sshMux` setting. By default fleet reuses one master connection per host (`ControlMaster=auto`, `ControlPersist=60s`, sockets under `~/.fleet/ssh/`) so fan-outs and poll loops don't re-handshake; a wedged socket is fixed by this flag or `rm ~/.fleet/ssh/cm-*` |
+| `FLEET_SSH_MUX` | `config` defers multiplexing to `~/.ssh/config` (no fleet Control options) |
+| `FLEET_SSH_PERSIST` | `ControlPersist` of fleet's control masters (default `60s`; beats `sshPersist`) |
+
+## Agent skill sets
+
+`fleet tools` ships one `SKILL.md` beside each CLI tool. `fleet skills` ships whole
+skill directories (scripts, references, topics) from the controller to the hosts
+named in a `skills` set:
+
+```jsonc
+{
+  "skills": {
+    "agents": {
+      "hosts": "@linux",                 // selector the set ships to
+      "include": ["*"],                  // skill directory names or globs under root
+      "exclude": ["*-wip", "private-*"], // optional; removed after include
+      "root": "~/.agents/skills"         // optional; this is the default
+    }
+  }
+}
+```
+
+A set takes the directories under `root` that contain a `SKILL.md`, keeps the ones
+an `include` glob matches, then drops the ones an `exclude` glob matches. A
+symlinked skill directory ships as its real contents. `node_modules`, `.git`,
+`.DS_Store` and `._*` files never ship. A name that a `tools` entry ships stays
+with `fleet tools sync` and is excluded from every set, so the two commands never
+write the same `SKILL.md`; `fleet skills list` names those exclusions.
+
+```sh
+fleet skills list [--json]                         # sets, resolved skills, hashes, tool-owned names
+fleet skills status [set] [<sel>] [--json]         # exit 1 unless every row is current
+fleet skills sync <set|--all> [<sel>] [--force] [--dry-run] [--json]
+```
+
+On each host the copy lives in `~/.agents/skills/<name>`
+(`%USERPROFILE%\.agents\skills\<name>` on Windows). When
+`~/.claude/skills/<name>` or `~/.openclaw/skills/<name>` is missing, sync makes it a
+relative symlink to that copy on Linux and macOS, and a second copy on Windows,
+where symlinks need extra privileges. A symlink already there is left alone. A
+real directory already there is updated as another copy, under the same rules.
+
+Each skill has a tree hash: the sha256 of the sorted `<file sha256>  <path>` lines
+of its regular files. The host computes it with `sha256sum` or `shasum -a 256`, or
+`Get-FileHash` on Windows. `~/.fleet-tools/skills/manifest.json` records the hash
+and set of each skill sync wrote. Status reads the hashes and that manifest in one
+round trip per host and reports each skill as:
+
+| state | meaning | sync |
+|---|---|---|
+| `current` | the host matches the controller | nothing; an unrecorded identical copy is recorded |
+| `stale` | the host matches the last sync, or a link or copy is missing | updates it |
+| `drifted` | the host differs from both the manifest and the controller: someone edited it there | holds it unless `--force` |
+| `unmanaged` | present without a manifest entry, and different | holds it unless `--force` |
+| `missing` | not on the host | installs it |
+| `orphan` | in the manifest, but its set no longer selects it | reports it; never deletes |
+| `unreachable` | the host could not be read | fails |
+
+Without a selector each set uses its own `hosts`. Sync snapshots the selected
+skills once, sends one archive to each host, and holds the host's skill
+installation lock. It replaces each skill whole (old copy moved aside, new one
+moved in, old one removed) and writes the manifest last. A held or failed skill
+keeps its previous manifest entry while the others still apply; sync exits 1 when
+anything was held or failed. `--dry-run` reads and plans without locking or
+writing. Sync needs the `deploy` feature on every target host. Hosts are read and
+synced up to `defaults.parallel.toolStatusHosts` at a time (default 8); with
+`--all`, sets run one after another.
 
 ## Why
 The `ssh → PowerShell → wsl bash` path with nested quoting is a recurring pain.

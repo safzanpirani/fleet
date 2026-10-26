@@ -11,7 +11,7 @@
  */
 import { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
-import { resolveHosts, type FleetConfig } from "./config.ts";
+import { captureSetting, resolveHosts, type FleetConfig } from "./config.ts";
 import type { ExecResult } from "./ssh.ts";
 import { lsHosts, runExec, rebootRefusal, nestedShellNote, serviceLogs, serviceTarget, hostStatus, captureScreenshot, overlayGrid, routeSelector } from "./core.ts";
 import { listJobs, jobLog, jobTail } from "./jobs.ts";
@@ -21,16 +21,16 @@ import { join } from "node:path";
 import { mkdtemp, rm } from "node:fs/promises";
 
 /** Each request owns its image directory, including partial capture output. */
-async function withTempImage<T>(prefix: string, capture: (path: string) => Promise<T>): Promise<T> {
+async function withTempDir<T>(prefix: string, capture: (directory: string) => Promise<T>): Promise<T> {
   const directory = await mkdtemp(join(tmpdir(), prefix));
   try {
-    return await capture(join(directory, "image.png"));
+    return await capture(directory);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
 }
 
-/** MCP responses embed the bytes; withTempImage removes the local artifacts. */
+/** MCP responses embed the bytes; withTempDir removes the local artifacts. */
 async function consumeImage(path: string): Promise<string> {
   return Buffer.from(await Bun.file(path).arrayBuffer()).toString("base64");
 }
@@ -85,7 +85,8 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
     const out = rows.map((h) =>
       `${h.up ? "●" : h.httpUp ? "◍" : "○"} ${h.name.padEnd(10)} ${h.os.padEnd(8)} ${h.ssh.padEnd(16)} `
       + `${h.gpu ? "gpu " : "    "}${!h.up && h.httpUp ? "ssh-down/http-ok " : ""}`
-      + `${h.services.length ? "[" + h.services.join(", ") + "]" : ""}`.trimEnd(),
+      + `${h.services.length ? "[" + h.services.join(", ") + "]" : ""}`
+      + `${h.disabled ? ` disabled: ${h.disabled.join(", ")}` : ""}`.trimEnd(),
     ).join("\n");
     return text(out);
   });
@@ -195,28 +196,34 @@ export function buildServer(cfg: FleetConfig, opts: BuildOpts = {}): McpServer {
   // (on Windows) registers a one-shot scheduled task — not read-only in effect.
   server.registerTool("fleet_screenshot", {
     title: "Screenshot a host's desktop",
-    description: "Capture the current desktop of a host and return it as a PNG image — for "
+    description: "Capture the current desktop of a host and return it as an image (PNG unless the "
+      + "host's shot.format setting asks for WebP) — for "
       + "diagnosing what is actually on screen (a hung app, a dialog, a crashed UI). Captures the "
       + "active interactive session on Windows/mac; on Linux needs grim/scrot/imagemagick and a "
       + "reachable display. " + sel,
     inputSchema: z.object({
           host: z.string().describe("Host name (or selector — first matched host is used)."),
           grid: z.boolean().optional().describe("Overlay a labeled coordinate grid on the returned image."),
-          gridStep: z.number().int().positive().max(1000).optional().describe("Grid spacing in pixels (default 100)."),
+          gridStep: z.number().int().positive().max(1000).optional().describe("Grid spacing in pixels (default: the host's shot.gridStep setting, else 100)."),
           output: z.string().optional().describe("One monitor: a connector name (DP-3), main, focused (Linux), or a 1-based index. Windows: main, an index, or DISPLAYn."),
           region: z.string().optional().describe("Part of that monitor (main when output is omitted): top-left, top-right, bottom-left, bottom-right, top, bottom, left, right, center, or X,Y,W,H fractions."),
           wake: z.boolean().optional().describe("Linux Wayland: switch powered-off monitors on for the capture and back off. Without it, a capture of an off monitor is refused."),
         }),
     annotations: { openWorldHint: true },
-  }, async ({ host, grid, gridStep, output, region, wake }) => withTempImage("fleet-shot-", async (local) => {
+  }, async ({ host, grid, gridStep, output, region, wake }) => withTempDir("fleet-shot-", async (directory) => {
     try {
-      const r = await captureScreenshot(cfg, await routeSelector(cfg, host), local, {}, { output, region, wake });
-      const gridApplied = grid ? await overlayGrid(r.localPath, gridStep ?? 100) : false;
+      const routed = await routeSelector(cfg, host);
+      const target = resolveHosts(cfg, routed)[0];
+      // Absent output and region take the host's shot settings inside captureScreenshot.
+      const local = join(directory, `image.${captureSetting(target, "format", cfg) ?? "png"}`);
+      const r = await captureScreenshot(cfg, routed, local, {}, { output, region, wake });
+      const step = gridStep ?? captureSetting(target, "gridStep", cfg) ?? 100;
+      const gridApplied = grid ? await overlayGrid(r.localPath, step) : false;
       const data = await consumeImage(r.localPath);
       return { content: [
         { type: "text" as const, text: `screenshot of ${r.host}`
           + (grid ? gridApplied ? " · coordinate grid applied" : " · grid skipped (python3 + Pillow required)" : "") },
-        { type: "image" as const, data, mimeType: "image/png" },
+        { type: "image" as const, data, mimeType: r.localPath.endsWith(".webp") ? "image/webp" : "image/png" },
       ] };
     } catch (e) {
       return text((e as Error).message, true);

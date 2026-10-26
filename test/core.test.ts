@@ -1,12 +1,14 @@
-import { test, expect, describe } from "bun:test";
+import { test, expect, describe, spyOn } from "bun:test";
 import {
   deployHosts, deployScript, logsCmd, parseLeadingFlags, parseRecipeStep, resolveDeploySourceRoot,
   restartCmd, routeSelector, statusCmd, waitFor, writeRemoteFile, pickPreferred, splitArgs, psInterpConflict, nestedShellNote, WAIT_PROBE_ATTEMPT_MS, sudoWrap,
+  rebootHosts, runExec,
 } from "../src/core.ts";
 import type { FleetConfig, Host } from "../src/config.ts";
 import { lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import * as ssh from "../src/ssh.ts";
 import { buildArgvCommand } from "../src/ssh.ts";
 
 const routeHost = (name: string): Host => ({ name, ssh: name, os: "windows" });
@@ -466,4 +468,28 @@ test("configured service aliases retain per-host mapping and skip rules", async 
     expect(execute.mock.calls[1]![1]).toContain("'beta'");
     expect(await core.svcStatus(cfg, "all", "app")).toHaveLength(2);
   } finally { execute.mockRestore(); }
+});
+
+test("a group containing an exec-disabled host refuses the whole call and names it", async () => {
+  const cfg: FleetConfig = {
+    hosts: {
+      a: { name: "a", ssh: "fixture-a", os: "linux" },
+      b: { name: "b", ssh: "fixture-b", os: "linux", disable: ["exec"] },
+    },
+    groups: { pair: ["a", "b"] },
+  };
+  const execute = spyOn(ssh, "exec").mockImplementation(async (h) => ({ host: h.name, ok: true, code: 0, stdout: "", stderr: "" }));
+  try {
+    await expect(runExec(cfg, "@pair", "true")).rejects.toThrow(/exec is disabled on b\b/);
+    expect(execute).not.toHaveBeenCalled();
+    expect((await runExec(cfg, "a", "true")).map((r) => r.host)).toEqual(["a"]);
+  } finally { execute.mockRestore(); }
+});
+
+test("a power-disabled host refuses a reboot before the trigger is sent", async () => {
+  const cfg: FleetConfig = { hosts: { a: { name: "a", ssh: "fixture-a", os: "linux", disable: ["power"] } } };
+  let calls = 0;
+  await expect(rebootHosts(cfg, "a", { deps: { exec: async (h) => { calls++; return { host: h.name, ok: true, code: 0, stdout: "", stderr: "" }; } } }))
+    .rejects.toThrow(/power is disabled on a/);
+  expect(calls).toBe(0);
 });

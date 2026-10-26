@@ -13,6 +13,7 @@
 import type { Host } from "./config.ts";
 import { proxyControlKey, proxyOpts, proxyReachableCached } from "./proxy.ts";
 import { hostKeyOpts, resolveProxy } from "./config.ts";
+import { doneGraceMs, execTimeoutMs, probeTimeout, sshMux, sshPersist } from "./settings.ts";
 import { dtExec, dtProbe, dtPush, dtPull } from "./daytona.ts";
 import { trySessionExec, winSessionEnabled } from "./winsession.ts";
 import { homedir, tmpdir } from "node:os";
@@ -25,20 +26,19 @@ import { join } from "node:path";
 // `%C` is a short fixed-length hash of (localhost, remotehost, port, user) — note
 // that it does NOT cover the ProxyCommand, so we append our own route key. Without
 // it a direct master and a proxied master to the same HostName collide and the
-// second connection silently rides the first one's route. Disable multiplexing
-// with FLEET_NO_SSH_MUX=1 (useful when debugging a wedged socket).
+// second connection silently rides the first one's route. FLEET_NO_SSH_MUX=1
+// (or settings.sshMux "off") disables multiplexing, useful when debugging a
+// wedged socket.
 //
-// FLEET_SSH_MUX=config defers entirely to ~/.ssh/config instead: we pass no
+// FLEET_SSH_MUX=config (or settings.sshMux "config") defers entirely to
+// ~/.ssh/config instead: we pass no
 // Control* options at all, so a long-lived master defined there is reused. This
 // matters when a host's direct network path is down but a config master (e.g.
 // ControlPersist 30m) is still alive — our own short-lived socket would force a
 // fresh connection and fail with "No route to host" where raw ssh succeeds.
 // Proxy options are still emitted in that mode: deferring the CONTROL socket is
 // not the same as deferring the ROUTE.
-// FLEET_SSH_PERSIST overrides just the persist duration (e.g. "30m").
-const muxEnabled = () => process.env.FLEET_NO_SSH_MUX !== "1";
-const muxFromConfig = () => process.env.FLEET_SSH_MUX === "config";
-const muxPersist = () => process.env.FLEET_SSH_PERSIST || "60s";
+// FLEET_SSH_PERSIST (or settings.sshPersist) sets the persist duration (e.g. "30m").
 let _muxDir: string | null = null;
 
 /** Multiplexing options for a host. Empty when mux is off, deferred to ssh
@@ -47,9 +47,10 @@ let _muxDir: string | null = null;
  *  "mux_client_request_session: read from master failed", which `fleet ls` then
  *  reports as a dead host). */
 export function muxOpts(host: Host): string[] {
-  if (!muxEnabled()) return [];
+  const mode = sshMux(host).value;
+  if (mode === "off") return [];
   if (process.platform === "win32") return [];
-  if (muxFromConfig()) return [];   // honour ControlMaster/ControlPath from ~/.ssh/config
+  if (mode === "config") return [];   // honour ControlMaster/ControlPath from ~/.ssh/config
   if (_muxDir === null) {
     _muxDir = join(homedir(), ".fleet", "ssh");
     try { mkdirSync(_muxDir, { recursive: true }); } catch { /* best-effort; ssh falls back to no-mux if the socket can't be made */ }
@@ -58,7 +59,7 @@ export function muxOpts(host: Host): string[] {
   // answer on the same address, so the alias keeps their masters apart.
   const alias = host.hostKeyAlias ? `-${host.hostKeyAlias}` : "";
   return ["-o", "ControlMaster=auto", "-o", `ControlPath=${join(_muxDir, `cm-%C-${proxyControlKey(host)}${alias}`)}`,
-    "-o", `ControlPersist=${muxPersist()}`];
+    "-o", `ControlPersist=${sshPersist(host)}`];
 }
 
 /** Win32-OpenSSH's sshd hands its session a table of POSIX fd types in a
@@ -144,9 +145,6 @@ function drain(stream: ReadableStream<Uint8Array>, onText?: (text: string) => vo
   })();
   return { done, text: () => text, cancel: () => { reader.cancel().catch(() => {}); } };
 }
-
-/** Milliseconds to wait for the pipes to close after the completion marker. */
-const DONE_GRACE_MS = Math.max(0, Number(process.env.FLEET_DONE_GRACE_MS ?? 1500) || 0);
 
 export function doneMarker(): string {
   return `__FLEET_DONE_${crypto.randomUUID().replaceAll("-", "")}__`;
@@ -385,13 +383,11 @@ export function stripClixml(stderr: string): string {
   return (before + errs.join("")).trimEnd();
 }
 
-/** Wall-clock cap for a single exec, in ms. ssh's ConnectTimeout only bounds
- *  the CONNECTION — a remote command that hangs would otherwise block forever.
- *  Default: FLEET_EXEC_TIMEOUT env (seconds), else no cap (0). Per-call
- *  `opts.timeoutMs` wins. On expiry the local ssh is killed and the result is
- *  exit 124 (timeout(1) convention). */
-const EXEC_TIMEOUT_MS = Math.max(0, Number(process.env.FLEET_EXEC_TIMEOUT ?? 0) * 1000 || 0);
-
+/** Run one command on one host under a wall-clock cap. ssh's ConnectTimeout
+ *  only bounds the CONNECTION — a remote command that hangs would otherwise
+ *  block forever. The cap: per-call `opts.timeoutMs`, else FLEET_EXEC_TIMEOUT
+ *  (seconds), else the host's execTimeoutS setting, else none (0). On expiry
+ *  the local ssh is killed and the result is exit 124 (timeout(1) convention). */
 export async function exec(
   host: Host,
   command: string,
@@ -402,12 +398,12 @@ export async function exec(
     if (shell !== "auto" && shell !== "bash")
       return { host: host.name, ok: false, code: 1, stdout: "",
         stderr: `${host.name} is a daytona sandbox — only bash is available` };
-    return dtExec(host, command, { cwd: opts.cwd, timeoutMs: opts.timeoutMs ?? (EXEC_TIMEOUT_MS || undefined) });
+    return dtExec(host, command, { cwd: opts.cwd, timeoutMs: opts.timeoutMs ?? (execTimeoutMs(host) || undefined) });
   }
   const resolved: Shell = shell === "auto"
     ? (host.os === "windows" ? "powershell" : "bash")
     : shell;
-  const timeoutMs = opts.timeoutMs ?? EXEC_TIMEOUT_MS;
+  const timeoutMs = opts.timeoutMs ?? execTimeoutMs(host);
   const startedAt = Date.now();
   const winBin = host.os === "windows" && resolved !== "bash"
     ? await resolveWinBin(host, timeoutMs) : "powershell";
@@ -464,7 +460,7 @@ export async function exec(
     }
     // The command finished on time; only its output-drain grace remains.
     if (timer) clearTimeout(timer);
-    graceTimer = setTimeout(() => stop("released"), DONE_GRACE_MS);
+    graceTimer = setTimeout(() => stop("released"), doneGraceMs(host));
   });
   if (timeoutMs > 0) timer = setTimeout(() => stop("timeout"), remainingMs);
   const finished = await Promise.race([
@@ -495,30 +491,30 @@ export async function exec(
     stderr: (err + note).trim() };
 }
 
-/** Fast reachability probe — a single `ssh … echo ok` that works on every OS
- *  (bare `echo ok` runs in cmd/sh without any shell-detection round-trip, so a
- *  dead Windows host costs ONE timeout, not the two that the full exec path pays
- *  via resolveWinBin). Capped by a wall-clock kill so a hung `.local` mDNS
- *  lookup (which ssh's ConnectTimeout does NOT bound) can't dominate a fan-out.
- *  Override the cap with FLEET_PROBE_TIMEOUT_MS. */
-const probeCap = () => Number(process.env.FLEET_PROBE_TIMEOUT_MS ?? 4000);
 /** Two hops cost more than one: a proxied host gets extra headroom unless the
- *  caller (or FLEET_PROBE_TIMEOUT_MS) pinned the cap explicitly. */
+ *  caller, FLEET_PROBE_TIMEOUT_MS or a probeTimeoutMs setting pinned the cap. */
 export const PROXY_PROBE_BONUS_MS = 2000;
 
 /** Why a probe said "down". `proxy` means fleet never got as far as the host —
  *  reporting that as a dead box is the lie this exists to prevent. */
 export interface ProbeResult { up: boolean; via?: string; down?: "proxy" | "host" }
 
+/** Fast reachability probe — a single `ssh … echo ok` that works on every OS
+ *  (bare `echo ok` runs in cmd/sh without any shell-detection round-trip, so a
+ *  dead Windows host costs ONE timeout, not the two that the full exec path pays
+ *  via resolveWinBin). Capped by a wall-clock kill so a hung `.local` mDNS
+ *  lookup (which ssh's ConnectTimeout does NOT bound) can't dominate a fan-out.
+ *  Override the cap with FLEET_PROBE_TIMEOUT_MS or the probeTimeoutMs setting. */
 export async function probeDetail(host: Host, capMs?: number): Promise<ProbeResult> {
-  if (host.transport === "daytona") return { up: await dtProbe(host, capMs ?? probeCap()) };
+  const configured = probeTimeout(host);
+  if (host.transport === "daytona") return { up: await dtProbe(host, capMs ?? configured.ms) };
   const proxy = resolveProxy(host);
-  let cap = capMs ?? probeCap();
+  let cap = capMs ?? configured.ms;
   if (proxy) {
     // Cheap pre-flight, memoized ~30s so a fan-out across a proxied group does
     // not stampede the endpoint with N TCP connects.
     if (!await proxyReachableCached(proxy.spec)) return { up: false, via: proxy.name, down: "proxy" };
-    if (capMs === undefined && process.env.FLEET_PROBE_TIMEOUT_MS === undefined) cap += PROXY_PROBE_BONUS_MS;
+    if (capMs === undefined && !configured.pinned) cap += PROXY_PROBE_BONUS_MS;
   }
   const connectTimeout = Math.max(1, Math.ceil(cap / 1000));
   const proc = Bun.spawn(["ssh", ...connOpts(host), "-o", "BatchMode=yes", "-o", `ConnectTimeout=${connectTimeout}`,

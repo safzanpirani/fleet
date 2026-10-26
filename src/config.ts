@@ -30,6 +30,58 @@ export interface Host {
   android?: AndroidSpec;   // `fleet cu` drives an Android phone through adb inside Termux on this host
   hostKeyAlias?: string;   // known_hosts name for this host's key; required when boots share an address
   sudo?: SudoSpec;         // where `--sudo` finds the password when sudo asks for one
+  disable?: HostFeature[]; // fleet commands refused on this host (on top of the top-level `disable`)
+  enable?: HostFeature[];  // features re-allowed on this host although the top-level `disable` lists them
+  settings?: HostSettings; // per-host overrides of the top-level `defaults`
+}
+/** Command families a host can refuse. Each names the fleet commands it covers;
+ *  internal ssh use by other commands is not gated. */
+export const HOST_FEATURES = [
+  "webcam",   // fleet webcam
+  "cu",       // fleet cu (desktop and Android, perception, record)
+  "shot",     // fleet shot, MCP screenshot
+  "browse",   // fleet browse
+  "exec",     // fleet exec, spawn, watch, ssh, exec --script, MCP exec
+  "files",    // fleet cp/push/pull, edit, diff
+  "power",    // fleet reboot, bios, switch
+  "kill",     // fleet kill
+  "restart",  // fleet restart
+  "deploy",   // fleet deploy, tools sync, skills sync
+] as const;
+export type HostFeature = (typeof HOST_FEATURES)[number];
+/** Capture defaults for `fleet shot` and the MCP screenshot tool. */
+export interface CaptureSettings {
+  output?: string;          // default --output (connector, main, focused, or 1-based index)
+  region?: string;          // default --region
+  format?: "webp" | "png";  // local image format
+  gridStep?: number;        // default --grid-step
+}
+/** Knobs that may differ per host. Precedence: env var > hosts.<h>.settings > defaults > built-in. */
+export interface HostSettings {
+  execTimeoutS?: number;    // FLEET_EXEC_TIMEOUT; 0 = no deadline
+  probeTimeoutMs?: number;  // FLEET_PROBE_TIMEOUT_MS
+  doneGraceMs?: number;     // FLEET_DONE_GRACE_MS
+  winSessionIdleS?: number; // FLEET_WIN_SESSION_IDLE_S (Windows hosts only)
+  sshMux?: "on" | "off" | "config"; // FLEET_NO_SSH_MUX=1 → off, FLEET_SSH_MUX=config → config
+  sshPersist?: string;      // FLEET_SSH_PERSIST, an ssh ControlPersist value
+  shot?: CaptureSettings;
+  webcam?: { device?: string };
+}
+/** Global knobs. Host-level `settings` override every HostSettings field. */
+export interface FleetDefaults extends HostSettings {
+  routeGraceMs?: number;    // ROUTE_GRACE_MS: head start of one route transport before the next probe starts
+  parallel?: {
+    exec?: number;          // max hosts one exec/spawn fan-out runs at once (default: all)
+    toolSync?: number;      // tools sync --all pool (default 2)
+    toolStatusHosts?: number; // tools/skills status host reads at once (default 8)
+  };
+}
+/** One named skill set `fleet skills sync` pushes from the controller. */
+export interface SkillSetSpec {
+  hosts: string;            // selector the set ships to
+  include: string[];        // skill directory names or globs under root ("*" = all)
+  exclude?: string[];       // names or globs removed after include
+  root?: string;            // controller skill root (default ~/.agents/skills)
 }
 /** The sudo password for `--sudo`, read on the controller and sent over ssh
  *  stdin. It never reaches an argv or a log. */
@@ -103,6 +155,9 @@ export interface FleetConfig {
   groups?: Record<string, string[]>;     // custom named groups
   recipes?: Record<string, string[]>;    // saved playbooks (fleet subcommand strings)
   tools?: Record<string, ToolSpec>;      // CLI tools this fleet ships to its boxes
+  skills?: Record<string, SkillSetSpec>; // agent skill sets `fleet skills sync` ships to its boxes
+  disable?: HostFeature[];               // features refused on every host unless a host `enable`s them
+  defaults?: FleetDefaults;              // global knobs; hosts.<h>.settings override them
   proxies?: Record<string, ProxySpec>;   // named proxies hosts can be routed through
   defaultProxy?: string;                 // applies to every host with no `proxy` of its own
   dashboard?: string;
@@ -190,6 +245,40 @@ let _activeConfig: FleetConfig | null = null;
 export function setActiveConfig(cfg: FleetConfig | null): void { _activeConfig = cfg; }
 export function activeConfig(): FleetConfig | null { return _activeConfig; }
 
+// ── features and settings ────────────────────────────────────────────────────
+
+/** Whether fleet may run `feature` on `host`: the host's own `disable` refuses,
+ *  its `enable` allows, and otherwise the top-level `disable` decides. */
+export function featureEnabled(host: Pick<Host, "disable" | "enable">, feature: HostFeature, cfg: FleetConfig | null = _activeConfig): boolean {
+  if (host.disable?.includes(feature)) return false;
+  if (host.enable?.includes(feature)) return true;
+  return !cfg?.disable?.includes(feature);
+}
+
+/** Refuse the whole call when any selected host disables `feature`, before
+ *  anything reaches a host. Throws one error naming every refusing host. */
+export function assertFeature(hosts: readonly Pick<Host, "name" | "disable" | "enable">[], feature: HostFeature, cfg: FleetConfig | null = _activeConfig): void {
+  const refused = hosts.filter((host) => !featureEnabled(host, feature, cfg)).map((host) => host.name);
+  if (!refused.length) return;
+  throw new Error(`${feature} is disabled on ${refused.join(", ")} by the fleet config `
+    + `(hosts.<host>.disable, or the top-level disable without a hosts.<host>.enable)`);
+}
+
+type ScalarSetting = Exclude<keyof HostSettings, "shot" | "webcam">;
+/** A host's value for one knob: hosts.<h>.settings, then defaults. Env vars are
+ *  checked by the caller first, because each knob has its own variable. */
+export function hostSetting<K extends ScalarSetting>(host: Pick<Host, "settings"> | undefined, key: K, cfg: FleetConfig | null = _activeConfig): HostSettings[K] {
+  return host?.settings?.[key] ?? cfg?.defaults?.[key];
+}
+/** One `fleet shot` capture default, merged field by field. */
+export function captureSetting<K extends keyof CaptureSettings>(host: Pick<Host, "settings"> | undefined, key: K, cfg: FleetConfig | null = _activeConfig): CaptureSettings[K] {
+  return host?.settings?.shot?.[key] ?? cfg?.defaults?.shot?.[key];
+}
+/** The default `fleet webcam` device for a host. */
+export function webcamDevice(host: Pick<Host, "settings"> | undefined, cfg: FleetConfig | null = _activeConfig): string | undefined {
+  return host?.settings?.webcam?.device ?? cfg?.defaults?.webcam?.device;
+}
+
 /** Look up a proxy reference (a `proxies` key or an inline URL). */
 export function lookupProxy(ref: string, cfg: FleetConfig | null = _activeConfig): ResolvedProxy {
   if (ref.includes("://")) return { name: redactProxy(ref), ref, spec: parseProxyUrl(ref) };
@@ -252,11 +341,65 @@ export function validateConfig(cfg: FleetConfig, path: string): void {
   };
 
   const root = record(cfg, "`config`");
-  knownKeys(root, ["$comment", "hosts", "machines", "routes", "groups", "recipes", "tools", "proxies", "defaultProxy", "dashboard"], "`config`");
+  knownKeys(root, ["$comment", "hosts", "machines", "routes", "groups", "recipes", "tools", "skills", "disable", "defaults", "proxies", "defaultProxy", "dashboard"], "`config`");
   stringIfPresent(root["$comment"], "`config`.$comment");
   if (!isRecord(cfg.hosts) || !Object.keys(cfg.hosts).length)
     fail("`hosts` must be a non-empty object");
   httpUrlIfPresent(cfg.dashboard, "dashboard");
+  const featureList = (value: unknown, at: string): void => {
+    if (value === undefined) return;
+    if (!Array.isArray(value)) fail(`${at} must be an array of feature names (${HOST_FEATURES.join(", ")})`);
+    const seen = new Set<string>();
+    for (const f of value as unknown[]) {
+      if (typeof f !== "string" || !(HOST_FEATURES as readonly string[]).includes(f))
+        fail(`${at}: unknown feature '${String(f)}' (have: ${HOST_FEATURES.join(", ")})${typeof f === "string" ? didYouMean(f, [...HOST_FEATURES]) : ""}`);
+      if (seen.has(f as string)) fail(`${at} lists '${f}' twice`);
+      seen.add(f as string);
+    }
+  };
+  const intIfPresent = (value: unknown, at: string, min: number, max = Number.MAX_SAFE_INTEGER): void => {
+    if (value !== undefined && (!Number.isInteger(value) || (value as number) < min || (value as number) > max))
+      fail(`${at} must be an integer from ${min}${max === Number.MAX_SAFE_INTEGER ? " up" : ` to ${max}`} (got '${String(value)}')`);
+  };
+  const SETTING_KEYS = ["execTimeoutS", "probeTimeoutMs", "doneGraceMs", "winSessionIdleS", "sshMux", "sshPersist", "shot", "webcam"] as const;
+  const checkSettings = (raw: Record<string, unknown>, at: string, extra: readonly string[] = []): void => {
+    knownKeys(raw, [...SETTING_KEYS, ...extra], at);
+    const s = raw as HostSettings;
+    intIfPresent(s.execTimeoutS, `${at}.execTimeoutS`, 0);
+    intIfPresent(s.probeTimeoutMs, `${at}.probeTimeoutMs`, 100);
+    intIfPresent(s.doneGraceMs, `${at}.doneGraceMs`, 0);
+    intIfPresent(s.winSessionIdleS, `${at}.winSessionIdleS`, 10);
+    if (s.sshMux !== undefined && !["on", "off", "config"].includes(s.sshMux))
+      fail(`${at}.sshMux must be one of on|off|config (got '${String(s.sshMux)}')`);
+    stringIfPresent(s.sshPersist, `${at}.sshPersist`);
+    if (s.sshPersist !== undefined && !/^(?:yes|no|\d+[smhdw]?)$/i.test(s.sshPersist))
+      fail(`${at}.sshPersist must be an ssh ControlPersist value like 60s, 30m or no (got '${s.sshPersist}')`);
+    if (s.shot !== undefined) {
+      const shot = record(s.shot, `${at}.shot`) as CaptureSettings;
+      knownKeys(shot as Record<string, unknown>, ["output", "region", "format", "gridStep"], `${at}.shot`);
+      stringIfPresent(shot.output, `${at}.shot.output`);
+      stringIfPresent(shot.region, `${at}.shot.region`);
+      if (shot.format !== undefined && shot.format !== "webp" && shot.format !== "png")
+        fail(`${at}.shot.format must be webp or png (got '${String(shot.format)}')`);
+      intIfPresent(shot.gridStep, `${at}.shot.gridStep`, 10, 10000);
+    }
+    if (s.webcam !== undefined) {
+      const webcam = record(s.webcam, `${at}.webcam`);
+      knownKeys(webcam, ["device"], `${at}.webcam`);
+      stringIfPresent(webcam.device, `${at}.webcam.device`);
+    }
+  };
+  featureList(cfg.disable, "disable");
+  if (cfg.defaults !== undefined) {
+    const d = record(cfg.defaults, "defaults");
+    checkSettings(d, "defaults", ["routeGraceMs", "parallel"]);
+    intIfPresent(d.routeGraceMs, "defaults.routeGraceMs", 0);
+    if (d.parallel !== undefined) {
+      const p = record(d.parallel, "defaults.parallel");
+      knownKeys(p, ["exec", "toolSync", "toolStatusHosts"], "defaults.parallel");
+      for (const key of ["exec", "toolSync", "toolStatusHosts"] as const) intIfPresent(p[key], `defaults.parallel.${key}`, 1);
+    }
+  }
   for (const [pn, rawProxy] of Object.entries(optionalRecord(cfg.proxies, "proxies"))) {
     const px = record(rawProxy, `proxies.${pn}`) as unknown as ProxySpec;
     knownKeys(px as unknown as Record<string, unknown>,
@@ -300,8 +443,15 @@ export function validateConfig(cfg: FleetConfig, path: string): void {
     const h = record(rawHost, `hosts.${name}`) as unknown as Host;
     knownKeys(h as unknown as Record<string, unknown>,
       ["name", "ssh", "os", "transport", "gpu", "wsl", "winShell", "python", "services", "health", "cdp", "deploy", "proxy", "android",
-        "hostKeyAlias", "sudo"],
+        "hostKeyAlias", "sudo", "disable", "enable", "settings"],
       `hosts.${name}`);
+    featureList(h.disable, `hosts.${name}.disable`);
+    featureList(h.enable, `hosts.${name}.enable`);
+    for (const f of h.disable ?? []) if (h.enable?.includes(f))
+      fail(`hosts.${name}: '${f}' is in both disable and enable`);
+    if (h.settings !== undefined) checkSettings(record(h.settings, `hosts.${name}.settings`), `hosts.${name}.settings`);
+    if (h.settings?.winSessionIdleS !== undefined && h.os !== "windows")
+      fail(`hosts.${name}.settings.winSessionIdleS is only valid for windows hosts`);
     if (!h.ssh || typeof h.ssh !== "string") fail(`hosts.${name}: missing/invalid \`ssh\``);
     if (h.ssh.startsWith("-")) fail(`hosts.${name}.ssh must not begin with '-' (ssh would parse it as an option)`);
     if (!OSES.has(h.os)) fail(`hosts.${name}: os must be one of ${[...OSES].join("|")} (got '${h.os}')`);
@@ -414,6 +564,11 @@ export function validateConfig(cfg: FleetConfig, path: string): void {
       fail(`routes.${rn}: unknown host '${name}' (have: ${Object.keys(cfg.hosts).join(", ")})`);
     const oses = new Set(route.prefer.map((name) => cfg.hosts[name]!.os));
     if (oses.size !== 1) fail(`routes.${rn}: all transports must target the same OS`);
+    // A route picks its transport at run time, so a feature allowed on one
+    // transport and refused on another would depend on which link is up.
+    const allowed = (name: string) => HOST_FEATURES.filter((f) => featureEnabled(cfg.hosts[name]!, f, cfg)).join(",");
+    if (new Set(route.prefer.map(allowed)).size !== 1)
+      fail(`routes.${rn}: every transport must allow the same features (check disable/enable on ${route.prefer.join(", ")})`);
   }
   for (const [rn, steps] of Object.entries(optionalRecord(cfg.recipes, "recipes")))
     if (!Array.isArray(steps) || steps.some((s) => typeof s !== "string"))
@@ -430,6 +585,18 @@ export function validateConfig(cfg: FleetConfig, path: string): void {
     if (tool.exclude !== undefined
       && (!Array.isArray(tool.exclude) || tool.exclude.some((e) => typeof e !== "string" || !e)))
       fail(`tools.${tn}.exclude must be an array of non-empty strings`);
+  }
+  for (const [sn, rawSet] of Object.entries(optionalRecord(cfg.skills, "skills"))) {
+    const set = record(rawSet, `skills.${sn}`) as unknown as SkillSetSpec;
+    knownKeys(set as unknown as Record<string, unknown>, ["hosts", "include", "exclude", "root"], `skills.${sn}`);
+    if (!set.hosts || typeof set.hosts !== "string") fail(`skills.${sn}: missing/invalid \`hosts\` selector`);
+    stringIfPresent(set.root, `skills.${sn}.root`);
+    for (const key of ["include", "exclude"] as const) {
+      const list = set[key];
+      if (list === undefined && key === "exclude") continue;
+      if (!Array.isArray(list) || !list.length || list.some((e) => typeof e !== "string" || !e || e.includes("/")))
+        fail(`skills.${sn}.${key} must be a non-empty array of skill names or globs without '/'`);
+    }
   }
 }
 

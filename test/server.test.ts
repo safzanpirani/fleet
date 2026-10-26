@@ -186,3 +186,16 @@ test("native service logs remain readonly and report failures", async () => {
     });
   } finally { execute.mockRestore(); }
 });
+
+test("fleet_screenshot reports a shot-disabled host as an error without capturing", async () => {
+  const execute = spyOn(ssh, "exec");
+  const gated: FleetConfig = { hosts: { local: { name: "local", ssh: "127.0.0.1", os: "linux", disable: ["shot"] } } };
+  try {
+    await withClient(false, async (client) => {
+      const r = await client.callTool({ name: "fleet_screenshot", arguments: { host: "local" } });
+      expect(r.isError).toBe(true);
+      expect(JSON.stringify(r.content)).toContain("shot is disabled on local");
+    }, gated);
+    expect(execute).not.toHaveBeenCalled();
+  } finally { execute.mockRestore(); }
+});

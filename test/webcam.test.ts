@@ -534,3 +534,23 @@ test("webcam producer uses a fresh SSH session and a separate Windows control bo
     expect(sent).toBeInstanceOf(Uint8Array);
   } finally { spawn.mockRestore(); }
 });
+
+test("a top-level webcam disable refuses hosts without an enable and never the local camera", async () => {
+  const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=", "base64");
+  const gated = { disable: ["webcam"], hosts: {
+    win: { name: "win", ssh: "fake", os: "windows" },
+    cam: { name: "cam", ssh: "fake-cam", os: "windows", enable: ["webcam"] },
+  } } as FleetConfig;
+  let calls = 0;
+  const deps = { exec: async (h: { name: string }) => { calls++; return { host: h.name, ok: true, code: 0, stdout: png.toString("base64"), stderr: "" }; } };
+  await expect(captureWebcam(gated, "win", "photo.png", { device: "Camera" }, deps)).rejects.toThrow(/webcam is disabled on win/);
+  expect(calls).toBe(0);
+  const dir = await mkdtemp(join(tmpdir(), "fleet-webcam-gate-"));
+  try {
+    expect((await captureWebcam(gated, "cam", join(dir, "photo.png"), { device: "Camera" }, deps)).host).toBe("cam");
+    expect(calls).toBe(1);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+  // The local selector never leaves this machine; it fails here only on the bad
+  // destination, after the gate has let it through.
+  await expect(captureWebcam(gated, "local", "photo.jpg", { device: "Camera" })).rejects.toThrow("PNG");
+});

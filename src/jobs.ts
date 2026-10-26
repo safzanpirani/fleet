@@ -22,10 +22,12 @@
  * on demand, then unregistering the definition once the runner records its pid.
  * Requires a user to be logged on at the console.
  */
-import { resolveHosts } from "./config.ts";
+import { assertFeature, resolveHosts } from "./config.ts";
 import type { FleetConfig, Host } from "./config.ts";
 import { buildArgvCommand, exec, execStream, bashEsc, psEsc, psHiddenTaskAction } from "./ssh.ts";
 import type { ExecResult, Shell } from "./ssh.ts";
+import { execParallelism } from "./settings.ts";
+import { mapPool } from "./tools.ts";
 
 const b64 = (s: string) => Buffer.from(s, "utf8").toString("base64");
 const shellFor = (h: Host): Shell => (h.os === "windows" ? "powershell" : "bash");
@@ -269,6 +271,7 @@ export async function spawnJob(
   dependencies: { exec?: typeof exec; newId?: typeof newId } = {},
 ): Promise<SpawnResult[]> {
   const hosts = resolveHosts(cfg, sel);
+  assertFeature(hosts, "exec", cfg);
   if (opts.wsl) {
     const bad = hosts.filter((h) => h.os !== "windows").map((h) => h.name);
     if (bad.length) throw new Error(`--wsl needs Windows hosts; ${bad.join(", ")} ${bad.length === 1 ? "is" : "are"} not`);
@@ -277,7 +280,7 @@ export async function spawnJob(
     const bad = hosts.filter((h) => h.os !== "windows").map((h) => h.name);
     if (bad.length) throw new Error(`--elevated needs Windows hosts; on ${bad.join(", ")} put sudo inside the job's command`);
   }
-  return Promise.all(hosts.map(async (h): Promise<SpawnResult> => {
+  return mapPool(hosts, execParallelism(cfg, hosts.length), async (h): Promise<SpawnResult> => {
     const id = (dependencies.newId ?? newId)(opts.label);
     const command = Array.isArray(cmd) ? buildArgvCommand(cmd, h.os === "windows" && !opts.wsl) : cmd;
     const script = h.os === "windows"
@@ -299,7 +302,7 @@ export async function spawnJob(
     const pid = await recordedPid(run, h, id);
     if (pid) return { host: h.name, ok: true, id, pid };
     return { host: h.name, ok: false, id, pid: null, error: "launch unconfirmed; inspect this job before retrying" + (detail ? `: ${detail}` : "") };
-  }));
+  });
 }
 
 /** The PID a job's runner recorded in its spool, read once over a new login
