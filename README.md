@@ -1,27 +1,48 @@
 <h1><img src="assets/pulse.svg" width="28" height="28" align="center" alt="●" />&nbsp;fleet</h1>
 
-**Run commands across all your machines without fighting SSH quoting.**
+**A command line that lets an agent run commands, jobs and desktop automation on your own Linux, Windows, macOS and Android machines.**
 
-Fleet is a small CLI and MCP server for managing Linux, Windows, and macOS
-machines from one place. Use it for a single command, a whole group, or every
-machine at once.
+Fleet reads your machines from one config file. Commands return one result per
+host with an exit code, and JSON with `--json`. People use the same CLI, and a
+small MCP server, over stdio or authenticated HTTP, covers agents without a shell.
 
 ![fleet in action](demo/fleet-demo.gif)
 
 ```sh
-fleet exec win-box "nvidia-smi"  # one machine
-fleet exec @linux "uptime"       # a group, in parallel
-fleet status                     # the whole fleet at a glance
+fleet exec win-box "nvidia-smi"        # one machine, in PowerShell
+fleet exec @linux "uptime"             # a group, in parallel
+fleet spawn web "./train.sh"           # a job that outlives the ssh connection
+fleet cu win-box click notepad 120 80  # click, then report whether the window changed
 ```
 
 ## Why Fleet?
 
-- Commands containing quotes, pipes, `$`, JSON, and shell operators arrive intact.
-- Logical routes can prefer a fast connection and fall back to another.
-- Long-running jobs survive SSH disconnects and remain easy to inspect.
-- People and agents use the same CLI. A small MCP server covers clients without a shell.
+Most of fleet handles what plain ssh leaves to the person at the keyboard, which
+matters once a program is the one typing.
 
-Driving fleet from Claude Code, Factory Droid, Codex, or another agent? Start with
+- Commands with quotes, `$`, pipes and JSON reach bash or PowerShell byte for byte.
+  Fleet sends each program on stdin, so nothing passes through nested quoting.
+- A remote process that keeps output open, such as a background child, cannot hang
+  the call. Each script reports its own exit status, and fleet stops waiting when it
+  arrives.
+- Windows hosts keep one PowerShell session open, so repeat commands take about
+  50-250 ms instead of 0.6 s, and output from PowerShell and native programs comes
+  back in the order it was written.
+- A call whose outcome is unknown is never sent twice. A job launch fleet cannot
+  confirm keeps its ID for inspection, and desktop input lost mid-call is reported
+  as unknown.
+- The config can refuse whole command families on a host, such as `cu`, `webcam`,
+  `exec` or `power`, and a root-owned policy file adds refusals an agent cannot edit
+  away. A refused command stops before it contacts any host.
+- Desktop automation works on Windows, macOS, Linux and Android. Controls can be
+  addressed by label from the accessibility tree, and each click reports from the
+  window's pixels whether anything changed.
+- Each OS on a dual-boot machine gets its own host key, so a command meant for one
+  OS fails instead of running on the other.
+- Logical routes prefer a fast connection and fall back to another, and long jobs
+  survive dropped connections.
+
+To drive fleet from Claude Code, Factory Droid, Codex or another agent, start with
 **[Agent setup](#agent-setup)**.
 
 ## Quick start
