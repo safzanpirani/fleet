@@ -2601,6 +2601,21 @@ export interface CaptureTarget {
  *  renders none for an output that is off, so an unbounded grim hangs. */
 const LINUX_CAPTURE_TIMEOUT_S = 20;
 
+/** PowerShell lines that declare per-monitor DPI awareness, so screen bounds
+ *  come in physical pixels. Windows PowerShell is not DPI aware: under display
+ *  scaling Windows reports it a shrunken screen. Reflection.Emit binds user32
+ *  without the csc compile that Add-Type -MemberDefinition costs. */
+export const PS_DPI_AWARE = [
+  `try {`,
+  `  $tb=[Reflection.Emit.AssemblyBuilder]::DefineDynamicAssembly((New-Object Reflection.AssemblyName 'FleetDpi'),'Run').DefineDynamicModule('FleetDpi').DefineType('FleetDpi','Public,Class')`,
+  `  $pinvoke={ param($name,$types) [void]$tb.DefinePInvokeMethod($name,'user32.dll','Public,Static,PinvokeImpl',[Reflection.CallingConventions]::Standard,[bool],$types,[Runtime.InteropServices.CallingConvention]::Winapi,[Runtime.InteropServices.CharSet]::Auto) }`,
+  `  & $pinvoke 'SetProcessDpiAwarenessContext' ([Type[]]@([IntPtr])); & $pinvoke 'SetProcessDPIAware' $null`,
+  `  $dpi=$tb.CreateType(); $aware=$false`,
+  `  try { $aware=$dpi::SetProcessDpiAwarenessContext([IntPtr](-4)) } catch {}`,
+  `  if (-not $aware) { [void]$dpi::SetProcessDPIAware() }`,
+  `} catch {}`,
+];
+
 export function captureCmd(os: Host["os"], target: CaptureTarget = {}): { cmd: string; shell: Shell } {
   const hidden = psHiddenLaunch("$psexe", "$psarg");
   if (os === "windows") return { shell: "powershell", cmd: [
@@ -2616,18 +2631,9 @@ export function captureCmd(os: Host["os"], target: CaptureTarget = {}): { cmd: s
     `$code=0; $bmp=$null; $g=$null`,
     `$fleetOutput='${psEsc(target.winOutput ?? "")}'; $fleetRegion='${target.winRegion ? target.winRegion.join(",") : ""}'; $fleetWake=$${target.winWake ? "true" : "false"}`,
     `try {`,
-    // Windows PowerShell is not DPI aware, so under display scaling Windows
-    // reports a shrunken screen and CopyFromScreen copies only its top-left
-    // part. Declare per-monitor awareness first. Reflection.Emit binds user32
-    // without the csc compile that Add-Type -MemberDefinition costs.
-    `  try {`,
-    `    $tb=[Reflection.Emit.AssemblyBuilder]::DefineDynamicAssembly((New-Object Reflection.AssemblyName 'FleetDpi'),'Run').DefineDynamicModule('FleetDpi').DefineType('FleetDpi','Public,Class')`,
-    `    $pinvoke={ param($name,$types) [void]$tb.DefinePInvokeMethod($name,'user32.dll','Public,Static,PinvokeImpl',[Reflection.CallingConventions]::Standard,[bool],$types,[Runtime.InteropServices.CallingConvention]::Winapi,[Runtime.InteropServices.CharSet]::Auto) }`,
-    `    & $pinvoke 'SetProcessDpiAwarenessContext' ([Type[]]@([IntPtr])); & $pinvoke 'SetProcessDPIAware' $null`,
-    `    $dpi=$tb.CreateType(); $aware=$false`,
-    `    try { $aware=$dpi::SetProcessDpiAwarenessContext([IntPtr](-4)) } catch {}`,
-    `    if (-not $aware) { [void]$dpi::SetProcessDPIAware() }`,
-    `  } catch {}`,
+    // Without DPI awareness, CopyFromScreen copies only the top-left part of
+    // a scaled screen.
+    ...PS_DPI_AWARE.map((line) => `  ${line}`),
     // --wake: Windows captures fine with the monitors asleep, so this is for the
     // person in front of them. Broadcast monitor power-on, nudge the mouse one
     // pixel and back (real input resets the idle timer), and ask for the display.

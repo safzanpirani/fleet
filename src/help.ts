@@ -29,6 +29,7 @@ const usage: Record<string, string> = {
   svc: "svc <service> [<sel>] [--json]\n  fleet svc [<sel>] --unit NAME --type TYPE [--json]",
   webcam: "webcam <host|local> [--device DEVICE] [--out photo.png] [--json]\n  fleet webcam <host|local> --list [--json]\n  fleet webcam <host|local> --stream [--device DEVICE] [--fps N] [--width PX] [--for S] [--vo kitty|text] [--window|-W]",
   shot: "shot <host> [--output NAME|main|focused|N] [--region AREA] [--wake] [--out|-o FILE] [--grid] [--grid-step N] [--no-open]\n  fleet shot <host> --list [--json]",
+  remote: "remote <host> [--view-only] [--listen [ADDR]] [--port N] [--no-open]\n  fleet remote <host> install|stop [--json]",
   cu: "cu <host> <tool> [JSON] [--out FILE] [--grid] [--grid-step N] [--full] [--no-open]\n  fleet cu <sel> install [--ref REF --sha256 HEX] | perception [status] | perception install [--version V] | perception remove\n    install runs upstream's installer from a pinned trycua/cua commit after checking its sha256 on the host, and\n    installs a pinned cua-driver release; --ref with --sha256 (the digest of its five scripts) overrides the commit\n  fleet cu <host> tools [FILTER] | describe <tool> [--brief] [--for TARGET] | apps [FILTER] [--all]\n  fleet cu <host> windows [TARGET] | shot-window <TARGET> [--out FILE] [--probe X,Y]\n  fleet cu <host> open <APP> [URL|ARG] | open <URL> [--wait MS] [--json]\n  fleet cu <host> elements <TARGET> [FILTER] [--role R] [--max N] [--task TEXT] [--json]\n  fleet cu <host> regions <TARGET> [FILTER] [--kind text|icon] [--min-confidence F] [--max N] [--out FILE] [--json]\n  fleet cu <host> verify <TARGET> <JSON> | verify <TARGET> --label L [--role R] [--value V] [--timeout MS]\n  fleet cu <host> click <TARGET> <X> <Y> [--space window|screen] [--button B] [--count N]\n  fleet cu <host> right-click|double-click <TARGET> <X> <Y>\n  fleet cu <host> click|right-click|double-click <TARGET> --label TEXT [--role R] [--nth N] | --element TOKEN\n  fleet cu <host> click|right-click|double-click <TARGET> --region TEXT | --region-at X,Y [--kind text|icon] [--nth N]\n  fleet cu <host> drag <TARGET> <FROM-X> <FROM-Y> <TO-X> <TO-Y> [--duration MS]\n  fleet cu <host> scroll <TARGET> <up|down|left|right> [AMOUNT] [--by line|page]\n  fleet cu <host> hotkey <TARGET> <MODIFIER> <KEY> [KEY\u2026]\n  fleet cu <host> key <TARGET> <KEY> | type <TARGET> <TEXT> | act <TARGET> <tool> [JSON]\n  fleet cu <host> set <TARGET> <VALUE> --label TEXT | --element TOKEN\n  fleet cu <host> menu <TARGET> <ITEM> [ITEM\u2026]\n  fleet cu <host> batch <TARGET> <JSON-array|-> [--json] | batch <TARGET> --file FILE\n    shared by named input/batch: [--foreground] [--space window|screen] [--settle MS] [--shot] [--grid] [--json]\n  fleet cu <host|phone> task <TARGET> <GOAL> --verify TEXT [--verify TEXT\u2026] [--input KEY=VALUE\u2026] [--secret-env KEY=ENVVAR\u2026]\n    [--constraint TEXT\u2026] [--allow delete|send|purchase|close\u2026] [--shortcut CHORD=DESCRIPTION\u2026] [--max-actions N]\n    [--min-confidence F] [--min-margin F] [--timeout S] [--dry-run] [--foreground] [--json]  |  task <TARGET> --file SUBTASK.json|-\n  fleet cu <host> record start|stop|status [--out DIR]\n  fleet cu <phone> doctor | state | release | bootstrap [PAIR-PORT PAIR-CODE] | apps [FILTER]\n  fleet cu <phone> notifications [PACKAGE] [--max N] | revive [--restart]\n  fleet cu <phone> watch [--view-only] | record start [--out FILE] [--limit S] [--bit-rate M] | record stop|status\n  fleet cu <phone> elements [FILTER] [--role R] [--all]\n  fleet cu <phone> shot [--out FILE] [--width N] [--grid] | open <PACKAGE|URL> [--in PACKAGE] [--wait MS]\n  fleet cu <phone> tap|long-press <TARGET> <X> <Y> | --label TEXT [--role R] [--nth N]\n  fleet cu <phone> swipe <TARGET> <X1> <Y1> <X2> <Y2> [--duration MS] | scroll <TARGET> <DIR> [N]\n  fleet cu <phone> swipe2 <TARGET> <X1> <Y1> <X2> <Y2> <DX> <DY> [--duration MS]\n  fleet cu <phone> zoom <TARGET> <in|out> [X Y | --label TEXT] [--scale F] | gesture <TARGET> <X1,Y1,X2,Y2>…\n  fleet cu <phone> key <TARGET> <KEY> | type <TARGET> <TEXT> [--label TEXT]\n  fleet cu <phone> batch <TARGET> <JSON-array|-> [--gap MS] | batch <TARGET> --file FILE\n  fleet cu <phone> wait --label TEXT [--role R] [--gone] | wait --focus PACKAGE [--timeout MS]\n  fleet cu <phone> flow <JSON-array|-> | flow --file FILE [--target PACKAGE] [--read FILTER | --no-read]\n    open and input verbs accept trailing --read FILTER (or '*') after their operands; --json includes the read",
   browse: "browse <host> [URL]                  verify configured CDP and list targets",
   run: "run <recipe>                        run configured steps; stop on failure",
@@ -80,6 +81,25 @@ const detail: Record<string, string> = {
     + "(hosts.<h>.settings.shot, then defaults.shot). shot.format picks webp or png for an\n"
     + "automatic file name; without it fleet writes webp when cwebp is installed.\n"
     + "fleet cu --grid uses shot.gridStep too.",
+  remote: "Live control of a host's desktop in a browser. fleet starts a VNC server on the host that only\n"
+    + "the host can reach, forwards it over one fresh ssh connection to a private unix socket here,\n"
+    + "and serves noVNC on 127.0.0.1 under a random URL token, which it opens on macOS. Ctrl-C (or\n"
+    + "the ssh connection dropping) ends the session and stops the server on the host.\n"
+    + "Windows: the TightVNC service (it follows the lock screen and UAC prompts), loopback only,\n"
+    + "with a new password each session. Linux: x11vnc on X11 or wayvnc on Wayland, on a unix\n"
+    + "socket in a 0700 directory, so no password. macOS: the built-in Screen Sharing service; the\n"
+    + "page asks for a macOS account. Android hosts open in a scrcpy window here (as cu watch).\n"
+    + "install sets the server up once: winget on Windows (the service stays Manual and stopped),\n"
+    + "the package manager as root on Linux, launchctl as root on macOS (Screen Sharing then\n"
+    + "listens on every interface). stop ends a server a crashed session left running.\n"
+    + "--listen ADDR serves the page on another address (a tailnet IP) for another device; --listen\n"
+    + "alone (or 0.0.0.0) serves every interface and prints the page's URL at each network address, the one an\n"
+    + "ssh login came in on first. From an ssh login nothing opens here. The URL token is the only\n"
+    + "lock, and over plain http a macOS login and clipboard access fail because browsers keep\n"
+    + "WebCrypto and the clipboard to https and localhost. A host with several monitors gets a\n"
+    + "screen picker in the page (Windows and X11): one screen fills the window, input included.\n"
+    + "wayvnc shares one output. --view-only starts with input off. remote follows cu: a host\n"
+    + "that refuses cu refuses remote unless its enable lists remote. One session per host at a time.",
   session: "Linux reads logind, the compositor (a Hyprland session lock shows as LOCK in its monitor\n"
     + "list), locker processes and DPMS; Windows reads query user and LogonUI; macOS reads\n"
     + "IOConsoleUsers. Idle time is reported only where the desktop exposes it.",
@@ -92,7 +112,7 @@ const detail: Record<string, string> = {
     + "defaults. Fleet-wide knobs (routeGraceMs, parallel.*) come from defaults only. refused lists\n"
     + "the features fleet will not run on the host and what refuses each: host (hosts.<h>.disable),\n"
     + "top-level (the top-level disable), policy (the policy file), or host/top-level/policy\n"
-    + "disable shot (ai follows shot). The policy: line names the policy file and says whether\n"
+    + "disable shot or cu (ai follows shot, remote follows cu). The policy: line names the policy file and says whether\n"
     + "only root can change it, whether it failed to parse, and any host it names that the config\n"
     + "lacks. Reads local files only; nothing is contacted. A route lists its transports.\n"
     + "On macOS and Linux every command that loads the config refuses one that another user\n"
@@ -178,7 +198,7 @@ const groups: [string, string[]][] = [
   ["Files and tools", ["cp", "edit", "du", "diff", "deploy", "tools", "skills"]],
   ["Services", ["restart", "logs", "svc"]],
   ["Power and boot", ["reboot", "bios", "boot", "switch", "wait"]],
-  ["Desktop and devices", ["shot", "webcam", "cu", "browse"]],
+  ["Desktop and devices", ["shot", "remote", "webcam", "cu", "browse"]],
   ["Connections", ["drop", "proxy"]],
   ["Shell", ["completion", "help"]],
 ];

@@ -41,6 +41,7 @@ export interface Host {
 export const HOST_FEATURES = [
   "webcam",   // fleet webcam
   "cu",       // fleet cu (desktop and Android, perception, record)
+  "remote",   // fleet remote (live desktop control in a browser)
   "shot",     // fleet shot, MCP screenshot
   "ai",       // fleet cu … task, fleet cu … elements --task: send window content to an AI service
   "browse",   // fleet browse
@@ -252,10 +253,18 @@ export function activeConfig(): FleetConfig | null { return _activeConfig; }
 
 // ── features and settings ────────────────────────────────────────────────────
 
+/** Features that a refusal of another feature also refuses, unless the host's
+ *  own `enable` lists them: `ai` follows `shot` (it sends what shot captures),
+ *  and `remote` follows `cu` (it gives a person the input cu gives an agent). */
+const FEATURE_FOLLOWS = { ai: "shot", remote: "cu" } as const satisfies Partial<Record<HostFeature, HostFeature>>;
+type FollowedFeature = (typeof FEATURE_FOLLOWS)[keyof typeof FEATURE_FOLLOWS];
+const FOLLOWS: Partial<Record<HostFeature, FollowedFeature>> = FEATURE_FOLLOWS;
+
 /** Where a refusal comes from. `policy` is the policy file; `host` and
- *  `top-level` are fleet.config.json's lists. `ai` follows `shot`, so the
- *  `… disable shot` sources name a shot refusal that also refuses ai. */
-export type FeatureSource = "policy" | "policy disable shot" | "host" | "top-level" | "host disable shot" | "top-level disable shot";
+ *  `top-level` are fleet.config.json's lists. A `… disable shot` or
+ *  `… disable cu` source names a refusal of the followed feature (see
+ *  FOLLOWS). */
+export type FeatureSource = "policy" | "host" | "top-level" | `${"policy" | "host" | "top-level"} disable ${FollowedFeature}`;
 
 /** The policy host keys that name `host`: its config label, its `ssh`
  *  destination, that destination without `user@`, and its `hostKeyAlias`.
@@ -288,18 +297,20 @@ function configRefusal(host: Pick<Host, "disable" | "enable">, feature: HostFeat
 /** Why fleet refuses `feature` on `host`, or null when it may run. The policy
  *  file refuses first and nothing in the config lifts it. Then the host's own
  *  `disable` refuses, its `enable` allows, and otherwise the top-level
- *  `disable` decides. A host that refuses `shot` refuses `ai` too, unless its
- *  `enable` lists `ai`. */
+ *  `disable` decides. A host that refuses a followed feature (FOLLOWS: `shot`,
+ *  `cu`) refuses its follower (`ai`, `remote`) too, unless its `enable` lists
+ *  the follower. */
 export function featureRefusal(
   host: PolicyHostRef, feature: HostFeature,
   cfg: FleetConfig | null = _activeConfig, policy: FleetPolicy | null = _activePolicy,
 ): FeatureSource | null {
   if (policyRefuses(host, feature, policy)) return "policy";
-  if (feature === "ai" && policyRefuses(host, "shot", policy)) return "policy disable shot";
+  const parent = FOLLOWS[feature];
+  if (parent && policyRefuses(host, parent, policy)) return `policy disable ${parent}`;
   const own = configRefusal(host, feature, cfg);
-  if (own || feature !== "ai" || host.enable?.includes("ai")) return own;
-  const shot = configRefusal(host, "shot", cfg);
-  return shot && (`${shot} disable shot` as const);
+  if (own || !parent || host.enable?.includes(feature)) return own;
+  const followed = configRefusal(host, parent, cfg);
+  return followed && `${followed} disable ${parent}`;
 }
 
 /** Whether fleet may run `feature` on `host` (see featureRefusal). */
@@ -317,15 +328,16 @@ export function assertFeature(
   hosts: readonly (PolicyHostRef & { name: string })[], feature: HostFeature,
   cfg: FleetConfig | null = _activeConfig, policy: FleetPolicy | null = _activePolicy,
 ): void {
+  const parent = FOLLOWS[feature];
   const why = (source: FeatureSource): string => {
-    if (source === "policy" || source === "policy disable shot") {
+    if (source === "policy" || source.startsWith("policy ")) {
       const file = `the fleet policy file ${policy!.path}`;
       if (policy!.error !== undefined) return `by ${file}, which is invalid (${policy!.error}) and so refuses every gated feature until root fixes or removes it`;
-      return `by ${file}, ${source === "policy disable shot" ? "which disables shot (ai follows shot) and " : ""}`
+      return `by ${file}, ${source !== "policy" ? `which disables ${parent} (${feature} follows ${parent}) and ` : ""}`
         + "which fleet.config.json cannot override";
     }
-    if (source === "host disable shot" || source === "top-level disable shot")
-      return "by the fleet config, which refuses shot there (ai follows shot unless hosts.<host>.enable lists ai)";
+    if (source !== "host" && source !== "top-level")
+      return `by the fleet config, which refuses ${parent} there (${feature} follows ${parent} unless hosts.<host>.enable lists ${feature})`;
     return "by the fleet config (hosts.<host>.disable, or the top-level disable without a hosts.<host>.enable)";
   };
   const groups = new Map<string, string[]>();
@@ -744,7 +756,7 @@ export function validateConfig(cfg: FleetConfig, path: string): void {
     // judges the config alone: the policy file is not part of the config.
     const allowed = (name: string) => HOST_FEATURES.filter((f) => featureEnabled(cfg.hosts[name]!, f, cfg, null)).join(",");
     if (new Set(route.prefer.map(allowed)).size !== 1)
-      fail(`routes.${rn}: every transport must allow the same features (check disable/enable on ${route.prefer.join(", ")}; ai follows shot)`);
+      fail(`routes.${rn}: every transport must allow the same features (check disable/enable on ${route.prefer.join(", ")}; ai follows shot, remote follows cu)`);
   }
   for (const [rn, steps] of Object.entries(optionalRecord(cfg.recipes, "recipes")))
     if (!Array.isArray(steps) || steps.some((s) => typeof s !== "string"))

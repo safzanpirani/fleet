@@ -40,10 +40,12 @@ export const LINUX_SESSION_SH = [
 ].join("\n");
 
 /** Windows: `query user` for sessions and idle time; LogonUI in a session means
- *  its lock or sign-in screen is up. */
+ *  its lock or sign-in screen is up. Rows go out untrimmed with the header, so
+ *  the parser can cut a username that holds a space at the header's columns. */
 export const WINDOWS_SESSION_PS = [
   `$lines = @(query user 2>$null)`,
-  `foreach ($l in ($lines | Select-Object -Skip 1)) { "@user " + $l.TrimStart('>', ' ') }`,
+  `if ($lines.Count) { "@header " + $lines[0] }`,
+  `foreach ($l in ($lines | Select-Object -Skip 1)) { "@user " + $l }`,
   `$ui = @(Get-Process LogonUI -ErrorAction SilentlyContinue | ForEach-Object SessionId)`,
   `"@logonui " + ($ui -join ' ')`,
   `try { Add-Type -Namespace FleetSess -Name W -MemberDefinition '[DllImport("kernel32.dll")] public static extern uint WTSGetActiveConsoleSessionId();' -ErrorAction Stop } catch {}`,
@@ -115,10 +117,19 @@ export function parseQueryIdle(s: string): number | undefined {
 
 export function parseWindowsSession(text: string): Omit<SessionState, "host" | "os"> {
   const notes: string[] = [];
+  // `query user` pads fixed columns, and a username may hold a space. Cut the
+  // name off at the header's SESSIONNAME column; a localized header leaves no
+  // column, and the whole row then goes through the pattern.
+  const header = /^@header (.*)$/m.exec(text)?.[1]?.replace(/\r$/, "") ?? "";
+  const nameEnd = header.indexOf("SESSIONNAME");
   const users = [...text.matchAll(/^@user (.*)$/gm)].map((m) => {
-    // USERNAME [SESSIONNAME] ID STATE IDLE-TIME LOGON-TIME (the session name is blank when disconnected)
-    const f = /^(\S+)\s+(?:(\S+)\s+)?(\d+)\s+(Active|Disc\S*|\S+)\s+(\S+)\s+(.+)$/.exec(m[1]!.trim());
-    return f ? { user: f[1]!, session: f[2], id: Number(f[3]), state: f[4]!, idle: f[5]! } : undefined;
+    const row = m[1]!.replace(/\r$/, "");
+    const named = nameEnd > 0 && row.length > nameEnd ? row.slice(0, nameEnd).replace(/^>/, "").trim() : "";
+    // [USERNAME] [SESSIONNAME] ID STATE IDLE-TIME LOGON-TIME (the session name is blank when disconnected)
+    const f = named
+      ? /^()\s*(?:(\S+)\s+)?(\d+)\s+(\S+)\s+(\S+)\s+(.+)$/.exec(row.slice(nameEnd))
+      : /^(\S+)\s+(?:(\S+)\s+)?(\d+)\s+(\S+)\s+(\S+)\s+(.+)$/.exec(row.replace(/^>/, "").trim());
+    return f ? { user: named || f[1]!, session: f[2], id: Number(f[3]), state: f[4]!, idle: f[5]! } : undefined;
   }).filter((u): u is NonNullable<typeof u> => !!u);
   const logonui = (lineVal(text, "logonui") ?? "").split(/\s+/).filter(Boolean).map(Number);
   const consoleId = Number(lineVal(text, "console"));

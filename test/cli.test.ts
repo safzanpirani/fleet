@@ -1,11 +1,19 @@
 import { describe, expect, test } from "bun:test";
-import { applyProxyFlags, completionScript, fleetJsonCommand, keepsArgvBoundaries, trailingFleetFlag } from "../src/cli.ts";
+import { applyProxyFlags, completionScript, fleetJsonCommand, keepsArgvBoundaries, remoteListenDefault, trailingFleetFlag } from "../src/cli.ts";
 import type { FleetConfig } from "../src/config.ts";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { cuaFixture } from "./helpers/cua-driver.ts";
 import { helpText, overviewGroups } from "../src/help.ts";
+
+test("remote --listen without an address listens everywhere and never swallows the host", () => {
+  expect(remoteListenDefault(["laptop", "--listen"])).toEqual(["laptop", "--listen", "0.0.0.0"]);
+  expect(remoteListenDefault(["--listen", "laptop"])).toEqual(["--listen", "0.0.0.0", "laptop"]);
+  expect(remoteListenDefault(["laptop", "--listen", "--no-open"])).toEqual(["laptop", "--listen", "0.0.0.0", "--no-open"]);
+  expect(remoteListenDefault(["laptop", "--listen", "192.0.2.2"])).toEqual(["laptop", "--listen", "192.0.2.2"]);
+  expect(remoteListenDefault(["laptop", "--listen", "localhost"])).toEqual(["laptop", "--listen", "localhost"]);
+});
 
 const cli = join(import.meta.dir, "../src/cli.ts");
 

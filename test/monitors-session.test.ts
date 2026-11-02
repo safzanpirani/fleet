@@ -159,6 +159,14 @@ describe("session state", () => {
     expect(parseQueryIdle("none")).toBe(0);
   });
 
+  test("Windows: a username with a space is cut at the header's columns", () => {
+    const header = "@header  USERNAME              SESSIONNAME        ID  STATE   IDLE TIME  LOGON TIME";
+    const active = "@user >jane doe              console             1  Active      none   10/29/2026 6:48 AM";
+    expect(parseWindowsSession(`${header}\n${active}\n@logonui \n@console 1`)).toMatchObject({ state: "logged-in", user: "jane doe", idleSeconds: 0 });
+    const disc = "@user  jane doe                                  2  Disc        3:10  10/29/2026 6:48 AM";
+    expect(parseWindowsSession(`${header}\n${disc}\n@logonui 3\n@console 3`)).toMatchObject({ state: "login-screen", user: "jane doe" });
+  });
+
   test("macOS: IOConsoleUsers and HID idle", () => {
     const users = JSON.stringify([{ kCGSSessionOnConsoleKey: true, kCGSSessionUserNameKey: "alex", CGSSessionScreenIsLocked: true }]);
     expect(parseMacSession(`@console ${users}\n@hid_idle_ns 5000000000`)).toMatchObject({ state: "locked", user: "alex", idleSeconds: 5 });

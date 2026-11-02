@@ -1136,6 +1136,20 @@ describe("the controller's own adb", () => {
       expect(shells).not.toContain("am force-stop com.termux");
     } finally { server.stop(true); }
   });
+  test("revive bounds adb connect and get-state, so a phone that is not there fails fast", async () => {
+    const server = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { data() {} } });
+    try {
+      const h: Host = { ...lan, android: { serial: `127.0.0.1:${server.port}` } };
+      const budgets = new Map<string, number | undefined>();
+      const run = async (cmd: string[], timeoutMs?: number) => {
+        if (cmd[0] === "adb") budgets.set(cmd.includes("get-state") ? "get-state" : cmd[1]!, timeoutMs);
+        return local([])(cmd);
+      };
+      await androidRevive([h], { waitMs: 0 }, { local: run, probe: async () => false });
+      expect(budgets.get("connect")).toBeLessThanOrEqual(5_000);
+      expect(budgets.get("get-state")).toBeLessThanOrEqual(3_000);
+    } finally { server.stop(true); }
+  });
   test("revive says so when SSH already works", async () => {
     const r = await androidRevive([lan], {}, { local: local([]), probe: async () => true });
     expect(r).toMatchObject({ ok: true, detail: "SSH to handset-wifi already works" });

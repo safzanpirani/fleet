@@ -111,6 +111,7 @@ fleet logs web cloudflared -n 50   # -f streams new lines from one host until Ct
 fleet shot web                 # screenshot the remote desktop -> local PNG
 fleet shot web --grid          # overlay a labeled pixel-coordinate grid (--grid-step N)
 fleet shot web --output DP-1 --region top-right   # one monitor, or part of it (--list shows the layout)
+fleet remote web               # control the desktop live in a browser (noVNC over ssh)
 fleet session web              # logged in, locked or at the login screen; idle time; displays on/off
 fleet cu @windows install      # install cua-driver across a selector (computer use)
 fleet cu web get_screen_size   # drive a desktop: click/type/read window state
@@ -602,6 +603,52 @@ A live stream uses its own SSH session. Quitting restores the terminal before th
 
 The operating system must grant camera access. macOS capture over SSH may lack camera permission; use `local` on the Mac. An application can hold exclusive access to a camera. Fleet reports capture failure and leaves that application running. Each photo capture has a 20-second process limit. Fleet installs no camera software.
 
+## Live control in a browser (`fleet remote`)
+
+`fleet remote <host>` puts a host's desktop in a browser tab. Fleet starts a VNC
+server on the host that only the host itself can reach, forwards it over one new
+ssh connection to a private unix socket on this machine, and serves
+[noVNC](https://github.com/novnc/noVNC) on `127.0.0.1` under a random URL token.
+On macOS it opens the page. Ctrl-C ends the session and stops the server on the
+host, and so does a dropped ssh connection.
+
+```sh
+fleet remote winbox install   # once per host
+fleet remote winbox           # prints the URL and opens it
+fleet remote web --view-only
+fleet remote winbox --listen  # serve it to other devices on the network
+fleet remote phone            # an Android host opens in a scrcpy window instead
+```
+
+| host | server | login |
+|---|---|---|
+| Windows | the TightVNC service, loopback only; it follows the lock screen and UAC prompts | a new VNC password each session, which the page already holds |
+| Linux, X11 | x11vnc on a unix socket in a 0700 directory | none; only the ssh user can open the socket |
+| Linux, Wayland | wayvnc on a unix socket in a 0700 directory | none, as above |
+| macOS | the built-in Screen Sharing service | a macOS account, typed into the page |
+
+`install` sets the server up once. On Windows it runs winget and leaves the
+`tvnserver` service Manual and stopped. On Linux it installs x11vnc or wayvnc
+for the running session through pacman, apt-get or dnf as root. On macOS it
+turns Screen Sharing on with launchctl as root, and Screen Sharing then listens
+on port 5900 on every interface. `stop` ends a server that a crashed session
+left running.
+
+`--listen ADDR` serves the page on another address, such as a tailnet IP, so
+another device can open it. `--listen` alone (or `--listen 0.0.0.0`) serves every interface and prints
+the page's URL at each of this machine's network addresses; run from an ssh
+login, the address that login came in on comes first and no browser opens on
+this machine. The URL token is then the only lock on the page. Browsers allow
+WebCrypto and the clipboard only on https and localhost, so over plain http
+from another device a macOS login and Send clipboard fail. Run one session per
+host at a time. A session needs a macOS or Linux controller, because the
+forward ends in a unix socket.
+
+A Windows or X11 host with several monitors gets a screen picker in the page.
+One screen then fills the window, and clicks land on that screen. Windows reads
+its layout through a scheduled task in the user's session, because sshd's
+session sees only a placeholder screen. wayvnc shares a single output.
+
 ## Agent setup
 
 Fleet is built for coding agents. Most setups need two things: the CLI on PATH,
@@ -945,6 +992,7 @@ host, and `hosts.<h>.enable` re-allows a feature the top level refuses:
 |---|---|
 | `webcam` | `webcam` (never `webcam local`) |
 | `cu` | `cu` on desktops and Android, perception, recording |
+| `remote` | `remote` (live control in a browser, and its `install` and `stop`) |
 | `shot` | `shot`, the MCP `screenshot` tool |
 | `ai` | `cu … task`, `cu … elements --task` (both send window content to an AI service) |
 | `browse` | `browse` |
@@ -964,17 +1012,18 @@ validation, and so does a route whose transports allow different features.
 Read-only commands such as `status`, `ps`, `disk`, `which` and `tools status`
 are never gated.
 
-`ai` follows `shot`: a host that refuses `shot` refuses `ai` too, unless its
-own `enable` lists `ai`. `fleet config` and `fleet ls` show such a refusal with
-the source `host disable shot` or `top-level disable shot`. With `ai` refused,
-`cu … task` refuses before it reads the window, and `elements --task` sends
-nothing and lists every row with a note saying focus was skipped.
+`ai` follows `shot` and `remote` follows `cu`: a host that refuses `shot`
+refuses `ai` too, and a host that refuses `cu` refuses `remote`, unless its own
+`enable` lists the follower. `fleet config` and `fleet ls` show such a refusal
+with a source like `host disable shot` or `policy disable cu`. With `ai`
+refused, `cu … task` refuses before it reads the window, and `elements --task`
+sends nothing and lists every row with a note saying focus was skipped.
 
 This is a policy on fleet's own commands, not a sandbox. Anyone holding the
 host's ssh login can still run cua-driver or ffmpeg directly, and so can
 `fleet exec`. To stop an agent from doing something through fleet, disable
 `exec` (and `files`) as well.
-Blocking all computer use means disabling `cu`, `shot` and `ai`.
+Blocking all computer use means disabling `cu`, `shot` and `ai`; `remote` follows `cu`.
 
 ### Policy file
 

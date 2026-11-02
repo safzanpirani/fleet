@@ -63,6 +63,25 @@ finally { $source.Dispose() }`;
   };
 }
 
+/** PowerShell that finds this login's sshd process and defines
+ *  `Test-FleetSshdGone`. When sshd's default shell is Windows PowerShell, it
+ *  wraps the command in 'powershell -c', which passes on the first stdin line
+ *  and never EOF, and the program outlives the ssh client. Waits on
+ *  `$fleetControl` must also poll this, or they never end there. */
+export const WINDOWS_SSHD_WATCH = `
+$fleetSshd=$null; $fleetP=$PID
+for($i=0; $i -lt 8 -and $fleetP; $i++){
+  $w=Get-CimInstance Win32_Process -Filter "ProcessId=$fleetP" -ErrorAction SilentlyContinue
+  if(-not $w){ break }
+  if($fleetP -ne $PID -and $w.Name -match '^sshd(-session)?\\.exe$'){
+    try { $fleetSshd=[Diagnostics.Process]::GetProcessById($fleetP); $null=$fleetSshd.Handle } catch { $fleetSshd=$null }
+    break
+  }
+  $fleetP=$w.ParentProcessId
+}
+function Test-FleetSshdGone { [bool]($fleetSshd -and $fleetSshd.HasExited) }
+`;
+
 // Closing the owning PowerShell process also closes this job and kills FFmpeg.
 // TODO(review): Suspended Windows process creation is needed to eliminate the shell-death race between Start and job assignment.
 const WINDOWS_WEBCAM_JOB = `
@@ -485,8 +504,12 @@ try {
   $out=[Console]::OpenStandardOutput()
   $copy=$proc.StandardOutput.BaseStream.CopyToAsync($out)
   $control=$fleetControl.CopyToAsync([IO.Stream]::Null)
-  $done=[Threading.Tasks.Task]::WaitAny([Threading.Tasks.Task[]]@($copy,$control))
-  if($done -eq 1){return}
+${WINDOWS_SSHD_WATCH}
+  while($true){
+    $done=[Threading.Tasks.Task]::WaitAny([Threading.Tasks.Task[]]@($copy,$control),1000)
+    if($done -eq 0){break}
+    if($done -eq 1 -or (Test-FleetSshdGone)){return}
+  }
   $copy.GetAwaiter().GetResult()
   $proc.WaitForExit()
   if($proc.ExitCode -ne 0){throw ('Camera unavailable, busy, or permission denied: '+$err.Result)}

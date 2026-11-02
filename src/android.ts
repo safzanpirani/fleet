@@ -1784,6 +1784,9 @@ const localRun: LocalRun = async (cmd, timeoutMs = 20_000) => {
   return { code, stdout, stderr };
 };
 
+const ADB_CONNECT_MS = 5_000;
+const ADB_STATE_MS = 3_000;
+
 /** The phone's network adb serial as this machine reaches it: the host's SSH
  *  alias resolved by `ssh -G`, with the port adbd listens on. Connected and
  *  checked; undefined with a reason when adb here cannot reach it. */
@@ -1795,8 +1798,10 @@ async function networkSerial(h: Host, run: LocalRun): Promise<{ serial?: string;
   // adb connect waits a long time on an address that is not there (the home
   // LAN, away from home); a quick TCP check skips it.
   if (!await portOpen(hostname, Number(port), 1500)) return { why: `${h.name}: nothing answers on ${serial}` };
-  await run(["adb", "connect", serial]);
-  const state = (await run(["adb", "-s", serial, "get-state"])).stdout.trim();
+  // The port answered, so adbd is there; a connect or state check that takes
+  // longer than this is a stuck device, and the default 20 s per call adds up.
+  await run(["adb", "connect", serial], ADB_CONNECT_MS);
+  const state = (await run(["adb", "-s", serial, "get-state"], ADB_STATE_MS)).stdout.trim();
   return state === "device" ? { serial } : { why: `${h.name}: adb at ${serial} is ${state || "unreachable"}` };
 }
 

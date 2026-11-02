@@ -198,3 +198,16 @@ describe("ai follows shot", () => {
     expect(() => validateConfig(cfg, "t")).not.toThrow();
   });
 });
+
+describe("remote follows cu", () => {
+  test("a policy that refuses cu refuses remote, which no config enable lifts", () => {
+    const cfg: FleetConfig = { hosts: { laptop: host("laptop", { enable: ["remote"] }), box: host("box", { disable: ["cu"] }) } };
+    const p = policy({ hosts: { laptop: { disable: ["cu"] } } });
+    expect(featureRefusal(cfg.hosts.laptop!, "remote", cfg, p)).toBe("policy disable cu");
+    expect(() => assertFeature([cfg.hosts.laptop!], "remote", cfg, p))
+      .toThrow("which disables cu (remote follows cu) and which fleet.config.json cannot override");
+    expect(featureRefusal(cfg.hosts.box!, "remote", cfg, null)).toBe("host disable cu");
+    cfg.hosts.box!.enable = ["remote"];
+    expect(featureRefusal(cfg.hosts.box!, "remote", cfg, null)).toBeNull();
+  });
+});

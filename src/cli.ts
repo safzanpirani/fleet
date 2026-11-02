@@ -30,6 +30,7 @@
 import { readFile } from "node:fs/promises";
 import { writeSync } from "node:fs";
 import { homedir } from "node:os";
+import { isIP } from "node:net";
 import { processList, processKill } from "./procs.ts";
 import type { KillResult } from "./procs.ts";
 import { portList } from "./ports.ts";
@@ -66,6 +67,7 @@ import {
 } from "./core.ts";
 import type { CuInstallerPin } from "./core.ts";
 import { currentViewport, detectWebcamVo, runWebcamStream, validateWebcamStreamOptions } from "./webcam.ts";
+import { installRemote, startRemote, stopRemote } from "./remote.ts";
 import {
   fingerprint,
   fingerprintTools,
@@ -212,6 +214,17 @@ function execStatus(results: ExecResult[], raw: boolean): number {
     return code === 0 ? 0 : (code & 255) || 1;
   }
   return results.some((r) => !r.ok) ? 1 : 0;
+}
+
+/** `fleet remote … --listen` with no address listens on every interface. The
+ *  next word is the address only when it is an IP literal or localhost, so
+ *  `--listen laptop` keeps the host as the selector. */
+export function remoteListenDefault(argv: string[]): string[] {
+  const i = argv.indexOf("--listen");
+  if (i < 0) return argv;
+  const next = argv[i + 1];
+  if (next !== undefined && (isIP(next) !== 0 || next === "localhost")) return argv;
+  return argv.toSpliced(i + 1, 0, "0.0.0.0");
 }
 
 /** A --cwd that the local shell already expanded: `--cwd ~/x` unquoted reaches
@@ -764,7 +777,7 @@ const SUBCOMMANDS = [
   "webcam",
   "config",
   "ls", "hosts", "dt", "exec", "spawn", "watch", "jobs", "cp", "edit", "diff", "restart", "reboot", "bios", "boot", "switch", "wait",
-  "gpu", "disk", "du", "which", "ps", "ports", "kill", "status", "top", "logs", "svc", "shot", "cu", "browse", "run", "deploy", "tools", "skills", "proxy", "doctor", "hostkey", "find", "session", "drop", "completion", "ssh", "help",
+  "gpu", "disk", "du", "which", "ps", "ports", "kill", "status", "top", "logs", "svc", "shot", "remote", "cu", "browse", "run", "deploy", "tools", "skills", "proxy", "doctor", "hostkey", "find", "session", "drop", "completion", "ssh", "help",
 ];
 /** Emit a bash/zsh completion script with this config's hosts/groups/recipes/
  *  services baked in. Source it: `eval "$(fleet completion zsh)"`. */
@@ -1787,6 +1800,72 @@ async function dispatch(command: string | undefined, rest0: string[], cfg: Fleet
       console.log(`${A.g("●")} ${A.b(r.host)} ${A.d("→")} ${r.localPath}${grid ? A.d(" (grid)") : ""}`);
       if (!noOpen && process.platform === "darwin")
         Bun.spawn(["open", r.localPath], { stdout: "ignore", stderr: "ignore" });
+      return 0;
+    }
+
+    case "remote": {
+      const { flags, rest: pos } = parseFlags(remoteListenDefault(rest), ["--no-open", "--view-only", "--json"], ["--listen", "--port"]);
+      const usage = "usage: fleet remote <host> [--view-only] [--listen [ADDR]] [--port N] [--no-open]\n       fleet remote <host> install|stop [--json]";
+      const [sel, action, ...extra] = pos;
+      if (!sel || extra.length || (action !== undefined && action !== "install" && action !== "stop")) die(usage);
+      const viewOnly = flags["--view-only"] === true;
+      const json = flags["--json"] === true;
+      const listen = flags["--listen"] as string | undefined;
+      const port = flags["--port"] !== undefined ? numFlag(flags, "--port", 0, 1) : undefined;
+      if (port !== undefined && port > 65535) die("--port must be 1-65535");
+      const sessionFlags = listen !== undefined || port !== undefined || flags["--no-open"] === true || viewOnly;
+      if (action && sessionFlags) die(`fleet remote ${sel} ${action} takes only --json`);
+      if (!action && json) die("--json applies to install and stop");
+      // An Android host (or a route of them) opens in a scrcpy window here,
+      // through this machine's adb, like `fleet cu <phone> watch`.
+      const names = cfg.routes?.[sel]?.prefer ?? [sel];
+      const android = names.map((n) => cfg.hosts[n]).filter((h): h is Host => !!h?.android);
+      if (android.length && android.length === names.length) {
+        if (action || listen !== undefined || port !== undefined)
+          die(`${sel} is an Android host: fleet remote opens it in a scrcpy window here and takes only --view-only`);
+        assertFeature(android, "remote", cfg);
+        const r = await androidWatch(android, { viewOnly });
+        console.log(`${r.ok ? A.g("●") : A.r("✗")} ${r.detail}`);
+        return r.ok ? 0 : 1;
+      }
+      const routed = await routeSelector(cfg, sel);
+      if (action) {
+        if (!json) process.stdout.write(A.d(`◎ ${action === "install" ? "installing the VNC server on" : "stopping the VNC server on"} ${routed} …\r`));
+        let r;
+        try { r = action === "install" ? await installRemote(cfg, routed) : await stopRemote(cfg, routed); }
+        catch (error) { die(error instanceof Error ? error.message : String(error)); }
+        if (json) { console.log(JSON.stringify(r)); return r.ok ? 0 : 1; }
+        console.log(`${r.ok ? A.g("●") : A.r("✗")} ${A.b(r.host)}${r.kind ? A.d(` ${r.kind}`) : ""} ${r.detail}`);
+        return r.ok ? 0 : 1;
+      }
+      process.stdout.write(A.d(`◎ starting a remote session on ${routed} …\r`));
+      let s;
+      try { s = await startRemote(cfg, routed, { listen, port, viewOnly }); }
+      catch (error) { die(error instanceof Error ? error.message : String(error)); }
+      const shown = s.screens && s.screens.monitors.length > 1 ? A.d(` ${s.screens.monitors.length} screens`) : "";
+      console.log(`${A.g("●")} ${A.b(s.host)} ${A.d(s.kind)}${shown} ${s.url}`);
+      // Over ssh, the address this login came in on is the one the other
+      // device can reach, so it goes first.
+      const sshServer = process.env.SSH_CONNECTION?.split(" ")[2];
+      const lan = s.lanUrls.toSorted((a, b) => Number(new URL(b).hostname === sshServer) - Number(new URL(a).hostname === sshServer));
+      for (const u of lan) console.log(`  ${u}`);
+      if (listen !== undefined && !/^(127\.|::1$|localhost$)/.test(listen))
+        console.log(A.y(`  listening on ${listen}: anyone who can reach it and holds this URL controls ${s.host}`));
+      console.log(A.d("  Ctrl-C ends the session and stops the server on the host"));
+      // From an ssh login the person is at another computer, not this screen.
+      if (flags["--no-open"] !== true && process.platform === "darwin" && !process.env.SSH_CONNECTION)
+        Bun.spawn(["open", s.url], { stdout: "ignore", stderr: "ignore" });
+      let stopped = false;
+      const stop = () => { stopped = true; s.stop(); };
+      const signals = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
+      for (const sig of signals) process.on(sig, stop);
+      const r = await s.done;
+      for (const sig of signals) process.off(sig, stop);
+      if (!stopped) {
+        console.error(`${A.r("✗")} ${s.host}: the session ended${r.stderr ? `: ${r.stderr}` : ` (ssh exit ${r.code})`}`);
+        return 1;
+      }
+      console.log(A.d(`○ ${s.host} session ended`));
       return 0;
     }
 
